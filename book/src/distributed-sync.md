@@ -457,9 +457,12 @@ push. A receive that lands without changing the root, the common case of an
 unchanged tree pushed again, resets nothing either: otherwise two neighbours
 would push each other every two seconds forever. A changed held set resets
 nothing: the next push carries it, so it reaches a Full neighbour within about
-two maximum intervals. A push whose tree changed while it ran, because a
-record was committed meanwhile, is followed by another at once from the root
-just confirmed; the timer does not see pushes end.
+two maximum intervals. A confirmed push whose tree changed while it ran,
+because a record was committed meanwhile, is followed by another at once from
+the root just confirmed. A push that ended any other way, failed, reset or
+timed out, is left to the timer however the tree moved, so retries to a
+neighbour that cannot land it are paced like any push; the timer does not see
+pushes end.
 
 A push runs only on the current connection to its neighbour, and the walks
 task never dials: a neighbour without a connection is pushed to once the
@@ -486,8 +489,10 @@ landed roots, until this side's tree moved. Forgetting costs the next push one
 root NODE, which the neighbour's HELD prunes. The receiver remembers the same
 thing from its side, the root of the last push of each tree from each peer
 that landed here, so a root it landed is held whole however its own tree grew
-since. Neither memory is persisted: a restarted side pushes everything again,
-and its neighbours hold it.
+since. Both memories are forgotten for a neighbour when the connection to it
+closes, so a reconnect starts from no confirmed root and costs one root NODE,
+and for a collection when it is deselected; neither is persisted: a restarted
+side pushes everything again, and its neighbours hold it.
 
 What a quiet collection costs is two `walk/1` streams a minute per neighbour
 this side sends to, its records and its evidence, and three to a Full
@@ -557,27 +562,39 @@ newest snapshot as each LEAF arrives, so a value another push landed meanwhile
 is not asked for again, and the sender answers each from its pinned tree. A
 duplicate is harmless under union.
 
-A push lands when its count proof closes, the leaves pushed plus the leaf
-counts of every child marked held being exactly the root's count, every value
-asked for landed without a failed insert, no fetch failed and no proof stayed
-deferred: the receiver sends LANDED, and the sender's pinned root becomes the
-confirmed one. A receiver whose own tree equals the pushed root, or that
-landed that root from the same sender before, holds everything: it answers
-every NODE with every child held, ignores every LEAF and counts the root's
-leaves at once, so ROOT then DONE lands with nothing in between, at a receiver
-that holds the tree or a superset of it. Anything else fails the push: a frame
-out of its place (a NODE, LEAF or DONE before the ROOT, a second ROOT, a VALUE
-nobody asked for, a frame after the end, or a frame only the other side
-sends), a NODE that is not canonical or whose root node does not match the
-ROOT, a VALUE that does not decode, is not under its key or is not evidence
-for C, a count that does not add up, a failed insert or fetch, a deferred
-proof, a HELD for no outstanding NODE, a VALUE_REQUEST for a key the pinned
-tree lacks, or a LANDED before DONE. The failing side resets the stream
-(`RESET_WALK_FAILED`); what landed stays, and the next push skips the subtrees
-that now match. A push or a receive also ends after 60 seconds without a frame
-from the other side. Every node hash-chains to the pushed root, and the
-receiver's answers disclose where it differs from the sender, which is one
-more reason pushes are served only to peers the sender sends C to.
+The receiver keeps the locators the sender owes it, each with the digest and
+leaf count declared for it: the root's, from ROOT, then each accepted NODE's
+children it does not hold. A NODE is accepted only at a locator owed, once,
+and is checked against the digest declared there, so every node hash-chains
+to the pushed root; a LEAF only under the owed locator on its key's path,
+with one leaf and the digest its key binds, once. A push lands when that
+membership proof closes, every locator owed having been pushed, so that the
+leaves pushed plus the leaf counts of every child marked held are exactly the
+root's count, every value asked for landed without a failed insert, no fetch
+failed and no proof stayed deferred: the receiver sends LANDED, and the
+sender's pinned root becomes the confirmed one. A receiver whose own tree
+equals the pushed root, or that landed that root from the same sender before,
+holds everything: it answers every NODE with every child held, ignores every
+LEAF and counts the root's leaves at once, so ROOT then DONE lands with
+nothing in between, at a receiver that holds the tree or a superset of it.
+Anything else fails the push: a frame out of its place (a NODE, LEAF or DONE
+before the ROOT, a second ROOT, a NODE or LEAF at a locator the sender does
+not owe or owes no more, a VALUE nobody asked for, a frame after the end, or a
+frame only the other side sends), a NODE that is not canonical or is not the
+node declared at its locator, a LEAF whose key does not bind the digest
+declared, a VALUE that does not decode, is not under its key or is not
+evidence for C, a locator owed that was never pushed or a count that does not
+add up, a failed insert or fetch, a deferred proof, a HELD for no outstanding
+NODE, a VALUE_REQUEST for a key the pinned tree lacks, or a LANDED before
+DONE. The failing side resets the stream (`RESET_WALK_FAILED`); what landed
+stays, and the next push skips the subtrees that now match. A push or a
+receive also ends after 60 seconds without a frame from the other side while
+one is owed: before DONE, and after it for the values the receiver asked for.
+After DONE the sender waits for LANDED as long as the connection lives, since
+the receiver's fetches and landings take what time they take, and the
+receiver reads nothing but the values it asked for. The receiver's answers
+disclose where it differs from the sender, which is one more reason pushes
+are served only to peers the sender sends C to.
 
 A record value must decode, with its signature, to a COMMIT or DERIVE naming
 C under the fingerprint it was asked for by. A proof value must match its id,
@@ -586,17 +603,21 @@ subordinate resource whose descriptor is missing fetches that descriptor from
 the sender, as described above, and lands with it if it routes the proof to
 C, or stays deferred. A references push carries no values: a held handle
 missing from the local held set joins it, one resident here noted held as it
-is, and another fetched by hash from the sender over `blob/1` within the same
-60 seconds and landed with its note. A failed fetch fails the push, and the
-blob stays in the next difference. Because a held set is a flat closure, one
-references push exposes the missing frontier at every depth.
+is, and another fetched by hash from the sender over `blob/1` and landed with
+its note. A fetch is held to progress, 60 seconds between any two chunks, and
+never to a bound on the whole, so a blob of any size lands at a steady rate. A
+failed fetch fails the push, and the blob stays in the next difference.
+Because a held set is a flat closure, one references push exposes the missing
+frontier at every depth.
 
 Three bounds keep what a push costs the receiver. It asks for values 64 at a
 time, value requests and blob fetches together, and the leaves beyond that
 wait their turn. It answers NODEs only while fewer than 1,024 leaves wait to
-be asked for, so the sender's window of unanswered NODEs holds its push. And
-it hands at most 1,024 values to landing ahead of their acknowledgement; while
-that many are with the landing task it reads no further, so QUIC's flow
+be asked for, so the sender's window of unanswered NODEs holds its push; a
+push with 32,768 leaves waiting, more than that window can push, is a flood
+and fails. And it hands at most 1,024 values to landing ahead of their
+acknowledgement; while that many are with the landing task it reads no
+further, so QUIC's flow
 control holds the sender, and a sender whose receiver stops reading stalls
 instead of queueing without bound. A walk stream takes no request permit on
 either side, but it counts as in use on its connection: a draining connection
