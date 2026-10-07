@@ -108,6 +108,17 @@ pub const RESET_UNKNOWN: u32 = 1;
 /// Stream reset code: the connection already holds
 /// [`MAX_HELD_REQUESTS_PER_CONNECTION`] request streams.
 pub const RESET_BUSY: u32 = 3;
+/// Stream reset code: the receiver of a `walk/1` push does not receive that
+/// collection from its opener.
+pub const RESET_WALK_REFUSED: u32 = 4;
+/// Stream reset code: a side of a `walk/1` push broke its protocol, or a
+/// second push of the same collection and kind replaced it.
+pub const RESET_WALK_FAILED: u32 = 5;
+
+/// The tag of a `walk/1` stream: one push of one collection tree
+/// ([`crate::walk_stream`]). The opener sends it, then one OPEN frame, and
+/// is the push's sender. A walk stream takes no request permit.
+pub const TAG_WALK: u8 = 0x12;
 
 /// What streams mean. The table decides which request streams reach the
 /// service and holds their permits; the service answers them, and hears what
@@ -1098,6 +1109,7 @@ fn tag_name(tag: u8) -> &'static str {
         TAG_RECON => "recon/1",
         TAG_DHT => "dht/1",
         TAG_BLOB => "blob/1",
+        TAG_WALK => "walk/1",
         _ => "unknown",
     }
 }
