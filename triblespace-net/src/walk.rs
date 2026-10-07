@@ -1,42 +1,40 @@
-//! Walk streams: each side pushes its collection trees to its neighbours
-//! (design: walk streams).
+//! Walk streams: each side exchanges its collection trees with its
+//! neighbours (design: walk streams).
 //!
-//! A push carries one tree of one collection, pinned when the push starts,
-//! to one neighbour on a `walk/1` stream the sender opens
-//! ([`crate::walk_stream`]). The sender ([`crate::push`]) sends the tree's
-//! root and walks the part of it the neighbour has not confirmed; the
-//! receiver ([`crate::receive`]) prunes with HELD bitmaps, asks for the
-//! values it lacks and lands them through the landing task
-//! ([`crate::landing`]); its LANDED confirms the push, and the pushed root
-//! becomes the confirmed root for that peer, collection and tree, which an
-//! unchanged tree is pushed as alone next time; the receiver remembers the
-//! roots that landed from each peer the same way, so a root it landed is
-//! held whole however its own tree grew since. A push that ends any other
-//! way forgets the confirmed root, and what landed stays. Both memories
-//! are forgotten for a peer when a connection to it closes, and for a
-//! collection when it is deselected.
+//! An exchange carries one tree of one collection both ways on one `walk/1`
+//! stream ([`crate::walk_stream`]): each side sends its delta against the
+//! tree the two agreed on last time, breadth first and without waiting, and
+//! lands the other's ([`crate::exchange`]). Both LANDEDs crossing confirms
+//! it, and the agreed tree for that peer, collection and kind becomes the
+//! union of the two pinned trees, which both hold; an exchange that ends any
+//! other way forgets it, and what landed stays. Agreed trees are forgotten
+//! for a peer when a connection to it closes, and for a collection when it
+//! is deselected; none is persisted.
 //!
 //! The kinds of tree are the collection's records, its authorization
 //! evidence (keyed by proof id under the collection) and the blobs it holds,
-//! as handles without values: a held reference the receiver lacks is noted
-//! held when the blob is resident, and fetched by hash from the sender
-//! first otherwise. A record lands as it is; a proof lands once its evidence
+//! as handles without values: a held reference a side lacks is noted held
+//! when the blob is resident, and fetched by hash from the peer first
+//! otherwise. A record lands as it is; a proof lands once its evidence
 //! validates, fetches the descriptor of a resource it is routed through, or
-//! stays deferred, which fails the push.
+//! stays deferred, which fails the exchange.
 //!
-//! The walks task runs one node's pushes and receives. A push runs only on
-//! the current connection to its neighbour, and the task never dials; at
-//! most one push per peer, collection and kind runs at a time. A push or a
-//! receive ends after [`WALK_DEADLINE`] without a frame from the other side
-//! while one is owed: before DONE, and after it for the values the receiver
-//! asked for. After DONE the sender waits for LANDED as long as the
-//! connection lives, since the receiver's fetches and landings take what
-//! time they take, and a blob fetch ends after [`WALK_DEADLINE`] without
-//! progress, never for its size. A second push of the same tree from a peer
-//! replaces the first, which is reset. Walk streams count as in use on
-//! their connection, so a draining connection waits for them.
+//! The walks task runs one node's exchanges. Either side opens the stream
+//! when its timer fires ([`crate::schedule`]), on the current connection to
+//! the neighbour, and the task never dials; the other side joins it. One
+//! exchange per peer, collection and kind runs at a time: when both open
+//! one within a round trip, the stream the smaller peer id opened survives
+//! and the larger id's own is reset [`RESET_WALK_DUPLICATE`], which neither
+//! counts nor forgets anything; a later stream from the peer for a running
+//! incoming exchange replaces it. An exchange ends after [`WALK_DEADLINE`]
+//! without a frame from the peer while one is owed: before its DONE, and
+//! after it for the values asked for; the peer's LANDED is waited for as
+//! long as the connection lives, since landings take what time they take,
+//! and a blob fetch ends after [`WALK_DEADLINE`] without progress, never for
+//! its size. Walk streams count as in use on their connection, so a
+//! draining connection waits for them.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -51,8 +49,10 @@ use tracing::debug;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::{Blob, MemoryBlobStore};
 use triblespace_core::capability::{CapabilityProof, CapabilityProofId, QuorumOutcome};
-use triblespace_core::collection::{CollectionHandle, CollectionRecordFingerprint, descriptor};
-use triblespace_core::patch::{Blake3Merkle, IdentitySchema, PATCH};
+use triblespace_core::collection::{
+    CollectionHandle, CollectionRecord, CollectionRecordFingerprint, descriptor,
+};
+use triblespace_core::patch::{Blake3Merkle, Entry, IdentitySchema, PATCH};
 use triblespace_core::repo::SnapshotSource;
 use triblespace_core::trible::TribleSet;
 
@@ -64,9 +64,10 @@ use crate::collection_activation::{
 };
 use crate::collection_delta::{decode_record, encode_record};
 use crate::connection::{
-    Connection, ConnectionTable, RESET_WALK_FAILED, RESET_WALK_REFUSED, Service, open_walk,
-    read_frame, write_frame,
+    ConnectionTable, FrameError, RESET_WALK_DUPLICATE, RESET_WALK_FAILED, RESET_WALK_REFUSED,
+    Service, open_walk, read_frame, write_frame,
 };
+use crate::exchange::{Ended, Exchange, Out, Outcome, Tree};
 use crate::health::Health;
 use crate::host::{CollectionSnapshot, METADATA_BLOB_BYTES, StoreSnapshot};
 use crate::landing::{LandSlot, Landed};
@@ -77,12 +78,9 @@ use crate::patch_repair::{
 use crate::protocol::{
     MAX_EXACT_BLOB_BYTES, RawHash, TAG_BLOB, fetch_get_blob_stream_with_limit, send_u8,
 };
-use crate::push::{ConfirmedRoots, Push, PushKey};
-use crate::receive::{Out, Receive};
 use crate::recon::Malformed;
-use crate::transport::{Conn, PeerId, RecvStream, SendStream, Transport};
+use crate::transport::{Conn, PeerId, RecvStream, SendStream, Transport, reset_code};
 use crate::walk_stream::Frame;
-use crate::{push, receive};
 
 /// Bytes of every key a walk enumerates, relative to its kind's base.
 pub(crate) const KEY_BYTES: usize = 32;
@@ -120,6 +118,18 @@ impl WalkKind {
             _ => None,
         }
     }
+}
+
+/// One exchange, as the walks task and the agreed trees name it: its peer,
+/// collection and kind.
+pub(crate) type Key = (PeerId, RawHash, WalkKind);
+
+fn agreed_key(peer: PeerId, collection: RawHash, kind: WalkKind) -> [u8; 65] {
+    let mut key = [0; 65];
+    key[..32].copy_from_slice(&peer);
+    key[32..64].copy_from_slice(&collection);
+    key[64] = kind.wire();
+    key
 }
 
 /// Append a summary: its root, all zeros for the empty set, and its leaf
@@ -259,18 +269,17 @@ impl Reader<'_> {
     }
 }
 
-/// A push or a receive ends after this long without a frame from the other
-/// side while one is owed, and a blob fetch of a receive after this long
-/// without progress.
+/// An exchange ends after this long without a frame from the peer while one
+/// is owed, and a blob fetch after this long without progress.
 pub(crate) const WALK_DEADLINE: Duration = Duration::from_secs(60);
-/// Value requests and blob fetches one receive keeps in flight.
+/// Value requests and blob fetches one exchange keeps in flight.
 pub(crate) const MAX_WALK_REQUESTS: usize = 64;
-/// Values one receive hands to landing before they are acknowledged. A
-/// receive whose landing queue is full reads no further.
+/// Values one exchange hands to landing before they are acknowledged. An
+/// exchange whose landing queue is full reads no further.
 pub(crate) const MAX_WALK_UNLANDED: usize = 1024;
 
-/// What the walks tell the scheduler: a push of a tree from a neighbour is
-/// being received here, or ended.
+/// What the walks tell the scheduler: a peer's delta of a tree is being
+/// received here, or its exchange ended.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Event {
     Receiving {
@@ -280,25 +289,23 @@ pub(crate) enum Event {
     Received {
         collection: CollectionHandle,
         kind: WalkKind,
-        /// Everything pushed landed, and the sender's root is confirmed.
+        /// Everything the peer sent landed, and LANDED went back.
         landed: bool,
     },
 }
 
-/// One node's pushes: which run, the roots its neighbours confirmed, and
-/// the roots that landed here from each of them.
+/// One node's exchanges: what each neighbour and this side agreed on, per
+/// collection and kind, and whether each neighbour is sent or received
+/// from.
 pub(crate) struct Walks {
     health: Health,
     snapshot: Option<Arc<StoreSnapshot>>,
     /// The collections the last snapshot selected: one that leaves the
     /// selection is forgotten.
-    selected: HashSet<RawHash>,
-    /// Pushes running, by peer, collection and kind.
-    pushes: HashSet<PushKey>,
-    confirmed: ConfirmedRoots,
-    /// The root of the last push from each peer of each tree that landed
-    /// here: the receiver's side of the confirmed root.
-    landed: HashMap<PushKey, PatchSummary>,
+    selected: PATCH<32, IdentitySchema, ()>,
+    /// The agreed tree of each peer, collection and kind: the union of the
+    /// two trees pinned for the last confirmed exchange, which both hold.
+    agreed: PATCH<65, IdentitySchema, Arc<Tree>>,
 }
 
 impl Walks {
@@ -306,126 +313,131 @@ impl Walks {
         Self {
             health,
             snapshot: None,
-            selected: HashSet::new(),
-            pushes: HashSet::new(),
-            confirmed: ConfirmedRoots::default(),
-            landed: HashMap::new(),
+            selected: PATCH::new(),
+            agreed: PATCH::new(),
         }
     }
 
-    /// Start a push of C's `kind` tree to `peer` on a `walk/1` stream of the
-    /// caller's: the push and its first frames, if this side sends C to the
-    /// peer and no push of this kind to it runs. [`Walks::pushed`] ends it.
-    pub(crate) fn push(
-        &mut self,
-        peer: PeerId,
-        collection: CollectionHandle,
-        kind: WalkKind,
-    ) -> Option<(Push, Vec<Frame>)> {
-        let key = (peer, collection.raw, kind);
-        if self.pushes.contains(&key) {
-            return None;
-        }
-        let pinned = self
-            .local(collection)
-            .filter(|pinned| self.sends(peer, pinned))?;
-        self.pushes.insert(key);
-        Some(Push::start(kind, pinned, self.confirmed.root(key)))
-    }
-
-    /// The push of C's `kind` tree to `peer` ended. Returns whether it was
-    /// confirmed and the tree here differs from the one pushed: the caller
-    /// then pushes again at once, from the root just confirmed. A push that
-    /// ended any other way is left to C's timer however the tree moved:
-    /// repeating it at once would retry a neighbour that cannot land it as
-    /// fast as the attempts fail.
-    pub(crate) fn pushed(
-        &mut self,
-        peer: PeerId,
-        collection: CollectionHandle,
-        kind: WalkKind,
-        outcome: push::Outcome,
-        now: Mono,
-    ) -> bool {
-        let key = (peer, collection.raw, kind);
-        self.pushes.remove(&key);
-        let root = outcome.root;
-        let confirmed = outcome.confirmed;
-        self.health.with_peer(collection, peer, |health| {
-            health.pushed(now, kind, root, confirmed)
-        });
-        let changed = self
-            .local(collection)
-            .is_some_and(|current| summary(kind, current.repair()) != root);
-        self.confirmed.settle(key, outcome);
-        changed && confirmed
-    }
-
-    /// Admit a push of C's `kind` tree from `peer`, if this side receives
-    /// C from it: the receive, told the root that last landed from the
-    /// peer.
-    fn receive(
+    /// Start an exchange of C's `kind` tree with `peer`, against what they
+    /// agreed on: none when C is not selected and active here, or this side neither
+    /// sends C to the peer nor receives C from it. [`Walks::ended`] ends it.
+    pub(crate) fn start(
         &self,
         peer: PeerId,
         collection: CollectionHandle,
         kind: WalkKind,
-    ) -> Option<Receive> {
-        let admitted = self
-            .local(collection)
-            .is_some_and(|live| self.receives(peer, &live));
-        let landed = self.landed.get(&(peer, collection.raw, kind)).copied();
-        Receive::on_open(peer, collection, kind, admitted, landed)
+    ) -> Option<Exchange> {
+        self.selected.get(&collection.raw)?;
+        let pinned = self.local(collection)?;
+        let sends = self.sends(peer, &pinned);
+        let receives = self.receives(peer, &pinned);
+        if !sends && !receives {
+            return None;
+        }
+        let agreed = self
+            .agreed
+            .get(&agreed_key(peer, collection.raw, kind))
+            .cloned();
+        Some(Exchange::start(
+            collection, kind, pinned, agreed, sends, receives,
+        ))
     }
 
-    /// A push of C's `kind` tree from `peer` ended here: everything landed,
-    /// or not. `root` is the tree's root, if the push got that far.
-    pub(crate) fn received(
+    /// The exchange of C's `kind` tree with `peer` ended: health sees a push
+    /// where this side sent, confirmed if the peer's LANDED arrived, and a
+    /// receive where it received, landed if LANDED went back; the agreed
+    /// tree is set when the exchange confirmed and forgotten otherwise.
+    /// Returns whether to exchange again at once: a confirmed exchange of a
+    /// tree that moved from the agreed one since. A failed exchange is left
+    /// to C's timer however the tree moved: repeating it at once would retry
+    /// a neighbour that cannot land it as fast as the attempts fail.
+    pub(crate) fn ended(
         &mut self,
         peer: PeerId,
         collection: CollectionHandle,
         kind: WalkKind,
-        root: Option<PatchSummary>,
-        landed: bool,
+        ended: Ended,
         now: Mono,
-    ) {
-        if let Some(root) = root.filter(|_| landed) {
-            self.landed.insert((peer, collection.raw, kind), root);
-        }
+    ) -> bool {
+        let key = agreed_key(peer, collection.raw, kind);
+        let confirmed = ended
+            .agreed
+            .as_ref()
+            .map_or(ended.root, |agreed| agreed.summary());
         self.health.with_peer(collection, peer, |health| {
-            health.received(now, kind, root, landed)
+            if ended.sends {
+                health.pushed(now, kind, confirmed, ended.confirmed)
+            }
+            if ended.receives {
+                health.received(now, kind, ended.peer_root, ended.landed)
+            }
+            // Directional end counters are LANDED receipts. This diagnostic
+            // root, unlike those counters, exists only with shared agreement.
+            let agreed_root = ended.agreed.as_ref().map(|tree| tree.summary());
+            match kind {
+                WalkKind::Records => health.confirmed.records = agreed_root,
+                WalkKind::Authorization => health.confirmed.authorization_evidence = agreed_root,
+                WalkKind::References => {}
+            }
         });
+        let Some(agreed) = ended.agreed else {
+            self.agreed.remove(&key);
+            return false;
+        };
+        let moved = ended.sends
+            && self
+                .local(collection)
+                .is_some_and(|current| agreed.has_new_keys(&Tree::pinned(kind, current.repair())));
+        // The key stays constant across exchanges; replace must publish the
+        // new attached tree even though PATCH set equality observes keys only.
+        self.agreed.replace(&Entry::with_value(&key, agreed));
+        moved
     }
 
-    /// A connection to `peer` closed: what it confirmed and what landed
-    /// from it are forgotten. A peer that restarted holds no landed roots,
-    /// so a ROOT then DONE it is pushed fails until this side's tree moves;
-    /// forgetting costs the next push one root NODE, which the peer's HELD
-    /// prunes, and a root the peer pushes again is held whole once it
-    /// lands.
+    /// A connection to `peer` closed: what they agreed on is forgotten. A
+    /// peer that restarted holds no agreed trees, and an exchange against
+    /// one it lacks fails the count proof until both forget it; forgetting
+    /// costs the next exchange the delta against nothing, which the peer's
+    /// announcements prune.
     pub(crate) fn closed(&mut self, peer: PeerId) {
-        self.landed.retain(|(from, ..), _| *from != peer);
-        self.confirmed.retain(|(to, ..)| *to != peer);
+        let dropped = self
+            .agreed
+            .iter()
+            .filter(|key| key[..32] == peer)
+            .copied()
+            .collect::<Vec<_>>();
+        for key in dropped {
+            self.agreed.remove(&key);
+        }
     }
 
-    /// Take the latest serving snapshot: what new pushes pin, and what an
-    /// incoming push is admitted against. A collection it no longer
-    /// selects is forgotten for every peer.
+    /// Take the latest serving snapshot: what new exchanges pin and are
+    /// admitted against. A collection it no longer selects is forgotten for
+    /// every peer.
     pub(crate) fn observe(&mut self, snapshot: Arc<StoreSnapshot>) {
-        let selected = snapshot
+        let mut selected = PATCH::new();
+        for collection in snapshot
             .active()
             .filter(|collection| snapshot.selected(*collection).is_some())
-            .map(|collection| collection.raw)
-            .collect::<HashSet<_>>();
+        {
+            selected.insert(&Entry::new(&collection.raw));
+        }
         let dropped = self
             .selected
-            .difference(&selected)
+            .iter()
+            .filter(|key| selected.get(key).is_none())
             .copied()
-            .collect::<HashSet<_>>();
+            .collect::<HashSet<_>>(); // Ephemeral scratch for this observation only.
         if !dropped.is_empty() {
-            self.landed
-                .retain(|(_, collection, _), _| !dropped.contains(collection));
-            self.confirmed
-                .retain(|(_, collection, _)| !dropped.contains(collection));
+            let forgotten = self
+                .agreed
+                .iter()
+                .filter(|key| dropped.contains(&key[32..64]))
+                .copied()
+                .collect::<Vec<_>>();
+            for key in forgotten {
+                self.agreed.remove(&key);
+            }
         }
         self.selected = selected;
         self.snapshot = Some(snapshot);
@@ -435,21 +447,22 @@ impl Walks {
         self.snapshot.as_ref()?.collection(collection)
     }
 
-    /// Whether this side sends C to `peer`: its peering for C sends to the
-    /// peer, or the peer passes READ under the pinned evidence.
+    /// Whether this side sends C to `peer`: an active peering's directional
+    /// flag, otherwise READ admission under the pinned evidence.
     fn sends(&self, peer: PeerId, pinned: &CollectionSnapshot) -> bool {
         let collection = pinned.repair().collection();
-        let mut flagged = false;
+        let mut flagged = None;
         self.health.update(|health| {
-            flagged = health.peerings.iter().any(|peering| {
-                peering.collection == collection
-                    && peering.peer == peer
-                    && peering.peered
-                    && peering.sends
-            });
+            flagged = health
+                .peerings
+                .iter()
+                .find(|peering| {
+                    peering.collection == collection && peering.peer == peer && peering.peered
+                })
+                .map(|peering| peering.sends);
         });
-        flagged
-            || VerifyingKey::from_bytes(&peer).is_ok_and(|peer| {
+        flagged.unwrap_or_else(|| {
+            VerifyingKey::from_bytes(&peer).is_ok_and(|peer| {
                 let evidence = pinned.repair().authorization_evidence();
                 let proofs = evidence.proofs().cloned().collect::<Vec<_>>();
                 matches!(
@@ -457,36 +470,39 @@ impl Walks {
                     QuorumOutcome::Met
                 )
             })
+        })
     }
 
     /// Whether this side receives C from `peer`, the mirror of
-    /// [`Self::sends`]: its peering for C receives from the peer, or the
-    /// peer passes WRITE under the live evidence.
-    fn receives(&self, peer: PeerId, live: &CollectionSnapshot) -> bool {
-        let collection = live.repair().collection();
-        let mut flagged = false;
+    /// [`Self::sends`]: an active peering's receive flag, otherwise WRITE
+    /// admission under the pinned evidence.
+    fn receives(&self, peer: PeerId, pinned: &CollectionSnapshot) -> bool {
+        let collection = pinned.repair().collection();
+        let mut flagged = None;
         self.health.update(|health| {
-            flagged = health.peerings.iter().any(|peering| {
-                peering.collection == collection
-                    && peering.peer == peer
-                    && peering.peered
-                    && peering.receives
-            });
+            flagged = health
+                .peerings
+                .iter()
+                .find(|peering| {
+                    peering.collection == collection && peering.peer == peer && peering.peered
+                })
+                .map(|peering| peering.receives);
         });
-        flagged
-            || VerifyingKey::from_bytes(&peer).is_ok_and(|peer| {
-                let evidence = live.repair().authorization_evidence();
+        flagged.unwrap_or_else(|| {
+            VerifyingKey::from_bytes(&peer).is_ok_and(|peer| {
+                let evidence = pinned.repair().authorization_evidence();
                 let proofs = evidence.proofs().cloned().collect::<Vec<_>>();
                 matches!(
                     evidence.writer_is_admitted_by(peer, &proofs),
                     QuorumOutcome::Met
                 )
             })
+        })
     }
 }
 
-/// What a receive does with a value, a missing leaf or a fetched blob once
-/// it is checked.
+/// What an exchange does with a value, a missing leaf or a fetched blob
+/// once it is checked.
 pub(crate) enum Admit {
     /// Events for the landing task.
     Land(Vec<NetEvent>),
@@ -497,31 +513,55 @@ pub(crate) enum Admit {
         proof: Option<CapabilityProof>,
     },
     /// A proof over a resource routed to C that the evidence here cannot
-    /// place yet stays deferred: the push does not land.
+    /// place yet stays deferred: the exchange does not confirm.
     Defer,
-    /// A held reference that could not be fetched: the push does not land,
-    /// and the blob stays in the next difference.
+    /// A held reference that could not be fetched: the exchange does not
+    /// confirm, and the blob stays in the next delta.
     Fail,
 }
 
-/// Check the value under `key` of a `kind` push of C against `evidence`
-/// (design 2.5). A record lands; a proof lands once its evidence validates,
-/// fetches the descriptor of the resource it is routed through, or stays
-/// deferred. Held references carry no values.
+/// The value under a key of one kind's tree.
+#[derive(Clone)]
+pub(crate) enum Value {
+    Record(CollectionRecord),
+    Proof(CapabilityProof),
+    /// A held reference carries no value.
+    Handle,
+}
+
+impl Value {
+    /// The value as it travels in a VALUE frame; a held reference does not.
+    pub(crate) fn bytes(&self, collection: CollectionHandle) -> Option<Vec<u8>> {
+        match self {
+            Self::Record(record) => encode_record(collection, *record).ok(),
+            Self::Proof(proof) => Some(proof.as_bytes().to_vec()),
+            Self::Handle => None,
+        }
+    }
+}
+
+/// Check the value under `key` of a `kind` exchange of C against `evidence`
+/// (design 2.5): the value, and what to do with it. A record lands; a proof
+/// lands once its evidence validates, fetches the descriptor of the
+/// resource it is routed through, or stays deferred. Held references carry
+/// no values.
 pub(crate) fn admit_value(
     kind: WalkKind,
     collection: CollectionHandle,
     key: [u8; KEY_BYTES],
     bytes: &[u8],
     evidence: &CollectionAuthorizationEvidencePatch,
-) -> anyhow::Result<Admit> {
+) -> anyhow::Result<(Value, Admit)> {
     match kind {
         WalkKind::Records => {
             let record = decode_record(collection, bytes)?;
             if record.fingerprint().raw() != key {
                 bail!("a record under another record's key");
             }
-            Ok(Admit::Land(vec![NetEvent::CollectionRecord(record)]))
+            Ok((
+                Value::Record(record),
+                Admit::Land(vec![NetEvent::CollectionRecord(record)]),
+            ))
         }
         WalkKind::Authorization => {
             let proof = CapabilityProof::from_bytes(bytes)?;
@@ -530,25 +570,26 @@ pub(crate) fn admit_value(
             }
             proof.verify_signatures()?;
             let routed = proof.resource().into_bytes() != collection.raw;
-            match evidence.validate_proof(&proof) {
-                Ok(()) => Ok(Admit::Land(vec![NetEvent::CapabilityProof(proof)])),
+            let admit = match evidence.validate_proof(&proof) {
+                Ok(()) => Admit::Land(vec![NetEvent::CapabilityProof(proof.clone())]),
                 // A proof over a resource routed to C needs that resource's
                 // descriptor, which the peer holds.
                 Err(CollectionAuthorizationEvidenceError::ResourceDescriptorUnavailable(
                     descriptor,
-                )) if routed => Ok(Admit::Fetch {
+                )) if routed => Admit::Fetch {
                     handle: descriptor.raw,
-                    proof: Some(proof),
-                }),
-                Err(CollectionAuthorizationEvidenceError::WrongRoot) if routed => Ok(Admit::Defer),
-                Err(error) => Err(error.into()),
-            }
+                    proof: Some(proof.clone()),
+                },
+                Err(CollectionAuthorizationEvidenceError::WrongRoot) if routed => Admit::Defer,
+                Err(error) => return Err(error.into()),
+            };
+            Ok((Value::Proof(proof), admit))
         }
         WalkKind::References => bail!("held references carry no values"),
     }
 }
 
-/// What a leaf of a `kind` push of C that the local store lacks needs. A
+/// What a leaf of a `kind` exchange of C that the local store lacks needs. A
 /// held reference joins the held set as it is when the blob is resident, and
 /// is fetched by hash otherwise; `None` is a value to request from the peer.
 pub(crate) fn admit_missing(
@@ -576,10 +617,10 @@ pub(crate) fn admit_missing(
     )
 }
 
-/// What a blob fetch of a push of C brought back. A fetched held reference
-/// lands, noted held in C; one that could not be fetched fails. A deferred
-/// `proof`'s descriptor that routes it to C lands with it; otherwise the
-/// proof stays deferred.
+/// What a blob fetch of an exchange of C brought back. A fetched held
+/// reference lands, noted held in C; one that could not be fetched fails. A
+/// deferred `proof`'s descriptor that routes it to C lands with it;
+/// otherwise the proof stays deferred.
 pub(crate) fn admit_fetched(
     collection: CollectionHandle,
     handle: RawHash,
@@ -634,8 +675,9 @@ pub(crate) fn local_summary(
     }
 }
 
-fn node_summary<V>(
-    patch: &PATCH<KEY_BYTES, IdentitySchema, V, Blake3Merkle>,
+/// The summary of the node at `prefix` of a canonical PATCH, if present.
+pub(crate) fn node_summary<const KEY_LEN: usize, V>(
+    patch: &PATCH<KEY_LEN, IdentitySchema, V, Blake3Merkle>,
     prefix: &[u8],
 ) -> Option<PatchSummary> {
     patch.merkle_node(prefix).map(|node| {
@@ -686,23 +728,27 @@ pub(crate) fn node(
     }
 }
 
-/// The value under `key` of a kind's PATCH, as it travels, if present. Held
-/// references carry none.
+/// The value under `key` of a kind's PATCH, if present.
 pub(crate) fn value(
     kind: WalkKind,
     overlay: &CollectionRepairOverlay,
     key: [u8; KEY_BYTES],
-) -> Option<Vec<u8>> {
+) -> Option<Value> {
     match kind {
         WalkKind::Records => overlay
             .records()
             .get(CollectionRecordFingerprint::from_raw(key))
-            .and_then(|record| encode_record(overlay.collection(), record).ok()),
+            .map(Value::Record),
         WalkKind::Authorization => overlay
             .authorization_evidence()
             .get(CapabilityProofId::new(key))
-            .map(|proof| proof.as_bytes().to_vec()),
-        WalkKind::References => None,
+            .cloned()
+            .map(Value::Proof),
+        WalkKind::References => overlay
+            .blob_inventory()
+            .get(&key)
+            .is_some()
+            .then_some(Value::Handle),
     }
 }
 
@@ -720,32 +766,34 @@ fn routes(
     descriptor::validate_proof_evidence(&reader, collection, &TribleSet::new(), proof).is_ok()
 }
 
-/// Starts pushes through the walks task, and hands it the `walk/1` streams
-/// peers open.
+/// Starts exchanges through the walks task, and hands it the `walk/1`
+/// streams peers open.
 #[derive(Clone)]
 pub(crate) struct WalksHandle(pub(crate) mpsc::UnboundedSender<Command>);
 
 impl WalksHandle {
-    /// Push C's `kind` tree to `peer`, on the current connection to it: a
-    /// peer with none, a collection this side does not send the peer, and a
-    /// push of this kind to it already running each start nothing.
-    pub(crate) fn push(&self, peer: PeerId, collection: CollectionHandle, kind: WalkKind) {
-        let _ = self.0.send(Command::Push {
+    /// Open an exchange of C's `kind` tree with `peer`, on the current
+    /// connection to it: a peer with none, a collection this side neither
+    /// sends the peer nor receives from it, and an exchange of this kind
+    /// with it already running each start nothing.
+    pub(crate) fn open(&self, peer: PeerId, collection: CollectionHandle, kind: WalkKind) {
+        let _ = self.0.send(Command::Open {
             peer,
             collection,
             kind,
         });
     }
 
-    /// A connection to `peer` closed: what the peer confirmed and what
-    /// landed from it are forgotten.
+    /// A connection to `peer` closed: what the peer and this side agreed on
+    /// is forgotten.
     pub(crate) fn closed(&self, peer: PeerId) {
         let _ = self.0.send(Command::Closed { peer });
     }
 
     /// A `walk/1` stream `peer` opened for C's `kind` tree, after its tag
     /// and Open frame were read. The stream is refused unless this side
-    /// receives C from the peer, and reset when the walks task is gone.
+    /// sends C to the peer or receives C from it, and reset when the walks
+    /// task is gone.
     pub(crate) fn incoming(
         &self,
         peer: PeerId,
@@ -772,23 +820,16 @@ impl WalksHandle {
 }
 
 pub(crate) enum Command {
-    Push {
+    Open {
         peer: PeerId,
         collection: CollectionHandle,
         kind: WalkKind,
     },
     /// A connection to the peer closed.
     Closed { peer: PeerId },
-    /// A push's stream ended.
-    Pushed {
-        peer: PeerId,
-        collection: CollectionHandle,
-        kind: WalkKind,
-        outcome: push::Outcome,
-    },
     /// A `walk/1` stream `peer` opened on its connection, after its tag and
-    /// Open frame: a push of C's tree of `kind`, read from `recv` and
-    /// answered on `send`.
+    /// Open frame: an exchange of C's tree of `kind`, read from `recv` and
+    /// written on `send`.
     Incoming {
         peer: PeerId,
         collection: CollectionHandle,
@@ -796,20 +837,21 @@ pub(crate) enum Command {
         send: Box<dyn SendStream>,
         recv: Box<dyn RecvStream>,
     },
-    /// An incoming walk stream ended.
-    Received {
+    /// An exchange's stream ended. `duplicate` says the peer reset it for
+    /// the stream it opened at the same time, which neither side counts.
+    Ended {
         id: u64,
         peer: PeerId,
         collection: CollectionHandle,
         kind: WalkKind,
-        root: Option<PatchSummary>,
-        landed: bool,
+        ended: Ended,
+        duplicate: bool,
     },
 }
 
-/// Run one node's walks: its landing task, and a task that starts pushes,
-/// receives the pushes of its peers and follows `snapshots`. Returns what
-/// starts pushes, and where receives are reported for the scheduler.
+/// Run one node's walks: its landing task, and a task that opens exchanges,
+/// joins the exchanges its peers open and follows `snapshots`. Returns what
+/// opens exchanges, and where receives are reported for the scheduler.
 pub(crate) fn spawn<T: Transport, S: Service>(
     connections: ConnectionTable<T, S>,
     snapshots: watch::Receiver<Option<Arc<StoreSnapshot>>>,
@@ -830,8 +872,8 @@ pub(crate) fn spawn<T: Transport, S: Service>(
         commands: WalksHandle(commands.clone()),
         landing,
         events,
-        incoming: HashMap::new(),
-        next_stream: 0,
+        running: HashMap::new(),
+        next_id: 0,
     };
     tokio::spawn(task.run(snapshots, commanded, landed));
     (WalksHandle(commands), heard)
@@ -841,19 +883,21 @@ struct Task<T: Transport, S> {
     connections: ConnectionTable<T, S>,
     snapshots: watch::Receiver<Option<Arc<StoreSnapshot>>>,
     walks: Walks,
-    /// Where pushes and incoming streams report back.
+    /// Where exchanges report back.
     commands: WalksHandle,
-    /// Values for the landing task, by incoming stream.
+    /// Values for the landing task, by exchange.
     landing: mpsc::UnboundedSender<(u64, Vec<NetEvent>)>,
     events: mpsc::UnboundedSender<Event>,
-    /// Incoming walk streams being received, by peer, collection and kind.
-    incoming: HashMap<PushKey, Receiving>,
-    next_stream: u64,
+    /// Exchanges running, by peer, collection and kind.
+    running: HashMap<Key, Running>,
+    next_id: u64,
 }
 
-/// An incoming walk stream's driver, as the task reaches it.
-struct Receiving {
+/// A running exchange's driver, as the task reaches it.
+struct Running {
     id: u64,
+    /// This side opened its stream.
+    opened: bool,
     /// Its landing acknowledgements.
     acks: mpsc::UnboundedSender<(u64, u64)>,
     /// Dropped to replace it: the driver resets the stream.
@@ -868,7 +912,7 @@ impl<T: Transport, S: Service> Task<T, S> {
         mut landed: mpsc::UnboundedReceiver<Landed<u64>>,
     ) {
         if let Some(snapshot) = snapshots.borrow_and_update().clone() {
-            self.walks.observe(snapshot);
+            self.observe(snapshot);
         }
         loop {
             tokio::select! {
@@ -877,13 +921,23 @@ impl<T: Transport, S: Service> Task<T, S> {
                         return;
                     }
                     if let Some(snapshot) = snapshots.borrow_and_update().clone() {
-                        self.walks.observe(snapshot);
+                        self.observe(snapshot);
                     }
                 }
-                Some(command) = commands.recv() => self.command(command),
+                Some(command) = commands.recv() => {
+                    // A command may win select while a newer publication
+                    // is pending. Pin the latest observed store for Open /
+                    // Incoming and use it when deciding whether to repush.
+                    if snapshots.has_changed().unwrap_or(false)
+                        && let Some(snapshot) = snapshots.borrow_and_update().clone()
+                    {
+                        self.observe(snapshot);
+                    }
+                    self.command(command);
+                },
                 Some(ack) = landed.recv() => {
-                    if let Some(receiving) = self.incoming.values().find(|receiving| receiving.id == ack.key) {
-                        let _ = receiving.acks.send((ack.landed, ack.failed));
+                    if let Some(running) = self.running.values().find(|running| running.id == ack.key) {
+                        let _ = running.acks.send((ack.landed, ack.failed));
                     }
                 }
                 else => return,
@@ -891,106 +945,179 @@ impl<T: Transport, S: Service> Task<T, S> {
         }
     }
 
+    fn observe(&mut self, snapshot: Arc<StoreSnapshot>) {
+        self.walks.observe(snapshot);
+        // Dropping the replacement sender retires drivers admitted under
+        // a selection that no longer exists. Their queued ends are stale.
+        self.running
+            .retain(|(_, collection, _), _| self.walks.selected.get(collection).is_some());
+    }
+
     fn command(&mut self, command: Command) {
-        let now = crate::clock::mono_now();
         match command {
-            Command::Push {
+            Command::Open {
                 peer,
                 collection,
                 kind,
-            } => self.push(peer, collection, kind),
-            Command::Closed { peer } => self.walks.closed(peer),
-            Command::Pushed {
-                peer,
-                collection,
-                kind,
-                outcome,
-            } => {
-                // A confirmed push of a tree that changed while it ran is
-                // followed at once, from the root just confirmed; a failed
-                // one waits for the timer.
-                if self.walks.pushed(peer, collection, kind, outcome, now) {
-                    self.push(peer, collection, kind);
-                }
+            } => self.open(peer, collection, kind),
+            Command::Closed { peer } => {
+                self.running.retain(|(other, _, _), _| *other != peer);
+                self.walks.closed(peer);
             }
             Command::Incoming {
                 peer,
                 collection,
                 kind,
-                mut send,
-                mut recv,
-            } => {
-                let Some(receive) = self.walks.receive(peer, collection, kind) else {
-                    send.reset(RESET_WALK_REFUSED);
-                    recv.stop(RESET_WALK_REFUSED);
-                    return;
-                };
-                let id = self.next_stream;
-                self.next_stream += 1;
-                let (acks, acked) = mpsc::unbounded_channel();
-                let (replace, replaced) = oneshot::channel();
-                // A second push of the same tree from the peer replaces the
-                // first, whose driver resets it.
-                self.incoming.insert(
-                    (peer, collection.raw, kind),
-                    Receiving {
-                        id,
-                        acks,
-                        _replace: replace,
-                    },
-                );
-                let _ = self.events.send(Event::Receiving { collection, kind });
-                let driver = Driver {
-                    connections: self.connections.clone(),
-                    snapshots: self.snapshots.clone(),
-                    landing: self.landing.clone(),
-                    commands: self.commands.0.clone(),
-                    id,
-                    peer,
-                    collection,
-                    kind,
-                };
-                tokio::spawn(receive_stream(driver, receive, send, recv, acked, replaced));
-            }
-            Command::Received {
+                send,
+                recv,
+            } => self.incoming(peer, collection, kind, send, recv),
+            Command::Ended {
                 id,
                 peer,
                 collection,
                 kind,
-                root,
-                landed,
+                ended,
+                duplicate,
             } => {
-                self.incoming.retain(|_, receiving| receiving.id != id);
-                self.walks
-                    .received(peer, collection, kind, root, landed, now);
-                let _ = self.events.send(Event::Received {
-                    collection,
-                    kind,
-                    landed,
-                });
+                let key = (peer, collection.raw, kind);
+                let current = self
+                    .running
+                    .get(&key)
+                    .is_some_and(|running| running.id == id);
+                if current {
+                    self.running.remove(&key);
+                }
+                if ended.receives {
+                    let _ = self.events.send(Event::Received {
+                        collection,
+                        kind,
+                        landed: current && !duplicate && ended.landed,
+                    });
+                }
+                // A replaced exchange, or one the peer reset for the stream
+                // it opened at the same time, settles nothing.
+                if !current || duplicate {
+                    return;
+                }
+                // A confirmed exchange of a tree that moved meanwhile is
+                // followed at once; a failed one waits for the timer.
+                let now = crate::clock::mono_now();
+                if self.walks.ended(peer, collection, kind, ended, now) {
+                    self.open(peer, collection, kind);
+                }
             }
         }
     }
 
-    /// Push C's `kind` tree to `peer` on the current connection to it, if
-    /// there is one and the walks start the push.
-    fn push(&mut self, peer: PeerId, collection: CollectionHandle, kind: WalkKind) {
+    /// Open an exchange of C's `kind` tree with `peer` on the current
+    /// connection to it, if there is one, the walks start the exchange and
+    /// none runs.
+    fn open(&mut self, peer: PeerId, collection: CollectionHandle, kind: WalkKind) {
+        let key = (peer, collection.raw, kind);
+        if self.running.contains_key(&key) {
+            return;
+        }
         let Some(connection) = self.connections.current(peer) else {
             return;
         };
-        let Some((push, frames)) = self.walks.push(peer, collection, kind) else {
+        let Some(exchange) = self.walks.start(peer, collection, kind) else {
             return;
         };
-        let commands = self.commands.0.clone();
+        let (driver, acked, replaced) = self.register(key, true, &exchange);
         tokio::spawn(async move {
-            let outcome = push_stream(&connection, collection, kind, push, frames).await;
-            let _ = commands.send(Command::Pushed {
-                peer,
-                collection,
-                kind,
-                outcome,
-            });
+            let (ended, duplicate) = match open_walk(&connection, collection, kind).await {
+                Ok((send, recv)) => {
+                    drive(
+                        &driver,
+                        exchange,
+                        Box::new(send),
+                        Box::new(recv),
+                        acked,
+                        replaced,
+                    )
+                    .await
+                }
+                Err(_) => (exchange.end(), false),
+            };
+            driver.ended(ended, duplicate);
         });
+    }
+
+    /// Join the exchange `peer` opened for C's `kind` tree: refused unless
+    /// this side sends C to the peer or receives C from it. It replaces the
+    /// exchange running for the same key, if any: an earlier stream of the
+    /// peer's, or this side's own, which the peer, holding the smaller id,
+    /// resets; when this side holds the smaller id its own stream survives
+    /// and the peer's is reset instead.
+    fn incoming(
+        &mut self,
+        peer: PeerId,
+        collection: CollectionHandle,
+        kind: WalkKind,
+        mut send: Box<dyn SendStream>,
+        mut recv: Box<dyn RecvStream>,
+    ) {
+        let key = (peer, collection.raw, kind);
+        if self.running.get(&key).is_some_and(|running| running.opened)
+            && self.connections.transport().local_id() < peer
+        {
+            send.reset(RESET_WALK_DUPLICATE);
+            recv.stop(RESET_WALK_DUPLICATE);
+            return;
+        }
+        let Some(exchange) = self.walks.start(peer, collection, kind) else {
+            send.reset(RESET_WALK_REFUSED);
+            recv.stop(RESET_WALK_REFUSED);
+            return;
+        };
+        let (driver, acked, replaced) = self.register(key, false, &exchange);
+        tokio::spawn(async move {
+            let (ended, duplicate) = drive(&driver, exchange, send, recv, acked, replaced).await;
+            driver.ended(ended, duplicate);
+        });
+    }
+
+    /// Register an exchange under `key`, replacing one running there, and
+    /// tell the scheduler when it receives: its driver, its landing
+    /// acknowledgements and what replaces it.
+    fn register(
+        &mut self,
+        key: Key,
+        opened: bool,
+        exchange: &Exchange,
+    ) -> (
+        Driver<T, S>,
+        mpsc::UnboundedReceiver<(u64, u64)>,
+        oneshot::Receiver<()>,
+    ) {
+        let id = self.next_id;
+        self.next_id += 1;
+        let (acks, acked) = mpsc::unbounded_channel();
+        let (replace, replaced) = oneshot::channel();
+        self.running.insert(
+            key,
+            Running {
+                id,
+                opened,
+                acks,
+                _replace: replace,
+            },
+        );
+        let (peer, collection, kind) = (key.0, CollectionHandle::new(key.1), key.2);
+        if exchange.receives() {
+            let _ = self.events.send(Event::Receiving { collection, kind });
+        }
+        let driver = Driver {
+            connections: self.connections.clone(),
+            snapshots: self.snapshots.clone(),
+            landing: self.landing.clone(),
+            commands: self.commands.0.clone(),
+            id,
+            peer,
+            collection,
+            kind,
+        };
+        (driver, acked, replaced)
     }
 }
 
@@ -1022,8 +1149,8 @@ async fn fetch_blob<T: Transport, S: Service>(
         .flatten()
 }
 
-/// A stream read under a deadline on progress: a read that brings no byte
-/// for `idle` fails, and every byte read starts the wait again.
+/// Stream IO under a deadline on byte progress: a read or write that moves
+/// no byte for `idle` fails, and every byte moved starts the wait again.
 struct Progress<R> {
     inner: R,
     idle: Duration,
@@ -1066,82 +1193,41 @@ impl<R: AsyncRead + Unpin> AsyncRead for Progress<R> {
     }
 }
 
-async fn write<W: AsyncWrite + Unpin>(send: &mut W, frame: &Frame) -> anyhow::Result<()> {
-    let (kind, payload) = frame.encode();
-    write_frame(send, kind, &payload).await
-}
-
-/// Drive one push on a `walk/1` stream opened on `connection`: the tag and
-/// Open, the push's first frames, then each of the receiver's frames through
-/// the push and its answers back, until Landed, which finishes the stream
-/// and confirms the push, or a failure, a reset, the end of the stream or,
-/// before DONE, [`WALK_DEADLINE`] without a frame, which reset it and leave
-/// the push unconfirmed. After DONE the receiver owes LANDED once its
-/// fetches and landings end, however long they take: the wait for it is
-/// bounded by the connection.
-async fn push_stream<C: Conn>(
-    connection: &Connection<C>,
-    collection: CollectionHandle,
-    kind: WalkKind,
-    mut push: Push,
-    frames: Vec<Frame>,
-) -> push::Outcome {
-    let Ok((mut send, recv)) = open_walk(connection, collection, kind).await else {
-        return push.outcome();
-    };
-    let (framed, mut heard) = mpsc::channel(1);
-    let reader = tokio::spawn(read_stream(Box::new(recv), framed));
-    let failed = 'drive: {
-        for frame in &frames {
-            if write(&mut send, frame).await.is_err() {
-                break 'drive true;
+impl<W: AsyncWrite + Unpin> AsyncWrite for Progress<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = &mut *self;
+        match Pin::new(&mut this.inner).poll_write(cx, bytes) {
+            Poll::Ready(Ok(n)) if n > 0 => {
+                this.deadline
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + this.idle);
+                Poll::Ready(Ok(n))
             }
+            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Pending => match this.deadline.as_mut().poll(cx) {
+                Poll::Ready(()) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "no write progress within the walk deadline",
+                ))),
+                Poll::Pending => Poll::Pending,
+            },
         }
-        let mut heard_at = tokio::time::Instant::now();
-        loop {
-            let next = if push.done() {
-                heard.recv().await
-            } else {
-                match tokio::time::timeout_at(heard_at + WALK_DEADLINE, heard.recv()).await {
-                    Ok(next) => next,
-                    Err(_) => {
-                        debug!("walk/1 push deadline exceeded");
-                        break 'drive true;
-                    }
-                }
-            };
-            let Some(Some(frame)) = next else {
-                break 'drive true;
-            };
-            heard_at = tokio::time::Instant::now();
-            let landed = frame == Frame::Landed;
-            let answers = match push.on_frame(frame) {
-                Ok(answers) => answers,
-                Err(push::Failed(violation)) => {
-                    debug!(violation, "walk/1 push failed");
-                    break 'drive true;
-                }
-            };
-            for answer in &answers {
-                if write(&mut send, answer).await.is_err() {
-                    break 'drive true;
-                }
-            }
-            if landed {
-                break 'drive false;
-            }
-        }
-    };
-    reader.abort();
-    if failed {
-        send.reset(RESET_WALK_FAILED);
-    } else {
-        let _ = send.shutdown().await;
     }
-    push.outcome()
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
-/// What one incoming walk stream's driver holds of the task.
+/// What one exchange's driver holds of the task.
 struct Driver<T: Transport, S> {
     connections: ConnectionTable<T, S>,
     snapshots: watch::Receiver<Option<Arc<StoreSnapshot>>>,
@@ -1153,53 +1239,95 @@ struct Driver<T: Transport, S> {
     kind: WalkKind,
 }
 
+impl<T: Transport, S> Driver<T, S> {
+    fn ended(&self, ended: Ended, duplicate: bool) {
+        let _ = self.commands.send(Command::Ended {
+            id: self.id,
+            peer: self.peer,
+            collection: self.collection,
+            kind: self.kind,
+            ended,
+            duplicate,
+        });
+    }
+}
+
 /// A blob fetch's result, as a driver hears it.
 type Fetched = (RawHash, Option<CapabilityProof>, Option<Blob<UnknownBlob>>);
 
-/// Drive one incoming walk stream: feed its frames, while the receive wants
-/// them, and what landing and blob fetches report to the [`Receive`], write
-/// what it sends, and end the stream as the push did: finished after
-/// `Landed`, reset otherwise. A stream whose sender owes a frame and sends
-/// none for [`WALK_DEADLINE`] is reset too; after DONE nothing is read but
-/// the values asked for, and the fetches and landings take what time they
-/// take.
-async fn receive_stream<T: Transport, S: Service>(
-    driver: Driver<T, S>,
-    mut receive: Receive,
-    mut send: Box<dyn SendStream>,
+/// Drive one exchange on its stream, after the tag and Open: write the
+/// frames of this side's delta as the stream takes them, interleaved with
+/// its answers, feed the peer's frames while the exchange wants them and
+/// what landing and blob fetches report, and end the stream as the exchange
+/// did: finished once confirmed, reset otherwise. A stream whose peer owes a
+/// frame and sends none for [`WALK_DEADLINE`] is reset too. Returns the
+/// exchange as it ended, and whether the peer reset the stream for the one
+/// it opened at the same time.
+async fn drive<T: Transport, S: Service>(
+    driver: &Driver<T, S>,
+    mut exchange: Exchange,
+    send: Box<dyn SendStream>,
     recv: Box<dyn RecvStream>,
     mut acked: mpsc::UnboundedReceiver<(u64, u64)>,
     mut replaced: oneshot::Receiver<()>,
-) {
+) -> (Ended, bool) {
     let (frames, mut framed) = mpsc::channel(1);
     let reader = tokio::spawn(read_stream(recv, frames));
+    let (outgoing, written) = mpsc::channel(1);
+    let (reset, resetting) = oneshot::channel();
+    let (write_failed, mut writer_failed) = oneshot::channel();
+    let mut writer = tokio::spawn(write_stream(send, written, resetting, write_failed));
     let (fetches, mut fetched) = mpsc::unbounded_channel::<Fetched>();
+    let mut outbox = VecDeque::new();
+    // ROOT first, whatever arrives meanwhile.
+    let mut pending = exchange.next_delta();
     let mut heard_at = tokio::time::Instant::now();
-    let outcome = 'drive: loop {
-        if let Some(outcome) = receive.outcome() {
-            break Some(outcome);
+    let mut duplicate = false;
+    let failed = 'drive: loop {
+        match exchange.outcome() {
+            Some(Outcome::Confirmed) => break false,
+            Some(Outcome::Failed(failure)) => {
+                debug!(?failure, "walk/1 exchange failed");
+                break true;
+            }
+            None => {}
         }
-        let deadline = receive.awaits().then(|| heard_at + WALK_DEADLINE);
+        // Answers first, then the delta, one frame ahead of the writer: the
+        // stream's credit is the delta's only pace.
+        if pending.is_none() {
+            pending = outbox.pop_front().or_else(|| exchange.next_delta());
+        }
+        if exchange.outcome().is_some() {
+            continue;
+        }
+        let deadline = exchange.awaits().then(|| heard_at + WALK_DEADLINE);
         let outs = tokio::select! {
-            frame = next_frame(&mut framed, deadline), if receive.want_read() => match frame {
-                Some(Some(frame)) => {
-                    heard_at = tokio::time::Instant::now();
-                    receive.on_frame(frame, driver.snapshots.borrow().clone())
+            permit = outgoing.reserve(), if pending.is_some() => match permit {
+                Ok(permit) => {
+                    permit.send(pending.take().expect("a frame is pending"));
+                    Vec::new()
                 }
-                Some(None) | None => break None,
+                Err(_) => break 'drive true,
             },
-            Some((landed, failed)) = acked.recv() => receive.on_landed_ack(landed, failed),
-            Some((handle, proof, blob)) = fetched.recv() => receive.on_fetched(handle, proof, blob),
-            _ = &mut replaced => break None,
-            else => break None,
+            frame = next_frame(&mut framed, deadline), if exchange.want_read() => match frame {
+                Some(Ok(frame)) => {
+                    heard_at = tokio::time::Instant::now();
+                    exchange.on_frame(frame, driver.snapshots.borrow().clone())
+                }
+                Some(Err(code)) => {
+                    duplicate = code == Some(RESET_WALK_DUPLICATE);
+                    break 'drive true;
+                }
+                None => break 'drive true,
+            },
+            Some((landed, failed)) = acked.recv() => exchange.on_landed_ack(landed, failed),
+            Some((handle, proof, blob)) = fetched.recv() => exchange.on_fetched(handle, proof, blob),
+            _ = &mut writer_failed => break 'drive true,
+            _ = &mut replaced => break 'drive true,
         };
         for out in outs {
             match out {
-                Out::Send(frame) => {
-                    if write(&mut send, &frame).await.is_err() {
-                        break 'drive None;
-                    }
-                }
+                Out::Send(frame) => outbox.push_back(frame),
                 Out::Land(events) => {
                     let _ = driver.landing.send((driver.id, events));
                 }
@@ -1216,67 +1344,171 @@ async fn receive_stream<T: Transport, S: Service>(
         }
     };
     reader.abort();
-    match outcome {
-        Some(receive::Outcome::Landed) => {
-            let _ = send.shutdown().await;
-        }
-        Some(receive::Outcome::Failed(failure)) => {
-            debug!(?failure, "walk/1 push failed");
-            send.reset(RESET_WALK_FAILED);
-        }
-        None => send.reset(RESET_WALK_FAILED),
+    let mut reset = Some(reset);
+    let mut failed = failed;
+    if !failed {
+        // The LANDED that confirmed the exchange may still be waiting for
+        // the writer.
+        let drain = async {
+            for frame in pending.into_iter().chain(outbox) {
+                outgoing.send(frame).await.map_err(|_| ())?;
+            }
+            Ok::<(), ()>(())
+        };
+        failed = tokio::select! {
+            result = drain => result.is_err(),
+            _ = &mut replaced => true,
+            _ = &mut writer_failed => true,
+        };
     }
-    let _ = driver.commands.send(Command::Received {
-        id: driver.id,
-        peer: driver.peer,
-        collection: driver.collection,
-        kind: driver.kind,
-        root: receive.root(),
-        landed: outcome == Some(receive::Outcome::Landed),
-    });
+    if failed {
+        let _ = reset.take().unwrap().send(RESET_WALK_FAILED);
+    }
+    drop(outgoing);
+    let (landed_written, finished) = if failed {
+        writer.await.unwrap_or((false, false))
+    } else {
+        tokio::select! {
+            result = &mut writer => result.unwrap_or((false, false)),
+            _ = &mut replaced => {
+                failed = true;
+                let _ = reset.take().unwrap().send(RESET_WALK_FAILED);
+                writer.await.unwrap_or((false, false))
+            }
+        }
+    };
+    let mut ended = exchange.end();
+    ended.landed = landed_written;
+    if failed || !finished || !landed_written {
+        // A queued LANDED is not a write receipt. The peer's independent
+        // receipt can still count our push, but no shared agreement survives.
+        ended.agreed = None;
+    }
+    (ended, duplicate)
 }
 
 /// The next frame the reader forwarded, within `deadline` when the driver
-/// is owed one: past it, `Some(None)`, as for a stream that ended.
+/// is owed one: past it, as for a stream that ended.
 async fn next_frame(
-    frames: &mut mpsc::Receiver<Option<Frame>>,
+    frames: &mut mpsc::Receiver<Result<Frame, Option<u32>>>,
     deadline: Option<tokio::time::Instant>,
-) -> Option<Option<Frame>> {
+) -> Option<Result<Frame, Option<u32>>> {
     match deadline {
         Some(deadline) => tokio::time::timeout_at(deadline, frames.recv())
             .await
             .unwrap_or_else(|_| {
-                debug!("walk/1 receive deadline exceeded");
-                Some(None)
+                debug!("walk/1 exchange deadline exceeded");
+                Some(Err(None))
             }),
         None => frames.recv().await,
     }
 }
 
 /// Read a walk stream's frames to `frames`, one ahead of the driver, so no
-/// frame is left half read when the driver turns to something else;
-/// `None` ends it: the stream ended, failed or carried a malformed frame.
-/// The driver times its waits, when a frame is owed.
-async fn read_stream(mut recv: Box<dyn RecvStream>, frames: mpsc::Sender<Option<Frame>>) {
+/// frame is left half read when the driver turns to something else. An
+/// `Err` ends it: the stream ended, failed (with the code the peer reset it
+/// with, if it did) or carried a malformed frame. The driver times its
+/// waits, when a frame is owed.
+async fn read_stream(
+    mut recv: Box<dyn RecvStream>,
+    frames: mpsc::Sender<Result<Frame, Option<u32>>>,
+) {
     loop {
         let frame = match read_frame(&mut recv).await {
             Ok(Some((kind, payload))) => match Frame::decode(kind, &payload) {
-                Ok(Some(frame)) => Some(frame),
+                Ok(Some(frame)) => Ok(frame),
                 Ok(None) => continue,
                 Err(Malformed(violation)) => {
                     debug!(violation, "malformed walk/1 frame");
-                    None
+                    Err(None)
                 }
             },
-            Ok(None) => None,
+            Ok(None) => Err(None),
             Err(error) => {
                 debug!(?error, "walk/1 stream failed");
-                None
+                Err(match error {
+                    FrameError::Transport(error) => reset_code(&error),
+                    FrameError::Violation(_) | FrameError::Stalled => None,
+                })
             }
         };
-        let ended = frame.is_none();
+        let ended = frame.is_err();
         if frames.send(frame).await.is_err() || ended {
             return;
+        }
+    }
+}
+
+/// Write `frames` to the stream in order and finish it once they end, or
+/// reset it with the code `reset` brings, even in the middle of a frame the
+/// peer is not reading. A stream that fails under a write is still reset or
+/// finished as the driver says, once it says so. A failed write also wakes
+/// the driver immediately. Writes have a byte-progress deadline, and final
+/// shutdown is bounded and cancellable. Returns actual LANDED write and
+/// successful stream-finish receipts separately.
+async fn write_stream(
+    mut send: Box<dyn SendStream>,
+    mut frames: mpsc::Receiver<Frame>,
+    reset: oneshot::Receiver<u32>,
+    write_failed: oneshot::Sender<()>,
+) -> (bool, bool) {
+    let mut reset = std::pin::pin!(futures::FutureExt::fuse(reset));
+    let mut broken = false;
+    let mut write_failed = Some(write_failed);
+    let mut landed_written = false;
+    loop {
+        tokio::select! {
+            biased;
+            Ok(code) = &mut reset => {
+                send.reset(code);
+                return (landed_written, false);
+            }
+            next = frames.recv() => {
+                let Some(frame) = next else {
+                    if !broken {
+                        let finished = tokio::select! {
+                            biased;
+                            Ok(code) = &mut reset => {
+                                send.reset(code);
+                                false
+                            }
+                            result = tokio::time::timeout(WALK_DEADLINE, send.shutdown()) => {
+                                matches!(result, Ok(Ok(())))
+                            }
+                        };
+                        if !finished {
+                            send.reset(RESET_WALK_FAILED);
+                        }
+                        return (landed_written, finished);
+                    } else {
+                        send.reset(RESET_WALK_FAILED);
+                    }
+                    return (landed_written, false);
+                };
+                if broken {
+                    continue;
+                }
+                let (kind, payload) = frame.encode();
+                tokio::select! {
+                    biased;
+                    Ok(code) = &mut reset => {
+                        send.reset(code);
+                        return (landed_written, false);
+                    }
+                    written = async {
+                        write_frame(&mut Progress::new(&mut send, WALK_DEADLINE), kind, &payload).await
+                    } => {
+                        broken = written.is_err();
+                        if broken {
+                            if let Some(failed) = write_failed.take() {
+                                let _ = failed.send(());
+                            }
+                        } else if matches!(frame, Frame::Landed) {
+                            landed_written = true;
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1285,8 +1517,8 @@ async fn read_stream(mut recv: Box<dyn RecvStream>, frames: mpsc::Sender<Option<
 pub(crate) mod tests {
     use super::*;
 
-    /// One node's store, serving snapshot and walks, for the push and
-    /// receive tests.
+    /// One node's store, serving snapshot and walks, for the exchange
+    /// tests.
     pub(crate) mod walking {
         use super::*;
 
@@ -1425,6 +1657,11 @@ pub(crate) mod tests {
                 self.walks.snapshot.clone().unwrap()
             }
 
+            /// The serving snapshot of C.
+            pub(crate) fn pinned(&self, collection: CollectionHandle) -> Arc<CollectionSnapshot> {
+                self.serving().collection(collection).unwrap()
+            }
+
             pub(crate) fn records(
                 &mut self,
                 collection: CollectionHandle,
@@ -1466,14 +1703,45 @@ pub(crate) mod tests {
         }
     }
 
-    /// What a peer confirmed and what landed from it are forgotten when a
-    /// connection to it closes, so a peer that restarted is not pushed
-    /// ROOT then DONE it cannot land; and a collection's roots, for every
-    /// peer, when the collection is deselected.
-    #[test]
-    fn landed_and_confirmed_roots_are_pruned_when_a_peering_ends_or_collection_is_dropped() {
-        use walking::{Node, open};
+    use walking::{Node, open};
 
+    /// Every branch locator of a records tree, by the PATCH's own view.
+    pub(crate) fn branches(
+        patch: &PATCH<32, IdentitySchema, CollectionRecord, Blake3Merkle>,
+        prefix: Vec<u8>,
+        out: &mut Vec<Vec<u8>>,
+    ) {
+        let node = patch.merkle_node(&prefix).unwrap();
+        if node.is_leaf() {
+            return;
+        }
+        let base = node.representative()[..node.end_depth()].to_vec();
+        out.push(prefix);
+        for (edge, _) in node.children() {
+            let mut child = base.clone();
+            child.push(edge);
+            branches(patch, child, out);
+        }
+    }
+
+    /// The branch locators of a records tree on the paths to `keys`.
+    pub(crate) fn paths(
+        patch: &PATCH<32, IdentitySchema, CollectionRecord, Blake3Merkle>,
+        keys: &[[u8; 32]],
+    ) -> std::collections::BTreeSet<Vec<u8>> {
+        let mut all = Vec::new();
+        branches(patch, Vec::new(), &mut all);
+        all.into_iter()
+            .filter(|locator| keys.iter().any(|key| key.starts_with(locator)))
+            .collect()
+    }
+
+    /// What a peer and this side agreed on is forgotten when a connection to
+    /// it closes, so a peer that restarted is not held to a tree it lost;
+    /// and a collection's agreed trees, for every peer, when the collection
+    /// is deselected.
+    #[test]
+    fn agreed_trees_are_forgotten_when_a_peering_ends_or_a_collection_is_dropped() {
         let mut node = Node::new(63);
         let kept = node.hold("kept", open());
         let dropped = node.hold("dropped", open());
@@ -1486,55 +1754,162 @@ pub(crate) mod tests {
         let pairs = [(a, kept), (a, dropped), (b, kept), (b, dropped)];
         let remember = |node: &mut Node| {
             for (peer, collection) in pairs {
-                let root = summary(
-                    kind,
-                    node.serving().collection(collection).unwrap().repair(),
-                );
-                let outcome = push::Outcome {
-                    root,
+                let pinned = node.pinned(collection);
+                let ended = Ended {
+                    sends: true,
+                    receives: true,
                     confirmed: true,
+                    landed: true,
+                    root: summary(kind, pinned.repair()),
+                    peer_root: Some(summary(kind, pinned.repair())),
+                    agreed: Some(Arc::new(Tree::pinned(kind, pinned.repair()))),
                 };
-                node.walks.pushed(peer, collection, kind, outcome, now);
-                node.walks
-                    .received(peer, collection, kind, Some(root), true, now);
+                assert!(!node.walks.ended(peer, collection, kind, ended, now));
             }
         };
         let remembered = |node: &Node, peer: PeerId, collection: CollectionHandle| {
-            let key = (peer, collection.raw, kind);
-            (
-                node.walks.confirmed.root(key).is_some(),
-                node.walks.landed.contains_key(&key),
-            )
+            node.walks
+                .agreed
+                .get(&agreed_key(peer, collection.raw, kind))
+                .is_some()
         };
         remember(&mut node);
         for (peer, collection) in pairs {
-            assert_eq!(remembered(&node, peer, collection), (true, true));
+            assert!(remembered(&node, peer, collection));
         }
 
-        // A connection to A closes: A's roots go, B's stay.
+        // A connection to A closes: A's trees go, B's stay.
         node.walks.closed(a);
-        assert_eq!(remembered(&node, a, kept), (false, false));
-        assert_eq!(remembered(&node, a, dropped), (false, false));
-        assert_eq!(remembered(&node, b, kept), (true, true));
-        assert_eq!(remembered(&node, b, dropped), (true, true));
+        assert!(!remembered(&node, a, kept));
+        assert!(!remembered(&node, a, dropped));
+        assert!(remembered(&node, b, kept));
+        assert!(remembered(&node, b, dropped));
 
-        // One collection is deselected: its roots go for every peer, and
+        // One collection is deselected: its trees go for every peer, and
         // the other's stay, over this observation and the next.
         remember(&mut node);
         node.select(dropped, false);
         node.observe();
         node.observe();
-        assert_eq!(remembered(&node, a, dropped), (false, false));
-        assert_eq!(remembered(&node, b, dropped), (false, false));
-        assert_eq!(remembered(&node, a, kept), (true, true));
-        assert_eq!(remembered(&node, b, kept), (true, true));
+        assert!(!remembered(&node, a, dropped));
+        assert!(!remembered(&node, b, dropped));
+        assert!(remembered(&node, a, kept));
+        assert!(remembered(&node, b, kept));
+
+        // Health saw every end: eight confirmed pushes and landed receives
+        // for A, and the agreed root is each collection's own.
+        let health = node.health.snapshot();
+        let kept_health = health
+            .collections
+            .iter()
+            .find(|entry| entry.collection == kept)
+            .unwrap();
+        let pair = kept_health
+            .peers
+            .iter()
+            .find(|pair| pair.peer == a)
+            .unwrap();
+        assert_eq!((pair.pushes.ok, pair.pushes.failed), (2, 0));
+        assert_eq!((pair.receives.ok, pair.receives.failed), (2, 0));
+        assert_eq!(
+            pair.confirmed.records,
+            Some(summary(kind, node.pinned(kept).repair()))
+        );
+    }
+
+    #[test]
+    fn active_peering_directions_override_credential_admission() {
+        let mut node = Node::new(109);
+        let collection = node.hold("explicit directions", open());
+        let peer = Node::new(110).id();
+        let pinned = node.pinned(collection);
+        assert!(node.walks.sends(peer, &pinned) && node.walks.receives(peer, &pinned));
+        node.health.update(|health| {
+            health.peerings.push(crate::health::PeeringHealth {
+                collection,
+                peer,
+                asked: false,
+                peered: true,
+                sends: false,
+                receives: true,
+                refused_by_me: false,
+                refused_by_them: false,
+            })
+        });
+        assert!(!node.walks.sends(peer, &pinned));
+        assert!(node.walks.receives(peer, &pinned));
+        node.health.update(|health| {
+            health.peerings[0].sends = true;
+            health.peerings[0].receives = false;
+        });
+        assert!(node.walks.sends(peer, &pinned));
+        assert!(!node.walks.receives(peer, &pinned));
+    }
+
+    #[test]
+    fn a_failed_exchange_forgets_an_already_agreed_tree() {
+        let mut node = Node::new(98);
+        let collection = node.hold("forget after failure", open());
+        node.commit(collection, 1);
+        node.observe();
+        let peer = Node::new(99).id();
+        let kind = WalkKind::Records;
+        let pinned = node.pinned(collection);
+        let root = summary(kind, pinned.repair());
+        node.walks.ended(
+            peer,
+            collection,
+            kind,
+            Ended {
+                sends: true,
+                receives: true,
+                confirmed: true,
+                landed: true,
+                root,
+                peer_root: Some(root),
+                agreed: Some(Arc::new(Tree::pinned(kind, pinned.repair()))),
+            },
+            crate::clock::mono_now(),
+        );
+        let mut exchange = node.walks.start(peer, collection, kind).unwrap();
+        assert!(
+            node.walks
+                .agreed
+                .get(&agreed_key(peer, collection.raw, kind))
+                .is_some()
+        );
+        // Connection interrupted before either LANDED, after a previously
+        // confirmed exchange. The end is not a confirmation of old memory.
+        assert!(matches!(exchange.next_delta(), Some(Frame::Root { .. })));
+        let ended = exchange.end();
+        assert!(!ended.confirmed && ended.agreed.is_none());
+        node.walks
+            .ended(peer, collection, kind, ended, crate::clock::mono_now());
+        assert!(
+            node.walks
+                .agreed
+                .get(&agreed_key(peer, collection.raw, kind))
+                .is_none()
+        );
+        let health = node.health.snapshot();
+        let pair = health
+            .collections
+            .iter()
+            .find(|entry| entry.collection == collection)
+            .unwrap()
+            .peers
+            .iter()
+            .find(|pair| pair.peer == peer)
+            .unwrap();
+        assert!(pair.confirmed.records.is_none());
+        let mut retry = node.walks.start(peer, collection, kind).unwrap();
+        assert!(matches!(retry.next_delta(), Some(Frame::Root { .. })));
+        assert!(matches!(retry.next_delta(), Some(Frame::Leaf { .. })));
     }
 
     /// Walk streams driven through the walks task over the simulated
-    /// transport: a scripted sender pushes over a duplex pipe, and the task
-    /// admits, receives, lands through the landing task and ends the
-    /// stream; and the task's own push driver, over a connection into
-    /// another task.
+    /// transport: a scripted peer over a duplex pipe, and the task's own
+    /// driver over a connection into another task, both ways.
     #[cfg(feature = "sim")]
     mod receiving {
         use super::walking::{Node, open};
@@ -1558,7 +1933,8 @@ pub(crate) mod tests {
         use crate::protocol::{TAG_BLOB, TAG_WALK, serve_get_blob};
         use crate::transport::sim::{Crossed, SimConfig, SimNet, Tapped, Taps};
         use crate::walk_stream::{
-            FRAME_DONE, FRAME_LANDED, FRAME_LEAF, FRAME_OPEN, FRAME_ROOT, FRAME_VALUE_REQUEST, held,
+            FRAME_DONE, FRAME_LANDED, FRAME_LEAF, FRAME_NODE, FRAME_OPEN, FRAME_ROOT,
+            FRAME_VALUE_REQUEST,
         };
 
         #[derive(Clone)]
@@ -1612,6 +1988,71 @@ pub(crate) mod tests {
             }
         }
 
+        struct FailLanded(Tx, Arc<Mutex<bool>>);
+
+        impl AsyncWrite for FailLanded {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                if buf == [crate::walk_stream::FRAME_LANDED, 0, 0, 0, 0] {
+                    *self.1.lock().unwrap() = true;
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "scripted LANDED write failure",
+                    )));
+                }
+                Pin::new(&mut self.0).poll_write(cx, buf)
+            }
+            fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.0).poll_flush(cx)
+            }
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.0).poll_shutdown(cx)
+            }
+        }
+
+        impl SendStream for FailLanded {
+            fn reset(&mut self, code: u32) {
+                self.0.reset(code);
+            }
+        }
+
+        struct BlockLanded(Tx, Arc<Mutex<bool>>);
+
+        impl AsyncWrite for BlockLanded {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                if bytes == [crate::walk_stream::FRAME_LANDED, 0, 0, 0, 0] {
+                    *self.1.lock().unwrap() = true;
+                    return Poll::Pending;
+                }
+                Pin::new(&mut self.0).poll_write(cx, bytes)
+            }
+            fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.0).poll_flush(cx)
+            }
+            fn poll_shutdown(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.0).poll_shutdown(cx)
+            }
+        }
+
+        impl SendStream for BlockLanded {
+            fn reset(&mut self, code: u32) {
+                self.0.reset(code);
+            }
+        }
+
         impl AsyncRead for Rx {
             fn poll_read(
                 mut self: Pin<&mut Self>,
@@ -1652,7 +2093,7 @@ pub(crate) mod tests {
 
         /// A node on `net` behind a running walks task, through a tap: its
         /// table dials and accepts, the walk streams peers open reach the
-        /// task, and the task's pushes go out on its connections. Its
+        /// task, and the task's exchanges go out on its connections. Its
         /// request streams are served by `S`.
         struct Hosted<S: Service = NoRequests> {
             peer: PeerId,
@@ -1709,8 +2150,7 @@ pub(crate) mod tests {
             }
 
             /// Open a scripted stream for C's records from `peer`; the
-            /// opener's halves, and where the receiver's reset of it is
-            /// noted.
+            /// opener's halves, and where the task's reset of it is noted.
             fn open(
                 &self,
                 peer: PeerId,
@@ -1738,6 +2178,16 @@ pub(crate) mod tests {
                 self.lander.node.lock().unwrap().records(collection)
             }
 
+            /// Commit a record and publish the serving snapshot.
+            fn commit(&self, collection: CollectionHandle, data: u64) -> [u8; 32] {
+                let mut node = self.lander.node.lock().unwrap();
+                let key = node.commit(collection, data).fingerprint().raw();
+                node.observe();
+                let snapshot = node.snapshot();
+                self.lander.snapshots.send_replace(Some(snapshot));
+                key
+            }
+
             /// What health recorded of the pair with `peer` for C.
             fn health(&self, collection: CollectionHandle, peer: PeerId) -> Option<PeerHealth> {
                 let node = self.lander.node.lock().unwrap();
@@ -1752,26 +2202,44 @@ pub(crate) mod tests {
                     .cloned()
             }
 
-            /// Push C's `kind` tree to `peer` through the walks task and
-            /// wait for the push to end; what health recorded of the pair.
-            async fn push(
+            /// Wait for an exchange with `peer` for C to end: what health
+            /// recorded of the pair.
+            async fn ended(
+                &self,
+                peer: PeerId,
+                collection: CollectionHandle,
+                before: Option<PeerHealth>,
+            ) -> PeerHealth {
+                let ends = |health: &PeerHealth| {
+                    health.pushes.ok
+                        + health.pushes.failed
+                        + health.receives.ok
+                        + health.receives.failed
+                };
+                let before = before.as_ref().map_or(0, ends);
+                for _ in 0..60_000 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    if let Some(health) = self.health(collection, peer)
+                        && ends(&health) > before
+                    {
+                        return health;
+                    }
+                }
+                panic!("the exchange never ended");
+            }
+
+            /// Open an exchange of C's `kind` tree with `peer` through the
+            /// walks task and wait for it to end; what health recorded of
+            /// the pair.
+            async fn exchange(
                 &self,
                 peer: PeerId,
                 collection: CollectionHandle,
                 kind: WalkKind,
             ) -> PeerHealth {
-                let ended = |health: &PeerHealth| health.pushes.ok + health.pushes.failed;
-                let before = self.health(collection, peer).as_ref().map_or(0, ended);
-                self.walks.push(peer, collection, kind);
-                for _ in 0..60_000 {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    if let Some(health) = self.health(collection, peer)
-                        && ended(&health) > before
-                    {
-                        return health;
-                    }
-                }
-                panic!("the push never ended");
+                let before = self.health(collection, peer);
+                self.walks.open(peer, collection, kind);
+                self.ended(peer, collection, before).await
             }
         }
 
@@ -1961,7 +2429,7 @@ pub(crate) mod tests {
             Frame::decode(kind, &payload).unwrap()
         }
 
-        /// Wait for the receiver to reset or stop the stream.
+        /// Wait for the task to reset or stop the stream.
         async fn reset(reset: &Mutex<Option<u32>>) -> Option<u32> {
             for _ in 0..500 {
                 if let Some(code) = *reset.lock().unwrap() {
@@ -1972,13 +2440,14 @@ pub(crate) mod tests {
             None
         }
 
-        /// Push `sender`'s records of C over the stream as a sender does,
-        /// skipping what each reply says is held and answering value
-        /// requests, until the receiver says everything landed or ends the
-        /// stream, or `cut` values were answered; the leaf `omit` names is
-        /// left out. Returns whether it landed, and how many value requests
-        /// it heard.
-        async fn push(
+        /// A scripted peer: stream `sender`'s whole records tree of C over
+        /// the stream, breadth first and heeding no announcement, leaving
+        /// out the leaf `omit` names; then answer value requests until the
+        /// task says everything landed or ends the stream, or `cut` values
+        /// were answered, sending LANDED for the task's own delta once its
+        /// DONE is in. Returns whether the task's LANDED came, and how many
+        /// value requests were heard.
+        async fn stream(
             sender: &Node,
             collection: CollectionHandle,
             send: &mut WriteHalf<DuplexStream>,
@@ -1993,7 +2462,10 @@ pub(crate) mod tests {
             let mut heard = 0;
             let value = |key| Frame::Value {
                 key,
-                bytes: value(kind, overlay, key).unwrap(),
+                bytes: value(kind, overlay, key)
+                    .unwrap()
+                    .bytes(collection)
+                    .unwrap(),
             };
             write(
                 send,
@@ -2002,8 +2474,8 @@ pub(crate) mod tests {
                 },
             )
             .await;
-            let mut stack = vec![Vec::new()];
-            while let Some(prefix) = stack.pop() {
+            let mut queue = VecDeque::from([Vec::new()]);
+            while let Some(prefix) = queue.pop_front() {
                 match node(kind, overlay, &prefix).unwrap() {
                     PatchNode::Leaf { leaf, .. } => {
                         let key = <[u8; 32]>::try_from(leaf.key).unwrap();
@@ -2011,45 +2483,17 @@ pub(crate) mod tests {
                             write(send, Frame::Leaf { key }).await;
                         }
                     }
-                    pushed @ PatchNode::Branch { .. } => {
-                        let PatchNode::Branch { branch, .. } = pushed.clone() else {
+                    sent @ PatchNode::Branch { .. } => {
+                        let PatchNode::Branch { branch, .. } = sent.clone() else {
                             unreachable!()
                         };
-                        write(
-                            send,
-                            Frame::Node {
-                                prefix: prefix.clone(),
-                                node: pushed,
-                            },
-                        )
-                        .await;
-                        let children = loop {
-                            match read(recv).await {
-                                Some(Frame::Held {
-                                    prefix: p,
-                                    children,
-                                }) if p == prefix => {
-                                    break children;
-                                }
-                                Some(Frame::ValueRequest { key }) => {
-                                    heard += 1;
-                                    if answered == cut {
-                                        return (false, heard);
-                                    }
-                                    answered += 1;
-                                    write(send, value(key)).await;
-                                }
-                                other => panic!("waiting for a reply: {other:?}"),
-                            }
-                        };
                         let end = usize::from(branch.end_depth);
-                        for child in branch.children.iter().rev() {
-                            if !held(&children, child.edge) {
-                                let mut locator = branch.representative[..end].to_vec();
-                                locator.push(child.edge);
-                                stack.push(locator);
-                            }
+                        for child in &branch.children {
+                            let mut locator = branch.representative[..end].to_vec();
+                            locator.push(child.edge);
+                            queue.push_back(locator);
                         }
+                        write(send, Frame::Node { prefix, node: sent }).await;
                     }
                 }
             }
@@ -2063,22 +2507,27 @@ pub(crate) mod tests {
                             return (false, heard);
                         }
                         answered += 1;
-                        // A request read after the receiver ended the push
+                        // A request read after the task ended the exchange
                         // can no longer be answered.
                         if !try_write(send, value(key)).await {
                             return (false, heard);
                         }
                     }
-                    Some(Frame::Held { .. }) => {}
+                    Some(Frame::Done) => {
+                        if !try_write(send, Frame::Landed).await {
+                            return (false, heard);
+                        }
+                    }
+                    Some(Frame::Root { .. } | Frame::Node { .. } | Frame::Leaf { .. }) => {}
                     Some(other) => panic!("waiting for Landed: {other:?}"),
                     None => return (false, heard),
                 }
             }
         }
 
-        /// A push from an admitted peer lands through the landing task and
-        /// ends with Landed and a finished stream; one from a peer the
-        /// receiver does not receive from is refused.
+        /// A stream from an admitted peer lands through the landing task and
+        /// ends with both LANDEDs and a finished stream; one from a peer the
+        /// task neither sends to nor receives from is refused.
         #[tokio::test]
         async fn an_incoming_stream_lands_through_the_task_or_is_refused() {
             let mut sender = Node::new(50);
@@ -2103,23 +2552,23 @@ pub(crate) mod tests {
             let mut receiving = Hosted::new(receiver, &SimNet::new(1, SimConfig::default()));
 
             let (mut send, mut recv, landed) = receiving.open(sender.id(), collection);
-            assert!(
-                push(&sender, collection, &mut send, &mut recv, usize::MAX, None)
-                    .await
-                    .0
-            );
+            let (confirmed, heard) =
+                stream(&sender, collection, &mut send, &mut recv, usize::MAX, None).await;
+            assert!(confirmed);
+            assert_eq!(heard, 150, "the fifty held are not asked for");
             assert!(read(&mut recv).await.is_none(), "the stream finished");
             assert_eq!(*landed.lock().unwrap(), None);
             assert_eq!(receiving.records(collection), records);
             let health = receiving.health(collection, sender.id()).unwrap();
             assert!(health.receives.last_ok && health.receives.ok == 1);
-            assert_eq!(
-                health.received.records,
-                Some(summary(
-                    WalkKind::Records,
-                    sender.serving().collection(collection).unwrap().repair()
-                ))
+            assert!(health.pushes.last_ok && health.pushes.ok == 1);
+            let root = summary(
+                WalkKind::Records,
+                sender.serving().collection(collection).unwrap().repair(),
             );
+            assert_eq!(health.received.records, Some(root));
+            // The agreed tree is the union, which is the sender's tree.
+            assert_eq!(health.confirmed.records, Some(root));
             assert_eq!(
                 receiving.events.try_recv(),
                 Ok(Event::Receiving {
@@ -2136,14 +2585,13 @@ pub(crate) mod tests {
                 })
             );
 
-            // A second push of the same tree is held whole at its first
-            // node.
+            // The same tree again: the root is held whole, and every node
+            // the scripted peer still streams is in flight waste.
             let (mut send, mut recv, _) = receiving.open(sender.id(), collection);
-            assert!(
-                push(&sender, collection, &mut send, &mut recv, usize::MAX, None)
-                    .await
-                    .0
-            );
+            let (confirmed, heard) =
+                stream(&sender, collection, &mut send, &mut recv, usize::MAX, None).await;
+            assert!(confirmed);
+            assert_eq!(heard, 0);
 
             let (_send, _recv, refusal) = receiving.open(sender.id(), refused);
             assert_eq!(reset(&refusal).await, Some(RESET_WALK_REFUSED));
@@ -2151,7 +2599,8 @@ pub(crate) mod tests {
         }
 
         /// A second stream from the peer for the same tree replaces the
-        /// first, which is reset; a push that omits a leaf is reset too.
+        /// first, which is reset and counted nowhere; a delta that omits a
+        /// leaf is reset too, and counts as a failed receive and push.
         #[tokio::test]
         async fn a_replaced_or_failed_stream_is_reset() {
             let mut sender = Node::new(53);
@@ -2173,9 +2622,9 @@ pub(crate) mod tests {
                 receiving.open(sender.id(), collection);
             assert_eq!(reset(&first_reset).await, Some(RESET_WALK_FAILED));
 
-            // The second pushes every leaf but one.
+            // The second streams every leaf but one.
             let omitted = records[0].fingerprint().raw();
-            let (landed, heard) = push(
+            let (confirmed, heard) = stream(
                 &sender,
                 collection,
                 &mut second,
@@ -2184,18 +2633,20 @@ pub(crate) mod tests {
                 Some(omitted),
             )
             .await;
-            assert!(!landed);
+            assert!(!confirmed);
             assert_eq!(reset(&second_reset).await, Some(RESET_WALK_FAILED));
             // Its value requests went out before the end failed it.
             let mut requested = heard;
-            while let Some(Frame::ValueRequest { .. }) = read(&mut second_recv).await {
-                requested += 1;
+            while let Some(frame) = read(&mut second_recv).await {
+                if matches!(frame, Frame::ValueRequest { .. }) {
+                    requested += 1;
+                }
             }
             assert_eq!(requested, 19);
             for _ in 0..500 {
                 if receiving
                     .health(collection, sender.id())
-                    .is_some_and(|health| health.receives.failed == 2)
+                    .is_some_and(|health| health.receives.failed == 1)
                 {
                     break;
                 }
@@ -2203,65 +2654,526 @@ pub(crate) mod tests {
             }
             assert!(receiving.records(collection).len() < 20);
             let health = receiving.health(collection, sender.id()).unwrap();
-            assert_eq!((health.receives.ok, health.receives.failed), (0, 2));
+            assert_eq!((health.receives.ok, health.receives.failed), (0, 1));
+            assert_eq!((health.pushes.ok, health.pushes.failed), (0, 1));
             assert!(!health.receives.last_ok);
         }
 
-        /// The frame kinds that crossed `taps` since `from` on walk streams
-        /// to `peer`, those this side sent and those it heard.
-        fn crossed(taps: &Taps, from: usize, peer: PeerId) -> (Vec<u8>, Vec<u8>) {
-            let crossed = taps.since(from, peer, TAG_WALK);
+        /// The frames that crossed `taps` since `from` on walk streams to
+        /// `peer`, in order, with whether this side sent each.
+        fn walked(taps: &Taps, from: usize, peer: PeerId) -> Vec<Crossed> {
+            taps.since(from, peer, TAG_WALK)
+        }
+
+        /// The frame kinds among `crossed` that this side sent, and those it
+        /// heard.
+        fn split(crossed: &[Crossed]) -> (Vec<u8>, Vec<u8>) {
             let kinds = |sent: bool| {
                 crossed
                     .iter()
-                    .filter(|crossed: &&Crossed| crossed.sent == sent)
+                    .filter(|crossed| crossed.sent == sent)
                     .map(|crossed| crossed.kind)
                     .collect::<Vec<_>>()
             };
             (kinds(true), kinds(false))
         }
 
+        fn crossed(taps: &Taps, from: usize, peer: PeerId) -> (Vec<u8>, Vec<u8>) {
+            split(&walked(taps, from, peer))
+        }
+
         fn count(kinds: &[u8], kind: u8) -> usize {
             kinds.iter().filter(|crossed| **crossed == kind).count()
         }
 
-        /// The walks task's push driver over a simulated connection into
-        /// another task's receiver. (a) Fifty records to an empty receiver:
-        /// all land, Landed comes back, and the push is confirmed. (b) The
-        /// confirmed tree again: Root then Done, answered with Landed alone.
-        /// (c) A receiver holding forty of the fifty from elsewhere: its
-        /// HELD prunes, so fewer than fifty leaves and exactly the ten
-        /// missing values cross, and the ten land.
-        #[tokio::test(start_paused = true)]
-        async fn a_push_over_a_connection_lands_confirms_and_prunes() {
+        /// Two hosted nodes on a net with a fixed latency: `full` holds
+        /// `records` of C, `empty` none.
+        fn pair(
+            seed: u64,
+            bytes: (u8, u8),
+            records: u64,
+        ) -> (
+            SimNet,
+            Hosted,
+            Hosted,
+            CollectionHandle,
+            Vec<CollectionRecord>,
+        ) {
             let net = SimNet::new(
-                0x3A1E,
+                seed,
                 SimConfig {
                     latency: Duration::from_millis(10)..Duration::from_millis(10),
                 },
             );
-            let kind = WalkKind::Records;
-            let mut sender = Node::new(55);
-            let collection = sender.hold("pushed", open());
-            let records = (0..50)
-                .map(|data| sender.commit(collection, data))
+            let mut full = Node::new(bytes.0);
+            let collection = full.hold("pair", open());
+            let records = (0..records)
+                .map(|data| full.commit(collection, data))
                 .collect::<Vec<_>>();
-            sender.observe();
+            full.observe();
+            let full = Hosted::new(full, &net);
+            let mut empty = Node::new(bytes.1);
+            empty.hold("pair", open());
+            empty.observe();
+            let empty = Hosted::new(empty, &net);
+            (net, full, empty, collection, records)
+        }
+
+        /// A first sync to an empty peer: the full side streams its whole
+        /// tree without waiting for anything, the empty side sends only its
+        /// ROOT, its DONE, a request per value and LANDED, and the full
+        /// side had written its last NODE before the first frame after the
+        /// empty side's ROOT arrived.
+        #[tokio::test(start_paused = true)]
+        async fn first_sync_to_an_empty_peer_streams_without_waiting() {
+            let (_net, full, empty, collection, records) = pair(0x3A1E, (55, 56), 300);
+            let kind = WalkKind::Records;
+            let _connection = full.table.connect(empty.peer).await.unwrap();
+            let health = full.exchange(empty.peer, collection, kind).await;
+            assert!(health.pushes.last_ok, "{health:?}");
+            assert_eq!((health.pushes.ok, health.pushes.failed), (1, 0));
+            assert_eq!(empty.records(collection).len(), 300);
+
+            let crossed = walked(&full.taps, 0, empty.peer);
+            let (sent, heard) = split(&crossed);
+            assert_eq!(count(&heard, FRAME_ROOT), 1);
+            assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 300);
+            assert_eq!(count(&heard, FRAME_DONE), 1);
+            assert_eq!(count(&heard, FRAME_LANDED), 1);
+            assert_eq!(heard.len(), 303, "{heard:?}");
+            assert_eq!(count(&heard, FRAME_NODE) + count(&heard, FRAME_LEAF), 0);
+            let mut expected = Vec::new();
+            let pinned = full.lander.node.lock().unwrap().pinned(collection);
+            branches(pinned.repair().records().patch(), Vec::new(), &mut expected);
+            assert!(expected.len() > 1);
+            assert_eq!(count(&sent, FRAME_NODE), expected.len());
+            assert_eq!(count(&sent, FRAME_LEAF), records.len());
+
+            // Zero waits. Stream data crosses the simulated transport
+            // without latency, so the tap's order is the two tasks'
+            // interleaving; the witness is a scripted empty peer that
+            // sends its ROOT and DONE and then reads nothing until the full
+            // side's DONE is in: the whole delta arrives before the peer
+            // sends anything else, which a side that waited for a reply
+            // could never finish.
+            let stranger = Node::new(57).id();
+            let before = full.health(collection, stranger);
+            let (mut send, mut recv, _) = full.open(stranger, collection);
+            write(
+                &mut send,
+                Frame::Root {
+                    summary: PatchSummary::new(None, 0).unwrap(),
+                },
+            )
+            .await;
+            write(&mut send, Frame::Done).await;
+            let mut delta = Vec::new();
+            loop {
+                let frame = read(&mut recv).await.expect("the delta");
+                let done = frame == Frame::Done;
+                delta.push(frame);
+                if done {
+                    break;
+                }
+            }
+            assert!(matches!(delta[0], Frame::Root { .. }));
+            let nodes = delta
+                .iter()
+                .filter(|frame| matches!(frame, Frame::Node { .. }))
+                .count();
+            let leaves = delta
+                .iter()
+                .filter_map(|frame| match frame {
+                    Frame::Leaf { key } => Some(*key),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(nodes, expected.len());
+            assert_eq!(leaves.len(), records.len());
+            assert!(
+                delta.iter().all(|frame| !matches!(
+                    frame,
+                    Frame::Value { .. } | Frame::ValueRequest { .. }
+                ))
+            );
+            // Now the values, and both LANDEDs.
+            for key in &leaves {
+                write(&mut send, Frame::ValueRequest { key: *key }).await;
+            }
+            let mut values = 0;
+            let mut landed = delta.contains(&Frame::Landed);
+            while values < leaves.len() || !landed {
+                match read(&mut recv).await.expect("the values") {
+                    Frame::Value { .. } => values += 1,
+                    Frame::Landed => landed = true,
+                    other => panic!("waiting for values: {other:?}"),
+                }
+            }
+            write(&mut send, Frame::Landed).await;
+            assert!(read(&mut recv).await.is_none(), "the stream finished");
+            let health = full.ended(stranger, collection, before).await;
+            assert!(health.pushes.last_ok, "{health:?}");
+            eprintln!(
+                "W8_EMPTY leaves={} nodes={} peer_frames={} delta_reply_waits=0 witness=scripted_peer_withholds_value_requests_until_DONE",
+                leaves.len(),
+                nodes,
+                heard.len()
+            );
+        }
+
+        async fn stale_completion_is_ignored(deselect: bool) {
+            let net = SimNet::new(0x3A29, SimConfig::default());
+            let mut node = Node::new(105);
+            let collection = node.hold("retired completion", open());
+            node.commit(collection, 1);
+            node.observe();
+            let snapshot = node.snapshot();
+            let pinned = node.pinned(collection);
+            let hosted = Hosted::new(node, &net);
+            let (landing, _landings) = mpsc::unbounded_channel();
+            let (events, _events) = mpsc::unbounded_channel();
+            let mut task = Task {
+                connections: hosted.table.clone(),
+                snapshots: hosted.lander.snapshots.subscribe(),
+                walks: Walks::new(hosted.lander.node.lock().unwrap().health.clone()),
+                commands: hosted.walks.clone(),
+                landing,
+                events,
+                running: HashMap::new(),
+                next_id: 0,
+            };
+            task.observe(snapshot);
+            let peer = Node::new(106).id();
+            let kind = WalkKind::Records;
+            let exchange = task.walks.start(peer, collection, kind).unwrap();
+            let (driver, _acks, mut replaced) =
+                task.register((peer, collection.raw, kind), false, &exchange);
+            if deselect {
+                let snapshot = {
+                    let mut node = hosted.lander.node.lock().unwrap();
+                    node.select(collection, false);
+                    node.observe();
+                    node.snapshot()
+                };
+                task.observe(snapshot);
+            } else {
+                task.command(Command::Closed { peer });
+            }
+            assert!(task.running.is_empty());
+            assert_eq!(
+                replaced.try_recv(),
+                Err(oneshot::error::TryRecvError::Closed)
+            );
+            task.command(Command::Ended {
+                id: driver.id,
+                peer,
+                collection,
+                kind,
+                duplicate: false,
+                ended: Ended {
+                    sends: true,
+                    receives: true,
+                    confirmed: true,
+                    landed: true,
+                    root: summary(kind, pinned.repair()),
+                    peer_root: Some(summary(kind, pinned.repair())),
+                    agreed: Some(Arc::new(Tree::pinned(kind, pinned.repair()))),
+                },
+            });
+            assert!(
+                task.walks
+                    .agreed
+                    .get(&agreed_key(peer, collection.raw, kind))
+                    .is_none()
+            );
+            assert_eq!(
+                hosted.records(collection).len(),
+                1,
+                "retirement keeps landed values"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_closed_connection_cannot_restore_agreement_from_an_old_end() {
+            stale_completion_is_ignored(false).await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_deselected_collection_cannot_restore_agreement_from_an_old_end() {
+            stale_completion_is_ignored(true).await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_deselected_but_active_collection_refuses_new_open_and_incoming() {
+            let net = SimNet::new(0x3A2B, SimConfig::default());
+            let mut node = Node::new(114);
+            let collection = node.hold("active but deselected", open());
+            node.select(collection, false);
+            node.observe();
+            let snapshot = node.snapshot();
+            assert!(snapshot.collection(collection).is_some(), "still active");
+            assert!(snapshot.selected(collection).is_none());
+            let hosted = Hosted::new(node, &net);
+            let mut other = Node::new(115);
+            other.hold("active but deselected", open());
+            let other = Hosted::new(other, &net);
+            let _connection = hosted.table.connect(other.peer).await.unwrap();
+            assert!(
+                hosted.table.current(other.peer).is_some(),
+                "Open has a current connection"
+            );
+            let (landing, _landings) = mpsc::unbounded_channel();
+            let (events, mut received) = mpsc::unbounded_channel();
+            let mut task = Task {
+                connections: hosted.table.clone(),
+                snapshots: hosted.lander.snapshots.subscribe(),
+                walks: Walks::new(hosted.lander.node.lock().unwrap().health.clone()),
+                commands: hosted.walks.clone(),
+                landing,
+                events,
+                running: HashMap::new(),
+                next_id: 0,
+            };
+            task.observe(snapshot);
+            let kind = WalkKind::Records;
+            assert!(task.walks.start(other.peer, collection, kind).is_none());
+            task.command(Command::Open {
+                peer: other.peer,
+                collection,
+                kind,
+            });
+            assert!(task.running.is_empty());
+            assert_eq!(task.next_id, 0);
+            let (_script, driven) = tokio::io::duplex(1024);
+            let (recv, send) = tokio::io::split(driven);
+            let reset = Arc::new(Mutex::new(None));
+            task.command(Command::Incoming {
+                peer: other.peer,
+                collection,
+                kind,
+                send: Box::new(Tx(send, reset.clone())),
+                recv: Box::new(Rx(recv, reset.clone())),
+            });
+            assert_eq!(*reset.lock().unwrap(), Some(RESET_WALK_REFUSED));
+            assert!(task.running.is_empty());
+            assert_eq!(task.next_id, 0);
+            assert!(received.try_recv().is_err(), "no admitted exchange events");
+        }
+
+        async fn blocked_final_write_finishes(retire: bool) {
+            let net = SimNet::new(0x3A2A, SimConfig::default());
+            let mut node = Node::new(107);
+            let collection = node.hold("blocked final LANDED", open());
+            let kind = WalkKind::Records;
+            let exchange =
+                Exchange::start(collection, kind, node.pinned(collection), None, true, true);
+            let hosted = Hosted::new(node, &net);
+            let (landing, _landings) = mpsc::unbounded_channel();
+            let (commands, _commands) = mpsc::unbounded_channel();
+            let driver = Driver {
+                connections: hosted.table.clone(),
+                snapshots: hosted.lander.snapshots.subscribe(),
+                landing,
+                commands,
+                id: 1,
+                peer: Node::new(108).id(),
+                collection,
+                kind,
+            };
+            let (script, driven) = tokio::io::duplex(1 << 20);
+            let (mut recv, mut send) = tokio::io::split(script);
+            let (driven_recv, driven_send) = tokio::io::split(driven);
+            let reset = Arc::new(Mutex::new(None));
+            let attempted = Arc::new(Mutex::new(false));
+            let (_acks, acked) = mpsc::unbounded_channel();
+            let (replace, replaced) = oneshot::channel();
+            let task_attempted = attempted.clone();
+            let task_reset = reset.clone();
+            let task = tokio::spawn(async move {
+                drive(
+                    &driver,
+                    exchange,
+                    Box::new(BlockLanded(
+                        Tx(driven_send, task_reset.clone()),
+                        task_attempted,
+                    )),
+                    Box::new(Rx(driven_recv, task_reset)),
+                    acked,
+                    replaced,
+                )
+                .await
+            });
+            write(
+                &mut send,
+                Frame::Root {
+                    summary: PatchSummary::new(None, 0).unwrap(),
+                },
+            )
+            .await;
+            loop {
+                if read(&mut recv).await == Some(Frame::Done) {
+                    break;
+                }
+            }
+            write(&mut send, Frame::Landed).await;
+            write(&mut send, Frame::Done).await;
+            for _ in 0..100 {
+                if *attempted.lock().unwrap() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                *attempted.lock().unwrap(),
+                "LANDED blocks after logical confirmation"
+            );
+            if retire {
+                drop(replace);
+            } else {
+                tokio::time::advance(WALK_DEADLINE + Duration::from_secs(1)).await;
+            }
+            let (ended, duplicate) = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("blocked final writer retires or times out")
+                .unwrap();
+            assert!(!duplicate);
+            assert!(ended.confirmed);
+            assert!(!ended.landed);
+            assert!(ended.agreed.is_none());
+            assert_eq!(*reset.lock().unwrap(), Some(RESET_WALK_FAILED));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_retired_driver_cancels_its_blocked_final_landed_write() {
+            blocked_final_write_finishes(true).await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_blocked_final_landed_write_has_a_progress_deadline() {
+            blocked_final_write_finishes(false).await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_failed_landed_write_cannot_leave_a_shared_agreement() {
+            let net = SimNet::new(0x3A28, SimConfig::default());
+            let mut node = Node::new(103);
+            let collection = node.hold("LANDED write failure", open());
+            node.commit(collection, 1);
+            node.observe();
+            let kind = WalkKind::Records;
+            let exchange =
+                Exchange::start(collection, kind, node.pinned(collection), None, true, true);
+            let hosted = Hosted::new(node, &net);
+            let (landing, _landings) = mpsc::unbounded_channel();
+            let (commands, _commands) = mpsc::unbounded_channel();
+            let driver = Driver {
+                connections: hosted.table.clone(),
+                snapshots: hosted.lander.snapshots.subscribe(),
+                landing,
+                commands,
+                id: 1,
+                peer: Node::new(104).id(),
+                collection,
+                kind,
+            };
+            let (script, driven) = tokio::io::duplex(1 << 20);
+            let (mut recv, mut send) = tokio::io::split(script);
+            let (driven_recv, driven_send) = tokio::io::split(driven);
+            let reset = Arc::new(Mutex::new(None));
+            let attempted = Arc::new(Mutex::new(false));
+            let (_acks, acked) = mpsc::unbounded_channel();
+            let (_replace, replaced) = oneshot::channel();
+            let task_attempted = attempted.clone();
+            let task_reset = reset.clone();
+            let task = tokio::spawn(async move {
+                drive(
+                    &driver,
+                    exchange,
+                    Box::new(FailLanded(
+                        Tx(driven_send, task_reset.clone()),
+                        task_attempted,
+                    )),
+                    Box::new(Rx(driven_recv, task_reset)),
+                    acked,
+                    replaced,
+                )
+                .await
+            });
+            write(
+                &mut send,
+                Frame::Root {
+                    summary: PatchSummary::new(None, 0).unwrap(),
+                },
+            )
+            .await;
+            let mut keys = Vec::new();
+            loop {
+                match read(&mut recv).await {
+                    Some(Frame::Leaf { key }) => keys.push(key),
+                    Some(Frame::Done) => break,
+                    Some(Frame::Root { .. } | Frame::Node { .. }) => {}
+                    other => panic!("our delta: {other:?}"),
+                }
+            }
+            for key in keys {
+                write(&mut send, Frame::ValueRequest { key }).await;
+                let Some(Frame::Value { key: served, bytes }) = read(&mut recv).await else {
+                    panic!("requested value");
+                };
+                assert_eq!(served, key);
+                assert_eq!(
+                    decode_record(collection, &bytes)
+                        .unwrap()
+                        .fingerprint()
+                        .raw(),
+                    key
+                );
+            }
+            // The peer acknowledges our delta before ending its empty one.
+            write(&mut send, Frame::Landed).await;
+            write(&mut send, Frame::Done).await;
+            let (ended, duplicate) = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("failed write wakes/finishes the driver")
+                .unwrap();
+            assert!(
+                *attempted.lock().unwrap(),
+                "a real LANDED write was attempted"
+            );
+            assert!(!duplicate);
+            assert!(ended.confirmed, "the peer's directional receipt arrived");
+            assert!(!ended.landed, "our failed write is not a receipt");
+            assert!(ended.agreed.is_none());
+            assert_eq!(*reset.lock().unwrap(), Some(RESET_WALK_FAILED));
+        }
+
+        /// The task's driver over a simulated connection into another
+        /// task's, both ways. (a) Fifty records to an empty peer: all land,
+        /// both LANDEDs cross, and both sides confirm the same agreed root.
+        /// (b) The agreed tree again: ROOT then DONE each way, answered with
+        /// LANDED alone. (c) A peer holding forty of the fifty from
+        /// elsewhere asks for exactly the ten missing values. (d) A peer
+        /// with no current connection gets no exchange at all.
+        #[tokio::test(start_paused = true)]
+        async fn an_exchange_over_a_connection_lands_confirms_and_prunes() {
+            let (net, sender, mut empty, collection, records) = pair(0x3A1F, (57, 58), 50);
+            let kind = WalkKind::Records;
             let root = summary(
                 kind,
-                sender.serving().collection(collection).unwrap().repair(),
+                sender
+                    .lander
+                    .node
+                    .lock()
+                    .unwrap()
+                    .pinned(collection)
+                    .repair(),
             );
             let all = records.iter().copied().collect::<BTreeSet<_>>();
-            let sender = Hosted::new(sender, &net);
-            let mut empty = Node::new(56);
-            empty.hold("pushed", open());
-            empty.observe();
-            let mut empty = Hosted::new(empty, &net);
             let _connection = sender.table.connect(empty.peer).await.unwrap();
 
-            // (a) Everything lands, and the push is confirmed.
+            // (a) Everything lands, and both sides confirm the union.
             let from = sender.taps.len();
-            let health = sender.push(empty.peer, collection, kind).await;
+            let health = sender.exchange(empty.peer, collection, kind).await;
             assert!(health.pushes.last_ok, "{health:?}");
             assert_eq!((health.pushes.ok, health.pushes.failed), (1, 0));
             assert_eq!(health.confirmed.records, Some(root));
@@ -2270,6 +3182,10 @@ pub(crate) mod tests {
             assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 50);
             assert_eq!(count(&sent, FRAME_LEAF), 50);
             assert_eq!(empty.records(collection), all);
+            let other = empty.health(collection, sender.peer).unwrap();
+            assert!(other.receives.last_ok && other.pushes.last_ok, "{other:?}");
+            assert_eq!(other.confirmed.records, Some(root));
+            assert_eq!(other.received.records, Some(root));
             assert_eq!(
                 empty.events.try_recv(),
                 Ok(Event::Receiving { collection, kind })
@@ -2283,36 +3199,37 @@ pub(crate) mod tests {
                 })
             );
 
-            // (b) The confirmed tree is Root then Done, answered with
-            // Landed alone.
+            // (b) The agreed tree is ROOT then DONE each way, answered with
+            // LANDED alone.
             let from = sender.taps.len();
-            let health = sender.push(empty.peer, collection, kind).await;
+            let health = sender.exchange(empty.peer, collection, kind).await;
             assert_eq!((health.pushes.ok, health.pushes.failed), (2, 0));
             let (sent, heard) = crossed(&sender.taps, from, empty.peer);
-            assert_eq!(sent, [FRAME_OPEN, FRAME_ROOT, FRAME_DONE]);
-            assert_eq!(heard, [FRAME_LANDED]);
+            assert_eq!(sent, [FRAME_OPEN, FRAME_ROOT, FRAME_DONE, FRAME_LANDED]);
+            assert_eq!(heard, [FRAME_ROOT, FRAME_DONE, FRAME_LANDED]);
 
-            // The receiver commits a record of its own, so its tree is a
-            // superset of the sender's: the unchanged push still lands on
-            // the root it landed before.
-            {
-                let mut node = empty.lander.node.lock().unwrap();
-                node.commit(collection, 1_000);
-                node.observe();
-                let snapshot = node.snapshot();
-                empty.lander.snapshots.send_replace(Some(snapshot));
-            }
+            // The peer commits a record of its own: its delta is that
+            // record's path, which lands here, and the sender's is nothing.
+            let own = empty.commit(collection, 1_000);
             let from = sender.taps.len();
-            let health = sender.push(empty.peer, collection, kind).await;
+            let health = sender.exchange(empty.peer, collection, kind).await;
             assert_eq!((health.pushes.ok, health.pushes.failed), (3, 0));
             let (sent, heard) = crossed(&sender.taps, from, empty.peer);
-            assert_eq!(sent, [FRAME_OPEN, FRAME_ROOT, FRAME_DONE]);
-            assert_eq!(heard, [FRAME_LANDED]);
-            assert_eq!(empty.records(collection).len(), 51);
+            assert_eq!(count(&sent, FRAME_NODE), 0);
+            assert_eq!(count(&sent, FRAME_VALUE_REQUEST), 1);
+            assert_eq!(count(&heard, FRAME_LEAF), 1);
+            assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 0);
+            assert!(
+                sender
+                    .records(collection)
+                    .iter()
+                    .any(|record| record.fingerprint().raw() == own)
+            );
+            assert_eq!(sender.records(collection).len(), 51);
 
-            // (c) A receiver that holds forty of the fifty prunes.
-            let mut partial = Node::new(57);
-            partial.hold("pushed", open());
+            // (c) A peer that holds forty of the fifty asks for ten.
+            let mut partial = Node::new(59);
+            partial.hold("pair", open());
             for record in &records[..40] {
                 partial.store.insert(*record).unwrap();
             }
@@ -2320,51 +3237,255 @@ pub(crate) mod tests {
             let partial = Hosted::new(partial, &net);
             let _connection = sender.table.connect(partial.peer).await.unwrap();
             let from = sender.taps.len();
-            let health = sender.push(partial.peer, collection, kind).await;
+            let health = sender.exchange(partial.peer, collection, kind).await;
             assert!(health.pushes.last_ok, "{health:?}");
             let (sent, heard) = crossed(&sender.taps, from, partial.peer);
-            assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 10);
-            let leaves = count(&sent, FRAME_LEAF);
-            assert!(leaves < 50, "{leaves} leaves crossed: nothing was pruned");
-            assert!(leaves >= 10);
-            assert_eq!(partial.records(collection), all);
+            // The ten of the fifty, and the peer's own record landed above.
+            assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 11);
+            assert_eq!(count(&sent, FRAME_VALUE_REQUEST), 0);
+            assert!(count(&sent, FRAME_LEAF) >= 11);
+            assert_eq!(partial.records(collection).len(), 51);
+            assert!(partial.records(collection).is_superset(&all));
 
-            // A peer with no current connection gets no push at all.
-            let stranger = Node::new(58).id();
-            sender.walks.push(stranger, collection, kind);
+            // (d) A peer with no current connection gets no exchange.
+            let stranger = Node::new(61).id();
+            sender.walks.open(stranger, collection, kind);
             tokio::time::sleep(Duration::from_secs(1)).await;
             assert!(sender.health(collection, stranger).is_none());
         }
 
-        /// A push cut after some values landed leaves them, fails the receive
-        /// and leaves the sender's confirmed root as it was. The next push,
-        /// driven by the walks task over a connection, is pruned by what
-        /// landed: exactly the rest is asked for, and it lands.
+        /// Two peers holding the same 300 records agree on them in one
+        /// exchange; then each commits ten of its own and A opens one
+        /// bidirectional stream. On it each side's delta is the
+        /// root NODE, which announces the shared subtrees, plus the nodes on
+        /// the paths to its own ten; exactly ten values are asked for each
+        /// way, and both sides agree on the union.
         #[tokio::test(start_paused = true)]
-        async fn a_push_cut_mid_way_leaves_what_landed_and_the_next_push_asks_for_the_rest() {
+        async fn a_shared_subtree_costs_one_frame_per_direction() {
+            let (_net, a, b, collection, records) = pair(0x3A22, (62, 63), 300);
+            let kind = WalkKind::Records;
+            {
+                let mut node = b.lander.node.lock().unwrap();
+                for record in &records {
+                    node.store.insert(*record).unwrap();
+                }
+                node.observe();
+                let snapshot = node.snapshot();
+                b.lander.snapshots.send_replace(Some(snapshot));
+            }
+            let _connection = a.table.connect(b.peer).await.unwrap();
+            let health = a.exchange(b.peer, collection, kind).await;
+            assert!(health.pushes.last_ok, "{health:?}");
+            let shared = summary(
+                kind,
+                a.lander.node.lock().unwrap().pinned(collection).repair(),
+            );
+            assert_eq!(health.confirmed.records, Some(shared));
+            assert_eq!(
+                b.health(collection, a.peer).unwrap().confirmed.records,
+                Some(shared)
+            );
+
+            let own_a = (0..10)
+                .map(|data| a.commit(collection, 1_000 + data))
+                .collect::<Vec<_>>();
+            let own_b = (0..10)
+                .map(|data| b.commit(collection, 2_000 + data))
+                .collect::<Vec<_>>();
+            let from = [a.taps.len(), b.taps.len()];
+            let before = [a.health(collection, b.peer), b.health(collection, a.peer)];
+            a.walks.open(b.peer, collection, kind);
+            let health_a = a.ended(b.peer, collection, before[0].clone()).await;
+            let health_b = b.ended(a.peer, collection, before[1].clone()).await;
+            assert!(
+                health_a.pushes.last_ok && health_a.receives.last_ok,
+                "{health_a:?}"
+            );
+            assert!(
+                health_b.pushes.last_ok && health_b.receives.last_ok,
+                "{health_b:?}"
+            );
+            assert_eq!((health_a.pushes.ok, health_a.pushes.failed), (2, 0));
+            assert_eq!((health_b.pushes.ok, health_b.pushes.failed), (2, 0));
+            assert_eq!(health_a.confirmed.records, health_b.confirmed.records);
+            assert_eq!(a.records(collection).len(), 320);
+            assert_eq!(b.records(collection), a.records(collection));
+
+            for (side, from, own, other) in
+                [(&a, from[0], &own_a, b.peer), (&b, from[1], &own_b, a.peer)]
+            {
+                let (sent, heard) = crossed(&side.taps, from, other);
+                assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 10);
+                assert_eq!(count(&sent, FRAME_VALUE_REQUEST), 10);
+                let pinned = side.lander.node.lock().unwrap().pinned(collection);
+                let expected = paths(pinned.repair().records().patch(), own);
+                assert!(expected.contains(&Vec::new()));
+                assert_eq!(count(&sent, FRAME_NODE), expected.len(), "{sent:?}");
+                assert_eq!(count(&sent, FRAME_LEAF), 10);
+                eprintln!(
+                    "W8_AGREED_SHARED peer={other:?} nodes={} leaves=10 value_requests_sent=10 value_requests_received=10 fixture=prior_agreement_plus_10_unique_each scheduler=sim_zero_stream_latency",
+                    expected.len()
+                );
+            }
+        }
+
+        /// After one exchange, seven records appended on one side and three
+        /// on the other go out as the nodes on their paths alone: seven and
+        /// three values are asked for, and both sides agree on the same
+        /// root before and after.
+        #[tokio::test(start_paused = true)]
+        async fn an_incremental_exchange_skips_what_was_agreed_and_lands_only_the_new() {
+            let (_net, a, b, collection, _) = pair(0x3A23, (64, 65), 300);
+            let kind = WalkKind::Records;
+            let _connection = a.table.connect(b.peer).await.unwrap();
+            let health = a.exchange(b.peer, collection, kind).await;
+            assert!(health.pushes.last_ok, "{health:?}");
+            let agreed = health.confirmed.records;
+            assert_eq!(
+                b.health(collection, a.peer).unwrap().confirmed.records,
+                agreed
+            );
+            assert_eq!(b.records(collection).len(), 300);
+
+            let seven = (0..7)
+                .map(|data| a.commit(collection, 1_000 + data))
+                .collect::<Vec<_>>();
+            let three = (0..3)
+                .map(|data| b.commit(collection, 2_000 + data))
+                .collect::<Vec<_>>();
+            let from = [a.taps.len(), b.taps.len()];
+            let health = a.exchange(b.peer, collection, kind).await;
+            assert!(health.pushes.last_ok, "{health:?}");
+            let health_b = b.health(collection, a.peer).unwrap();
+            assert!(
+                health_b.pushes.last_ok && health_b.receives.last_ok,
+                "{health_b:?}"
+            );
+            assert_eq!(health.confirmed.records, health_b.confirmed.records);
+            assert_ne!(health.confirmed.records, agreed);
+            assert_eq!(a.records(collection).len(), 310);
+            assert_eq!(b.records(collection), a.records(collection));
+            for (side, from, own, other, asked) in [
+                (&a, from[0], &seven, b.peer, 3),
+                (&b, from[1], &three, a.peer, 7),
+            ] {
+                let (sent, heard) = crossed(&side.taps, from, other);
+                assert_eq!(count(&heard, FRAME_VALUE_REQUEST), own.len());
+                assert_eq!(count(&sent, FRAME_VALUE_REQUEST), asked);
+                let pinned = side.lander.node.lock().unwrap().pinned(collection);
+                let expected = paths(pinned.repair().records().patch(), own);
+                assert_eq!(count(&sent, FRAME_NODE), expected.len(), "{sent:?}");
+                assert_eq!(count(&sent, FRAME_LEAF), own.len());
+                eprintln!(
+                    "W8_INCREMENTAL peer={other:?} nodes={} leaves={} value_requests_sent={asked} value_requests_received={} scheduler=sim_zero_stream_latency",
+                    expected.len(),
+                    own.len(),
+                    own.len()
+                );
+            }
+        }
+
+        /// Both sides open an exchange of the same tree within one round
+        /// trip: the stream the smaller peer id opened survives and lands,
+        /// the other is reset at both ends and counted nowhere.
+        #[tokio::test(start_paused = true)]
+        async fn simultaneous_opens_keep_the_smaller_peer_s_stream() {
+            let (_net, a, b, collection, _) = pair(0x3A24, (66, 67), 100);
+            let kind = WalkKind::Records;
+            let _connection = a.table.connect(b.peer).await.unwrap();
+            // The accepted connection is current at B once its opening
+            // frame is read.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let (smaller, larger) = if a.peer < b.peer { (&a, &b) } else { (&b, &a) };
+            a.walks.open(b.peer, collection, kind);
+            b.walks.open(a.peer, collection, kind);
+            let health_a = a.ended(b.peer, collection, None).await;
+            let health_b = b.ended(a.peer, collection, None).await;
+            for health in [&health_a, &health_b] {
+                assert!(
+                    health.pushes.last_ok && health.receives.last_ok,
+                    "{health:?}"
+                );
+                assert_eq!((health.pushes.ok, health.pushes.failed), (1, 0));
+                assert_eq!((health.receives.ok, health.receives.failed), (1, 0));
+            }
+            assert_eq!(health_a.confirmed.records, health_b.confirmed.records);
+            assert_eq!(b.records(collection).len(), 100);
+
+            // Each side opened one stream and heard the other's Open.
+            for (side, other) in [(&a, b.peer), (&b, a.peer)] {
+                let (sent, heard) = crossed(&side.taps, 0, other);
+                assert_eq!(count(&sent, FRAME_OPEN), 1);
+                assert_eq!(count(&heard, FRAME_OPEN), 1);
+            }
+            // On the smaller side, the stream that carried LANDED both ways
+            // is the one it opened; on the larger side, the one it accepted.
+            for (side, other, opened) in
+                [(smaller, larger.peer, true), (larger, smaller.peer, false)]
+            {
+                let crossed = walked(&side.taps, 0, other);
+                let streams = crossed
+                    .iter()
+                    .map(|crossed| crossed.stream)
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(streams.len(), 2);
+                let landed = |stream, sent| {
+                    crossed.iter().any(|crossed| {
+                        crossed.stream == stream
+                            && crossed.sent == sent
+                            && crossed.kind == FRAME_LANDED
+                    })
+                };
+                let survivor = streams
+                    .iter()
+                    .copied()
+                    .find(|stream| landed(*stream, true) && landed(*stream, false))
+                    .expect("one stream carried LANDED both ways");
+                let open = crossed
+                    .iter()
+                    .find(|crossed| crossed.stream == survivor && crossed.kind == FRAME_OPEN)
+                    .unwrap();
+                assert_eq!(open.sent, opened);
+                let loser = streams
+                    .iter()
+                    .copied()
+                    .find(|stream| *stream != survivor)
+                    .unwrap();
+                assert!(!landed(loser, true) && !landed(loser, false));
+                assert!(
+                    !crossed
+                        .iter()
+                        .any(|crossed| crossed.stream == loser && crossed.kind == FRAME_DONE)
+                );
+            }
+        }
+
+        /// An exchange cut after some values landed leaves them, fails both
+        /// ways and forgets the agreed tree. The next exchange, driven by
+        /// the walks task over a connection, asks for exactly the rest, and
+        /// it lands.
+        #[tokio::test(start_paused = true)]
+        async fn an_exchange_cut_mid_way_leaves_what_landed_and_the_next_asks_for_the_rest() {
             let net = SimNet::new(
-                0x3A1F,
+                0x3A25,
                 SimConfig {
                     latency: Duration::from_millis(10)..Duration::from_millis(10),
                 },
             );
             let kind = WalkKind::Records;
-            let mut sender = Node::new(59);
+            let mut sender = Node::new(68);
             let collection = sender.hold("cut", open());
             let records = (0..300)
                 .map(|data| sender.commit(collection, data))
                 .collect::<BTreeSet<_>>();
             sender.observe();
-            let root = summary(
-                kind,
-                sender.serving().collection(collection).unwrap().repair(),
-            );
-            let mut receiver = Node::new(60);
+            let root = summary(kind, sender.pinned(collection).repair());
+            let mut receiver = Node::new(69);
             receiver.hold("cut", open());
             receiver.observe();
             let receiver = Hosted::new(receiver, &net);
 
-            // The first push, scripted, answers fifty values and drops the
+            // The first, scripted, answers fifty values and drops the
             // stream.
             let (send, recv, reset) = receiving_cut(&receiver, &sender, collection).await;
             drop((send, recv));
@@ -2382,25 +3503,28 @@ pub(crate) mod tests {
             assert!(landed > 0 && landed < 300, "{landed} landed");
             let health = receiver.health(collection, sender.id()).unwrap();
             assert!(!health.receives.last_ok && health.received.records.is_none());
+            // The scripted peer LANDED our empty delta before cutting its
+            // own. That directional push succeeded, but no union was agreed.
+            assert!(health.pushes.last_ok && health.confirmed.records.is_none());
 
-            // The sender never confirmed anything, and its next push asks
-            // only for the rest.
+            // The sender agreed on nothing, and the next exchange asks only
+            // for the rest.
             let sender = Hosted::new(sender, &net);
             assert!(sender.health(collection, receiver.peer).is_none());
             let _connection = sender.table.connect(receiver.peer).await.unwrap();
             let from = sender.taps.len();
-            let health = sender.push(receiver.peer, collection, kind).await;
+            let health = sender.exchange(receiver.peer, collection, kind).await;
             assert!(health.pushes.last_ok, "{health:?}");
             assert_eq!(health.confirmed.records, Some(root));
             let (sent, heard) = crossed(&sender.taps, from, receiver.peer);
             assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 300 - landed);
-            assert!(count(&sent, FRAME_LEAF) < 300);
+            assert!((300 - landed..=300).contains(&count(&sent, FRAME_LEAF)));
             assert_eq!(receiver.records(collection), records);
         }
 
-        /// Open a scripted stream from `sender` to `receiver` and push until
-        /// fifty values were answered: the halves, still open, and the
-        /// receiver's reset of the stream once they drop.
+        /// Open a scripted stream from `sender` to `receiver` and stream
+        /// until fifty values were answered: the halves, still open, and the
+        /// task's reset of the stream once they drop.
         async fn receiving_cut(
             receiver: &Hosted,
             sender: &Node,
@@ -2412,21 +3536,22 @@ pub(crate) mod tests {
         ) {
             let (mut send, mut recv, reset_code) = receiver.open(sender.id(), collection);
             assert!(
-                !push(sender, collection, &mut send, &mut recv, 50, None)
+                !stream(sender, collection, &mut send, &mut recv, 50, None)
                     .await
                     .0
             );
             (send, recv, async move { reset(&reset_code).await })
         }
 
-        /// A references push whose one held blob takes longer than the walk
-        /// deadline to transfer still lands: the fetch is held to progress
-        /// between chunks, not to a deadline for the whole blob, and after
-        /// DONE the sender waits for LANDED as long as the connection lives.
+        /// A references exchange whose one held blob takes longer than the
+        /// walk deadline to transfer still lands: the fetch is held to
+        /// progress between chunks, not to a deadline for the whole blob,
+        /// and after DONE each side waits for the other's LANDED as long as
+        /// the connection lives.
         #[tokio::test(start_paused = true)]
-        async fn a_references_push_lands_while_one_held_blob_outlasts_the_walk_deadline() {
+        async fn a_references_exchange_lands_while_one_held_blob_outlasts_the_walk_deadline() {
             let net = SimNet::new(
-                0x3A20,
+                0x3A26,
                 SimConfig {
                     latency: Duration::from_millis(10)..Duration::from_millis(10),
                 },
@@ -2434,12 +3559,12 @@ pub(crate) mod tests {
             let kind = WalkKind::References;
             // Six writes twenty seconds apart: two minutes for one blob.
             let (sender, collection, root, handles, receiver) =
-                holding(&net, (61, 62), &[7], Duration::from_secs(20), 1 << 18);
+                holding(&net, (70, 71), &[7], Duration::from_secs(20), 1 << 18);
             let mut receiver = Hosted::new(receiver, &net);
             let _connection = sender.table.connect(receiver.peer).await.unwrap();
             let from = sender.taps.len();
             let started = tokio::time::Instant::now();
-            let health = sender.push(receiver.peer, collection, kind).await;
+            let health = sender.exchange(receiver.peer, collection, kind).await;
             assert!(health.pushes.last_ok, "{health:?}");
             assert_eq!((health.pushes.ok, health.pushes.failed), (1, 0));
             let took = started.elapsed();
@@ -2469,12 +3594,13 @@ pub(crate) mod tests {
 
         /// A fetch phase longer than the walk deadline, two held blobs the
         /// sender serves one at a time, resets neither end: after DONE the
-        /// receiver reads nothing and times nothing while it fetches, and
-        /// the sender waits for LANDED as long as the connection lives.
+        /// receiver reads nothing it is owed and times nothing while it
+        /// fetches, and the sender waits for LANDED as long as the
+        /// connection lives.
         #[tokio::test(start_paused = true)]
         async fn a_references_fetch_phase_longer_than_the_walk_deadline_resets_neither_end() {
             let net = SimNet::new(
-                0x3A21,
+                0x3A27,
                 SimConfig {
                     latency: Duration::from_millis(10)..Duration::from_millis(10),
                 },
@@ -2483,12 +3609,12 @@ pub(crate) mod tests {
             // Four writes fifteen seconds apart per blob, one blob at a
             // time: each fetch within the deadline, the two together past it.
             let (sender, collection, root, handles, receiver) =
-                holding(&net, (63, 64), &[8, 9], Duration::from_secs(15), 1 << 20);
+                holding(&net, (72, 73), &[8, 9], Duration::from_secs(15), 1 << 20);
             let receiver = Hosted::new(receiver, &net);
             let _connection = sender.table.connect(receiver.peer).await.unwrap();
             let from = sender.taps.len();
             let started = tokio::time::Instant::now();
-            let health = sender.push(receiver.peer, collection, kind).await;
+            let health = sender.exchange(receiver.peer, collection, kind).await;
             assert!(health.pushes.last_ok, "{health:?}");
             assert_eq!((health.pushes.ok, health.pushes.failed), (1, 0));
             let took = started.elapsed();

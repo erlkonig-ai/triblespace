@@ -141,3 +141,29 @@ pub mod iroh;
 
 #[cfg(feature = "sim")]
 pub mod sim;
+
+/// A stream the peer reset or stopped, as the error of a read or write
+/// carries it.
+#[derive(Debug)]
+pub struct Reset(pub u32);
+
+impl std::fmt::Display for Reset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stream reset by the peer with code {}", self.0)
+    }
+}
+
+impl std::error::Error for Reset {}
+
+/// The code the peer reset the stream with, when `error` is that reset: from
+/// the simulated transport's [`Reset`], or iroh's read error.
+pub fn reset_code(error: &std::io::Error) -> Option<u32> {
+    let inner = error.get_ref()?;
+    if let Some(Reset(code)) = inner.downcast_ref::<Reset>() {
+        return Some(*code);
+    }
+    match inner.downcast_ref::<::iroh::endpoint::ReadError>()? {
+        ::iroh::endpoint::ReadError::Reset(code) => u32::try_from(code.into_inner()).ok(),
+        _ => None,
+    }
+}

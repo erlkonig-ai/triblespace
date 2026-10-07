@@ -506,11 +506,9 @@ fn wake(waker: &mut Option<Waker>) {
     }
 }
 
-fn stream_error(what: &str, code: u32) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::ConnectionReset,
-        format!("simnet: stream {what} with code {code}"),
-    )
+/// The peer reset or stopped the stream with `code`.
+fn stream_error(code: u32) -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionReset, super::Reset(code))
 }
 
 /// One half of a simulated stream, permanently bound to its original
@@ -598,12 +596,12 @@ impl AsyncRead for SimRecvStream {
         let direction = &mut stream.directions[half.direction];
         match (direction.receiving, direction.sending) {
             (Receiving::Stopped(code), _) => {
-                return Poll::Ready(Err(stream_error("stopped", code)));
+                return Poll::Ready(Err(stream_error(code)));
             }
             (_, Sending::Reset(code)) => {
                 direction.receiving = Receiving::Closed;
                 stream.release_closed_slot();
-                return Poll::Ready(Err(stream_error("reset", code)));
+                return Poll::Ready(Err(stream_error(code)));
             }
             _ => {}
         }
@@ -638,9 +636,9 @@ impl AsyncWrite for SimSendStream {
         let mut stream = half.stream.lock().unwrap();
         let direction = &mut stream.directions[half.direction];
         match (direction.sending, direction.receiving) {
-            (Sending::Reset(code), _) => return Poll::Ready(Err(stream_error("reset", code))),
+            (Sending::Reset(code), _) => return Poll::Ready(Err(stream_error(code))),
             (_, Receiving::Stopped(code)) => {
-                return Poll::Ready(Err(stream_error("stopped", code)));
+                return Poll::Ready(Err(stream_error(code)));
             }
             (Sending::Finished, _) => {
                 return Poll::Ready(Err(io::Error::new(
@@ -672,7 +670,7 @@ impl AsyncWrite for SimSendStream {
         half.check_open(cx)?;
         let mut stream = half.stream.lock().unwrap();
         if let Sending::Reset(code) = stream.directions[half.direction].sending {
-            return Poll::Ready(Err(stream_error("reset", code)));
+            return Poll::Ready(Err(stream_error(code)));
         }
         stream.directions[half.direction].finish();
         stream.release_closed_slot();

@@ -1,67 +1,62 @@
-//! The frames of `walk/1`, the stream one push of a collection's tree rides.
+//! The frames of `walk/1`, the stream one exchange of a collection's tree
+//! rides.
 //!
-//! A `walk/1` stream carries one collection's tree of one kind one way: from
-//! the side that opened it, the sender, to the side that accepted it, the
-//! receiver. A frame is its kind (one byte), a big-endian `u32` payload
-//! length and the payload, at most [`crate::recon::MAX_RECON_FRAME_BYTES`],
-//! the framing [`crate::connection`] reads and writes.
+//! A `walk/1` stream carries one collection's tree of one kind both ways:
+//! each side's delta against the tree the two agreed on, and each side's
+//! requests for the values the other's delta names. A frame is its kind
+//! (one byte), a big-endian `u32` payload length and the payload, at most
+//! [`crate::recon::MAX_RECON_FRAME_BYTES`], the framing
+//! [`crate::connection`] reads and writes.
 //!
-//! | kind | frame         | payload                                | from     |
-//! |------|---------------|----------------------------------------|----------|
-//! | 0x01 | OPEN          | collection, walk kind (u8)             | sender   |
-//! | 0x02 | ROOT          | summary: root, leaf count              | sender   |
-//! | 0x03 | NODE          | tag, prefix, node                      | sender   |
-//! | 0x04 | LEAF          | key                                    | sender   |
-//! | 0x05 | HELD          | prefix, 256-bit child bitmap           | receiver |
-//! | 0x06 | VALUE_REQUEST | key                                    | receiver |
-//! | 0x07 | VALUE         | key, bytes (at least one)              | sender   |
-//! | 0x08 | DONE          | empty                                  | sender   |
-//! | 0x09 | LANDED        | empty                                  | receiver |
+//! | kind | frame         | payload                                | from   |
+//! |------|---------------|----------------------------------------|--------|
+//! | 0x01 | OPEN          | collection, walk kind (u8)             | opener |
+//! | 0x02 | ROOT          | summary: root, leaf count              | both   |
+//! | 0x03 | NODE          | tag, prefix, node                      | both   |
+//! | 0x04 | LEAF          | key                                    | both   |
+//! | 0x05 | VALUE_REQUEST | key                                    | both   |
+//! | 0x06 | VALUE         | key, bytes (at least one)              | both   |
+//! | 0x07 | DONE          | empty                                  | both   |
+//! | 0x08 | LANDED        | empty                                  | both   |
 //!
-//! The sender opens with OPEN and its ROOT, then pushes the nodes of its
-//! tree the receiver has not confirmed, each a NODE at a prefix. The
-//! receiver answers each NODE with a HELD whose bit `i` (byte `i / 8`, bit
-//! `i % 8`, least significant first: [`hold`] sets it and [`held`] reads it)
-//! says it holds the child at branch byte `i` with the same digest, and the
-//! sender skips those subtrees. A LEAF names a leaf by key alone. Values stay pull: the receiver
+//! The opener sends OPEN; then each side sends its ROOT and the NODEs and
+//! LEAFs of its delta, breadth first, and DONE. A NODE at a prefix carries
+//! the node there, whose children announce, by digest, what the side holds
+//! under it; a LEAF names a leaf by key alone. Values stay pull: a side
 //! asks with VALUE_REQUEST for the leaves it lacks, and a VALUE answers one.
-//! DONE ends the push, and LANDED says everything the receiver asked for
-//! landed: the pushed root is then the one the sender knows the receiver
-//! holds.
+//! LANDED says everything a side asked for landed; once both have crossed,
+//! the exchange is confirmed ([`crate::exchange`]).
 //!
 //! A prefix is a length byte and at most 32 bytes. A summary and a node are
 //! laid out by [`crate::walk`]'s own code; a node's tag byte says whether it
-//! is a branch or a leaf. Integers
-//! are big-endian. A kind this reader does not know, or an OPEN of a walk
-//! kind it does not know, is skipped; a known kind whose payload does not
-//! parse is malformed, and so is a VALUE without bytes.
+//! is a branch or a leaf. Integers are big-endian. A kind this reader does
+//! not know, or an OPEN of a walk kind it does not know, is skipped; a known
+//! kind whose payload does not parse is malformed, and so is a VALUE without
+//! bytes.
 
 use triblespace_core::collection::CollectionHandle;
 
 use crate::collection_wire::MAX_COLLECTION_LEAF_BYTES;
 use crate::patch_repair::{PatchNode, PatchSummary};
 use crate::recon::Malformed;
-use crate::walk::{Reader, WalkKind, node_tag, push_node, push_prefix, push_summary};
+use crate::walk::{Reader, WalkKind, node_tag, push_node, push_summary};
 
-/// The sender's first frame: the collection and the kind of tree it pushes.
+/// The opener's first frame: the collection and the kind of tree exchanged.
 pub const FRAME_OPEN: u8 = 0x01;
-/// The summary of the pushed tree.
+/// The summary of a side's pinned tree.
 pub const FRAME_ROOT: u8 = 0x02;
-/// One node of the pushed tree, at its prefix.
+/// One node of a side's delta, at its prefix.
 pub const FRAME_NODE: u8 = 0x03;
-/// One leaf of the pushed tree, by key.
+/// One leaf of a side's delta, by key.
 pub const FRAME_LEAF: u8 = 0x04;
-/// The receiver's answer to a NODE: which children it holds with the same
-/// digest.
-pub const FRAME_HELD: u8 = 0x05;
-/// The receiver asks for the value under a key.
-pub const FRAME_VALUE_REQUEST: u8 = 0x06;
+/// A side asks for the value under a key.
+pub const FRAME_VALUE_REQUEST: u8 = 0x05;
 /// The value under a key.
-pub const FRAME_VALUE: u8 = 0x07;
-/// The sender pushed everything.
-pub const FRAME_DONE: u8 = 0x08;
-/// Everything the receiver asked for landed.
-pub const FRAME_LANDED: u8 = 0x09;
+pub const FRAME_VALUE: u8 = 0x06;
+/// A side sent its whole delta.
+pub const FRAME_DONE: u8 = 0x07;
+/// Everything a side asked for landed.
+pub const FRAME_LANDED: u8 = 0x08;
 
 /// One frame of a `walk/1` stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,12 +75,6 @@ pub(crate) enum Frame {
     },
     Leaf {
         key: [u8; 32],
-    },
-    /// Bit `i` of `children` set: the child at branch byte `i` of the node at
-    /// `prefix` is held with the same digest.
-    Held {
-        prefix: Vec<u8>,
-        children: [u8; 32],
     },
     ValueRequest {
         key: [u8; 32],
@@ -121,11 +110,6 @@ impl Frame {
             Self::Leaf { key } => {
                 payload.extend_from_slice(key);
                 FRAME_LEAF
-            }
-            Self::Held { prefix, children } => {
-                push_prefix(&mut payload, prefix);
-                payload.extend_from_slice(children);
-                FRAME_HELD
             }
             Self::ValueRequest { key } => {
                 payload.extend_from_slice(key);
@@ -163,10 +147,6 @@ impl Frame {
                 Self::Node { prefix, node }
             }
             FRAME_LEAF => Self::Leaf { key: rest.hash()? },
-            FRAME_HELD => Self::Held {
-                prefix: rest.prefix()?,
-                children: rest.hash()?,
-            },
             FRAME_VALUE_REQUEST => Self::ValueRequest { key: rest.hash()? },
             FRAME_VALUE => {
                 let key = rest.hash()?;
@@ -190,19 +170,6 @@ impl Frame {
         }
         Ok(Some(frame))
     }
-}
-
-/// Whether the held-children bitmap of a HELD frame marks the child at
-/// `edge`: bit `edge` is byte `edge / 8`, bit `edge % 8`, least significant
-/// first. The receiver builds the bitmap with [`hold`], and the sender reads
-/// it with this.
-pub(crate) fn held(children: &[u8; 32], edge: u8) -> bool {
-    children[usize::from(edge >> 3)] & (1 << (edge & 7)) != 0
-}
-
-/// Mark the child at `edge` in the held-children bitmap of a HELD frame.
-pub(crate) fn hold(children: &mut [u8; 32], edge: u8) {
-    children[usize::from(edge >> 3)] |= 1 << (edge & 7);
 }
 
 #[cfg(test)]
@@ -278,18 +245,6 @@ mod tests {
         roundtrip(leaf(Vec::new()));
         roundtrip(leaf(vec![8; 32]));
         roundtrip(Frame::Leaf { key: [9; 32] });
-        roundtrip(Frame::Held {
-            prefix: Vec::new(),
-            children: [0xFF; 32],
-        });
-        roundtrip(Frame::Held {
-            prefix: vec![10; 32],
-            children: [0; 32],
-        });
-        roundtrip(Frame::Held {
-            prefix: vec![11; 3],
-            children: [0x80; 32],
-        });
         roundtrip(Frame::ValueRequest { key: [12; 32] });
         roundtrip(Frame::Value {
             key: [13; 32],
@@ -303,28 +258,23 @@ mod tests {
         assert!(roundtrip(Frame::Landed).is_empty());
     }
 
-    /// The held bitmap puts branch byte `i` at byte `i / 8`, bit `i % 8`,
-    /// least significant first, and a HELD carries it as it is.
+    /// The kinds are 0x01 to 0x08 in the order of the table: no HELD exists.
     #[test]
-    fn held_bits_are_byte_i_over_8_bit_i_mod_8_least_significant_first() {
-        let mut children = [0; 32];
-        for edge in [0, 7, 8, 9, 255] {
-            assert!(!held(&children, edge));
-            hold(&mut children, edge);
-            assert!(held(&children, edge));
-        }
-        let mut expected = [0; 32];
-        expected[0] = 0b1000_0001;
-        expected[1] = 0b0000_0011;
-        expected[31] = 0b1000_0000;
-        assert_eq!(children, expected);
-        assert!(!held(&children, 10) && !held(&children, 254));
-        assert_eq!((0..=255).filter(|edge| held(&children, *edge)).count(), 5);
-        let payload = roundtrip(Frame::Held {
-            prefix: vec![1, 2, 3],
-            children,
-        });
-        assert_eq!(payload[4..], children);
+    fn the_kinds_are_dense_from_open_to_landed() {
+        assert_eq!(
+            [
+                FRAME_OPEN,
+                FRAME_ROOT,
+                FRAME_NODE,
+                FRAME_LEAF,
+                FRAME_VALUE_REQUEST,
+                FRAME_VALUE,
+                FRAME_DONE,
+                FRAME_LANDED
+            ],
+            [1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        assert_eq!(Frame::decode(0x09, &[]), Ok(None));
     }
 
     #[test]
@@ -347,13 +297,6 @@ mod tests {
         third_node_tag[0] = 3;
         let mut long_prefix = node.clone();
         long_prefix[1] = 33;
-        let (_, held) = Frame::Held {
-            prefix: vec![1; 2],
-            children: [0xFF; 32],
-        }
-        .encode();
-        let mut held_long_prefix = held.clone();
-        held_long_prefix[0] = 33;
         let (_, value) = Frame::Value {
             key: [13; 32],
             bytes: vec![14; 2],
@@ -379,10 +322,6 @@ mod tests {
             (FRAME_NODE, &node[..36]),
             (FRAME_LEAF, &node[..31]),
             (FRAME_LEAF, &node[..33]),
-            (FRAME_HELD, &held[..held.len() - 1]),
-            (FRAME_HELD, &[&held[..], &[0]].concat()[..]),
-            (FRAME_HELD, &held_long_prefix[..]),
-            (FRAME_HELD, &[][..]),
             (FRAME_VALUE_REQUEST, &node[..31]),
             (FRAME_VALUE_REQUEST, &node[..33]),
             // A value is at least one byte.
@@ -425,7 +364,7 @@ mod sim_tests {
     use crate::patch_repair::{PatchBranch, PatchChild};
     use crate::protocol::{PILE_SYNC_ALPN, TAG_WALK, send_u8};
     use crate::transport::sim::{SimConfig, SimNet, SimTransport};
-    use crate::transport::{Conn, PeerId, RecvStream, SendStream, Transport};
+    use crate::transport::{Conn, PeerId, RecvStream, SendStream, Transport, reset_code};
     use crate::walk::{Command, WalksHandle};
 
     /// A service that serves no request stream.
@@ -483,10 +422,7 @@ mod sim_tests {
     /// Whether a read fails with the stream reset carrying `code`.
     async fn reads_reset<R: tokio::io::AsyncRead + Unpin>(recv: &mut R, code: u32) -> bool {
         match tokio::time::timeout(Duration::from_secs(30), recv.read(&mut [0; 1])).await {
-            Ok(Err(error)) => {
-                error.kind() == std::io::ErrorKind::ConnectionReset
-                    && error.to_string().contains(&format!("code {code}"))
-            }
+            Ok(Err(error)) => reset_code(&error) == Some(code),
             _ => false,
         }
     }

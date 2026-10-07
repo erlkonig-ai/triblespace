@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- W8: one bidirectional `walk/1` exchange per collection/tree, with continuous
+  FIFO deltas, authenticated subtree announcements, key-based value pulls,
+  and a shared pinned-tree union only after both LANDEDs. Failure forgets
+  agreement without retracting landed values. Retained exchange/agreement
+  indexes use PATCH, including explicit attached-tree replacement. Locator
+  state grows on demand to 1,048,576 entries; withheld-value demand retains
+  its separate 32,768-entry bound. Trees beyond the locator budget fail
+  explicitly; this is not unbounded synchronization. Generation 30 remains
+  a source candidate, with no live rollout.
+
 - Transport generation `/triblespace/pile-sync/30` (sync redesign, walk
   streams): each side pushes its collection trees, records, authorization
   evidence and, between two Full neighbours, the held set, on `walk/1`

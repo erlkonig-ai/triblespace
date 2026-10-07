@@ -508,8 +508,9 @@ fn a_demand_host_and_a_full_host_compare_no_held_blobs() {
 /// Astra's R3 through whole hosts. A writer that cannot read asks the
 /// collection's owner to peer with its send flag set, presenting its WRITE
 /// grant. The owner accepts without sending: the writer's pushes land its
-/// record and grant, and the owner starts no push back, so its confirmed
-/// root for the writer stays empty and the writer holds nothing of the
+/// record and grant, and the owner starts no push back. The shared agreed
+/// tree contains the writer's delta, never the owner's private record, and
+/// the writer holds nothing of the
 /// owner's, however long the peering stands.
 #[test]
 fn a_writer_that_cannot_read_delivers_and_receives_nothing() {
@@ -558,7 +559,14 @@ fn a_writer_that_cannot_read_delivers_and_receives_nothing() {
         writer.activate_collection(collection);
 
         advance(&clock, &mut [&mut owner, &mut writer], 30).await;
-        assert!(holds(&mut owner, written));
+        assert!(
+            holds(&mut owner, written),
+            "owner={:?} writer={:?} owner_peerings={:?} writer_peerings={:?}",
+            pair(&owner, collection, writer_id),
+            pair(&writer, collection, owner_id),
+            peerings(&owner),
+            peerings(&writer),
+        );
         let delivered = owner.snapshot().unwrap();
         assert!(
             delivered
@@ -581,10 +589,12 @@ fn a_writer_that_cannot_read_delivers_and_receives_nothing() {
         let received = pair(&owner, collection, writer_id).expect("the owner received");
         assert!(received.receives.last_ok && received.receives.ok >= 1);
         assert_eq!((received.pushes.ok, received.pushes.failed), (0, 0));
-        assert!(received.confirmed.records.is_none(), "{received:?}");
         let delivered = pair(&writer, collection, owner_id).expect("the writer pushed");
         assert!(delivered.pushes.last_ok && delivered.pushes.ok >= 1);
         assert_eq!((delivered.receives.ok, delivered.receives.failed), (0, 0));
+        assert!(received.confirmed.records.is_some(), "{received:?}");
+        assert_eq!(received.confirmed.records, delivered.confirmed.records);
+        assert!(!holds(&mut writer, owned));
 
         // Five intervals at their sixty-second cap: the writer's unchanged
         // root goes out as ROOT then DONE each time, and nothing comes back.
@@ -592,7 +602,7 @@ fn a_writer_that_cannot_read_delivers_and_receives_nothing() {
         let later = pair(&owner, collection, writer_id).unwrap();
         assert!(later.receives.ok > received.receives.ok && later.receives.failed == 0);
         assert_eq!((later.pushes.ok, later.pushes.failed), (0, 0));
-        assert!(later.confirmed.records.is_none());
+        assert_eq!(later.confirmed.records, received.confirmed.records);
         assert!(!holds(&mut writer, owned));
         let later = pair(&writer, collection, owner_id).unwrap();
         assert_eq!((later.receives.ok, later.receives.failed), (0, 0));

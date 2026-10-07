@@ -1,26 +1,28 @@
-//! The push scheduler: when each selected collection's trees go out
-//! (design: walk streams).
+//! The exchange scheduler: when each selected collection's trees are
+//! exchanged (design: walk streams).
 //!
 //! Each selected collection has one [`WakeSchedule`]. When it fires, this
-//! side starts a push of C's records tree and its authorization tree to each
-//! neighbour its peering for C sends to, and of its references tree to each
-//! of those with which it replicates C in full; the ROOT frame of each push
-//! is the announcement, and a push already running for a neighbour and tree
-//! is skipped, not queued. A local append resets the timer to its shortest
-//! interval. A root that changes while a push of C's records or evidence is
-//! being received here is that push landing and resets nothing; the receive
-//! resets the timer once when it lands, so the merged root goes out once
-//! (D4). A receive that lands without changing the root, the common case of
-//! an unchanged root pushed again, resets nothing: otherwise two neighbours
-//! would push each other every shortest interval forever. A changed held
-//! set resets nothing: the next push carries it. A neighbour this side
-//! starts sending to is pushed to within two minimum intervals.
+//! side opens an exchange of C's records tree and its authorization tree
+//! with each neighbour it sends C to or receives C from, and of its
+//! references tree with each of those with which it replicates C in full;
+//! an exchange already running with a neighbour for a tree is skipped, not
+//! queued, and one the neighbour opened at the same time takes its place
+//! ([`crate::walk`]). A local append resets the timer to its shortest
+//! interval. A root that changes while the peer's delta of C's records or
+//! evidence is being received here is that delta landing and resets
+//! nothing; the receive resets the timer once when it lands, so the merged
+//! root goes out once (D4). A receive that lands without changing the root,
+//! the common case of an unchanged tree exchanged again, resets nothing:
+//! otherwise two neighbours would exchange every shortest interval forever.
+//! A changed held set resets nothing: the next exchange carries it. A
+//! neighbour this side starts sending to or receiving from is exchanged
+//! with within two minimum intervals.
 //!
-//! When a push is confirmed, the walks task compares the tree with the one
-//! pushed and pushes again at once if they differ
-//! ([`crate::walk::Walks::pushed`]); a push that ends any other way waits
-//! for the timer, so retries to a neighbour that cannot land it are paced
-//! like any push. The scheduler does not see pushes end.
+//! When an exchange is confirmed, the walks task compares the tree with the
+//! one agreed and exchanges again at once if they differ
+//! ([`crate::walk::Walks::ended`]); an exchange that ends any other way
+//! waits for the timer, so retries with a neighbour that cannot land it are
+//! paced like any exchange. The scheduler does not see exchanges end.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -36,7 +38,7 @@ use crate::transport::PeerId;
 use crate::wake_schedule::WakeSchedule;
 use crate::walk::{Event, WalkKind};
 
-/// A push to start: to a peer, of one tree of a collection.
+/// An exchange to open: with a peer, of one tree of a collection.
 pub(crate) type Start = (PeerId, CollectionHandle, WalkKind);
 
 struct Neighbour {
@@ -45,22 +47,31 @@ struct Neighbour {
     link: u64,
     /// This side sends the collection to the neighbour.
     sends: bool,
+    /// This side receives the collection from the neighbour.
+    receives: bool,
     /// Both sides replicate the collection in full.
     full: bool,
+}
+
+impl Neighbour {
+    /// Whether the collection flows either way: an exchange is opened.
+    fn exchanges(&self) -> bool {
+        self.sends || self.receives
+    }
 }
 
 struct Scheduled {
     root: RawHash,
     schedule: WakeSchedule,
     neighbours: HashMap<PeerId, Neighbour>,
-    /// Pushes of the records or authorization tree being received.
+    /// Deltas of the records or authorization tree being received.
     receiving: usize,
     /// The root changed while one was: the merged root goes out once they
     /// end.
     merged: bool,
 }
 
-/// The push schedules of every selected collection of one node.
+/// The exchange schedules of every selected collection of one node.
 #[derive(Default)]
 pub(crate) struct Schedules {
     collections: HashMap<RawHash, Scheduled>,
@@ -85,7 +96,7 @@ pub(crate) fn roots(snapshot: &StoreSnapshot) -> impl Iterator<Item = (Collectio
 impl Schedules {
     /// Follow the selected collections and their roots: start and stop
     /// scheduling collections, and reset the timer of one whose root
-    /// changed while no push of it is being received.
+    /// changed while no delta of it is being received.
     pub(crate) fn observe(
         &mut self,
         selected: impl IntoIterator<Item = (CollectionHandle, RawHash)>,
@@ -123,16 +134,17 @@ impl Schedules {
     }
 
     /// Follow the peerings: each with its collection and its connection,
-    /// whether this side sends on it, and whether both sides replicate the
-    /// collection in full. A neighbour this side starts sending to is pushed
-    /// to within two minimum intervals.
+    /// whether this side sends on it, whether it receives on it, and whether
+    /// both sides replicate the collection in full. A neighbour this side
+    /// starts exchanging with is exchanged with within two minimum
+    /// intervals.
     pub(crate) fn neighbours<'a>(
         &mut self,
-        peerings: impl IntoIterator<Item = (CollectionHandle, &'a Link, bool, bool)>,
+        peerings: impl IntoIterator<Item = (CollectionHandle, &'a Link, bool, bool, bool)>,
         now: Mono,
     ) {
         let mut current = HashMap::<RawHash, HashMap<PeerId, Neighbour>>::new();
-        for (collection, link, sends, full) in peerings {
+        for (collection, link, sends, receives, full) in peerings {
             let peers = current.entry(collection.raw).or_default();
             if peers
                 .get(&link.peer())
@@ -143,6 +155,7 @@ impl Schedules {
                     Neighbour {
                         link: link.id(),
                         sends,
+                        receives,
                         full,
                     },
                 );
@@ -154,11 +167,11 @@ impl Schedules {
                 .neighbours
                 .retain(|peer, _| peers.contains_key(peer));
             for (peer, neighbour) in peers {
-                let joined = neighbour.sends
+                let joined = neighbour.exchanges()
                     && !scheduled
                         .neighbours
                         .get(&peer)
-                        .is_some_and(|known| known.sends);
+                        .is_some_and(Neighbour::exchanges);
                 if joined {
                     scheduled.schedule.neighbour_joined(now, rand::random());
                 }
@@ -167,10 +180,10 @@ impl Schedules {
         }
     }
 
-    /// A push of a tree is being received here, or ended. A root that
-    /// changes while one of C's records or evidence is received resets
-    /// nothing; once the last of them ends, having landed, the change resets
-    /// C's timer once.
+    /// A delta of a tree is being received here, or its exchange ended. A
+    /// root that changes while one of C's records or evidence is received
+    /// resets nothing; once the last of them ends, having landed, the change
+    /// resets C's timer once.
     pub(crate) fn event(&mut self, event: Event, now: Mono) {
         let (collection, kind, landed) = match event {
             Event::Receiving { collection, kind } => (collection, kind, None),
@@ -205,9 +218,10 @@ impl Schedules {
             .min()
     }
 
-    /// The pushes to start: of each collection whose opportunity is due, its
-    /// records and authorization trees to every neighbour this side sends
-    /// to, and its references tree to those it replicates in full with.
+    /// The exchanges to open: of each collection whose opportunity is due,
+    /// its records and authorization trees with every neighbour this side
+    /// sends to or receives from, and its references tree with those it
+    /// replicates in full with.
     pub(crate) fn poll(&mut self, now: Mono) -> Vec<Start> {
         let mut starts = Vec::new();
         for (raw, scheduled) in &mut self.collections {
@@ -217,7 +231,7 @@ impl Schedules {
             }
             let collection = CollectionHandle::new(*raw);
             for (peer, neighbour) in &scheduled.neighbours {
-                if !neighbour.sends {
+                if !neighbour.exchanges() {
                     continue;
                 }
                 starts.push((*peer, collection, WalkKind::Records));
@@ -255,7 +269,7 @@ mod tests {
         Link::detached(id, peer).0
     }
 
-    /// Poll `node` every step for `by`; the pushes started, in order.
+    /// Poll `node` every step for `by`; the exchanges opened, in order.
     fn advance(node: &mut Schedules, now: &mut Mono, by: Duration) -> Vec<Start> {
         let until = *now + by;
         let mut starts = Vec::new();
@@ -274,18 +288,22 @@ mod tests {
             .collect()
     }
 
-    /// A timer's opportunity pushes the records and authorization trees to
-    /// every neighbour this side sends to, and the references tree only to
-    /// one it replicates the collection in full with. A neighbour this side
-    /// does not send to gets nothing.
+    /// A timer's opportunity exchanges the records and authorization trees
+    /// with every neighbour this side sends to or receives from, and the
+    /// references tree only with one it replicates the collection in full
+    /// with. A neighbour the collection flows neither way with gets
+    /// nothing.
     #[test]
-    fn an_opportunity_pushes_two_trees_to_each_sending_neighbour_and_three_to_a_full_one() {
+    fn an_opportunity_exchanges_two_trees_with_each_neighbour_and_three_with_a_full_one() {
         let c = collection(1);
         let mut now = crate::clock::mono_now();
         let mut node = Schedules::default();
         node.observe([(c, root(1))], now);
         let (a, b) = (link(1, A), link(2, B));
-        node.neighbours([(c, &a, true, true), (c, &b, false, true)], now);
+        node.neighbours(
+            [(c, &a, true, true, true), (c, &b, false, false, true)],
+            now,
+        );
         let starts = advance(&mut node, &mut now, Duration::from_secs(2));
         assert_eq!(
             to(&starts, A),
@@ -297,9 +315,12 @@ mod tests {
         );
         assert!(to(&starts, B).is_empty());
 
-        // B starts sending on demand: records and evidence only, within two
-        // minimum intervals, at one or both of their opportunities.
-        node.neighbours([(c, &a, true, true), (c, &b, true, false)], now);
+        // B starts receiving on demand: records and evidence only, within
+        // two minimum intervals, at one or both of their opportunities.
+        node.neighbours(
+            [(c, &a, true, true, true), (c, &b, false, true, false)],
+            now,
+        );
         let starts = advance(&mut node, &mut now, Duration::from_secs(4));
         let to_b = to(&starts, B);
         assert!(!to_b.is_empty() && to_b.len() <= 4, "{to_b:?}");
@@ -310,23 +331,26 @@ mod tests {
     }
 
     #[test]
-    fn a_busy_collection_pushes_every_two_seconds_beside_a_quiet_one() {
+    fn a_busy_collection_exchanges_every_two_seconds_beside_a_quiet_one() {
         let (busy, quiet) = (collection(3), collection(4));
         let start = crate::clock::mono_now();
         let mut node = Schedules::default();
         node.observe([(busy, root(0)), (quiet, root(0))], start);
         let peer = link(1, A);
         node.neighbours(
-            [(busy, &peer, true, false), (quiet, &peer, true, false)],
+            [
+                (busy, &peer, true, true, false),
+                (quiet, &peer, true, true, false),
+            ],
             start,
         );
-        let mut pushed = HashMap::<CollectionHandle, Vec<Duration>>::new();
+        let mut opened = HashMap::<CollectionHandle, Vec<Duration>>::new();
         let mut now = start;
         for step in 1..=2_400_u32 {
             now = now + STEP;
             for (_, collection, kind) in node.poll(now) {
                 if kind == WalkKind::Records {
-                    pushed
+                    opened
                         .entry(collection)
                         .or_default()
                         .push(now.duration_since(start));
@@ -338,7 +362,7 @@ mod tests {
             }
         }
         let gaps = |collection| {
-            pushed[&collection]
+            opened[&collection]
                 .windows(2)
                 .map(|pair| pair[1] - pair[0])
                 .collect::<Vec<_>>()
@@ -362,17 +386,17 @@ mod tests {
         );
     }
 
-    /// A push from A lands here for fifty seconds without resetting the
-    /// timer: B gets at most the push already due. Landing resets it once,
-    /// and B gets the merged root.
+    /// A delta from A lands here for fifty seconds without resetting the
+    /// timer: B gets at most the exchange already due. Landing resets it
+    /// once, and B gets the merged root.
     #[test]
-    fn after_a_long_receive_lands_other_neighbours_get_one_push() {
+    fn after_a_long_receive_lands_other_neighbours_get_one_exchange() {
         let c = collection(5);
         let mut now = crate::clock::mono_now();
         let mut node = Schedules::default();
         node.observe([(c, root(0))], now);
         let b = link(2, B);
-        node.neighbours([(c, &b, true, false)], now);
+        node.neighbours([(c, &b, true, false, false)], now);
         // Quiet long enough to reach sixty-second intervals.
         advance(&mut node, &mut now, Duration::from_secs(200));
 
@@ -478,14 +502,20 @@ mod tests {
         let mut node = Schedules::default();
         node.observe([(c, root(0))], now);
         let a = link(1, A);
-        node.neighbours([(c, &a, true, false), (d, &a, true, false)], now);
+        node.neighbours(
+            [(c, &a, true, true, false), (d, &a, true, true, false)],
+            now,
+        );
         assert!(node.deadline().is_some());
         let starts = advance(&mut node, &mut now, Duration::from_secs(2));
         assert_eq!(to(&starts, A).len(), 2);
         assert!(starts.iter().all(|(_, collection, _)| *collection == c));
 
         node.observe([(d, root(0))], now);
-        node.neighbours([(c, &a, true, false), (d, &a, true, false)], now);
+        node.neighbours(
+            [(c, &a, true, true, false), (d, &a, true, true, false)],
+            now,
+        );
         let starts = advance(&mut node, &mut now, Duration::from_secs(2));
         assert!(starts.iter().all(|(_, collection, _)| *collection == d));
         node.observe([], now);

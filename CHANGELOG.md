@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- W8 source candidate: bidirectional collection-tree exchanges replace
+  one-way HELD walks, using continuous FIFO deltas and authenticated subtree
+  pruning. Shared PATCH agreement is confirmed only after both LANDEDs and
+  forgotten on failure. Generation 30 is unchanged; no live rollout.
+
 - Sync redesign: transport generation `/triblespace/pile-sync/30`. Each
   collection a pile selects is peered on one `recon/1` stream per connection
   and its trees are pushed on `walk/1` streams; gossip wakes, repair

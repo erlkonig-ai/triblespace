@@ -125,6 +125,9 @@ pub const RESET_WALK_REFUSED: u32 = 4;
 /// Stream reset code: the `walk/1` stream could not be served: it did not
 /// open with an Open frame, no walk task runs, or the walk failed.
 pub const RESET_WALK_FAILED: u32 = 5;
+/// Stream reset code: the peer opened a `walk/1` stream for the same exchange
+/// within a round trip, and the stream the smaller peer id opened survives.
+pub const RESET_WALK_DUPLICATE: u32 = 6;
 
 /// What streams mean. The table decides which request streams reach the
 /// service and holds their permits; the service answers them, and hears what

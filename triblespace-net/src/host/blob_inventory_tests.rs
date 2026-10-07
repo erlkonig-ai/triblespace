@@ -298,14 +298,14 @@ fn a_new_records_closure_is_served_by_the_observation_that_carries_it() {
     }
 }
 
-mod reference_push {
+mod reference_exchange {
     use triblespace_core::collection::{CollectionData, empty_metadata_handle};
     use triblespace_core::repo::SnapshotSource;
 
     use super::*;
+    use crate::exchange::tests::{Side, carry};
+    use crate::exchange::{Failure, Outcome};
     use crate::patch_repair::PatchSummary;
-    use crate::push::Push;
-    use crate::receive::{Out, Outcome, Receive};
     use crate::walk::WalkKind;
     use crate::walk::tests::walking::{Node, open};
 
@@ -377,71 +377,68 @@ mod reference_push {
         }
     }
 
-    /// Push `sender`'s references tree of C into `receiver` by hand, through
-    /// the push and receive state machines, landing as the landing task
-    /// does and answering the receiver's fetches from the sender's store
-    /// except those `fail` names. Returns how the receive ended and the
+    /// Exchange `sender`'s references tree of C with `receiver` by hand,
+    /// through two exchange state machines, the sender's sending only and
+    /// the receiver's receiving only, landing as the landing task does and
+    /// answering the receiver's fetches from the sender's store except
+    /// those `fail` names. Returns how the receiver's exchange ended and the
     /// handles fetched.
-    fn push_references(
+    fn exchange_references(
         sender: &mut Node,
         receiver: &mut Node,
         collection: CollectionHandle,
         fail: &[[u8; 32]],
     ) -> (Outcome, Vec<[u8; 32]>) {
         let kind = WalkKind::References;
-        let pinned = sender.serving().collection(collection).unwrap();
-        let (mut push, frames) = Push::start(kind, pinned, None);
-        let mut receive = Receive::on_open(sender.id(), collection, kind, true, None).unwrap();
         let store = sender.store.snapshot().unwrap();
+        let mut sending = Side::new(
+            std::mem::replace(sender, Node::new(0)),
+            collection,
+            kind,
+            None,
+            true,
+            false,
+        );
+        let mut receiving = Side::new(
+            std::mem::replace(receiver, Node::new(0)),
+            collection,
+            kind,
+            None,
+            false,
+            true,
+        );
         let mut fetched = Vec::new();
-        let mut frames = std::collections::VecDeque::from(frames);
-        let mut outs = Vec::new();
         loop {
-            if let Some(out) = outs.pop() {
-                let more = match out {
-                    Out::Send(frame) => {
-                        frames.extend(push.on_frame(frame).unwrap());
-                        continue;
-                    }
-                    Out::Land(events) => {
-                        let (landed, failed) = receiver.insert(events);
-                        receiver.observe();
-                        receive.on_landed_ack(landed, failed)
-                    }
-                    Out::Fetch { handle, proof } => {
-                        assert!(proof.is_none());
-                        fetched.push(handle);
-                        let blob = (!fail.contains(&handle)).then(|| {
-                            BlobStoreGet::get::<Blob<UnknownBlob>, UnknownBlob>(
-                                &store,
-                                Inline::new(handle),
-                            )
-                            .unwrap()
-                        });
-                        receive.on_fetched(handle, None, blob)
-                    }
-                };
-                outs.extend(more);
-            } else if let Some(frame) = frames.pop_front() {
-                outs.extend(receive.on_frame(frame, Some(receiver.snapshot())));
-            } else {
+            carry(&mut sending, &mut receiving);
+            let Some((handle, proof)) = receiving.fetches.pop() else {
                 break;
-            }
+            };
+            assert!(proof.is_none());
+            fetched.push(handle);
+            let blob = (!fail.contains(&handle)).then(|| {
+                BlobStoreGet::get::<Blob<UnknownBlob>, UnknownBlob>(&store, Inline::new(handle))
+                    .unwrap()
+            });
+            let outs = receiving.exchange.on_fetched(handle, None, blob);
+            receiving.outputs(outs);
         }
         fetched.sort_unstable();
-        (receive.outcome().expect("the push ended"), fetched)
+        let outcome = receiving.outcome().expect("the exchange ended");
+        *sender = sending.node;
+        *receiver = receiving.node;
+        (outcome, fetched)
     }
 
     /// The receiver lacks both children. It fetches them by hash from the
     /// sender and holds them in C only because the sender holds them there:
     /// D, which names them, was scanned before they arrived.
     #[test]
-    fn a_pushed_references_tree_fetches_what_the_peer_holds_and_holds_it_in_c() {
+    fn an_exchanged_references_tree_fetches_what_the_peer_holds_and_holds_it_in_c() {
         let mut pair = pair(41);
         let collection = pair.collection;
         let (outcome, fetched) =
-            push_references(&mut pair.sender, &mut pair.receiver, collection, &[]);
-        assert_eq!(outcome, Outcome::Landed);
+            exchange_references(&mut pair.sender, &mut pair.receiver, collection, &[]);
+        assert_eq!(outcome, Outcome::Confirmed);
         let mut children = pair.children.clone().map(|child| child.get_handle().raw);
         children.sort_unstable();
         assert_eq!(fetched, children);
@@ -456,9 +453,9 @@ mod reference_push {
 
     /// The first child is resident at the receiver without being held
     /// there, and joins without a fetch. The fetch of the second fails, so
-    /// the push does not land, and the next one fetches it again.
+    /// the exchange does not confirm, and the next one fetches it again.
     #[test]
-    fn a_resident_blob_joins_without_a_fetch_and_a_failed_fetch_fails_the_push() {
+    fn a_resident_blob_joins_without_a_fetch_and_a_failed_fetch_fails_the_exchange() {
         let mut pair = pair(43);
         let collection = pair.collection;
         let [resident, fetched] = pair.children.clone().map(|child| child.get_handle().raw);
@@ -475,14 +472,14 @@ mod reference_push {
                 Vec::new()
             };
             let (outcome, handles) =
-                push_references(&mut pair.sender, &mut pair.receiver, collection, &fail);
+                exchange_references(&mut pair.sender, &mut pair.receiver, collection, &fail);
             assert_eq!(handles, [fetched]);
             assert!(holds(&pair.receiver, collection, &resident));
             assert_eq!(holds(&pair.receiver, collection, &fetched), attempt == 1);
             let expected = if attempt == 0 {
-                Outcome::Failed(crate::receive::Failure::InsertFailed)
+                Outcome::Failed(Failure::InsertFailed)
             } else {
-                Outcome::Landed
+                Outcome::Confirmed
             };
             assert_eq!(outcome, expected);
         }
@@ -493,10 +490,11 @@ mod reference_push {
     }
 
     /// Astra's R1: two Full neighbours with equal records hold different
-    /// blobs in C. A push of the references tree each way ends with both
-    /// holding the union, and a push of the union is held whole.
+    /// blobs in C. An exchange of the references tree each way ends with
+    /// both holding the union, and an exchange of the union fetches
+    /// nothing.
     #[test]
-    fn full_neighbours_converge_on_their_held_blobs_by_pushing_each_way() {
+    fn full_neighbours_converge_on_their_held_blobs_by_exchanging_each_way() {
         let mut x = Node::new(51);
         let mut y = Node::new(52);
         let collection = x.hold("held apart", open());
@@ -524,18 +522,18 @@ mod reference_push {
         }
         assert_ne!(held_set(&x, collection), held_set(&y, collection));
 
-        let (outcome, fetched) = push_references(&mut x, &mut y, collection, &[]);
-        assert_eq!(outcome, Outcome::Landed);
+        let (outcome, fetched) = exchange_references(&mut x, &mut y, collection, &[]);
+        assert_eq!(outcome, Outcome::Confirmed);
         assert_eq!(fetched, [children[0].get_handle().raw]);
-        let (outcome, fetched) = push_references(&mut y, &mut x, collection, &[]);
-        assert_eq!(outcome, Outcome::Landed);
+        let (outcome, fetched) = exchange_references(&mut y, &mut x, collection, &[]);
+        assert_eq!(outcome, Outcome::Confirmed);
         assert_eq!(fetched, [children[1].get_handle().raw]);
         assert_eq!(held_set(&x, collection), held_set(&y, collection));
         for child in &children {
             assert!(holds(&x, collection, &child.get_handle().raw));
             assert!(holds(&y, collection, &child.get_handle().raw));
         }
-        let (outcome, fetched) = push_references(&mut x, &mut y, collection, &[]);
-        assert_eq!((outcome, fetched), (Outcome::Landed, Vec::new()));
+        let (outcome, fetched) = exchange_references(&mut x, &mut y, collection, &[]);
+        assert_eq!((outcome, fetched), (Outcome::Confirmed, Vec::new()));
     }
 }

@@ -535,10 +535,12 @@ impl Peerings {
     }
 
     /// Every peering, with its collection and its connection, whether this
-    /// side sends on it, and whether both sides replicate the collection in
-    /// full. Only a peer that may READ or WRITE C here counts as full: held
-    /// sets are compared with no other key.
-    pub(crate) fn neighbours(&self) -> impl Iterator<Item = (CollectionHandle, &Link, bool, bool)> {
+    /// side sends on it, whether it receives on it, and whether both sides
+    /// replicate the collection in full. Only a peer that may READ or WRITE C
+    /// here counts as full: held sets are compared with no other key.
+    pub(crate) fn neighbours(
+        &self,
+    ) -> impl Iterator<Item = (CollectionHandle, &Link, bool, bool, bool)> {
         self.meshes.iter().flat_map(move |(raw, mesh)| {
             let collection = CollectionHandle::new(*raw);
             mesh.peerings
@@ -557,7 +559,7 @@ impl Peerings {
                                 })
                         };
                         let full = mine.full && theirs.full && (mine.send || writes());
-                        Some((collection, link, mine.send, full))
+                        Some((collection, link, mine.send, theirs.send, full))
                     }
                     _ => None,
                 })
@@ -1119,7 +1121,7 @@ pub(crate) async fn run<T: Transport, S: Service>(
             Some(event) = received.recv() => schedules.event(event, crate::clock::mono_now()),
             () = push_due => {
                 for (peer, collection, kind) in schedules.poll(crate::clock::mono_now()) {
-                    walks.push(peer, collection, kind);
+                    walks.open(peer, collection, kind);
                 }
             }
             Some((peer, connected)) = dialled.recv() => peerings.dialled(peer, connected),
@@ -1721,7 +1723,7 @@ mod tests {
         let full = |node: &Node| {
             let neighbours = node.peerings.neighbours().collect::<Vec<_>>();
             assert_eq!(neighbours.len(), 1);
-            neighbours[0].3
+            neighbours[0].4
         };
         set_full(&mut owner, true);
         let mut wire = connect(&mut owner, &mut reader, 1);
