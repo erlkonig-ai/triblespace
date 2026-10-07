@@ -393,7 +393,7 @@ impl CollectionRepairOverlay {
         self.authorization_evidence.discovery_candidates()
     }
 
-    /// The collection's [`record_root`], which its announcements carry.
+    /// The collection's [`record_root`], which its push schedule follows.
     /// Held blobs are not part of it.
     pub fn wake_root(&self) -> [u8; 32] {
         record_root(
@@ -459,8 +459,8 @@ impl CollectionRepairOverlay {
     }
 }
 
-/// The root of a collection's records and authorization evidence: what a
-/// record pull walks, and what an announcement of that state carries.
+/// The root of a collection's records and authorization evidence: the
+/// collection's wake root, which its push schedule follows.
 ///
 /// Counts participate alongside roots so the digest commits to the same
 /// authenticated component summaries used by PATCH repair. Neither a proof,
@@ -477,12 +477,6 @@ pub fn record_root(
     update_summary(&mut hasher, records);
     update_summary(&mut hasher, authorization);
     *hasher.finalize().as_bytes()
-}
-
-/// The digest of a collection's held set that two Full neighbours compare
-/// (design 2.9): the set's Merkle root, all zeros for the empty set.
-pub(crate) fn held_digest(held: PatchSummary) -> [u8; 32] {
-    held.root().unwrap_or_default()
 }
 
 fn update_summary(hasher: &mut blake3::Hasher, summary: PatchSummary) {
@@ -1146,7 +1140,6 @@ mod tests {
             panic!("selected resource exists")
         };
         let request = crate::patch_repair::PatchRepairRequest::new(
-            (),
             before,
             32,
             vec![],

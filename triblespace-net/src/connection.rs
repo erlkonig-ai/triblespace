@@ -31,9 +31,11 @@
 //!
 //! A `walk/1` stream carries one push of a collection's tree, in the frames
 //! of `walk_stream`. Its opener sends the tag and an Open frame naming the
-//! collection and kind, and the accept loop hands the stream to the walk
+//! collection and kind, and the accept loop hands the stream to the walks
 //! task, which serves it from there. One that sends no Open within
-//! [`TAG_DEADLINE`], or arrives while no walk task runs, is reset.
+//! [`TAG_DEADLINE`], or arrives while no walks task runs, is reset. A walk
+//! stream, opened or accepted, counts as in use on its connection like a
+//! request stream: a draining connection waits for it.
 //!
 //! A connection closes after [`CONNECTION_IDLE_DEADLINE`] without a frame on
 //! any of its streams, sent or received. Above [`MAX_CONNECTIONS`] in one
@@ -60,7 +62,7 @@ use crate::protocol::{PILE_SYNC_ALPN, TAG_BLOB, TAG_DHT, TAG_RECON, TAG_WALK, re
 pub(crate) use crate::recon::{FRAME_OPEN, MAX_RECON_FRAME_BYTES};
 use crate::recon::{Frame, Malformed};
 use crate::transport::{Conn, PeerId, RecvStream, SendStream, Transport};
-use crate::walk::{Pulls, WalkKind};
+use crate::walk::{WalkKind, WalksHandle};
 use crate::walk_stream;
 
 /// Bound on a dial, including its opening `recon/1` frame.
@@ -71,8 +73,8 @@ pub(crate) const CONNECTION_IDLE_DEADLINE: Duration = Duration::from_secs(120);
 /// stream: the peer stopped reading it.
 pub(crate) const RECON_CREDIT_DEADLINE: Duration = Duration::from_secs(60);
 /// Frames a connection may hold queued, at most a 64 KiB frame each, before
-/// a request that arrives on it, a walk's or a peering's, goes unanswered: a
-/// peer that asks faster than it reads gets no more until it reads.
+/// a peering request that arrives on it goes unanswered: a peer that asks
+/// faster than it reads gets no more until it reads.
 pub(crate) const MAX_QUEUED_REPLIES: usize = 1024;
 /// A retired connection closes after this long without a frame once no
 /// request stream is in flight on it. The peer keeps using it only until it
@@ -261,9 +263,9 @@ struct Shared<T: Transport, S> {
     sequence: AtomicU64,
     next_id: AtomicU64,
     table: Mutex<Table<T::Conn>>,
-    /// The walk task, once it runs: it takes the `walk/1` streams peers
+    /// The walks task, once it runs: it takes the `walk/1` streams peers
     /// open.
-    walks: OnceLock<Pulls>,
+    walks: OnceLock<WalksHandle>,
 }
 
 struct Table<C> {
@@ -299,7 +301,8 @@ struct State {
     epoch: Instant,
     /// Nanoseconds after `epoch` of the last frame sent or received.
     last_frame: AtomicU64,
-    /// Request streams open on the connection, in either direction.
+    /// Request and walk streams open on the connection, in either
+    /// direction.
     in_flight: AtomicUsize,
     /// Callers holding a [`Connection`] handle to it.
     handles: AtomicUsize,
@@ -399,7 +402,7 @@ fn outbox() -> (mpsc::Sender<Frame>, mpsc::Receiver<Frame>) {
     mpsc::channel(Semaphore::MAX_PERMITS)
 }
 
-/// Counts one request stream as in flight until dropped.
+/// Counts one request or walk stream as in flight until dropped.
 struct InFlight {
     state: Arc<State>,
     _permit: Option<OwnedSemaphorePermit>,
@@ -672,9 +675,9 @@ impl<T: Transport, S: Service> ConnectionTable<T, S> {
         &self.shared.transport
     }
 
-    /// Hand the `walk/1` streams peers open to `walks`. Until a walk task is
-    /// named, such a stream is reset.
-    pub(crate) fn walks(&self, walks: Pulls) {
+    /// Hand the `walk/1` streams peers open to `walks`. Until a walks task
+    /// is named, such a stream is reset.
+    pub(crate) fn walks(&self, walks: WalksHandle) {
         let _ = self.shared.walks.set(walks);
     }
 
@@ -1110,11 +1113,14 @@ async fn stream<T: Transport, S: Service>(
             }
             let _ = send.shutdown().await;
         }
-        // A walk/1 opens with the collection and kind it pushes, and the walk
-        // task serves it from there. It takes no permit: its own windows
-        // bound it, and stream credit holds a sender whose receiver stops
-        // reading.
+        // A walk/1 opens with the collection and kind it pushes, and the
+        // walks task serves it from there. It takes no permit: its own
+        // windows bound it, and stream credit holds a sender whose receiver
+        // stops reading. It counts as in flight while either half lives.
         TAG_WALK => {
+            let walk = Arc::new(InFlight::new(&state, None, None));
+            send.request = Some(walk.clone());
+            recv.request = Some(walk);
             let open = match tokio::time::timeout(TAG_DEADLINE, read_frame(&mut recv)).await {
                 Ok(Ok(Some((kind, payload)))) => walk_stream::Frame::decode(kind, &payload),
                 _ => Ok(None),
@@ -1174,7 +1180,8 @@ async fn open_recon<C: Conn>(
 
 /// Open a `walk/1` stream on `connection` for a push of C's tree of `kind`:
 /// the tag, then the Open frame. It takes no request permit; its frames
-/// keep the connection from going idle.
+/// keep the connection from going idle, and it counts as in flight while
+/// either half lives.
 pub(crate) async fn open_walk<C: Conn>(
     connection: &Connection<C>,
     collection: CollectionHandle,
@@ -1182,11 +1189,12 @@ pub(crate) async fn open_walk<C: Conn>(
 ) -> anyhow::Result<(Tracked<C::SendHalf>, Tracked<C::RecvHalf>)> {
     let state = connection.state();
     let (send, recv) = connection.conn.open_bi().await?;
-    let mut send = Tracked::new(send, state, None);
+    let walk = Arc::new(InFlight::new(state, None, None));
+    let mut send = Tracked::new(send, state, Some(walk.clone()));
     send_u8(&mut send, TAG_WALK).await?;
     let (frame, payload) = walk_stream::Frame::Open { collection, kind }.encode();
     write_frame(&mut send, frame, &payload).await?;
-    Ok((send, Tracked::new(recv, state, None)))
+    Ok((send, Tracked::new(recv, state, Some(walk))))
 }
 
 /// Close the connection for a peer that broke the `recon/1` protocol.

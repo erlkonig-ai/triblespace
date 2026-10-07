@@ -81,7 +81,6 @@ async fn saturated_requests_complete_without_closing_connection(connection_count
         providers: Arc::new(Mutex::new(ProviderDirectory::new(provider))),
         local_id: provider,
         recon: None,
-        walks: None,
     };
     let (accepted_tx, mut accepted_rx) = tokio::sync::watch::channel(0usize);
     let table = ConnectionTable::new(

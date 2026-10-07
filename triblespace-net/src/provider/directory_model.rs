@@ -27,8 +27,8 @@ use triblespace_core::patch::{Blake3Merkle, Entry, IdentitySchema, PATCH};
 
 use crate::clock::VirtualClock;
 use crate::patch_repair::{
-    PatchNode, PatchNodeResponse, PatchRepairRequest, PatchRepairWalker, PatchSummary,
-    patch_node_response, validate_patch_node,
+    PatchNode, PatchNodeResponse, PatchRepairRequest, PatchSummary, patch_node_response,
+    validate_patch_node,
 };
 use crate::routing::{K, distance_cmp};
 
@@ -370,7 +370,7 @@ fn verify_inclusion(
     let mut count = summary.leaf_count();
     let mut prefix = Vec::new();
     for (index, node) in proof.iter().enumerate() {
-        let request = PatchRepairRequest::new((), summary, 64, prefix.clone(), digest)?;
+        let request = PatchRepairRequest::new(summary, 64, prefix.clone(), digest)?;
         validate_patch_node(&request, 64, &[], node, |raw, ()| {
             ensure!(raw == key.as_slice(), "proof names another member");
             Ok(())
@@ -551,39 +551,58 @@ impl Directory {
     }
 }
 
+/// The keys of `remote` that `local` lacks, found as a receiver prunes a
+/// pushed tree: the remote tree is walked from its root, every subtree
+/// `local` holds whole is skipped, and each node visited is one request.
 fn missing<const N: usize, V>(
     remote: &PATCH<N, IdentitySchema, V, Blake3Merkle>,
     local: &PATCH<N, IdentitySchema, V, Blake3Merkle>,
     cost: &mut Cost,
 ) -> Result<Vec<[u8; N]>> {
     ensure!(remote.len() <= MAX_MODEL_ITEMS, "repair inventory budget");
-    let mut walker = PatchRepairWalker::new((), PatchSummary::from_patch(remote), N)?;
-    let mut result = Vec::new();
-    let mut requests = 0;
-    while let Some(request) = walker.next_request(|_, prefix| {
-        local
+    let summary = |patch: &PATCH<N, IdentitySchema, V, Blake3Merkle>, prefix: &[u8]| {
+        patch
             .merkle_node(prefix)
             .map(|node| PatchSummary::new(Some(node.digest()), node.leaf_count()).unwrap())
-    })? {
+    };
+    let pinned = PatchSummary::from_patch(remote);
+    let mut result = Vec::new();
+    let mut requests = 0;
+    let mut pending = vec![Vec::new()];
+    while let Some(prefix) = pending.pop() {
+        let Some(wanted) = summary(remote, &prefix) else {
+            continue;
+        };
+        if summary(local, &prefix) == Some(wanted) {
+            continue;
+        }
         requests += 1;
         ensure!(requests <= MAX_MODEL_NODE_REQUESTS, "repair request budget");
         cost.repair_node_requests += 1;
-        let response = patch_node_response(remote, &[], request.prefix(), |_, _| Ok(()))?;
-        if let PatchNodeResponse::Found(node) = &response {
-            validate_patch_node(&request, N, &[], node, |_, ()| Ok(()))?;
-        }
-        if let Some(leaf) = walker.accept(&request, response, |_, raw| {
-            let key: [u8; N] = raw.try_into().unwrap();
-            local.get(&key).is_some()
-        })? {
-            result.push(leaf.key.as_slice().try_into().unwrap());
+        let PatchNodeResponse::Found(node) =
+            patch_node_response(remote, &[], &prefix, |_, _| Ok(()))?
+        else {
+            bail!("a pinned tree holds the nodes its branches name");
+        };
+        let request = PatchRepairRequest::new(pinned, N, prefix, wanted.root().unwrap())?;
+        validate_patch_node(&request, N, &[], &node, |_, ()| Ok(()))?;
+        match node {
+            PatchNode::Leaf { leaf, .. } => {
+                let key: [u8; N] = leaf.key.as_slice().try_into().unwrap();
+                if local.get(&key).is_none() {
+                    result.push(key);
+                }
+            }
+            PatchNode::Branch { branch, .. } => {
+                let end = usize::from(branch.end_depth);
+                for child in branch.children.iter().rev() {
+                    let mut locator = branch.representative[..end].to_vec();
+                    locator.push(child.edge);
+                    pending.push(locator);
+                }
+            }
         }
     }
-    let complete = walker.finish()?;
-    ensure!(
-        complete.missing_count == result.len() as u64,
-        "repair count mismatch"
-    );
     Ok(result)
 }
 

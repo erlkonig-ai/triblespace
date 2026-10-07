@@ -1,11 +1,11 @@
 //! Collection-scoped anti-entropy for triblespace.
 //!
-//! [`Peer<S>`](peer::Peer) wraps one store. Root-driven, per-request authorized
-//! PATCH walks converge one explicitly active collection's records and
-//! collection-scoped native evidence for descriptor-declared capabilities.
-//! Neighbours that peer for a selected collection announce its root to each
-//! other on the one `recon/1` stream of their connection, and a different
-//! root starts a pull. Policy roots, scoped AUTH keys and ordinary
+//! [`Peer<S>`](peer::Peer) wraps one store. Authorized pushes of PATCH trees
+//! converge one explicitly active collection's records and collection-scoped
+//! native evidence for descriptor-declared capabilities. Neighbours that peer
+//! for a selected collection on the one `recon/1` stream of their connection
+//! each push it the part of their trees it has not confirmed, on `walk/1`
+//! streams of their own. Policy roots, scoped AUTH keys and ordinary
 //! descriptor-blob providers supply candidate contacts, never authority;
 //! every useful collection byte remains capability-gated.
 //! Exact content reads are independent: every served resident blob may publish
@@ -19,7 +19,6 @@
 //! [`Leech<S>`](peer::Leech) provides the same local store and exact-acquisition
 //! operations without constructing or advertising a serving inventory.
 
-pub(crate) mod announce;
 pub(crate) mod bearer;
 mod channel;
 pub mod clock;
@@ -44,8 +43,9 @@ pub(crate) mod receive;
 pub mod recon;
 pub mod reconcile;
 pub(crate) mod routing;
+pub(crate) mod schedule;
 pub mod telemetry;
 pub mod transport;
 mod wake_schedule;
 pub mod walk;
-pub(crate) mod walk_stream;
+pub mod walk_stream;

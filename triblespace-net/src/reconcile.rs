@@ -39,8 +39,9 @@ pub enum ReplicationMode {
     /// Obtain every direct reference of the selected collections' foundations:
     /// descriptor, COMMIT data and metadata, and DERIVE outputs.
     Shallow,
-    /// Also hold what a Full neighbour holds in each selected collection: the
-    /// reference pull ([`crate::walk`]) fetches it from that neighbour.
+    /// Also hold what a Full neighbour holds in each selected collection:
+    /// its pushed references tree ([`crate::walk`]) names it, and what is
+    /// not resident is fetched from that neighbour.
     Full,
 }
 

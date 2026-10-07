@@ -52,7 +52,6 @@ use crate::provider::{
     ProviderDirectory, ProviderKey, ProviderObservation, ProviderPublication, ProviderPublisher,
     ProviderPutResult, ProviderToken, PublicationResult, blob_provider_token,
 };
-use crate::recon::Frame;
 use crate::routing::{ALPHA, IterativeLookup, K, RoutingKey, RoutingTable};
 use crate::transport::{Conn, Harness, PeerId, RecvStream, SendStream, Transport};
 
@@ -378,7 +377,7 @@ impl StoreSnapshot {
     }
 
     /// Replicate `full`'s collections in full: their peerings say so, and
-    /// announcements to full neighbours carry their held digests.
+    /// their references trees are pushed to full neighbours.
     pub(crate) fn with_full(mut self, full: ActiveCollections) -> Self {
         self.full = full;
         self
@@ -1021,7 +1020,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
     let candidates = Arc::new(Mutex::new(routes));
     let providers = Arc::new(Mutex::new(ProviderDirectory::new(my_id)));
     let (recon_tx, recon_rx) = tokio::sync::mpsc::channel(crate::peering::RECON_EVENTS);
-    let (walks_tx, walks_rx) = tokio::sync::mpsc::channel(crate::walk::WALK_EVENTS);
     let handler = SnapshotHandler {
         snapshot: wiring.snapshot.clone(),
         health: wiring.health.clone(),
@@ -1029,18 +1027,17 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
         providers: providers.clone(),
         local_id: my_id,
         recon: Some(recon_tx),
-        walks: Some(walks_tx),
     };
     // One table holds the connections of both directions; each serves the
     // same handler, whichever side dialled it.
     let connections = ConnectionTable::new(transport.clone(), handler);
-    // Walks pull what this node lacks over recon/1 and land it through one
-    // task, which also reobserves the store for appends made elsewhere.
-    let (pulls, pulled) = crate::walk::spawn(
+    // The walks task pushes this node's trees on walk/1 streams and lands
+    // what its neighbours push through one task, which also reobserves the
+    // store for appends made elsewhere.
+    let (walks, received) = crate::walk::spawn(
         connections.clone(),
         wiring.snapshot.clone(),
         crate::walk::Walks::new(wiring.health.clone()),
-        walks_rx,
         wiring.lander.clone(),
     );
     let provider_client = ProviderClient {
@@ -1050,10 +1047,10 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
         my_id,
         salt: rand::random(),
     };
-    // Peerings and announcements ride the connections' recon/1 streams.
-    // Announcements start record and reference pulls and hear every pull
-    // end. A collection's DHT providers, the last tier of its candidates,
-    // are looked up when its candidate order is drawn, ALPHA at a time.
+    // Peerings ride the connections' recon/1 streams, and the push
+    // scheduler beside them starts pushes to the neighbours they make. A
+    // collection's DHT providers, the last tier of its candidates, are
+    // looked up when its candidate order is drawn, ALPHA at a time.
     let finder = provider_client.clone();
     let lookups = Arc::new(tokio::sync::Semaphore::new(ALPHA));
     tokio::spawn(crate::peering::run(
@@ -1080,8 +1077,8 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
             }
             .boxed()
         },
-        move |peer, collection, kind| pulls.start(peer, collection, kind),
-        pulled,
+        walks,
+        received,
         wiring.health.clone(),
         wiring.evt_tx.clone(),
     ));
@@ -1869,8 +1866,6 @@ struct SnapshotHandler {
     local_id: PeerId,
     /// Where `recon/1` events go: the host's peering task.
     recon: Option<tokio::sync::mpsc::Sender<ReconEvent>>,
-    /// Where walk frames and closed connections go: the host's walk task.
-    walks: Option<tokio::sync::mpsc::Sender<ReconEvent>>,
 }
 
 #[cfg(test)]
@@ -1884,7 +1879,6 @@ impl SnapshotHandler {
             providers: Arc::new(Mutex::new(ProviderDirectory::new(local_id))),
             local_id,
             recon: None,
-            walks: None,
         }
     }
 }
@@ -1953,19 +1947,7 @@ impl Service for SnapshotHandler {
                 .unwrap()
                 .promote_authenticated(link.peer());
         }
-        let (walks, peering) = match event {
-            ReconEvent::Frame(_, Frame::Walk(_)) => (Some(event), None),
-            // Both hear a connection close.
-            ReconEvent::Closed(link) => (
-                Some(ReconEvent::Closed(link.clone())),
-                Some(ReconEvent::Closed(link)),
-            ),
-            event => (None, Some(event)),
-        };
-        if let (Some(walks), Some(event)) = (&self.walks, walks) {
-            let _ = walks.send(event).await;
-        }
-        if let (Some(recon), Some(event)) = (&self.recon, peering) {
+        if let Some(recon) = &self.recon {
             let _ = recon.send(event).await;
         }
     }

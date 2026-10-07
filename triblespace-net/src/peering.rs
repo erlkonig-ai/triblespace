@@ -25,8 +25,8 @@
 //! Every [`SWAP_INTERVAL`] one healthy asked-for neighbour makes room for the
 //! next candidate, so groups formed during a partition meet again after it.
 //!
-//! The peering task also carries each collection's announcements
-//! ([`crate::announce`]) to the neighbours its peerings make.
+//! The peering task also runs each collection's push schedule
+//! ([`crate::schedule`]), which pushes to the neighbours its peerings make.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -40,7 +40,6 @@ use rand::seq::SliceRandom as _;
 use triblespace_core::capability::{CapabilityHandle, CapabilityProof, QuorumOutcome};
 use triblespace_core::collection::CollectionHandle;
 
-use crate::announce::{self, Announcements, State};
 use crate::channel::NetEventBatch;
 use crate::clock::Mono;
 use crate::collection_activation::MAX_PROOFS_PER_EXCHANGE;
@@ -50,8 +49,9 @@ use crate::health::{Health, PeeringHealth};
 use crate::host::{CollectionSnapshot, StoreSnapshot};
 use crate::protocol::RawHash;
 use crate::recon::{Flags, Frame, credential_frames, request_frames};
+use crate::schedule::{self, Schedules};
 use crate::transport::{PeerId, Transport};
-use crate::walk::{PullDone, PullKind};
+use crate::walk::{self, WalksHandle};
 
 /// Neighbours per collection this side asks for.
 pub(crate) const MAX_ASKED: usize = 5;
@@ -1060,41 +1060,41 @@ impl Peerings {
     }
 }
 
-/// Run one node's peerings, grant exchange and announcements until its store
-/// observations end: hear its connections' events, follow its observations,
-/// refill its neighbour sets every [`PEERING_TICK`], announce when a
-/// collection's schedule fires, and publish what changed into `health`.
-/// A collection's DHT providers are looked up through `find_providers`.
-/// Pulls start through `start_pull`, and their ends arrive on
-/// `pulls_ended`. Received proofs and fetched definitions land through
+/// Run one node's peerings, grant exchange and push schedules until its
+/// store observations end: hear its connections' events, follow its
+/// observations, refill its neighbour sets every [`PEERING_TICK`], start
+/// pushes through `walks` when a collection's schedule fires, and publish
+/// what changed into `health`. A collection's DHT providers are looked up
+/// through `find_providers`. The pushes received here arrive on `received`,
+/// for the schedules. Received proofs and fetched definitions land through
 /// `admissions`.
 pub(crate) async fn run<T: Transport, S: Service>(
     connections: ConnectionTable<T, S>,
     mut snapshots: tokio::sync::watch::Receiver<Option<Arc<StoreSnapshot>>>,
     mut events: tokio::sync::mpsc::Receiver<ReconEvent>,
     mut find_providers: impl FnMut(CollectionHandle) -> BoxFuture<'static, Vec<PeerId>>,
-    mut start_pull: impl FnMut(PeerId, CollectionHandle, PullKind),
-    mut pulls_ended: tokio::sync::mpsc::UnboundedReceiver<PullDone>,
+    walks: WalksHandle,
+    mut received: tokio::sync::mpsc::UnboundedReceiver<walk::Event>,
     health: Health,
     admissions: tokio::sync::mpsc::Sender<NetEventBatch>,
 ) {
     let mut peerings = Peerings::new(connections.transport().local_id());
     let mut grants = Grants::new(connections.transport().local_id());
     let sink = Sink::new(connections.clone(), admissions);
-    let mut announcements = Announcements::default();
+    let mut schedules = Schedules::default();
     let (dialled_tx, mut dialled) = tokio::sync::mpsc::unbounded_channel();
     let mut lookups = FuturesUnordered::new();
     let mut tick = tokio::time::interval(PEERING_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     if let Some(snapshot) = snapshots.borrow_and_update().clone() {
-        announcements.observe(announce::states(&snapshot), crate::clock::mono_now());
+        schedules.observe(schedule::roots(&snapshot), crate::clock::mono_now());
         peerings.observe(snapshot.clone());
         sink.apply(grants.observe(snapshot));
     }
     loop {
-        let announce_at = announcements.deadline();
-        let announcement_due = async {
-            match announce_at {
+        let push_at = schedules.deadline();
+        let push_due = async {
+            match push_at {
                 Some(at) => tokio::time::sleep(at.duration_since(crate::clock::mono_now())).await,
                 None => std::future::pending().await,
             }
@@ -1107,37 +1107,21 @@ pub(crate) async fn run<T: Transport, S: Service>(
                 // A withdrawn observation is not an unselection; the next
                 // one is compared with the last one seen.
                 if let Some(snapshot) = snapshots.borrow_and_update().clone() {
-                    announcements.observe(announce::states(&snapshot), crate::clock::mono_now());
+                    schedules.observe(schedule::roots(&snapshot), crate::clock::mono_now());
                     peerings.observe(snapshot.clone());
                     sink.apply(grants.observe(snapshot));
                 }
             }
             Some(event) = events.recv() => {
                 sink.apply(grants.event(&event));
-                match event {
-                    ReconEvent::Frame(
-                        link,
-                        Frame::Announce { collection, root, held_digest: held, reply },
-                    ) => {
-                        let now = crate::clock::mono_now();
-                        let state = State { root, held };
-                        for (peer, collection, kind) in
-                            announcements.heard(link.peer(), collection, state, reply, now)
-                        {
-                            start_pull(peer, collection, kind);
-                        }
-                    }
-                    event => peerings.event(event),
+                peerings.event(event);
+            }
+            Some(event) = received.recv() => schedules.event(event, crate::clock::mono_now()),
+            () = push_due => {
+                for (peer, collection, kind) in schedules.poll(crate::clock::mono_now()) {
+                    walks.push(peer, collection, kind);
                 }
             }
-            Some(ended) = pulls_ended.recv() => {
-                for (peer, collection, kind) in
-                    announcements.ended(ended, crate::clock::mono_now())
-                {
-                    start_pull(peer, collection, kind);
-                }
-            }
-            () = announcement_due => announcements.poll(crate::clock::mono_now()),
             Some((peer, connected)) = dialled.recv() => peerings.dialled(peer, connected),
             Some((collection, found)) = lookups.next(), if !lookups.is_empty() => {
                 peerings.providers(collection, found);
@@ -1161,7 +1145,7 @@ pub(crate) async fn run<T: Transport, S: Service>(
             lookups.push(find_providers(collection).map(move |found| (collection, found)));
         }
         if peerings.publish(&health) {
-            announcements.neighbours(peerings.neighbours(), crate::clock::mono_now());
+            schedules.neighbours(peerings.neighbours(), crate::clock::mono_now());
         }
         grants.publish(&health);
     }
@@ -1711,7 +1695,7 @@ mod tests {
 
     /// A side's full flag follows its replication mode: it rides the
     /// request, a change goes out as PEER_FLAGS, and a peering is full for
-    /// announcements only while both sides are.
+    /// the push schedule only while both sides are.
     #[test]
     fn the_full_flag_follows_the_replication_mode() {
         let mut owner = Node::new(14);
@@ -1762,8 +1746,7 @@ mod tests {
 
     /// A DHT provider that may neither read nor write C accepts this side's
     /// request and says it replicates C in full. The peering stands, but it
-    /// is not full here, so the provider's held digest starts no reference
-    /// pull.
+    /// is not full here, so no references tree is pushed to the provider.
     #[test]
     fn a_full_peer_that_may_neither_read_nor_write_is_no_full_neighbour() {
         let mut node = Node::new(16);
@@ -1782,7 +1765,10 @@ mod tests {
         let now = crate::clock::mono_now();
         assert!(node.peerings.fill(now).is_empty());
         node.peerings.providers(collection, vec![provider.id()]);
-        assert!(node.peerings.fill(now).is_empty(), "asked on the connection");
+        assert!(
+            node.peerings.fill(now).is_empty(),
+            "asked on the connection"
+        );
         carry(&mut node, &mut provider, &mut wire);
         assert!(peering(&node, provider.id()).unwrap().peered);
         let full = node.peerings.neighbours().map(|(.., full)| full);
@@ -1954,7 +1940,11 @@ mod tests {
                 node.peerings.providers(looked_up, Vec::new());
             }
         }
-        assert_eq!((redials, lookups), (2, 2), "redials and lookups in two minutes");
+        assert_eq!(
+            (redials, lookups),
+            (2, 2),
+            "redials and lookups in two minutes"
+        );
     }
 
     /// Peerings over real connection tables on the simulated transport,
@@ -2017,15 +2007,17 @@ mod tests {
                 let (snapshots, observed) = watch::channel(None);
                 let health = Health::new(EndpointId::from_bytes(&pile.id()).unwrap());
                 let (admissions, _) = tokio::sync::mpsc::channel(1);
-                // These hosts have no DHT and run no pulls.
-                let (_ended, pulls_ended) = tokio::sync::mpsc::unbounded_channel();
+                // These hosts have no DHT and no walks task: pushes go
+                // nowhere.
+                let (walks, _) = tokio::sync::mpsc::unbounded_channel();
+                let (_, received) = tokio::sync::mpsc::unbounded_channel();
                 let peering = tokio::spawn(run(
                     table.clone(),
                     observed,
                     recon,
                     |_| futures::future::ready(Vec::new()).boxed(),
-                    |_, _, _| {},
-                    pulls_ended,
+                    WalksHandle(walks),
+                    received,
                     health.clone(),
                     admissions,
                 ));

@@ -1,43 +1,41 @@
 //! The sender of a `walk/1` push (design: walk streams).
 //!
-//! A push sends one neighbour the part of one collection tree it has not
-//! confirmed, as its own stream ([`crate::walk_stream`]). The sender pins a
-//! snapshot and sends its root, then walks the difference between the pinned
-//! tree and the neighbour's confirmed root depth first: every branch it
-//! reaches goes out as a NODE, and the neighbour answers each with the
-//! children it already holds with the same digest, which the sender skips as
-//! it skips those the confirmed tree holds with the same digest. A ROOT the
-//! neighbour's own tree equals is answered with the root held whole, before
-//! any NODE, and nothing below it is owed. A leaf goes out as a LEAF, and
-//! the neighbour asks for the values it lacks. At most
-//! [`MAX_OUTSTANDING_NODES`] NODEs wait for their HELD, and the walk pauses
-//! while that window is full. DONE follows the last answered NODE, and once
-//! the neighbour's LANDED arrives the pinned snapshot is its confirmed root,
-//! so the next push walks only what changed since. A push that ends before
-//! LANDED leaves the confirmed root as it was, and one to a neighbour never
-//! pushed to starts from an empty confirmed root, so the first push and an
-//! incremental one are one path.
+//! A push sends one neighbour the part of one collection tree it does not
+//! hold, as its own stream ([`crate::walk_stream`]). The sender pins a
+//! snapshot and sends its root. A root the neighbour confirmed before is
+//! followed by DONE at once. Otherwise the sender walks the pinned tree depth
+//! first: every branch it reaches goes out as a NODE, and the neighbour
+//! answers each with the children it already holds with the same digest,
+//! which the sender skips; what the neighbour holds as more than the pushed
+//! subtree is walked on, so the count proof closes at a neighbour that holds
+//! a superset. A ROOT is never answered: a neighbour whose own tree equals
+//! it, or that landed it before, answers the root NODE with every child held,
+//! and nothing below it is owed. A leaf goes out as a LEAF, and the neighbour
+//! asks for the values it lacks. At most [`MAX_OUTSTANDING_NODES`] NODEs
+//! wait for their HELD, and the walk pauses while that window is full. DONE
+//! follows the last answered NODE, and once the neighbour's LANDED arrives
+//! the pinned root is its confirmed root, so an unchanged tree is one
+//! exchange next time. A push that ends before LANDED leaves the confirmed
+//! root as it was, and one to a neighbour never pushed to starts from none,
+//! so the first push and a later one are one path.
 //!
-//! [`Push`] is the state machine without its stream. [`Push::start`] and
-//! [`Push::on_frame`] yield the frames to write, after the stream's tag and
-//! [`Push::open`]; an `Err` from `on_frame` resets the stream
+//! [`Push`] is the state machine without its stream, which the walks task
+//! drives ([`crate::walk`]). [`Push::start`] and [`Push::on_frame`] yield
+//! the frames to write, after the stream's tag and Open; an `Err` from
+//! `on_frame` resets the stream
 //! [`RESET_WALK_FAILED`](crate::connection::RESET_WALK_FAILED); and once the
 //! stream ended, however it ended, [`Push::outcome`] settles the
 //! [`ConfirmedRoots`] the walks task keeps
 //! ([`crate::walk::Walks::pushed`]).
 
-// The walks task wires a push to its stream; until it does, only the tests
-// drive one.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::host::CollectionSnapshot;
-use crate::patch_repair::PatchNode;
+use crate::patch_repair::{PatchNode, PatchSummary};
 use crate::protocol::RawHash;
 use crate::transport::PeerId;
-use crate::walk::{Request, Response, WalkKind, answer, node, summary};
+use crate::walk::{WalkKind, node, summary, value};
 use crate::walk_stream::{Frame, held};
 
 /// NODE frames one push keeps outstanding: sent, with no HELD yet.
@@ -47,12 +45,12 @@ pub(crate) const MAX_OUTSTANDING_NODES: usize = 64;
 /// collection and kind.
 pub(crate) type PushKey = (PeerId, RawHash, WalkKind);
 
-/// How a push ended.
-pub(crate) enum Outcome {
-    /// LANDED arrived: the pinned snapshot is the neighbour's confirmed root.
-    Confirmed(Arc<CollectionSnapshot>),
-    /// The stream ended before LANDED: the confirmed root is unchanged.
-    Unconfirmed,
+/// How a push ended: the root it pushed, and whether LANDED arrived, which
+/// makes that root the neighbour's confirmed root. A stream that ended
+/// before LANDED leaves the confirmed root unchanged.
+pub(crate) struct Outcome {
+    pub(crate) root: PatchSummary,
+    pub(crate) confirmed: bool,
 }
 
 /// The receiver broke the protocol; its stream is reset
@@ -61,21 +59,20 @@ pub(crate) enum Outcome {
 pub(crate) struct Failed(pub(crate) &'static str);
 
 /// The confirmed roots of this side's pushes: per peer, collection and kind,
-/// the pinned snapshot of the last push the peer confirmed landed. Never
-/// persisted: a restarted side pushes everything again, and the neighbour
-/// holds it.
+/// the root of the last push the peer confirmed landed. Never persisted: a
+/// restarted side pushes everything again, and the neighbour holds it.
 #[derive(Default)]
-pub(crate) struct ConfirmedRoots(HashMap<PushKey, Arc<CollectionSnapshot>>);
+pub(crate) struct ConfirmedRoots(HashMap<PushKey, PatchSummary>);
 
 impl ConfirmedRoots {
-    pub(crate) fn root(&self, key: PushKey) -> Option<Arc<CollectionSnapshot>> {
-        self.0.get(&key).cloned()
+    pub(crate) fn root(&self, key: PushKey) -> Option<PatchSummary> {
+        self.0.get(&key).copied()
     }
 
     /// A push under `key` ended: a confirmed one sets the root.
     pub(crate) fn settle(&mut self, key: PushKey, outcome: Outcome) {
-        if let Outcome::Confirmed(pinned) = outcome {
-            self.0.insert(key, pinned);
+        if outcome.confirmed {
+            self.0.insert(key, outcome.root);
         }
     }
 }
@@ -84,11 +81,10 @@ impl ConfirmedRoots {
 pub(crate) struct Push {
     kind: WalkKind,
     pinned: Arc<CollectionSnapshot>,
-    confirmed: Option<Arc<CollectionSnapshot>>,
     /// Prefixes to visit, the last first: the walk is depth first.
     pending: Vec<Vec<u8>>,
-    /// NODEs sent without a HELD, by prefix: the children the confirmed tree
-    /// does not hold with the same digest, each its edge and prefix.
+    /// NODEs sent without a HELD, by prefix: their children, each its edge
+    /// and prefix.
     outstanding: HashMap<Vec<u8>, Vec<(u8, Vec<u8>)>>,
     done: bool,
     landed: bool,
@@ -101,35 +97,23 @@ impl Push {
     pub(crate) fn start(
         kind: WalkKind,
         pinned: Arc<CollectionSnapshot>,
-        confirmed: Option<Arc<CollectionSnapshot>>,
+        confirmed: Option<PatchSummary>,
     ) -> (Self, Vec<Frame>) {
         let root = summary(kind, pinned.repair());
-        let unchanged = confirmed
-            .as_ref()
-            .is_some_and(|confirmed| summary(kind, confirmed.repair()) == root);
         let mut push = Self {
             kind,
             pinned,
-            confirmed,
             pending: Vec::new(),
             outstanding: HashMap::new(),
             done: false,
             landed: false,
         };
-        if root.root().is_some() && !unchanged {
+        if root.root().is_some() && confirmed != Some(root) {
             push.pending.push(Vec::new());
         }
         let mut frames = vec![Frame::Root { summary: root }];
         push.pump(&mut frames);
         (push, frames)
-    }
-
-    /// The stream's first frame, after its tag.
-    pub(crate) fn open(&self) -> Frame {
-        Frame::Open {
-            collection: self.pinned.repair().collection(),
-            kind: self.kind,
-        }
     }
 
     /// Take one frame from the receiver; the frames to send in answer.
@@ -140,33 +124,22 @@ impl Push {
         let mut frames = Vec::new();
         match frame {
             Frame::Held { prefix, children } => {
-                match self.outstanding.remove(&prefix) {
-                    Some(unheld) => {
-                        // Pushed in reverse, so the walk takes ascending
-                        // edges first.
-                        for (edge, child) in unheld.into_iter().rev() {
-                            if !held(&children, edge) {
-                                self.pending.push(child);
-                            }
-                        }
+                let Some(unheld) = self.outstanding.remove(&prefix) else {
+                    return Err(Failed("a HELD for no outstanding NODE"));
+                };
+                // Pushed in reverse, so the walk takes ascending edges
+                // first.
+                for (edge, child) in unheld.into_iter().rev() {
+                    if !held(&children, edge) {
+                        self.pending.push(child);
                     }
-                    // The receiver answers a ROOT equal to its own tree with
-                    // the root held whole, before any NODE (and the root NODE,
-                    // if one went out, the same way): nothing below it is
-                    // owed.
-                    None if prefix.is_empty() && children == [0xFF; 32] => self.pending.clear(),
-                    None => return Err(Failed("a HELD for no outstanding NODE")),
                 }
                 self.pump(&mut frames);
             }
-            Frame::ValueRequest { key } => {
-                match answer(self.kind, self.pinned.repair(), Request::Value(key)) {
-                    Some(Response::Value { key, bytes }) => {
-                        frames.push(Frame::Value { key, bytes })
-                    }
-                    _ => return Err(Failed("a VALUE_REQUEST for a key the pinned tree lacks")),
-                }
-            }
+            Frame::ValueRequest { key } => match value(self.kind, self.pinned.repair(), key) {
+                Some(bytes) => frames.push(Frame::Value { key, bytes }),
+                None => return Err(Failed("a VALUE_REQUEST for a key the pinned tree lacks")),
+            },
             Frame::Landed => {
                 if !self.done {
                     return Err(Failed("a LANDED before DONE"));
@@ -183,17 +156,11 @@ impl Push {
         Ok(frames)
     }
 
-    /// Whether DONE went out: the walk finished and every NODE was answered.
-    pub(crate) fn done_sent(&self) -> bool {
-        self.done
-    }
-
     /// The push's outcome once its stream ended, however it ended.
     pub(crate) fn outcome(self) -> Outcome {
-        if self.landed {
-            Outcome::Confirmed(self.pinned)
-        } else {
-            Outcome::Unconfirmed
+        Outcome {
+            root: summary(self.kind, self.pinned.repair()),
+            confirmed: self.landed,
         }
     }
 
@@ -213,7 +180,7 @@ impl Push {
     }
 
     /// Send the pinned node at `prefix`: a leaf as a LEAF, a branch as a
-    /// NODE whose unconfirmed children wait for its HELD.
+    /// NODE whose children wait for its HELD.
     fn visit(&mut self, prefix: Vec<u8>, frames: &mut Vec<Frame>) {
         let visited = node(self.kind, self.pinned.repair(), &prefix)
             .expect("a pinned tree holds the nodes its own branches name");
@@ -224,20 +191,16 @@ impl Push {
             let key = leaf.key.try_into().expect("a walked key is 32 bytes");
             return frames.push(Frame::Leaf { key });
         };
-        let confirmed = self.confirmed.as_deref().map(CollectionSnapshot::repair);
-        let unconfirmed = branch
+        let children = branch
             .children
             .iter()
-            .filter_map(|child| {
+            .map(|child| {
                 let mut prefix = branch.representative[..usize::from(branch.end_depth)].to_vec();
                 prefix.push(child.edge);
-                let confirmed = confirmed
-                    .and_then(|confirmed| node(self.kind, confirmed, &prefix))
-                    .is_some_and(|node| node.digest() == child.digest);
-                (!confirmed).then_some((child.edge, prefix))
+                (child.edge, prefix)
             })
             .collect();
-        self.outstanding.insert(prefix.clone(), unconfirmed);
+        self.outstanding.insert(prefix.clone(), children);
         frames.push(Frame::Node {
             prefix,
             node: visited,
@@ -435,13 +398,6 @@ mod tests {
         sender.observe();
         let pinned = snapshot(&sender, collection);
         let (mut push, frames) = Push::start(WalkKind::Records, pinned.clone(), None);
-        assert_eq!(
-            push.open(),
-            Frame::Open {
-                collection,
-                kind: WalkKind::Records
-            }
-        );
         let mut receiver = Receiver::new(WalkKind::Records, None);
         carry(&mut push, &mut receiver, frames).unwrap();
 
@@ -475,11 +431,9 @@ mod tests {
             assert_eq!(record.fingerprint().raw(), *key);
         }
         assert_eq!(receiver.count(|frame| *frame == Frame::Done), 1);
-        assert!(push.done_sent());
-        let Outcome::Confirmed(confirmed) = push.outcome() else {
-            panic!("LANDED arrived");
-        };
-        assert!(Arc::ptr_eq(&confirmed, &pinned));
+        let outcome = push.outcome();
+        assert!(outcome.confirmed, "LANDED arrived");
+        assert_eq!(outcome.root, pinned.repair().records().summary());
     }
 
     #[test]
@@ -491,22 +445,22 @@ mod tests {
         }
         sender.observe();
         let pinned = snapshot(&sender, collection);
-        sender.observe();
-        let again = snapshot(&sender, collection);
-        assert!(!Arc::ptr_eq(&pinned, &again));
-        let root = Frame::Root {
-            summary: pinned.repair().records().summary(),
-        };
-        for confirmed in [pinned.clone(), again] {
-            let (push, frames) = Push::start(WalkKind::Records, pinned.clone(), Some(confirmed));
-            assert_eq!(frames, [root.clone(), Frame::Done]);
-            assert!(push.done_sent());
-        }
+        let summary = pinned.repair().records().summary();
+        let root = Frame::Root { summary };
+        let (_, frames) = Push::start(WalkKind::Records, pinned.clone(), Some(summary));
+        assert_eq!(frames, [root.clone(), Frame::Done]);
+        // Any other confirmed root walks the tree, from its root node.
+        let other = PatchSummary::new(Some([9; 32]), 50).unwrap();
+        let (_, frames) = Push::start(WalkKind::Records, pinned, Some(other));
+        assert!(
+            matches!(frames[..], [Frame::Root { .. }, Frame::Node { .. }]),
+            "{frames:?}"
+        );
         // An empty tree is root then done too, confirmed or not.
         let mut empty = Node::new(32);
         let collection = empty.hold("empty", open());
         let pinned = snapshot(&empty, collection);
-        let (push, frames) = Push::start(WalkKind::Authorization, pinned, None);
+        let (_, frames) = Push::start(WalkKind::Authorization, pinned, None);
         assert_eq!(
             frames,
             [
@@ -516,7 +470,6 @@ mod tests {
                 Frame::Done
             ]
         );
-        assert!(push.done_sent());
     }
 
     /// A sender with twenty records, one more chosen by `wanted` from its
@@ -551,40 +504,47 @@ mod tests {
         (sender, collection, before, record.fingerprint().raw())
     }
 
+    /// The receiver holds the tree as it was before one record: its HELD
+    /// prunes the walk to the new record's path, whether or not the sender
+    /// has a confirmed root. A receiver holding nothing is pushed the whole
+    /// tree even under a confirmed root: the confirmed root skips only an
+    /// unchanged tree.
     #[test]
-    fn a_push_of_one_new_record_walks_only_its_path() {
+    fn a_push_of_one_new_record_walks_only_its_path_at_a_receiver_holding_the_rest() {
         // The new key's first byte is its own: the root gains a leaf.
         let (sender, collection, before, key) = one_more(33, |company| company.is_none());
         let pinned = snapshot(&sender, collection);
-        let (mut push, frames) = Push::start(WalkKind::Records, pinned.clone(), Some(before));
-        let mut receiver = Receiver::new(WalkKind::Records, None);
+        let confirmed = before.repair().records().summary();
+        let (mut push, frames) = Push::start(WalkKind::Records, pinned.clone(), Some(confirmed));
+        let mut receiver = Receiver::new(WalkKind::Records, Some(before));
         carry(&mut push, &mut receiver, frames).unwrap();
         assert_eq!(receiver.nodes(), [Vec::<u8>::new()]);
         assert_eq!(receiver.leaves(), [key]);
         assert_eq!(receiver.values.keys().copied().collect::<Vec<_>>(), [key]);
-        assert!(matches!(push.outcome(), Outcome::Confirmed(_)));
+        assert!(push.outcome().confirmed);
 
         // The new key shares its first byte with one record: that leaf
         // becomes a branch of two, and only the new leaf goes out.
         let (sender, collection, before, key) = one_more(34, |company| company == Some(&1));
         let pinned = snapshot(&sender, collection);
-        let (mut push, frames) =
-            Push::start(WalkKind::Records, pinned.clone(), Some(before.clone()));
+        let confirmed = before.repair().records().summary();
+        for confirmed in [Some(confirmed), None] {
+            let (mut push, frames) = Push::start(WalkKind::Records, pinned.clone(), confirmed);
+            let mut receiver = Receiver::new(WalkKind::Records, Some(before.clone()));
+            carry(&mut push, &mut receiver, frames).unwrap();
+            assert_eq!(receiver.nodes(), [Vec::new(), vec![key[0]]]);
+            assert_eq!(receiver.leaves(), [key]);
+            assert_eq!(receiver.values.keys().copied().collect::<Vec<_>>(), [key]);
+            assert_eq!(receiver.count(|frame| *frame == Frame::Done), 1);
+            assert!(push.outcome().confirmed);
+        }
+
+        // A receiver holding nothing gets every leaf, confirmed root or not.
+        let (mut push, frames) = Push::start(WalkKind::Records, pinned, Some(confirmed));
         let mut receiver = Receiver::new(WalkKind::Records, None);
         carry(&mut push, &mut receiver, frames).unwrap();
-        assert_eq!(receiver.nodes(), [Vec::new(), vec![key[0]]]);
-        assert_eq!(receiver.leaves(), [key]);
-        assert_eq!(receiver.count(|frame| *frame == Frame::Done), 1);
-        assert!(matches!(push.outcome(), Outcome::Confirmed(_)));
-
-        // A receiver that holds the old tree prunes the same way through
-        // HELD when the sender has no confirmed root.
-        let (mut push, frames) = Push::start(WalkKind::Records, pinned, None);
-        let mut receiver = Receiver::new(WalkKind::Records, Some(before));
-        carry(&mut push, &mut receiver, frames).unwrap();
-        assert_eq!(receiver.nodes(), [Vec::new(), vec![key[0]]]);
-        assert_eq!(receiver.leaves(), [key]);
-        assert_eq!(receiver.values.keys().copied().collect::<Vec<_>>(), [key]);
+        assert_eq!(receiver.leaves().len(), 21);
+        assert!(push.outcome().confirmed);
     }
 
     #[test]
@@ -613,7 +573,7 @@ mod tests {
             ]
         );
         assert!(receiver.values.is_empty());
-        assert!(matches!(push.outcome(), Outcome::Confirmed(_)));
+        assert!(push.outcome().confirmed);
     }
 
     #[test]
@@ -653,8 +613,8 @@ mod tests {
         assert_eq!(most, MAX_OUTSTANDING_NODES);
         assert_eq!(receiver.nodes().len(), expected.len());
         assert_eq!(receiver.leaves().len(), 3000);
-        assert!(push.done_sent());
-        assert!(matches!(push.outcome(), Outcome::Confirmed(_)));
+        assert_eq!(receiver.count(|frame| *frame == Frame::Done), 1);
+        assert!(push.outcome().confirmed);
     }
 
     #[test]
@@ -672,13 +632,13 @@ mod tests {
         let mut receiver = Receiver::new(WalkKind::Records, None);
         receiver.lands = false;
         carry(&mut push, &mut receiver, frames).unwrap();
-        assert!(push.done_sent());
-        assert!(matches!(push.outcome(), Outcome::Unconfirmed));
+        assert!(receiver.done);
+        assert!(!push.outcome().confirmed);
 
         // The stream closes mid-walk.
-        let (push, _) = Push::start(WalkKind::Records, pinned.clone(), None);
-        assert!(!push.done_sent());
-        assert!(matches!(push.outcome(), Outcome::Unconfirmed));
+        let (push, frames) = Push::start(WalkKind::Records, pinned.clone(), None);
+        assert!(!frames.contains(&Frame::Done));
+        assert!(!push.outcome().confirmed);
 
         // LANDED before DONE, a VALUE_REQUEST for a key the tree lacks, a HELD
         // for no NODE and a sender's frame fail the push.
@@ -693,8 +653,21 @@ mod tests {
         ] {
             let (mut push, _) = Push::start(WalkKind::Records, pinned.clone(), None);
             assert!(push.on_frame(frame.clone()).is_err(), "{frame:?}");
-            assert!(matches!(push.outcome(), Outcome::Unconfirmed));
+            assert!(!push.outcome().confirmed);
         }
+        // A push of the confirmed tree has no NODE outstanding: a HELD for
+        // the root, held whole, is a HELD for no NODE.
+        let confirmed = pinned.repair().records().summary();
+        let (mut push, frames) = Push::start(WalkKind::Records, pinned.clone(), Some(confirmed));
+        assert!(matches!(frames[..], [Frame::Root { .. }, Frame::Done]));
+        assert!(
+            push.on_frame(Frame::Held {
+                prefix: Vec::new(),
+                children: [0xFF; 32],
+            })
+            .is_err()
+        );
+        assert!(!push.outcome().confirmed);
         // A references push serves no values.
         let (mut push, _) = Push::start(WalkKind::References, pinned, None);
         assert!(push.on_frame(Frame::ValueRequest { key: [9; 32] }).is_err());
@@ -746,25 +719,57 @@ mod tests {
         );
 
         // An unconfirmed end leaves the root empty: the next push carries
-        // the tree again.
-        owner.walks.pushed(peer, collection, kind, push.outcome());
+        // the tree again. The tree is as pushed, so nothing follows at once.
+        let now = crate::clock::mono_now();
+        assert!(
+            !owner
+                .walks
+                .pushed(peer, collection, kind, push.outcome(), now)
+        );
         let (mut push, frames) = owner.walks.push(peer, collection, kind).unwrap();
         assert!(frames.len() > 2, "{frames:?}");
         let mut receiver = Receiver::new(kind, None);
         carry(&mut push, &mut receiver, frames).unwrap();
-        owner.walks.pushed(peer, collection, kind, push.outcome());
+        assert!(
+            !owner
+                .walks
+                .pushed(peer, collection, kind, push.outcome(), now)
+        );
 
         // A confirmed end pins the root: the unchanged tree is root then
-        // done, and a new record walks only its path.
+        // done, and a new record walks only its path at a receiver holding
+        // the rest. A record committed while a push runs makes its end ask
+        // for the next push at once.
         let (push, frames) = owner.walks.push(peer, collection, kind).unwrap();
         assert!(matches!(frames[..], [Frame::Root { .. }, Frame::Done]));
-        owner.walks.pushed(peer, collection, kind, push.outcome());
+        let before = snapshot(&owner, collection);
         let key = owner.commit(collection, 2).fingerprint().raw();
         owner.observe();
+        assert!(
+            owner
+                .walks
+                .pushed(peer, collection, kind, push.outcome(), now)
+        );
         let (mut push, frames) = owner.walks.push(peer, collection, kind).unwrap();
-        let mut receiver = Receiver::new(kind, None);
+        let mut receiver = Receiver::new(kind, Some(before));
         carry(&mut push, &mut receiver, frames).unwrap();
         assert_eq!(receiver.leaves(), [key]);
+        assert!(
+            !owner
+                .walks
+                .pushed(peer, collection, kind, push.outcome(), now)
+        );
+
+        // Health saw every end: two confirmed, two not, and the confirmed
+        // records root is the tree as it is now.
+        let health = owner.health.snapshot();
+        let pair = &health.collections[0].peers[0];
+        assert_eq!(pair.peer, peer);
+        assert_eq!((pair.pushes.ok, pair.pushes.failed), (2, 2));
+        assert_eq!(
+            pair.confirmed.records,
+            Some(summary(kind, snapshot(&owner, collection).repair()))
+        );
     }
 
     /// The receiver builds its HELD bitmap through [`hold`] and the sender
@@ -805,7 +810,7 @@ mod tests {
         // The receiver takes the ROOT and the root NODE; its one reply is
         // the HELD it built through `hold`.
         let mut receive =
-            Receive::on_open(sender.id(), collection, WalkKind::Records, true).unwrap();
+            Receive::on_open(sender.id(), collection, WalkKind::Records, true, None).unwrap();
         let (mut push, frames) = Push::start(WalkKind::Records, pinned, None);
         let mut replies = Vec::new();
         for frame in frames {

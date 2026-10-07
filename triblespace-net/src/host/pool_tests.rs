@@ -826,24 +826,22 @@ async fn outbound_eviction_spares_a_connection_a_caller_holds() {
     assert!(answers_empty(&held).await);
 }
 
-/// A node whose `recon/1` events reach the test: walk frames and closed
-/// connections on `walks`, every other event on `peering`.
+/// A node whose `recon/1` events reach the test on a channel holding
+/// `events` of them: once the test stops taking them, the node's `recon/1`
+/// readers stop reading.
 fn listening(
     net: &SimNet,
     key: &SigningKey,
-    walks: usize,
+    events: usize,
 ) -> (
     ConnectionTable<SimTransport, SnapshotHandler>,
-    tokio::sync::mpsc::Receiver<ReconEvent>,
     tokio::sync::mpsc::Receiver<ReconEvent>,
     tokio::task::JoinHandle<()>,
 ) {
     let mut harness = net.join(key);
     let peer = harness.transport.local_id();
-    let (walks, walked) = tokio::sync::mpsc::channel(walks);
-    let (peering, peered) = tokio::sync::mpsc::channel(64);
+    let (peering, peered) = tokio::sync::mpsc::channel(events);
     let handler = SnapshotHandler {
-        walks: Some(walks),
         recon: Some(peering),
         ..SnapshotHandler::for_test(peer, RoutingTable::new(peer))
     };
@@ -854,21 +852,19 @@ fn listening(
             accepting.accept(incoming.conn);
         }
     });
-    (table, walked, peered, server)
+    (table, peered, server)
 }
 
 /// An idle `recon/1` outlives the credit deadline. One whose peer stops
-/// reading ends after it, and its connection closes with it at both ends,
-/// which ends the walks on it.
+/// reading ends after it, and its connection closes with it at both ends.
 #[tokio::test(start_paused = true)]
 async fn a_peer_that_stops_reading_recon_loses_the_connection() {
     use crate::connection::RECON_CREDIT_DEADLINE;
     use crate::recon::Frame;
-    use crate::walk::{Response, WalkBody, WalkFrame, WalkId, WalkKind};
 
     let net = network(Duration::from_millis(10));
-    let (acceptor, mut walked, mut peered, _accepting) = listening(&net, &key(1), 1);
-    let (dialler, mut dialler_walked, _dialler_peered, _dialling) = listening(&net, &key(2), 64);
+    let (acceptor, mut peered, _accepting) = listening(&net, &key(1), 1);
+    let (dialler, mut dialler_peered, _dialling) = listening(&net, &key(2), 64);
     let collection = CollectionHandle::new([3; 32]);
     let unpeer = Frame::Unpeer { collection };
     let link = dialler
@@ -878,45 +874,38 @@ async fn a_peer_that_stops_reading_recon_loses_the_connection() {
         .link();
     settle().await;
     assert!(matches!(peered.try_recv(), Ok(ReconEvent::Opened(_))));
+    assert!(matches!(
+        dialler_peered.try_recv(),
+        Ok(ReconEvent::Opened(_))
+    ));
 
     tokio::time::sleep(RECON_CREDIT_DEADLINE + Duration::from_secs(30)).await;
     link.send(unpeer.clone());
     settle().await;
     assert!(matches!(peered.try_recv(), Ok(ReconEvent::Frame(_, frame)) if frame == unpeer));
     assert!(
-        dialler_walked.try_recv().is_err(),
+        dialler_peered.try_recv().is_err(),
         "the idle connection closed"
     );
 
-    // The acceptor's walk task stops taking frames, so its recon/1 reader
-    // stops reading: about forty values exhaust the stream's credit.
-    let value = Frame::Walk(WalkFrame {
-        walk: WalkId {
-            collection,
-            kind: WalkKind::Records,
-            number: 0,
-        },
-        body: WalkBody::Response(Response::Value {
-            key: [4; 32],
-            bytes: vec![5; crate::collection_wire::MAX_COLLECTION_LEAF_BYTES],
-        }),
-    });
-    for _ in 0..60 {
-        link.send(value.clone());
+    // The acceptor's service stops taking frames, so its recon/1 reader
+    // stops reading: forty thousand frames exhaust the stream's credit.
+    for _ in 0..40_000 {
+        link.send(unpeer.clone());
     }
     tokio::time::sleep(RECON_CREDIT_DEADLINE - Duration::from_secs(1)).await;
-    assert!(dialler_walked.try_recv().is_err());
+    assert!(dialler_peered.try_recv().is_err());
     assert_eq!(dialler.len(), 1);
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!(
-        matches!(dialler_walked.try_recv(), Ok(ReconEvent::Closed(closed)) if closed.id() == link.id())
+        matches!(dialler_peered.try_recv(), Ok(ReconEvent::Closed(closed)) if closed.id() == link.id())
     );
     assert!(link.closed());
     assert!(dialler.is_empty());
 
     // The acceptor takes frames again and hears its connection close.
     let heard = tokio::time::timeout(Duration::from_secs(30), async {
-        while let Some(event) = walked.recv().await {
+        while let Some(event) = peered.recv().await {
             if matches!(event, ReconEvent::Closed(_)) {
                 return;
             }

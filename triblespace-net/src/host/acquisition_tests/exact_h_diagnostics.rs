@@ -485,7 +485,6 @@ impl Node {
             providers: directory.clone(),
             local_id: peer,
             recon: None,
-            walks: None,
         };
         let server_trace = trace.clone();
         let server_gate = gate.clone();

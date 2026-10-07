@@ -121,7 +121,6 @@ impl Fixture {
             providers: provider_directory.clone(),
             local_id: provider,
             recon: None,
-            walks: None,
         };
         let connections = ConnectionTable::new(server_harness.transport.clone(), handler);
         let server = tokio::spawn(async move {
@@ -181,7 +180,6 @@ impl RecoveryNode {
             providers: directory.clone(),
             local_id: peer,
             recon: None,
-            walks: None,
         };
         let connections = ConnectionTable::new(harness.transport.clone(), handler);
         let server = tokio::spawn(async move {
@@ -1393,7 +1391,6 @@ async fn known_resident_outside_selected_dht_replicas_is_not_directly_probed() {
             providers: Arc::new(Mutex::new(ProviderDirectory::new(peer))),
             local_id: peer,
             recon: None,
-            walks: None,
         };
         let connections = ConnectionTable::new(harness.transport.clone(), handler);
         servers.push(tokio::spawn(async move {

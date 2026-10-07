@@ -161,7 +161,6 @@ async fn find_value_answers_routes_and_provider_hints_in_one_reply() {
             providers: directory.clone(),
             local_id: provider,
             recon: None,
-            walks: None,
         },
         requester: requester_key.verifying_key(),
     };

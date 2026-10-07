@@ -1,12 +1,12 @@
-//! Held sets at the real immutable store/host boundary, and the reference
-//! pull that compares them (design 2.9).
+//! Held sets at the real immutable store/host boundary, and the push of a
+//! references tree that carries them (design 2.9).
 //!
 //! The host publishes the store's held set of each active collection; it
 //! scans nothing itself. These tests pin what that means for the serving
 //! overlay: scan-once (a late child is not found by an arrival), rule-3
-//! reports, and reset on removal. A reference pull
-//! brings a peer's held set here: what is resident joins as it is, what is
-//! not is fetched by hash first.
+//! reports, and reset on removal. A pushed references tree brings a peer's
+//! held set here: what is resident joins as it is, what is not is fetched by
+//! hash first.
 
 use anybytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -97,15 +97,16 @@ fn observe(
     .unwrap()
 }
 
-/// The held digest a Full neighbour would compare.
+/// The root of the held set, which a pushed references tree carries: all
+/// zeros for the empty set.
 fn digest(serving: &StoreSnapshot, collection: CollectionHandle) -> [u8; 32] {
-    crate::collection_activation::held_digest(crate::patch_repair::PatchSummary::from_patch(
-        serving
-            .collection(collection)
-            .unwrap()
-            .repair
-            .blob_inventory(),
-    ))
+    serving
+        .collection(collection)
+        .unwrap()
+        .repair
+        .blob_inventory()
+        .merkle_root()
+        .unwrap_or_default()
 }
 
 fn held(serving: &StoreSnapshot, collection: CollectionHandle, handle: &[u8; 32]) -> bool {
@@ -297,19 +298,16 @@ fn a_new_records_closure_is_served_by_the_observation_that_carries_it() {
     }
 }
 
-mod reference_pull {
-    use tokio::sync::mpsc::Receiver;
+mod reference_push {
     use triblespace_core::collection::{CollectionData, empty_metadata_handle};
     use triblespace_core::repo::SnapshotSource;
 
     use super::*;
-    use crate::announce::{Announcements, State};
-    use crate::collection_activation::{held_digest, record_root};
-    use crate::connection::Link;
     use crate::patch_repair::PatchSummary;
-    use crate::recon::Frame;
-    use crate::walk::tests::walking::{Node, carry, connect, open};
-    use crate::walk::{PullDone, PullKind};
+    use crate::push::Push;
+    use crate::receive::{Out, Outcome, Receive};
+    use crate::walk::WalkKind;
+    use crate::walk::tests::walking::{Node, open};
 
     /// The held set the node's walks observe for C.
     fn held_set(node: &Node, collection: CollectionHandle) -> PatchSummary {
@@ -327,22 +325,22 @@ mod reference_pull {
         collection.repair().blob_inventory().has_prefix(handle)
     }
 
-    /// Two nodes holding one collection with the responder's record, whose
-    /// data D names two blob-only children. The responder holds all three.
-    /// The puller holds D, scanned before either child was resident, so no
-    /// later arrival of a child makes it held there.
+    /// Two nodes holding one collection with the sender's record, whose
+    /// data D names two blob-only children. The sender holds all three.
+    /// The receiver holds D, scanned before either child was resident, so
+    /// no later arrival of a child makes it held there.
     struct Pair {
-        puller: Node,
-        responder: Node,
+        receiver: Node,
+        sender: Node,
         collection: CollectionHandle,
         children: [Blob<UnknownBlob>; 2],
     }
 
     fn pair(first: u8) -> Pair {
-        let mut puller = Node::new(first);
-        let mut responder = Node::new(first + 1);
-        let collection = puller.hold("references", open());
-        assert_eq!(responder.hold("references", open()), collection);
+        let mut receiver = Node::new(first);
+        let mut sender = Node::new(first + 1);
+        let collection = receiver.hold("references", open());
+        assert_eq!(sender.hold("references", open()), collection);
         let children = [b"first child".as_slice(), b"second child".as_slice()]
             .map(|bytes| Blob::<UnknownBlob>::new(Bytes::from_source(bytes.to_vec())));
         let data = Blob::<UnknownBlob>::new(Bytes::from_source(
@@ -352,18 +350,15 @@ mod reference_pull {
                 .collect::<Vec<_>>(),
         ));
         for child in &children {
-            responder
-                .store
-                .put::<UnknownBlob, _>(child.clone())
-                .unwrap();
+            sender.store.put::<UnknownBlob, _>(child.clone()).unwrap();
         }
         let record = CollectionRecord::Commit(CollectionCommit::sign(
-            &responder.key,
+            &sender.key,
             collection,
             CollectionData::new(data.get_handle().raw),
             empty_metadata_handle(),
         ));
-        for node in [&mut puller, &mut responder] {
+        for node in [&mut receiver, &mut sender] {
             node.store.put::<UnknownBlob, _>(data.clone()).unwrap();
             node.store.insert(record).unwrap();
             node.store.track_held([collection]);
@@ -371,167 +366,137 @@ mod reference_pull {
             assert!(holds(node, collection, &data.get_handle().raw));
         }
         for child in &children {
-            assert!(holds(&responder, collection, &child.get_handle().raw));
-            assert!(!holds(&puller, collection, &child.get_handle().raw));
+            assert!(holds(&sender, collection, &child.get_handle().raw));
+            assert!(!holds(&receiver, collection, &child.get_handle().raw));
         }
         Pair {
-            puller,
-            responder,
+            receiver,
+            sender,
             collection,
             children,
         }
     }
 
-    impl Pair {
-        /// Answer the puller's fetches from the responder's store, failing
-        /// those `fail` names. Returns the handles fetched.
-        fn answer(&mut self, fail: &[[u8; 32]]) -> Vec<[u8; 32]> {
-            let now = crate::clock::mono_now();
-            let store = self.responder.store.snapshot().unwrap();
-            let mut handles = Vec::new();
-            for (walk, handle, proof) in std::mem::take(&mut self.puller.fetches) {
-                assert!(proof.is_none());
-                let blob = (!fail.contains(&handle)).then(|| {
-                    BlobStoreGet::get::<Blob<UnknownBlob>, UnknownBlob>(&store, Inline::new(handle))
-                        .unwrap()
-                });
-                self.puller.walks.fetched(walk, handle, None, blob, now);
-                handles.push(handle);
+    /// Push `sender`'s references tree of C into `receiver` by hand, through
+    /// the push and receive state machines, landing as the landing task
+    /// does and answering the receiver's fetches from the sender's store
+    /// except those `fail` names. Returns how the receive ended and the
+    /// handles fetched.
+    fn push_references(
+        sender: &mut Node,
+        receiver: &mut Node,
+        collection: CollectionHandle,
+        fail: &[[u8; 32]],
+    ) -> (Outcome, Vec<[u8; 32]>) {
+        let kind = WalkKind::References;
+        let pinned = sender.serving().collection(collection).unwrap();
+        let (mut push, frames) = Push::start(kind, pinned, None);
+        let mut receive = Receive::on_open(sender.id(), collection, kind, true, None).unwrap();
+        let store = sender.store.snapshot().unwrap();
+        let mut fetched = Vec::new();
+        let mut frames = std::collections::VecDeque::from(frames);
+        let mut outs = Vec::new();
+        loop {
+            if let Some(out) = outs.pop() {
+                let more = match out {
+                    Out::Send(frame) => {
+                        frames.extend(push.on_frame(frame).unwrap());
+                        continue;
+                    }
+                    Out::Land(events) => {
+                        let (landed, failed) = receiver.insert(events);
+                        receiver.observe();
+                        receive.on_landed_ack(landed, failed)
+                    }
+                    Out::Fetch { handle, proof } => {
+                        assert!(proof.is_none());
+                        fetched.push(handle);
+                        let blob = (!fail.contains(&handle)).then(|| {
+                            BlobStoreGet::get::<Blob<UnknownBlob>, UnknownBlob>(
+                                &store,
+                                Inline::new(handle),
+                            )
+                            .unwrap()
+                        });
+                        receive.on_fetched(handle, None, blob)
+                    }
+                };
+                outs.extend(more);
+            } else if let Some(frame) = frames.pop_front() {
+                outs.extend(receive.on_frame(frame, Some(receiver.snapshot())));
+            } else {
+                break;
             }
-            handles.sort_unstable();
-            handles
         }
+        fetched.sort_unstable();
+        (receive.outcome().expect("the push ended"), fetched)
     }
 
-    /// The puller lacks both children. It fetches them by hash from the
-    /// responder and holds them in C only because the responder holds them
-    /// there: D, which names them, was scanned before they arrived.
+    /// The receiver lacks both children. It fetches them by hash from the
+    /// sender and holds them in C only because the sender holds them there:
+    /// D, which names them, was scanned before they arrived.
     #[test]
-    fn a_reference_pull_fetches_what_the_peer_holds_and_holds_it_in_c() {
-        let now = crate::clock::mono_now();
+    fn a_pushed_references_tree_fetches_what_the_peer_holds_and_holds_it_in_c() {
         let mut pair = pair(41);
         let collection = pair.collection;
-        let mut wire = connect(&pair.puller, &pair.responder, 1);
-        pair.puller
-            .walks
-            .start_reference_pull(&wire.to_right, collection, now);
-        carry(&mut pair.puller, &mut pair.responder, &mut wire, now);
+        let (outcome, fetched) =
+            push_references(&mut pair.sender, &mut pair.receiver, collection, &[]);
+        assert_eq!(outcome, Outcome::Landed);
         let mut children = pair.children.clone().map(|child| child.get_handle().raw);
         children.sort_unstable();
-        assert_eq!(pair.answer(&[]), children);
-        carry(&mut pair.puller, &mut pair.responder, &mut wire, now);
-
-        let walked = held_set(&pair.responder, collection);
-        assert_eq!(
-            pair.puller.done,
-            [PullDone {
-                peer: pair.responder.id(),
-                collection,
-                kind: PullKind::References,
-                root: held_digest(walked),
-                completed: true,
-            }]
-        );
+        assert_eq!(fetched, children);
         for child in &children {
-            assert!(holds(&pair.puller, collection, child));
+            assert!(holds(&pair.receiver, collection, child));
         }
-        assert_eq!(held_set(&pair.puller, collection), walked);
+        assert_eq!(
+            held_set(&pair.receiver, collection),
+            held_set(&pair.sender, collection)
+        );
     }
 
-    /// The first child is resident at the puller without being held there,
-    /// and joins without a fetch. The fetch of the second fails, so the pull
-    /// does not complete and the next one fetches it again.
+    /// The first child is resident at the receiver without being held
+    /// there, and joins without a fetch. The fetch of the second fails, so
+    /// the push does not land, and the next one fetches it again.
     #[test]
-    fn a_resident_blob_joins_without_a_fetch_and_a_failed_fetch_is_retried() {
-        let now = crate::clock::mono_now();
+    fn a_resident_blob_joins_without_a_fetch_and_a_failed_fetch_fails_the_push() {
         let mut pair = pair(43);
         let collection = pair.collection;
         let [resident, fetched] = pair.children.clone().map(|child| child.get_handle().raw);
-        pair.puller
+        pair.receiver
             .store
             .put::<UnknownBlob, _>(pair.children[0].clone())
             .unwrap();
-        pair.puller.observe();
-        assert!(!holds(&pair.puller, collection, &resident));
-        let mut wire = connect(&pair.puller, &pair.responder, 1);
+        pair.receiver.observe();
+        assert!(!holds(&pair.receiver, collection, &resident));
         for attempt in 0..2 {
-            pair.puller
-                .walks
-                .start_reference_pull(&wire.to_right, collection, now);
-            carry(&mut pair.puller, &mut pair.responder, &mut wire, now);
             let fail = if attempt == 0 {
                 vec![fetched]
             } else {
                 Vec::new()
             };
-            assert_eq!(pair.answer(&fail), [fetched]);
-            carry(&mut pair.puller, &mut pair.responder, &mut wire, now);
-            assert!(holds(&pair.puller, collection, &resident));
-            assert_eq!(holds(&pair.puller, collection, &fetched), attempt == 1);
-            assert_eq!(pair.puller.done[attempt].completed, attempt == 1);
+            let (outcome, handles) =
+                push_references(&mut pair.sender, &mut pair.receiver, collection, &fail);
+            assert_eq!(handles, [fetched]);
+            assert!(holds(&pair.receiver, collection, &resident));
+            assert_eq!(holds(&pair.receiver, collection, &fetched), attempt == 1);
+            let expected = if attempt == 0 {
+                Outcome::Failed(crate::receive::Failure::InsertFailed)
+            } else {
+                Outcome::Landed
+            };
+            assert_eq!(outcome, expected);
         }
         assert_eq!(
-            held_set(&pair.puller, collection),
-            held_set(&pair.responder, collection)
+            held_set(&pair.receiver, collection),
+            held_set(&pair.sender, collection)
         );
     }
 
-    /// Answer `node`'s fetches from `holder`'s store.
-    fn serve_fetches(node: &mut Node, holder: &mut Node) {
-        let now = crate::clock::mono_now();
-        let store = holder.store.snapshot().unwrap();
-        for (walk, handle, _) in std::mem::take(&mut node.fetches) {
-            let blob =
-                BlobStoreGet::get::<Blob<UnknownBlob>, UnknownBlob>(&store, Inline::new(handle))
-                    .ok();
-            node.walks.fetched(walk, handle, None, blob, now);
-        }
-    }
-
-    /// What `node` announces for C as a Full neighbour.
-    fn state(node: &Node, collection: CollectionHandle) -> State {
-        let repair = node.serving().collection(collection).unwrap();
-        let repair = repair.repair();
-        State {
-            root: record_root(
-                collection,
-                repair.records().summary(),
-                repair.authorization_evidence().summary(),
-            ),
-            held: Some(held_digest(PatchSummary::from_patch(
-                repair.blob_inventory(),
-            ))),
-        }
-    }
-
-    /// The announcements sent on a link: state and reply flag.
-    fn announced(frames: &mut Receiver<Frame>) -> Vec<(State, bool)> {
-        std::iter::from_fn(|| frames.try_recv().ok())
-            .map(|frame| match frame {
-                Frame::Announce {
-                    root,
-                    held_digest,
-                    reply,
-                    ..
-                } => (
-                    State {
-                        root,
-                        held: held_digest,
-                    },
-                    reply,
-                ),
-                other => panic!("unexpected {other:?}"),
-            })
-            .collect()
-    }
-
-    /// Astra's R1: two quiet Full neighbours with equal records hold
-    /// different blobs in C. One announcement and its reply start a
-    /// reference pull each way, and both end with the union: the next
-    /// announcement is equal and starts nothing.
+    /// Astra's R1: two Full neighbours with equal records hold different
+    /// blobs in C. A push of the references tree each way ends with both
+    /// holding the union, and a push of the union is held whole.
     #[test]
-    fn quiet_full_neighbours_converge_after_one_announcement_and_reply() {
-        let mut now = crate::clock::mono_now();
+    fn full_neighbours_converge_on_their_held_blobs_by_pushing_each_way() {
         let mut x = Node::new(51);
         let mut y = Node::new(52);
         let collection = x.hold("held apart", open());
@@ -557,63 +522,20 @@ mod reference_pull {
             node.store.track_held([collection]);
             node.observe();
         }
-        let (x_state, y_state) = (state(&x, collection), state(&y, collection));
-        assert_eq!(x_state.root, y_state.root);
-        assert_ne!(x_state.held, y_state.held);
+        assert_ne!(held_set(&x, collection), held_set(&y, collection));
 
-        // Announcements and walks ride separate fake links here.
-        let (x_to_y, mut from_x) = Link::detached(2, y.id());
-        let (y_to_x, mut from_y) = Link::detached(2, x.id());
-        let (mut x_says, mut y_says) = (Announcements::default(), Announcements::default());
-        x_says.observe([(collection, x_state)], now);
-        y_says.observe([(collection, y_state)], now);
-        x_says.neighbours([(collection, &x_to_y, true, true)], now);
-        y_says.neighbours([(collection, &y_to_x, true, true)], now);
-        // X's first opportunity comes first.
-        while from_x.is_empty() {
-            now = now + std::time::Duration::from_millis(100);
-            x_says.poll(now);
-        }
-        let mut wire = connect(&x, &y, 1);
-        let [(announcement, false)] = announced(&mut from_x)[..] else {
-            panic!("one periodic announcement");
-        };
-        assert_eq!(announcement, x_state);
-        let pulls = y_says.heard(x.id(), collection, announcement, false, now);
-        assert_eq!(pulls, [(x.id(), collection, PullKind::References)]);
-        y.walks.start_reference_pull(&wire.to_left, collection, now);
-        let [(reply, true)] = announced(&mut from_y)[..] else {
-            panic!("one reply");
-        };
-        assert_eq!(reply, y_state);
-        let pulls = x_says.heard(y.id(), collection, reply, true, now);
-        assert_eq!(pulls, [(y.id(), collection, PullKind::References)]);
-        x.walks
-            .start_reference_pull(&wire.to_right, collection, now);
-
-        carry(&mut x, &mut y, &mut wire, now);
-        serve_fetches(&mut x, &mut y);
-        serve_fetches(&mut y, &mut x);
-        carry(&mut x, &mut y, &mut wire, now);
-        for (node, says) in [(&x, &mut x_says), (&y, &mut y_says)] {
-            assert_eq!(node.done.len(), 1);
-            assert!(node.done[0].completed);
-            assert!(says.ended(node.done[0], now).is_empty());
-        }
-        let union = state(&x, collection);
-        assert_eq!(union, state(&y, collection));
+        let (outcome, fetched) = push_references(&mut x, &mut y, collection, &[]);
+        assert_eq!(outcome, Outcome::Landed);
+        assert_eq!(fetched, [children[0].get_handle().raw]);
+        let (outcome, fetched) = push_references(&mut y, &mut x, collection, &[]);
+        assert_eq!(outcome, Outcome::Landed);
+        assert_eq!(fetched, [children[1].get_handle().raw]);
+        assert_eq!(held_set(&x, collection), held_set(&y, collection));
         for child in &children {
             assert!(holds(&x, collection, &child.get_handle().raw));
+            assert!(holds(&y, collection, &child.get_handle().raw));
         }
-        assert!(announced(&mut from_x).is_empty() && announced(&mut from_y).is_empty());
-
-        x_says.observe([(collection, union)], now);
-        y_says.observe([(collection, union)], now);
-        assert!(
-            y_says
-                .heard(x.id(), collection, union, false, now)
-                .is_empty()
-        );
-        assert!(announced(&mut from_y).is_empty());
+        let (outcome, fetched) = push_references(&mut x, &mut y, collection, &[]);
+        assert_eq!((outcome, fetched), (Outcome::Landed, Vec::new()));
     }
 }

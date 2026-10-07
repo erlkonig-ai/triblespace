@@ -1,9 +1,9 @@
 //! Bounds and summaries of one collection's repair evidence.
 //!
-//! The repair session that pinned one manifest per stream is gone: pull
-//! walks on `recon/1` ([`crate::walk`]) carry the evidence now. What stays is
-//! the leaf bound a walk frame enforces and the manifest that health reports
-//! as a collection's frontier.
+//! The repair session that pinned one manifest per stream is gone: pushes
+//! on `walk/1` streams ([`crate::walk`]) carry the evidence now. What stays
+//! is the leaf bound a walk frame enforces and the manifest that health
+//! reports as a collection's frontier.
 
 use triblespace_core::capability::MAX_CAPABILITY_PROOF_BYTES;
 

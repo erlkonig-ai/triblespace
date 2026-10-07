@@ -4,9 +4,10 @@
 //! instants belong to this process's monotonic clock; a reporter must preserve
 //! their age and its process identity instead of serializing them as wall time.
 //! Missing observations, offline peers, and missing cached blobs are not
-//! corruption. Collection comparisons concern READ-authorized repair evidence
+//! corruption. A pair's sync concerns READ-authorized repair evidence
 //! (`Record × AuthorizationEvidence`), including inert records, not admitted
-//! application values or payload availability.
+//! application values or payload availability: what the peer confirmed of
+//! this side's trees, and what landed of the peer's.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -18,6 +19,7 @@ use crate::clock::Mono;
 use crate::collection_wire::CollectionRepairManifest;
 use crate::patch_repair::PatchSummary;
 use crate::transport::PeerId;
+use crate::walk::WalkKind;
 
 /// Hard per-active-collection bound on retained pairwise runtime evidence.
 pub const MAX_HEALTH_PEERS_PER_COLLECTION: usize = 128;
@@ -51,86 +53,120 @@ impl From<CollectionRepairManifest> for RepairFrontier {
     }
 }
 
-/// A completed, validated pull's pinned observations, before store admission.
-/// `more == false` or receiving no leaves does not establish equality: the
-/// local set may strictly contain the remote set.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RepairComparison {
-    pub observed_at: Mono,
-    pub local: RepairFrontier,
-    pub remote: RepairFrontier,
-    pub records_received: u64,
-    pub proofs_received: u64,
-    pub more: bool,
+/// One direction of a pair's sync, as its ends were observed here: the
+/// pushes of this side's trees to the peer, or the pushes of the peer's trees
+/// received here.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Ends {
+    /// When the last one ended, and whether it ended well: a push the peer
+    /// confirmed, or a receive that landed whole.
+    pub last_at: Option<Mono>,
+    pub last_ok: bool,
+    /// When the last one that ended well did.
+    pub last_ok_at: Option<Mono>,
+    pub ok: u64,
+    pub failed: u64,
 }
 
-/// Sanitized failure classes. No error strings or bearer handles are retained.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RepairFailure {
-    Failed,
-    Deadline,
+impl Ends {
+    fn ended(&mut self, at: Mono, ok: bool) {
+        self.last_at = Some(at);
+        self.last_ok = ok;
+        if ok {
+            self.last_ok_at = Some(at);
+            self.ok += 1;
+        } else {
+            self.failed += 1;
+        }
+    }
 }
 
+/// The roots of a collection's records and authorization trees as pushes
+/// carry them, each from the last push of that tree that ended well. The
+/// references tree is in neither: held blobs are no part of record/AUTH
+/// health.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Roots {
+    pub records: Option<PatchSummary>,
+    pub authorization_evidence: Option<PatchSummary>,
+}
+
+impl Roots {
+    fn set(&mut self, kind: WalkKind, root: PatchSummary) {
+        match kind {
+            WalkKind::Records => self.records = Some(root),
+            WalkKind::Authorization => self.authorization_evidence = Some(root),
+            WalkKind::References => {}
+        }
+    }
+
+    /// Whether both roots are those of `frontier`.
+    pub fn hold(&self, frontier: &RepairFrontier) -> bool {
+        self.records == Some(frontier.records)
+            && self.authorization_evidence == Some(frontier.authorization_evidence)
+    }
+}
+
+/// One collection's sync with one peer, as this side observed it.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RepairHealth {
+pub struct PeerHealth {
     pub peer: PeerId,
-    pub in_flight: bool,
-    /// First scheduled attempt while this peer observation is retained. Retries
-    /// cannot extend the grace period of a peer that has never answered.
-    pub first_started_at: Option<Mono>,
-    pub last_started_at: Option<Mono>,
-    pub last_completed_at: Option<Mono>,
-    /// Last validated nonempty record/AUTH delta; not a durability receipt.
-    /// Repeated downloads can advance this while store admission is blocked.
-    /// Blob inventory hints are neither semantic progress nor fetched bodies.
-    pub last_progress_at: Option<Mono>,
-    /// First authorized comparison, or a change in its remote record/AUTH
-    /// frontier. Local writes, cache changes and repeated identical remote
-    /// evidence never advance this clock.
-    /// This is evidence of a changing remote frontier, not proof of gap closure.
-    pub last_remote_change_at: Option<Mono>,
-    pub last_failure_at: Option<Mono>,
-    pub last_failure: Option<RepairFailure>,
-    pub comparison: Option<RepairComparison>,
+    /// The first push or receive that ended while this observation is
+    /// retained. The progress grace counts from it; later ends cannot extend
+    /// it.
+    pub first_at: Option<Mono>,
+    /// Pushes of this side's trees to the peer: one ends well when the peer
+    /// confirms it landed.
+    pub pushes: Ends,
+    /// What the peer confirmed: a root is held once a push of its tree was
+    /// confirmed, and the peer holds that tree.
+    pub confirmed: Roots,
+    /// Pushes of the peer's trees received here: one ends well when
+    /// everything it pushed landed.
+    pub receives: Ends,
+    /// What the peer pushed that landed whole here.
+    pub received: Roots,
 }
 
-impl RepairHealth {
+impl PeerHealth {
     fn new(peer: PeerId) -> Self {
         Self {
             peer,
-            in_flight: false,
-            first_started_at: None,
-            last_started_at: None,
-            last_completed_at: None,
-            last_progress_at: None,
-            last_remote_change_at: None,
-            last_failure_at: None,
-            last_failure: None,
-            comparison: None,
+            first_at: None,
+            pushes: Ends::default(),
+            confirmed: Roots::default(),
+            receives: Ends::default(),
+            received: Roots::default(),
         }
     }
 
     fn last_event_at(&self) -> Option<Mono> {
-        self.last_started_at.max(self.last_completed_at)
+        self.pushes.last_at.max(self.receives.last_at)
     }
 
-    pub(crate) fn started(&mut self, at: Mono) {
-        self.in_flight = true;
-        self.first_started_at.get_or_insert(at);
-        self.last_started_at = Some(at);
+    /// A push of the `kind` tree, whose root is `root`, ended.
+    pub(crate) fn pushed(&mut self, at: Mono, kind: WalkKind, root: PatchSummary, confirmed: bool) {
+        self.first_at.get_or_insert(at);
+        self.pushes.ended(at, confirmed);
+        if confirmed {
+            self.confirmed.set(kind, root);
+        }
     }
 
-    pub(crate) fn compared(&mut self, comparison: RepairComparison, completed_at: Mono) {
-        if self
-            .comparison
-            .is_none_or(|previous| !previous.remote.same_evidence(&comparison.remote))
-        {
-            self.last_remote_change_at = Some(comparison.observed_at);
+    /// A push of the peer's `kind` tree ended here; `root` is its root, if
+    /// the push got that far.
+    pub(crate) fn received(
+        &mut self,
+        at: Mono,
+        kind: WalkKind,
+        root: Option<PatchSummary>,
+        landed: bool,
+    ) {
+        self.first_at.get_or_insert(at);
+        self.receives.ended(at, landed);
+        if let Some(root) = root.filter(|_| landed) {
+            self.received.set(kind, root);
         }
-        if comparison.records_received != 0 || comparison.proofs_received != 0 {
-            self.last_progress_at = Some(completed_at);
-        }
-        self.comparison = Some(comparison);
     }
 }
 
@@ -141,7 +177,7 @@ pub struct CollectionHealth {
     pub local_frontier: Option<RepairFrontier>,
     pub last_local_change_at: Option<Mono>,
     /// Recent observations only, not a roster or a list of all holders.
-    pub peers: Vec<RepairHealth>,
+    pub peers: Vec<PeerHealth>,
 }
 
 /// One collection's peering with one key, on one connection, as this side
@@ -251,11 +287,19 @@ impl PublicationHealth {
     }
 }
 
+/// What this side knows of one pair's sync.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ComparisonState {
+pub enum PairState {
     Unknown,
-    Matching,
-    Different,
+    /// Every direction the peering has is settled.
+    Current,
+    /// A direction is not: `pushes` says the peer has not confirmed the
+    /// records and evidence this side serves now, `receives` that the last
+    /// push from the peer did not land whole, or none has arrived.
+    Behind {
+        pushes: bool,
+        receives: bool,
+    },
 }
 
 /// An immutable copy of bounded evidence recorded at actual runtime events.
@@ -288,50 +332,55 @@ impl HealthSnapshot {
         fresh(self.observed_at, now, max_age)
     }
 
-    /// Pairwise, time-bounded evidence only. A local record/AUTH advance or
-    /// unavailable/stale store observation invalidates a former match.
-    /// Catching-up/stalled policy belongs to the observer: use actual local
-    /// changes, in-flight work, failures and progress, not successful RPC counts.
-    pub fn comparison(
+    /// Pairwise, time-bounded evidence only: `Current` once the peer
+    /// confirmed the records and evidence this side serves now, where this
+    /// side sends, and the last push from the peer landed whole, where it
+    /// receives. A local record/AUTH advance, an unavailable or stale store
+    /// observation, an ended peering or no push or receive within `max_age`
+    /// leaves the pair `Unknown`. Catching-up/stalled policy belongs to the
+    /// observer: use the ends and their times, not successful RPC counts.
+    pub fn pair(
         &self,
         collection: CollectionHandle,
         peer: PeerId,
         now: Mono,
         max_age: Duration,
-    ) -> ComparisonState {
+    ) -> PairState {
         if !self.is_fresh(now, max_age)
             || !self.store.serving_snapshot
             || !fresh(self.store.last_snapshot_observed_at, now, max_age)
             || self.store.last_failure_at > self.store.last_snapshot_observed_at
         {
-            return ComparisonState::Unknown;
+            return PairState::Unknown;
         }
-        let Some(collection) = self
+        let Some(entry) = self
             .collections
             .iter()
             .find(|entry| entry.collection == collection)
         else {
-            return ComparisonState::Unknown;
+            return PairState::Unknown;
         };
-        let Some(comparison) = collection
-            .peers
-            .iter()
-            .find(|entry| entry.peer == peer)
-            .and_then(|entry| entry.comparison)
-        else {
-            return ComparisonState::Unknown;
+        let Some(pair) = entry.peers.iter().find(|pair| pair.peer == peer) else {
+            return PairState::Unknown;
         };
-        if !fresh(Some(comparison.observed_at), now, max_age)
-            || !collection
-                .local_frontier
-                .is_some_and(|local| local.same_evidence(&comparison.local))
-        {
-            return ComparisonState::Unknown;
+        let Some(peering) = self.peerings.iter().find(|peering| {
+            peering.collection == collection && peering.peer == peer && peering.peered
+        }) else {
+            return PairState::Unknown;
+        };
+        if !fresh(pair.last_event_at(), now, max_age) {
+            return PairState::Unknown;
         }
-        if comparison.local.same_evidence(&comparison.remote) {
-            ComparisonState::Matching
+        let pushes = peering.sends
+            && !(pair.pushes.last_ok
+                && entry
+                    .local_frontier
+                    .is_some_and(|local| pair.confirmed.hold(&local)));
+        let receives = peering.receives && !pair.receives.last_ok;
+        if pushes || receives {
+            PairState::Behind { pushes, receives }
         } else {
-            ComparisonState::Different
+            PairState::Current
         }
     }
 }
@@ -375,7 +424,7 @@ impl Health {
         &self,
         collection: CollectionHandle,
         peer: PeerId,
-        update: impl FnOnce(&mut RepairHealth),
+        update: impl FnOnce(&mut PeerHealth),
     ) {
         self.update(|health| {
             let Some(collection) = health
@@ -394,14 +443,13 @@ impl Health {
                             .peers
                             .iter()
                             .enumerate()
-                            .filter(|(_, entry)| !entry.in_flight)
                             .min_by_key(|(_, entry)| (entry.last_event_at(), entry.peer))
                         else {
                             return;
                         };
                         collection.peers.swap_remove(oldest);
                     }
-                    collection.peers.push(RepairHealth::new(peer));
+                    collection.peers.push(PeerHealth::new(peer));
                     collection.peers.len() - 1
                 }
             };
@@ -506,197 +554,129 @@ mod tests {
                 last_local_change_at: Some(now),
                 peers: Vec::new(),
             });
+            health.peerings.push(PeeringHealth {
+                collection,
+                peer,
+                asked: true,
+                peered: true,
+                sends: true,
+                receives: true,
+                refused_by_me: false,
+                refused_by_them: false,
+            });
         });
         (health, collection, peer, now)
     }
 
-    fn compare(health: &Health, collection: CollectionHandle, peer: PeerId, now: Mono) {
-        health.with_peer(collection, peer, |health| {
-            health.last_started_at = Some(now);
-            health.last_completed_at = Some(now);
-            health.comparison = Some(RepairComparison {
-                observed_at: now,
-                local: frontier(5, 1),
-                remote: frontier(5, 1),
-                records_received: 0,
-                proofs_received: 0,
-                more: false,
-            });
+    /// Both trees of `frontier` pushed and confirmed, and a receive landed.
+    fn settle(health: &Health, collection: CollectionHandle, peer: PeerId, now: Mono) {
+        health.with_peer(collection, peer, |pair| {
+            let frontier = frontier(5, 1);
+            pair.pushed(now, WalkKind::Records, frontier.records, true);
+            pair.pushed(
+                now,
+                WalkKind::Authorization,
+                frontier.authorization_evidence,
+                true,
+            );
+            pair.received(now, WalkKind::Records, Some(frontier.records), true);
         });
     }
 
+    const AGE: Duration = Duration::from_secs(180);
+
     #[test]
-    fn unknown_until_an_actual_comparison_then_fresh_match_expires() {
+    fn unknown_until_an_end_then_a_fresh_settled_pair_expires() {
         let (health, collection, peer, now) = fixture();
-        let age = Duration::from_secs(180);
         assert_eq!(
-            health.snapshot().comparison(collection, peer, now, age),
-            ComparisonState::Unknown
+            health.snapshot().pair(collection, peer, now, AGE),
+            PairState::Unknown
         );
-        compare(&health, collection, peer, now);
+        settle(&health, collection, peer, now);
         let pinned = health.snapshot();
-        assert_eq!(
-            pinned.comparison(collection, peer, now, age),
-            ComparisonState::Matching
-        );
-        let later = now + age + Duration::from_secs(1);
+        assert_eq!(pinned.pair(collection, peer, now, AGE), PairState::Current);
+        let later = now + AGE + Duration::from_secs(1);
         // A live store/status reader cannot replace the host's last loop tick.
         health.update(|health| health.store.last_snapshot_observed_at = Some(later));
         for _ in 0..3 {
             let sampled = health.snapshot();
             assert_eq!(sampled.observed_at, Some(now));
-            assert!(!sampled.is_fresh(later, age));
+            assert!(!sampled.is_fresh(later, AGE));
             assert_eq!(
-                sampled.comparison(collection, peer, later, age),
-                ComparisonState::Unknown
+                sampled.pair(collection, peer, later, AGE),
+                PairState::Unknown
             );
         }
-        // Refreshing the host alone does not refresh the old remote comparison.
+        // Refreshing the host alone does not refresh the old ends.
         health.update(|health| health.observed_at = Some(later));
         assert_eq!(
-            health.snapshot().comparison(collection, peer, later, age),
-            ComparisonState::Unknown
+            health.snapshot().pair(collection, peer, later, AGE),
+            PairState::Unknown
         );
         assert_eq!(pinned.store.last_snapshot_observed_at, Some(now));
     }
 
+    /// A local advance leaves the confirmed roots behind the frontier; a
+    /// push the peer did not confirm, or a receive that did not land, each
+    /// name their direction.
     #[test]
-    fn one_way_pull_success_and_empty_delta_do_not_mean_equal() {
+    fn a_direction_is_behind_until_its_last_end_settles_the_frontier() {
         let (health, collection, peer, now) = fixture();
-        compare(&health, collection, peer, now);
-        health.update(|health| {
-            let collection = &mut health.collections[0];
-            collection.local_frontier = Some(frontier(6, 2));
-            collection.peers[0].comparison.as_mut().unwrap().local = frontier(6, 2);
-        });
-        assert_eq!(
-            health
-                .snapshot()
-                .comparison(collection, peer, now, Duration::from_secs(180)),
-            ComparisonState::Different,
-        );
-    }
-
-    #[test]
-    fn cache_only_root_changes_preserve_semantic_comparison_and_progress_clock() {
-        let (health, collection, peer, now) = fixture();
-        let local = frontier(5, 1);
-        let remote = RepairFrontier {
-            wake_root: [6; 32],
-            ..local
-        };
-        health.with_peer(collection, peer, |peer| {
-            peer.compared(
-                RepairComparison {
-                    observed_at: now,
-                    local,
-                    remote,
-                    records_received: 0,
-                    proofs_received: 0,
-                    more: false,
-                },
-                now,
-            );
-        });
-        let later = now + Duration::from_secs(1);
-        health.update(|health| {
-            // A local inventory pass changes only the composite scheduling root.
-            health.collections[0]
-                .local_frontier
-                .as_mut()
-                .unwrap()
-                .wake_root = [7; 32];
-        });
-        health.with_peer(collection, peer, |peer| {
-            let previous = peer.comparison.unwrap();
-            peer.compared(
-                RepairComparison {
-                    observed_at: later,
-                    remote: RepairFrontier {
-                        wake_root: [8; 32],
-                        ..previous.remote
-                    },
-                    ..previous
-                },
-                later,
-            );
-            assert_eq!(peer.last_remote_change_at, Some(now));
-            assert_eq!(peer.last_progress_at, None);
-        });
-        assert_eq!(
-            health
-                .snapshot()
-                .comparison(collection, peer, later, Duration::from_secs(180)),
-            ComparisonState::Matching,
-        );
-    }
-
-    #[test]
-    fn local_advances_and_identical_remote_replies_do_not_extend_remote_progress_grace() {
-        let now = crate::clock::mono_now();
-        let mut health = RepairHealth::new([4; 32]);
-        health.started(now);
-        let first_comparison = now + Duration::from_secs(1);
-        let comparison = RepairComparison {
-            observed_at: first_comparison,
-            local: frontier(5, 2),
-            remote: frontier(6, 1),
-            records_received: 0,
-            proofs_received: 0,
-            more: false,
-        };
-        health.compared(comparison, first_comparison);
-        assert_eq!(health.last_remote_change_at, Some(first_comparison));
-
-        let later = now + Duration::from_secs(601);
-        health.started(later);
-        health.compared(
-            RepairComparison {
-                observed_at: later,
-                local: frontier(7, 3),
-                ..comparison
-            },
-            later,
-        );
-        assert_eq!(health.first_started_at, Some(now));
-        assert_eq!(health.last_started_at, Some(later));
-        assert_eq!(health.last_remote_change_at, Some(first_comparison));
-        assert_eq!(health.comparison.unwrap().local, frontier(7, 3));
-        assert_eq!(health.last_progress_at, None);
-
-        let changed = later + Duration::from_secs(1);
-        health.compared(
-            RepairComparison {
-                observed_at: changed,
-                remote: frontier(8, 2),
-                ..health.comparison.unwrap()
-            },
-            changed,
-        );
-        assert_eq!(health.last_remote_change_at, Some(changed));
-    }
-
-    #[test]
-    fn unanswered_attempts_keep_the_first_attempt_for_grace() {
-        let now = crate::clock::mono_now();
-        let mut health = RepairHealth::new([4; 32]);
-        health.started(now);
-        health.started(now + Duration::from_secs(601));
-        assert_eq!(health.first_started_at, Some(now));
-        assert_eq!(health.last_remote_change_at, None);
-        assert_eq!(health.comparison, None);
-    }
-
-    #[test]
-    fn local_frontier_advance_and_withdrawal_invalidate_former_match() {
-        let (health, collection, peer, now) = fixture();
-        compare(&health, collection, peer, now);
-        let age = Duration::from_secs(180);
+        settle(&health, collection, peer, now);
         health.update(|health| health.collections[0].local_frontier = Some(frontier(6, 2)));
         assert_eq!(
-            health.snapshot().comparison(collection, peer, now, age),
-            ComparisonState::Unknown
+            health.snapshot().pair(collection, peer, now, AGE),
+            PairState::Behind {
+                pushes: true,
+                receives: false
+            }
         );
+        health.with_peer(collection, peer, |pair| {
+            pair.pushed(now, WalkKind::Records, frontier(6, 2).records, true);
+        });
+        assert_eq!(
+            health.snapshot().pair(collection, peer, now, AGE),
+            PairState::Current
+        );
+        health.with_peer(collection, peer, |pair| {
+            pair.pushed(now, WalkKind::Records, frontier(6, 2).records, false);
+            pair.received(now, WalkKind::Authorization, None, false);
+        });
+        let pinned = health.snapshot();
+        assert_eq!(
+            pinned.pair(collection, peer, now, AGE),
+            PairState::Behind {
+                pushes: true,
+                receives: true
+            }
+        );
+        let pair = &pinned.collections[0].peers[0];
+        assert_eq!((pair.pushes.ok, pair.pushes.failed), (3, 1));
+        assert_eq!((pair.receives.ok, pair.receives.failed), (1, 1));
+        assert_eq!(pair.confirmed.records, Some(frontier(6, 2).records));
+        assert_eq!(pair.received.records, Some(frontier(5, 1).records));
+        assert_eq!(pair.first_at, Some(now));
+
+        // A direction the peering does not have is never behind.
+        health.update(|health| {
+            health.peerings[0].sends = false;
+            health.peerings[0].receives = false;
+        });
+        assert_eq!(
+            health.snapshot().pair(collection, peer, now, AGE),
+            PairState::Current
+        );
+        health.update(|health| health.peerings.clear());
+        assert_eq!(
+            health.snapshot().pair(collection, peer, now, AGE),
+            PairState::Unknown
+        );
+    }
+
+    #[test]
+    fn local_frontier_withdrawal_and_failed_store_observation_leave_the_pair_unknown() {
+        let (health, collection, peer, now) = fixture();
+        settle(&health, collection, peer, now);
         health.update(|health| {
             health.collections[0].local_frontier = None;
             health.store.serving_snapshot = false;
@@ -708,29 +688,25 @@ mod tests {
             "active interest is not withdrawn with its view"
         );
         assert_eq!(
-            snapshot.comparison(collection, peer, now, age),
-            ComparisonState::Unknown
+            snapshot.pair(collection, peer, now, AGE),
+            PairState::Unknown
         );
-    }
 
-    #[test]
-    fn failed_store_observation_is_not_a_fresh_match() {
         let (health, collection, peer, now) = fixture();
-        compare(&health, collection, peer, now);
+        settle(&health, collection, peer, now);
         let later = now + Duration::from_secs(1);
-        let age = Duration::from_secs(180);
         health.update(|health| {
             health.store.last_failure_at = Some(later);
             health.store.last_failure = Some(StoreFailure::Snapshot);
         });
         assert_eq!(
-            health.snapshot().comparison(collection, peer, later, age),
-            ComparisonState::Unknown
+            health.snapshot().pair(collection, peer, later, AGE),
+            PairState::Unknown
         );
         health.update(|health| health.store.last_snapshot_observed_at = Some(later));
         assert_eq!(
-            health.snapshot().comparison(collection, peer, later, age),
-            ComparisonState::Matching
+            health.snapshot().pair(collection, peer, later, AGE),
+            PairState::Current
         );
     }
 
@@ -741,7 +717,7 @@ mod tests {
             let mut peer = [0; 32];
             peer[..8].copy_from_slice(&(index as u64).to_be_bytes());
             health.with_peer(collection, peer, |health| {
-                health.last_started_at = Some(now)
+                health.pushed(now, WalkKind::Records, frontier(1, 1).records, false)
             });
         }
         assert_eq!(

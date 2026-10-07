@@ -30,8 +30,8 @@
 //! holds.
 //!
 //! A prefix is a length byte and at most 32 bytes. A summary and a node are
-//! laid out as the pull walk's frames lay them out, by [`crate::walk`]'s own
-//! code; a node's tag byte says whether it is a branch or a leaf. Integers
+//! laid out by [`crate::walk`]'s own code; a node's tag byte says whether it
+//! is a branch or a leaf. Integers
 //! are big-endian. A kind this reader does not know, or an OPEN of a walk
 //! kind it does not know, is skipped; a known kind whose payload does not
 //! parse is malformed, and so is a VALUE without bytes.
@@ -44,24 +44,24 @@ use crate::recon::Malformed;
 use crate::walk::{Reader, WalkKind, node_tag, push_node, push_prefix, push_summary};
 
 /// The sender's first frame: the collection and the kind of tree it pushes.
-pub(crate) const FRAME_OPEN: u8 = 0x01;
+pub const FRAME_OPEN: u8 = 0x01;
 /// The summary of the pushed tree.
-pub(crate) const FRAME_ROOT: u8 = 0x02;
+pub const FRAME_ROOT: u8 = 0x02;
 /// One node of the pushed tree, at its prefix.
-pub(crate) const FRAME_NODE: u8 = 0x03;
+pub const FRAME_NODE: u8 = 0x03;
 /// One leaf of the pushed tree, by key.
-pub(crate) const FRAME_LEAF: u8 = 0x04;
+pub const FRAME_LEAF: u8 = 0x04;
 /// The receiver's answer to a NODE: which children it holds with the same
 /// digest.
-pub(crate) const FRAME_HELD: u8 = 0x05;
+pub const FRAME_HELD: u8 = 0x05;
 /// The receiver asks for the value under a key.
-pub(crate) const FRAME_VALUE_REQUEST: u8 = 0x06;
+pub const FRAME_VALUE_REQUEST: u8 = 0x06;
 /// The value under a key.
-pub(crate) const FRAME_VALUE: u8 = 0x07;
+pub const FRAME_VALUE: u8 = 0x07;
 /// The sender pushed everything.
-pub(crate) const FRAME_DONE: u8 = 0x08;
+pub const FRAME_DONE: u8 = 0x08;
 /// Everything the receiver asked for landed.
-pub(crate) const FRAME_LANDED: u8 = 0x09;
+pub const FRAME_LANDED: u8 = 0x09;
 
 /// One frame of a `walk/1` stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -327,41 +327,6 @@ mod tests {
         assert_eq!(payload[4..], children);
     }
 
-    /// A node is laid out as the pull walk lays it out, after its tag.
-    #[test]
-    fn nodes_and_summaries_share_the_pull_walks_layout() {
-        use crate::recon::Frame as ReconFrame;
-        use crate::walk::{Response, WalkBody, WalkFrame, WalkId};
-
-        let walk = WalkId {
-            collection: CollectionHandle::new([7; 32]),
-            kind: WalkKind::Records,
-            number: 0,
-        };
-        for frame in [branch(vec![6; 3], 4), leaf(vec![6; 3])] {
-            let (_, pushed) = frame.encode();
-            let Frame::Node { prefix, node } = frame else {
-                unreachable!()
-            };
-            let (_, pulled) = ReconFrame::Walk(WalkFrame {
-                walk,
-                body: WalkBody::Response(Response::Node { prefix, node }),
-            })
-            .encode();
-            // The pull walk's header is its collection, kind, number and
-            // the node's tag as its operation.
-            assert_eq!(pushed, pulled[35..]);
-        }
-        let summary = PatchSummary::new(Some([5; 32]), 600).unwrap();
-        let (_, pushed) = Frame::Root { summary }.encode();
-        let (_, pulled) = ReconFrame::Walk(WalkFrame {
-            walk,
-            body: WalkBody::Response(Response::Summary(summary)),
-        })
-        .encode();
-        assert_eq!(pushed, pulled[36..]);
-    }
-
     #[test]
     fn malformed_payloads_are_malformed_and_unknown_kinds_are_skipped() {
         let (_, open) = Frame::Open {
@@ -461,7 +426,7 @@ mod sim_tests {
     use crate::protocol::{PILE_SYNC_ALPN, TAG_WALK, send_u8};
     use crate::transport::sim::{SimConfig, SimNet, SimTransport};
     use crate::transport::{Conn, PeerId, RecvStream, SendStream, Transport};
-    use crate::walk::{Command, Pulls};
+    use crate::walk::{Command, WalksHandle};
 
     /// A service that serves no request stream.
     #[derive(Clone)]
@@ -549,7 +514,7 @@ mod sim_tests {
         assert_eq!(acceptor.table.len(), 1);
 
         let (commands, mut incoming) = mpsc::unbounded_channel();
-        acceptor.table.walks(Pulls(commands));
+        acceptor.table.walks(WalksHandle(commands));
         for (index, kind) in [
             WalkKind::Records,
             WalkKind::Authorization,

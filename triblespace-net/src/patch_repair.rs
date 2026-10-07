@@ -1,11 +1,12 @@
-//! Overlay-neutral, root-and-count-proven PATCH reconciliation.
+//! Overlay-neutral, root-and-count-proven PATCH nodes.
 //!
-//! A [`PatchSummary`] pins one immutable remote trie. The repair walker treats
-//! that authenticated remote shape as its only traversal plan: local state may
-//! discharge a subtree only when both digest and leaf count agree. Compressed
-//! paths need not line up between peers, responses may arrive out of order,
-//! and an unavailable or contradictory pinned snapshot fails closed without
-//! discarding leaves already admitted by the caller.
+//! A [`PatchSummary`] pins one immutable trie. A node of it travels as a
+//! [`PatchNode`], read from the pinned PATCH by [`patch_node_response`] and
+//! checked at the other end by [`validate_patch_node`] against the
+//! [`PatchRepairRequest`] that authenticates it: the root, or a child of a
+//! branch accepted before. A receiver discharges a subtree it holds only
+//! when both digest and leaf count agree; compressed paths need not line up
+//! between peers.
 
 use anyhow::{Result, anyhow, bail};
 
@@ -51,8 +52,7 @@ impl PatchSummary {
 
 /// Exact locator for one node under a pinned PATCH summary.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PatchRepairRequest<S> {
-    scope: S,
+pub(crate) struct PatchRepairRequest {
     summary: PatchSummary,
     /// Prefix relative to the caller-selected PATCH base.
     prefix: Vec<u8>,
@@ -60,9 +60,8 @@ pub(crate) struct PatchRepairRequest<S> {
     expected_digest: [u8; 32],
 }
 
-impl<S> PatchRepairRequest<S> {
+impl PatchRepairRequest {
     pub(crate) fn new(
-        scope: S,
         summary: PatchSummary,
         relative_key_len: usize,
         prefix: Vec<u8>,
@@ -81,15 +80,10 @@ impl<S> PatchRepairRequest<S> {
             bail!("PATCH root request digest does not match its pinned root");
         }
         Ok(Self {
-            scope,
             summary,
             prefix,
             expected_digest,
         })
-    }
-
-    pub(crate) const fn scope(&self) -> &S {
-        &self.scope
     }
 
     pub(crate) const fn summary(&self) -> PatchSummary {
@@ -161,8 +155,6 @@ impl<V> PatchNode<V> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PatchNodeResponse<V> {
     Found(PatchNode<V>),
-    /// The exact root is no longer retained by the serving peer.
-    SnapshotUnavailable,
     /// No node exists at a locator authenticated by an earlier branch.
     PrefixAbsent,
 }
@@ -237,8 +229,8 @@ pub(crate) fn patch_node_response<const KEY_LEN: usize, V, W>(
 
 /// Validate one returned node against its exact request and canonical PATCH
 /// hashing rules. The caller supplies only value-specific leaf validation.
-pub(crate) fn validate_patch_node<S, V>(
-    request: &PatchRepairRequest<S>,
+pub(crate) fn validate_patch_node<V>(
+    request: &PatchRepairRequest,
     key_len: usize,
     base: &[u8],
     node: &PatchNode<V>,
@@ -341,277 +333,6 @@ pub(crate) fn validate_patch_node<S, V>(
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PendingNode {
-    prefix: Vec<u8>,
-    digest: [u8; 32],
-    leaf_count: u64,
-}
-
-/// Count-proven outcome of one completed PATCH repair walk.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PatchRepairResult<S> {
-    pub(crate) scope: S,
-    pub(crate) summary: PatchSummary,
-    pub(crate) missing_count: u64,
-}
-
-/// Pipelined traversal state for one immutable remote PATCH root.
-///
-/// The local callbacks must describe one immutable observation for the entire
-/// walk. Later admissions can make work redundant, but must not manufacture a
-/// subtree equality against a moving snapshot.
-#[derive(Clone, Debug)]
-pub(crate) struct PatchRepairWalker<S> {
-    scope: S,
-    summary: PatchSummary,
-    relative_key_len: usize,
-    frontier: Vec<PendingNode>,
-    in_flight: Vec<PendingNode>,
-    accounted: u64,
-    missing_count: u64,
-    failed: bool,
-}
-
-impl<S> PatchRepairWalker<S>
-where
-    S: Clone + Eq,
-{
-    pub(crate) fn new(scope: S, summary: PatchSummary, relative_key_len: usize) -> Result<Self> {
-        // Revalidate at the trust boundary even when a local constructor made
-        // the summary.
-        let summary = PatchSummary::new(summary.root(), summary.leaf_count())?;
-        let frontier = summary
-            .root()
-            .map(|digest| {
-                vec![PendingNode {
-                    prefix: Vec::new(),
-                    digest,
-                    leaf_count: summary.leaf_count(),
-                }]
-            })
-            .unwrap_or_default();
-        let walker = Self {
-            scope,
-            summary,
-            relative_key_len,
-            frontier,
-            in_flight: Vec::new(),
-            accounted: 0,
-            missing_count: 0,
-            failed: false,
-        };
-        walker.verify_count_invariant()?;
-        Ok(walker)
-    }
-
-    /// Return the next pinned request, skipping exact local subtrees.
-    pub(crate) fn next_request(
-        &mut self,
-        mut local_summary: impl FnMut(&S, &[u8]) -> Option<PatchSummary>,
-    ) -> Result<Option<PatchRepairRequest<S>>> {
-        if self.failed {
-            bail!("PATCH repair walker is failed");
-        }
-        while let Some(pending) = self.frontier.pop() {
-            if local_summary(&self.scope, &pending.prefix)
-                == Some(PatchSummary::new(Some(pending.digest), pending.leaf_count)?)
-            {
-                self.accounted = self
-                    .accounted
-                    .checked_add(pending.leaf_count)
-                    .ok_or_else(|| anyhow!("PATCH repair accounted count overflow"))?;
-                self.verify_count_invariant()?;
-                continue;
-            }
-
-            let request = PatchRepairRequest::new(
-                self.scope.clone(),
-                self.summary,
-                self.relative_key_len,
-                pending.prefix.clone(),
-                pending.digest,
-            )?;
-            self.in_flight.push(pending);
-            self.verify_count_invariant()?;
-            return Ok(Some(request));
-        }
-
-        self.verify_count_invariant()?;
-        if self.in_flight.is_empty() && self.accounted != self.summary.leaf_count() {
-            self.failed = true;
-            bail!(
-                "PATCH repair frontier ended after accounting for {} of {} leaves",
-                self.accounted,
-                self.summary.leaf_count()
-            );
-        }
-        Ok(None)
-    }
-
-    /// Consume one response and yield a missing authenticated leaf immediately.
-    pub(crate) fn accept<V>(
-        &mut self,
-        request: &PatchRepairRequest<S>,
-        response: PatchNodeResponse<V>,
-        mut local_contains: impl FnMut(&S, &[u8]) -> bool,
-    ) -> Result<Option<PatchLeaf<V>>> {
-        if self.failed {
-            bail!("PATCH repair walker is failed");
-        }
-        let result = self.accept_inner(request, response, &mut local_contains);
-        if result.is_err() {
-            self.failed = true;
-        }
-        result
-    }
-
-    fn accept_inner<V>(
-        &mut self,
-        request: &PatchRepairRequest<S>,
-        response: PatchNodeResponse<V>,
-        local_contains: &mut impl FnMut(&S, &[u8]) -> bool,
-    ) -> Result<Option<PatchLeaf<V>>> {
-        if request.scope() != &self.scope || request.summary() != self.summary {
-            bail!("PATCH response request does not belong to this pinned walk");
-        }
-        let position = self
-            .in_flight
-            .iter()
-            .position(|pending| {
-                pending.prefix == request.prefix() && pending.digest == request.expected_digest()
-            })
-            .ok_or_else(|| anyhow!("PATCH response has no matching in-flight request"))?;
-        let pending = self.in_flight.swap_remove(position);
-        let node = match response {
-            PatchNodeResponse::SnapshotUnavailable => {
-                bail!("pinned PATCH snapshot is unavailable; request a fresh summary")
-            }
-            PatchNodeResponse::PrefixAbsent => bail!(
-                "authenticated PATCH prefix {} is absent",
-                hex::encode(&pending.prefix)
-            ),
-            PatchNodeResponse::Found(node) => node,
-        };
-
-        if node.digest() != pending.digest {
-            bail!("PATCH node digest does not match its authenticated parent");
-        }
-        if node.leaf_count() != pending.leaf_count {
-            bail!(
-                "PATCH node leaf count {} does not match authenticated pending count {}",
-                node.leaf_count(),
-                pending.leaf_count
-            );
-        }
-
-        let missing = match node {
-            PatchNode::Leaf { leaf, .. } => {
-                if pending.leaf_count != 1 || !leaf.key.starts_with(&pending.prefix) {
-                    bail!("PATCH leaf does not discharge its authenticated locator");
-                }
-                let missing = (!local_contains(&self.scope, &leaf.key)).then_some(leaf);
-                if missing.is_some() {
-                    self.missing_count = self
-                        .missing_count
-                        .checked_add(1)
-                        .ok_or_else(|| anyhow!("PATCH repair missing count overflow"))?;
-                }
-                self.accounted = self
-                    .accounted
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow!("PATCH repair accounted count overflow"))?;
-                missing
-            }
-            PatchNode::Branch { branch, .. } => {
-                let end_depth = usize::from(branch.end_depth);
-                if end_depth >= branch.representative.len()
-                    || !branch.representative[..end_depth].starts_with(&pending.prefix)
-                {
-                    bail!("PATCH branch does not extend its authenticated locator");
-                }
-
-                let mut previous = None;
-                let mut child_total = 0u64;
-                for child in &branch.children {
-                    if previous.is_some_and(|edge| child.edge <= edge) || child.leaf_count == 0 {
-                        bail!("PATCH branch children are not canonical");
-                    }
-                    previous = Some(child.edge);
-                    child_total = child_total
-                        .checked_add(child.leaf_count)
-                        .ok_or_else(|| anyhow!("PATCH child count overflow"))?;
-                }
-                if child_total != pending.leaf_count {
-                    bail!(
-                        "PATCH branch child counts {child_total} do not discharge pending count {}",
-                        pending.leaf_count
-                    );
-                }
-
-                // Reverse push makes the LIFO frontier walk ascending edges.
-                // Bytes after end_depth are representative-only routing
-                // witnesses and never participate in a child locator.
-                for child in branch.children.into_iter().rev() {
-                    let mut prefix = branch.representative[..end_depth].to_vec();
-                    prefix.push(child.edge);
-                    self.frontier.push(PendingNode {
-                        prefix,
-                        digest: child.digest,
-                        leaf_count: child.leaf_count,
-                    });
-                }
-                None
-            }
-        };
-        self.verify_count_invariant()?;
-        Ok(missing)
-    }
-
-    /// Prove completion and return the exact summary plus bounded counters.
-    pub(crate) fn finish(self) -> Result<PatchRepairResult<S>> {
-        if self.failed {
-            bail!("PATCH repair walker failed before completion");
-        }
-        if !self.in_flight.is_empty()
-            || !self.frontier.is_empty()
-            || self.accounted != self.summary.leaf_count()
-        {
-            bail!(
-                "PATCH repair walk is incomplete: accounted {} of {} leaves",
-                self.accounted,
-                self.summary.leaf_count()
-            );
-        }
-        Ok(PatchRepairResult {
-            scope: self.scope,
-            summary: self.summary,
-            missing_count: self.missing_count,
-        })
-    }
-
-    fn verify_count_invariant(&self) -> Result<()> {
-        let mut total = self.accounted;
-        for in_flight in &self.in_flight {
-            total = total
-                .checked_add(in_flight.leaf_count)
-                .ok_or_else(|| anyhow!("PATCH repair count invariant overflow"))?;
-        }
-        for pending in &self.frontier {
-            total = total
-                .checked_add(pending.leaf_count)
-                .ok_or_else(|| anyhow!("PATCH repair count invariant overflow"))?;
-        }
-        if total != self.summary.leaf_count() {
-            bail!(
-                "PATCH repair count invariant accounts for {total} of {} leaves",
-                self.summary.leaf_count()
-            );
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -628,45 +349,6 @@ mod tests {
         patch_node_response(patch, &[], prefix, |_, ()| Ok(())).unwrap()
     }
 
-    fn run_walk(
-        remote: &TestPatch,
-        local: &TestPatch,
-    ) -> (PatchRepairResult<()>, Vec<Vec<u8>>, Vec<PatchLeaf<()>>) {
-        let mut walker = PatchRepairWalker::new((), PatchSummary::from_patch(remote), 32).unwrap();
-        let mut requests = Vec::new();
-        let mut missing = Vec::new();
-        loop {
-            let request = walker
-                .next_request(|_, prefix| {
-                    local.merkle_node(prefix).map(|node| {
-                        PatchSummary::new(Some(node.digest()), node.leaf_count()).unwrap()
-                    })
-                })
-                .unwrap();
-            let Some(request) = request else {
-                break;
-            };
-            requests.push(request.prefix().to_vec());
-            if let Some(leaf) = walker
-                .accept(&request, response(remote, request.prefix()), |_, raw| {
-                    let key: [u8; 32] = raw.try_into().unwrap();
-                    local.get(&key).is_some()
-                })
-                .unwrap()
-            {
-                missing.push(leaf);
-            }
-        }
-        (walker.finish().unwrap(), requests, missing)
-    }
-
-    fn missing_keys(missing: &[PatchLeaf<()>]) -> Vec<[u8; 32]> {
-        missing
-            .iter()
-            .map(|leaf| leaf.key.as_slice().try_into().unwrap())
-            .collect()
-    }
-
     #[test]
     fn summary_rejects_empty_root_count_disagreement() {
         assert!(PatchSummary::new(None, 1).is_err());
@@ -674,180 +356,37 @@ mod tests {
         assert_eq!(PatchSummary::new(None, 0).unwrap().leaf_count(), 0);
     }
 
+    /// A node whose digest is not the requested one, or whose children's
+    /// counts do not add up to its own, is rejected, as is a leaf outside
+    /// the requested prefix; the node as the PATCH serves it passes.
     #[test]
-    fn remote_split_shallower_than_local_compressed_path() {
-        let a = key([1, 2, 3, 0]);
-        let b = key([1, 2, 4, 0]);
-        let c = key([1, 2, 3, 255]);
-        let remote = TestPatch::from_keys([a, b]);
-        let local = TestPatch::from_keys([a, c]);
-
-        let (result, _, missing) = run_walk(&remote, &local);
-        assert_eq!(result.summary.leaf_count(), 2);
-        assert_eq!(result.missing_count, 1);
-        assert_eq!(missing_keys(&missing), [b]);
-    }
-
-    #[test]
-    fn local_split_shallower_than_remote_compressed_path() {
-        let a = key([1, 2, 3, 0]);
-        let b = key([1, 2, 4, 0]);
-        let c = key([1, 2, 3, 255]);
-        let remote = TestPatch::from_keys([a, c]);
-        let local = TestPatch::from_keys([a, b]);
-
-        let (result, _, missing) = run_walk(&remote, &local);
-        assert_eq!(result.summary.leaf_count(), 2);
-        assert_eq!(result.missing_count, 1);
-        assert_eq!(missing_keys(&missing), [c]);
-    }
-
-    #[test]
-    fn singleton_and_branch_reconcile_in_both_directions() {
-        let a = key([1, 2, 3, 0]);
-        let c = key([1, 2, 3, 255]);
-
-        let remote_singleton = TestPatch::from_keys([a]);
-        let local_branch = TestPatch::from_keys([a, c]);
-        let (singleton, _, singleton_missing) = run_walk(&remote_singleton, &local_branch);
-        assert_eq!(singleton.summary.leaf_count(), 1);
-        assert_eq!(singleton.missing_count, 0);
-        assert!(singleton_missing.is_empty());
-
-        let remote_branch = TestPatch::from_keys([a, c]);
-        let local_singleton = TestPatch::from_keys([a]);
-        let (branch, _, branch_missing) = run_walk(&remote_branch, &local_singleton);
-        assert_eq!(branch.summary.leaf_count(), 2);
-        assert_eq!(branch.missing_count, 1);
-        assert_eq!(missing_keys(&branch_missing), [c]);
-    }
-
-    #[test]
-    fn child_locator_may_end_inside_remote_compression() {
-        let d = key([0, 7, 8, 1]);
-        let e = key([0, 7, 8, 2]);
-        let f = key([9, 0, 0, 0]);
-        let remote = TestPatch::from_keys([d, e, f]);
-        let local = TestPatch::from_keys([d, f]);
-
-        let (result, requests, missing) = run_walk(&remote, &local);
-        assert_eq!(result.missing_count, 1);
-        assert_eq!(missing_keys(&missing), [e]);
-        assert!(requests.iter().any(|prefix| prefix == &[0]));
-        assert!(requests.iter().any(|prefix| prefix == &[0, 7, 8, 2]));
-    }
-
-    #[test]
-    fn independent_frontier_responses_may_arrive_out_of_order() {
-        let remote = TestPatch::from_keys((0..32u8).map(|edge| key([edge, 7, 8, 9])));
-        let summary = PatchSummary::from_patch(&remote);
-        let mut walker = PatchRepairWalker::new((), summary, 32).unwrap();
-
-        let root = walker.next_request(|_, _| None).unwrap().unwrap();
-        walker
-            .accept(&root, response(&remote, root.prefix()), |_, _| false)
-            .unwrap();
-
-        let mut frontier = Vec::new();
-        while let Some(request) = walker.next_request(|_, _| None).unwrap() {
-            frontier.push(request);
-        }
-        assert_eq!(frontier.len(), 32);
-        assert!(walker.finish().is_err(), "outstanding requests are counted");
-
-        let mut walker = PatchRepairWalker::new((), summary, 32).unwrap();
-        let root = walker.next_request(|_, _| None).unwrap().unwrap();
-        walker
-            .accept(&root, response(&remote, root.prefix()), |_, _| false)
-            .unwrap();
-        let mut frontier = Vec::new();
-        while let Some(request) = walker.next_request(|_, _| None).unwrap() {
-            frontier.push(request);
-        }
-
-        let mut missing = Vec::new();
-        for request in frontier.into_iter().rev() {
-            missing.push(
-                walker
-                    .accept(&request, response(&remote, request.prefix()), |_, _| false)
-                    .unwrap()
-                    .expect("empty local PATCH misses every leaf"),
-            );
-        }
-        assert!(walker.next_request(|_, _| None).unwrap().is_none());
-        let result = walker.finish().unwrap();
-        assert_eq!(result.summary.leaf_count(), 32);
-        assert_eq!(result.missing_count, 32);
-        assert_eq!(missing.len(), 32);
-    }
-
-    #[test]
-    fn unavailable_or_absent_prefix_never_completes() {
-        let remote = TestPatch::from_keys([key([1, 2, 3, 0])]);
-        let summary = PatchSummary::from_patch(&remote);
-        for response in [
-            PatchNodeResponse::<()>::SnapshotUnavailable,
-            PatchNodeResponse::<()>::PrefixAbsent,
-        ] {
-            let mut walker = PatchRepairWalker::new((), summary, 32).unwrap();
-            let request = walker.next_request(|_, _| None).unwrap().unwrap();
-            assert!(walker.accept(&request, response, |_, _| false).is_err());
-            assert!(walker.finish().is_err());
-        }
-
-        let branch =
-            TestPatch::from_keys([key([0, 7, 8, 1]), key([0, 7, 8, 2]), key([9, 0, 0, 0])]);
-        let mut child_absent =
-            PatchRepairWalker::new((), PatchSummary::from_patch(&branch), 32).unwrap();
-        let root = child_absent.next_request(|_, _| None).unwrap().unwrap();
-        child_absent
-            .accept(&root, response(&branch, root.prefix()), |_, _| false)
-            .unwrap();
-        let child = child_absent.next_request(|_, _| None).unwrap().unwrap();
-        assert!(!child.prefix().is_empty());
-        assert!(
-            child_absent
-                .accept(&child, PatchNodeResponse::<()>::PrefixAbsent, |_, _| false)
-                .is_err()
-        );
-        assert!(child_absent.finish().is_err());
-    }
-
-    #[test]
-    fn wrong_digest_or_exact_child_count_never_completes() {
+    fn a_node_is_rejected_unless_it_binds_its_request() {
         let a = key([1, 2, 3, 0]);
         let b = key([1, 2, 3, 1]);
         let c = key([1, 2, 3, 2]);
         let d = key([1, 2, 4, 0]);
         let remote = TestPatch::from_keys([a, b, c, d]);
         let summary = PatchSummary::from_patch(&remote);
-
-        let mut wrong_digest = PatchRepairWalker::new((), summary, 32).unwrap();
-        let root = wrong_digest.next_request(|_, _| None).unwrap().unwrap();
-        let PatchNodeResponse::Found(mut node) = response(&remote, root.prefix()) else {
+        let root =
+            PatchRepairRequest::new(summary, 32, Vec::new(), summary.root().unwrap()).unwrap();
+        let PatchNodeResponse::Found(node) = response(&remote, &[]) else {
             unreachable!()
         };
-        match &mut node {
+        validate_patch_node(&root, 32, &[], &node, |_, ()| Ok(())).unwrap();
+
+        let mut wrong_digest = node.clone();
+        match &mut wrong_digest {
             PatchNode::Leaf { digest, .. } | PatchNode::Branch { digest, .. } => {
                 digest[0] ^= 1;
             }
         }
-        assert!(
-            wrong_digest
-                .accept(&root, PatchNodeResponse::Found(node), |_, _| false)
-                .is_err()
-        );
-        assert!(wrong_digest.finish().is_err());
+        assert!(validate_patch_node(&root, 32, &[], &wrong_digest, |_, ()| Ok(())).is_err());
 
-        // Blake3Merkle rejects this redistribution at the wire validator. The
-        // state machine still fails closed if an internal caller bypasses it.
-        let mut wrong_count = PatchRepairWalker::new((), summary, 32).unwrap();
-        let root = wrong_count.next_request(|_, _| None).unwrap().unwrap();
-        let PatchNodeResponse::Found(PatchNode::Branch {
+        let PatchNode::Branch {
             digest,
             leaf_count,
             mut branch,
-        }) = response(&remote, root.prefix())
+        } = node
         else {
             unreachable!()
         };
@@ -859,26 +398,34 @@ mod tests {
                 .collect::<Vec<_>>(),
             [3, 1]
         );
+        let mut child =
+            PatchRepairRequest::new(summary, 32, vec![1, 2, 3], branch.children[0].digest).unwrap();
+        let PatchNodeResponse::Found(first) = response(&remote, &[1, 2, 3]) else {
+            unreachable!()
+        };
+        validate_patch_node(&child, 32, &[], &first, |_, ()| Ok(())).unwrap();
+        // A leaf under another prefix than the one requested.
+        child =
+            PatchRepairRequest::new(summary, 32, vec![1, 2, 4], branch.children[0].digest).unwrap();
+        assert!(validate_patch_node(&child, 32, &[], &first, |_, ()| Ok(())).is_err());
+
+        // Child counts redistributed: the sum still matches, the digest
+        // no longer does; a sum that does not match fails first.
         branch.children[0].leaf_count = 2;
         branch.children[1].leaf_count = 2;
-        wrong_count
-            .accept(
-                &root,
-                PatchNodeResponse::<()>::Found(PatchNode::Branch {
-                    digest,
-                    leaf_count,
-                    branch,
-                }),
-                |_, _| false,
-            )
-            .unwrap();
-        let child = wrong_count.next_request(|_, _| None).unwrap().unwrap();
-        assert!(
-            wrong_count
-                .accept(&child, response(&remote, child.prefix()), |_, _| false)
-                .is_err()
-        );
-        assert!(wrong_count.finish().is_err());
+        let redistributed = PatchNode::<()>::Branch {
+            digest,
+            leaf_count,
+            branch: branch.clone(),
+        };
+        assert!(validate_patch_node(&root, 32, &[], &redistributed, |_, ()| Ok(())).is_err());
+        branch.children[1].leaf_count = 3;
+        let overcounted = PatchNode::<()>::Branch {
+            digest,
+            leaf_count,
+            branch,
+        };
+        assert!(validate_patch_node(&root, 32, &[], &overcounted, |_, ()| Ok(())).is_err());
     }
 
     #[test]
@@ -890,8 +437,7 @@ mod tests {
             let root = patch.merkle_node(&[9, 9]).unwrap();
             PatchSummary::new(Some(root.digest()), root.leaf_count()).unwrap()
         };
-        let request =
-            PatchRepairRequest::new((), summary, 2, vec![], summary.root().unwrap()).unwrap();
+        let request = PatchRepairRequest::new(summary, 2, vec![], summary.root().unwrap()).unwrap();
         let PatchNodeResponse::Found(node) = response else {
             unreachable!()
         };

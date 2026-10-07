@@ -3,13 +3,17 @@
 //! A [`Receive`] takes what one sender pushes on one `walk/1` stream
 //! ([`crate::walk_stream`]) of one collection and kind and decides, frame by
 //! frame, what to send back and what to land; it does no I/O of its own, and
-//! [`crate::walk`] drives it. The pushed root is compared with the live tree:
-//! an equal root is answered with everything held, and the push ends there.
-//! Every pushed node is answered with the children the live tree holds under
-//! the same digest, whose subtrees the sender then skips; every pushed leaf
-//! whose value the live store lacks is asked for and lands as it arrives. A
-//! held reference carries no value: one resident here is noted held as it
-//! is, another is fetched by hash.
+//! [`crate::walk`] drives it. The pushed root is never answered. It is
+//! compared with the live tree and with the root of the last push from the
+//! same sender that landed here: while it equals either, every pushed node
+//! is answered with every child held and pushed leaves are ignored, so the
+//! root alone satisfies the count proof and a push of ROOT then DONE lands
+//! at once, at a receiver that holds the tree or a superset of it. Otherwise
+//! every pushed node is answered with the children the
+//! live tree holds under the same digest, whose subtrees the sender then
+//! skips, and every pushed leaf whose value the live store lacks is asked
+//! for and lands as it arrives. A held reference carries no value: one
+//! resident here is noted held as it is, another is fetched by hash.
 //!
 //! The push ends in one of two ways. It lands when its count proof closes
 //! (the leaves pushed plus the leaves of every skipped subtree are exactly
@@ -104,7 +108,11 @@ pub(crate) struct Receive {
     /// against between frames.
     snapshot: Option<Arc<StoreSnapshot>>,
     root: Option<PatchSummary>,
-    /// The pushed root equals the live tree: everything is held.
+    /// The root of the last push of this tree from the sender that landed
+    /// here, which the sender may push again as ROOT then DONE.
+    landed: Option<PatchSummary>,
+    /// The pushed root equals the live tree, or landed here before:
+    /// everything is held.
     equal: bool,
     /// Leaves pushed, and the leaves of the subtrees skipped as held.
     accounted: u64,
@@ -127,18 +135,21 @@ pub(crate) struct Receive {
 impl Receive {
     /// Take the sender's open of C's `kind` tree. `admitted` is whether this
     /// side receives C from the peer; a push it does not admit is refused
-    /// (`None`), and the driver resets the stream.
+    /// (`None`), and the driver resets the stream. `landed` is the root of
+    /// the last push of this tree from the peer that landed here.
     pub(crate) fn on_open(
         _peer: PeerId,
         collection: CollectionHandle,
         kind: WalkKind,
         admitted: bool,
+        landed: Option<PatchSummary>,
     ) -> Option<Self> {
         admitted.then(|| Self {
             collection,
             kind,
             snapshot: None,
             root: None,
+            landed,
             equal: false,
             accounted: 0,
             held: VecDeque::new(),
@@ -208,6 +219,11 @@ impl Receive {
         self.outcome
     }
 
+    /// The pushed root, once it arrived.
+    pub(crate) fn root(&self) -> Option<PatchSummary> {
+        self.root
+    }
+
     fn frame(&mut self, frame: Frame, outs: &mut Vec<Out>) -> Result<(), Failure> {
         let live = self
             .snapshot
@@ -221,20 +237,17 @@ impl Receive {
                     return Err(Failure::Protocol);
                 }
                 self.root = Some(summary);
-                if summary == crate::walk::summary(self.kind, overlay) {
+                if summary == crate::walk::summary(self.kind, overlay)
+                    || Some(summary) == self.landed
+                {
                     self.equal = true;
                     self.accounted = summary.leaf_count();
-                    self.held.push_back(Frame::Held {
-                        prefix: Vec::new(),
-                        children: [0xFF; 32],
-                    });
                 }
             }
             Frame::Node { prefix, node } => {
                 let root = self.pushing()?;
                 if self.equal {
-                    // Held whole at the root; the sender may have pushed on
-                    // before it read that.
+                    // The whole tree is here: every child of every node.
                     self.held.push_back(Frame::Held {
                         prefix,
                         children: [0xFF; 32],
@@ -243,7 +256,7 @@ impl Receive {
                 }
                 let base = crate::walk::base(self.kind, self.collection);
                 let request =
-                    PatchRepairRequest::new((), root, KEY_BYTES, prefix.clone(), node.digest())
+                    PatchRepairRequest::new(root, KEY_BYTES, prefix.clone(), node.digest())
                         .map_err(|_| Failure::BadNode)?;
                 validate_patch_node(&request, base.len() + KEY_BYTES, &base, &node, |_, ()| {
                     Ok(())
@@ -427,8 +440,19 @@ mod tests {
 
     impl Harness {
         fn new(node: Node, collection: CollectionHandle, kind: WalkKind) -> Self {
+            Self::landed(node, collection, kind, None)
+        }
+
+        /// A harness whose receiver landed a push with root `landed` from
+        /// the sender before.
+        fn landed(
+            node: Node,
+            collection: CollectionHandle,
+            kind: WalkKind,
+            landed: Option<PatchSummary>,
+        ) -> Self {
             Self {
-                receive: Receive::on_open([0; 32], collection, kind, true).unwrap(),
+                receive: Receive::on_open([0; 32], collection, kind, true, landed).unwrap(),
                 node,
                 sent: Vec::new(),
                 pending: Vec::new(),
@@ -540,14 +564,7 @@ mod tests {
             helds
         };
         let root = crate::walk::summary(kind, overlay);
-        let helds = send(harness, Frame::Root { summary: root });
-        if helds
-            .iter()
-            .any(|(prefix, children)| prefix.is_empty() && *children == [0xFF; 32])
-        {
-            send(harness, Frame::Done);
-            return pushed;
-        }
+        assert!(send(harness, Frame::Root { summary: root }).is_empty());
         let mut stack = vec![Vec::new()];
         while let Some(prefix) = stack.pop() {
             match crate::walk::node(kind, overlay, &prefix).expect("a pushed prefix is present") {
@@ -597,10 +614,15 @@ mod tests {
             .collect()
     }
 
-    /// A push of a tree the receiver already holds is answered at the root
-    /// and ends with the sender's end: two frames each way.
+    /// A push of a tree the receiver already holds is held whole at its
+    /// first node and ends with the sender's end; one of the confirmed tree,
+    /// ROOT then DONE, is answered with LANDED alone, at a receiver whose
+    /// tree equals it or that landed it before and holds more now. A push
+    /// whose root the receiver's tree does not equal, and that it never
+    /// landed, is not held at its first node, and ROOT then DONE fails its
+    /// count proof there.
     #[test]
-    fn an_equal_root_ends_in_one_exchange() {
+    fn an_equal_or_landed_root_is_held_whole_and_never_answered() {
         let mut sender = Node::new(30);
         let mut receiver = Node::new(31);
         let collection = sender.hold("equal", open());
@@ -619,7 +641,10 @@ mod tests {
             WalkKind::Records,
             &BTreeSet::new(),
         );
-        assert!(matches!(&pushed[..], [Frame::Root { .. }, Frame::Done]));
+        assert!(matches!(
+            &pushed[..],
+            [Frame::Root { .. }, Frame::Node { .. }, Frame::Done]
+        ));
         assert_eq!(
             harness.sent,
             [
@@ -631,14 +656,64 @@ mod tests {
             ]
         );
         assert_eq!(harness.receive.outcome(), Some(Outcome::Landed));
+
+        let root = crate::walk::summary(
+            WalkKind::Records,
+            sender.serving().collection(collection).unwrap().repair(),
+        );
+        let mut harness = Harness::new(harness.node, collection, WalkKind::Records);
+        assert!(harness.feed(Frame::Root { summary: root }).is_empty());
+        assert_eq!(harness.receive.root(), Some(root));
+        assert_eq!(harness.feed(Frame::Done), [Frame::Landed]);
+        assert_eq!(harness.receive.outcome(), Some(Outcome::Landed));
+
+        // The receiver holds more than it landed: the landed root still
+        // satisfies the count proof.
+        let mut superset = harness.node;
+        superset.commit(collection, 100);
+        superset.observe();
+        let mut harness = Harness::landed(superset, collection, WalkKind::Records, Some(root));
+        assert!(harness.feed(Frame::Root { summary: root }).is_empty());
+        assert_eq!(harness.feed(Frame::Done), [Frame::Landed]);
+        assert_eq!(harness.receive.outcome(), Some(Outcome::Landed));
+
+        // Without that memory a superset neither holds the root nor
+        // accounts for it.
+        let mut harness = Harness::new(harness.node, collection, WalkKind::Records);
+        assert!(harness.feed(Frame::Root { summary: root }).is_empty());
+        assert!(harness.feed(Frame::Done).is_empty());
+        assert_eq!(
+            harness.receive.outcome(),
+            Some(Outcome::Failed(Failure::CountMismatch))
+        );
+
+        let mut other = Node::new(32);
+        other.hold("equal", open());
+        other.commit(collection, 100);
+        other.observe();
+        let mut harness = Harness::new(other, collection, WalkKind::Records);
+        assert!(harness.feed(Frame::Root { summary: root }).is_empty());
+        let node = crate::walk::node(
+            WalkKind::Records,
+            sender.serving().collection(collection).unwrap().repair(),
+            &[],
+        )
+        .unwrap();
+        let [Frame::Held { prefix, children }] = &harness.feed(Frame::Node {
+            prefix: Vec::new(),
+            node,
+        })[..] else {
+            panic!("one HELD");
+        };
+        assert!(prefix.is_empty() && *children == [0; 32]);
     }
 
     /// Leaves the receiver lacks are asked for and land; it ends with the
     /// union and says so.
     #[test]
     fn missing_leaves_are_requested_and_land() {
-        let mut sender = Node::new(32);
-        let mut receiver = Node::new(33);
+        let mut sender = Node::new(33);
+        let mut receiver = Node::new(34);
         let collection = sender.hold("missing", open());
         receiver.hold("missing", open());
         let records = (0..300)
@@ -677,8 +752,8 @@ mod tests {
     /// sender never pushes its leaves, and the receiver never asks for them.
     #[test]
     fn a_held_subtree_is_pruned() {
-        let mut sender = Node::new(34);
-        let mut receiver = Node::new(35);
+        let mut sender = Node::new(35);
+        let mut receiver = Node::new(36);
         let collection = sender.hold("pruned", open());
         receiver.hold("pruned", open());
         let records = (0..400)
@@ -732,8 +807,8 @@ mod tests {
     /// fails at the end; what landed stays.
     #[test]
     fn the_count_proof_fails_on_a_push_that_omits_a_leaf() {
-        let mut sender = Node::new(36);
-        let mut receiver = Node::new(37);
+        let mut sender = Node::new(37);
+        let mut receiver = Node::new(38);
         let collection = sender.hold("omitted", open());
         receiver.hold("omitted", open());
         let records = (0..60)
@@ -756,8 +831,8 @@ mod tests {
     /// without a Landed; what landed stays.
     #[test]
     fn a_failed_insert_yields_no_landed() {
-        let mut sender = Node::new(38);
-        let mut receiver = Node::new(39);
+        let mut sender = Node::new(39);
+        let mut receiver = Node::new(40);
         let collection = sender.hold("failed", open());
         receiver.hold("failed", open());
         for data in 0..20 {
@@ -790,7 +865,7 @@ mod tests {
         assert_eq!(harness.node.records(collection).len(), 19);
 
         // A value that is not a foundation record fails the push at once.
-        let mut receiver = Node::new(40);
+        let mut receiver = Node::new(41);
         receiver.hold("failed", open());
         receiver.observe();
         let mut harness = Harness::new(receiver, collection, WalkKind::Records);
@@ -826,8 +901,8 @@ mod tests {
     /// task, and resumes as they land.
     #[test]
     fn requests_are_windowed_and_reading_stops_at_unlanded_values() {
-        let mut sender = Node::new(41);
-        let mut receiver = Node::new(42);
+        let mut sender = Node::new(42);
+        let mut receiver = Node::new(43);
         let collection = sender.hold("window", open());
         receiver.hold("window", open());
         let records = (0..MAX_WALK_UNLANDED as u64 + 100)
@@ -893,8 +968,8 @@ mod tests {
     /// without the stream going unread.
     #[test]
     fn nodes_go_unanswered_while_too_many_leaves_wait() {
-        let mut sender = Node::new(43);
-        let mut receiver = Node::new(44);
+        let mut sender = Node::new(44);
+        let mut receiver = Node::new(45);
         let collection = sender.hold("wanted", open());
         receiver.hold("wanted", open());
         let records = (0..MAX_WANTED as u64 + MAX_WALK_REQUESTS as u64 + 1)
@@ -949,11 +1024,11 @@ mod tests {
     /// a value nobody asked for.
     #[test]
     fn frames_out_of_place_fail_the_push() {
-        let mut sender = Node::new(45);
+        let mut sender = Node::new(46);
         let collection = sender.hold("order", open());
         sender.commit(collection, 1);
         sender.observe();
-        let mut receiver = Node::new(46);
+        let mut receiver = Node::new(47);
         receiver.hold("order", open());
         receiver.observe();
         let overlay = sender.serving().collection(collection).unwrap();
@@ -968,7 +1043,7 @@ mod tests {
             Some(Outcome::Failed(Failure::Protocol))
         );
 
-        let mut receiver = Node::new(47);
+        let mut receiver = Node::new(48);
         receiver.hold("order", open());
         receiver.observe();
         let mut harness = Harness::new(receiver, collection, WalkKind::Records);
@@ -983,6 +1058,97 @@ mod tests {
             harness.receive.outcome(),
             Some(Outcome::Failed(Failure::Protocol))
         );
-        assert!(!Receive::on_open([0; 32], collection, WalkKind::Records, false).is_some());
+        assert!(Receive::on_open([0; 32], collection, WalkKind::Records, false, None).is_none());
+    }
+
+    /// A proof over another resource routed to C waits for that resource's
+    /// descriptor, fetched from the sender. A push whose fetch of it fails
+    /// does not land; the next push lands the proof with the descriptor.
+    #[test]
+    fn a_deferred_proof_fails_the_push_until_its_descriptor_arrives() {
+        use triblespace_core::blob::Blob;
+        use triblespace_core::blob::encodings::UnknownBlob;
+        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+        use triblespace_core::capability::policy::{resource_collection, resource_policy};
+        use triblespace_core::capability::{CapabilityProof, CapabilityResource};
+        use triblespace_core::collection::AdmissionPolicy;
+        use triblespace_core::macros::entity;
+        use triblespace_core::repo::{
+            BlobStoreGet, BlobStorePut, CapabilityProofStore, SnapshotSource,
+        };
+
+        use crate::walk::tests::walking::key;
+
+        let mut sender = Node::new(49);
+        let mut receiver = Node::new(50);
+        let collection = sender.hold("deferred", open());
+        receiver.hold("deferred", open());
+        let resource_root = key(51);
+        let capability = triblespace_core::inline::Inline::new([10; 32]);
+        let resource = sender
+            .store
+            .put::<SimpleArchive, _>(
+                entity! {
+                    resource_collection: collection,
+                    resource_policy*: AdmissionPolicy::direct(resource_root.verifying_key())
+                        .binding(capability),
+                }
+                .facts()
+                .clone(),
+            )
+            .unwrap();
+        let proof = CapabilityProof::new(
+            CapabilityResource::from(resource),
+            &resource_root,
+            capability,
+            receiver.key.verifying_key(),
+        );
+        sender.store.insert_proof(proof.clone()).unwrap();
+        sender.observe();
+        receiver.observe();
+        let evidence = |node: &Node| {
+            node.serving()
+                .collection(collection)
+                .unwrap()
+                .repair()
+                .authorization_evidence()
+                .get(proof.id())
+                .cloned()
+        };
+        assert_eq!(evidence(&sender), Some(proof.clone()));
+
+        for attempt in 0..2 {
+            let mut harness = Harness::new(receiver, collection, WalkKind::Authorization);
+            push(
+                &mut harness,
+                &sender,
+                collection,
+                WalkKind::Authorization,
+                &BTreeSet::new(),
+            );
+            assert_eq!(harness.receive.outcome(), None, "a fetch is owed");
+            let (descriptor, fetched) = harness.fetches.pop().unwrap();
+            assert_eq!((fetched, descriptor), (Some(proof.clone()), resource.raw));
+            // The first fetch fails; the second gets the descriptor.
+            let blob = (attempt == 1).then(|| {
+                BlobStoreGet::get::<Blob<UnknownBlob>, UnknownBlob>(
+                    &sender.store.snapshot().unwrap(),
+                    triblespace_core::inline::Inline::new(resource.raw),
+                )
+                .unwrap()
+            });
+            let outs = harness
+                .receive
+                .on_fetched(resource.raw, Some(proof.clone()), blob);
+            harness.outputs(outs);
+            let expected = if attempt == 0 {
+                Outcome::Failed(Failure::DeferredProof)
+            } else {
+                Outcome::Landed
+            };
+            assert_eq!(harness.receive.outcome(), Some(expected));
+            assert_eq!(evidence(&harness.node).is_some(), attempt == 1);
+            receiver = harness.node;
+        }
     }
 }
