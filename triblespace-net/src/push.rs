@@ -69,10 +69,17 @@ impl ConfirmedRoots {
         self.0.get(&key).copied()
     }
 
-    /// A push under `key` ended: a confirmed one sets the root.
+    /// A push under `key` ended: a confirmed one sets the root, a failed one
+    /// forgets it. Keeping it would make an unchanged tree repeat a push the
+    /// peer cannot land (a peer that restarted holds no landed roots, so a
+    /// Root-then-Done push to it fails its count proof) until this side's
+    /// tree moved; forgetting costs the next push one root NODE, which the
+    /// peer's HELD prunes.
     pub(crate) fn settle(&mut self, key: PushKey, outcome: Outcome) {
         if outcome.confirmed {
             self.0.insert(key, outcome.root);
+        } else {
+            self.0.remove(&key);
         }
     }
 }
@@ -848,5 +855,31 @@ mod tests {
         for edge in edges {
             assert!(!below.contains(&edge), "child {edge} was pruned");
         }
+    }
+
+    /// A failed push forgets the confirmed root, so the next push starts from
+    /// the root NODE and lets the peer's HELD prune, instead of repeating a
+    /// Root-then-Done the peer may be unable to land.
+    #[test]
+    fn a_failed_push_forgets_the_confirmed_root() {
+        let key: PushKey = ([7; 32], [1; 32], WalkKind::Records);
+        let root = PatchSummary::new(Some([9; 32]), 3).unwrap();
+        let mut roots = ConfirmedRoots::default();
+        roots.settle(
+            key,
+            Outcome {
+                root,
+                confirmed: true,
+            },
+        );
+        assert_eq!(roots.root(key), Some(root));
+        roots.settle(
+            key,
+            Outcome {
+                root,
+                confirmed: false,
+            },
+        );
+        assert_eq!(roots.root(key), None);
     }
 }
