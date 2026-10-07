@@ -247,7 +247,7 @@ tag, read before any permit is taken:
 | Tag | Stream | Carries |
 |---:|---|---|
 | `0x10` | `recon/1` | the connection's one long-lived stream: grant exchange, and every collection's peering |
-| `0x12` | `walk/1` | one push of one collection tree, opened by its sender |
+| `0x12` | `walk/1` | one bidirectional delta exchange of one collection kind |
 | `0x11` | `dht/1` | one DHT operation byte and its exchange: `FIND_VALUE` or `PROVIDER_PUT` |
 | `0x02` | `blob/1` | one locator-addressed bearer exact GET |
 
@@ -428,203 +428,131 @@ accepted, which way C flows, and which side refused the other.
 
 ## Pushes
 
-A push says "here is my tree of C" and carries the part of it the receiver
-lacks. Each side pushes its own trees: a collection's records, its
-authorization evidence and, between two Full neighbours, its held set, each
-as one push to one neighbour on a `walk/1` stream the sender opens (*Walk
-streams*). A push goes only to C's neighbours, and only to those this side
-sends C to; the references tree goes only to a neighbour with which this side
-replicates C in full. Two neighbours that both send therefore push each other,
-and the two pushes of a tree on one connection, one each way, reconcile both
-sides. Nothing is forwarded: each side pushes only its own state, and a pushed
-root is a trigger, never the source of truth.
+Each neighbour exchanges one kind of one selected collection on a bidirectional
+`walk/1` stream: records, authorization evidence, or (between Full neighbours)
+held references. Either side may open it. Each sends its own immutable delta
+against the last agreement on this connection; both directions share the stream.
+Nothing is broadcast or forwarded merely because it arrived.
 
-Each selected collection has one push timer (`WakeSchedule`), in the style of
-Trickle: intervals of two to sixty seconds, doubling while C is quiet, with
-one transmit opportunity in each interval's second half. At that opportunity
-the side starts a push of C's records tree and of its authorization tree to
-each neighbour it sends to, and of its references tree to each of those it
-replicates C in full with. A push already running to a neighbour for that
-tree is skipped, not queued. A neighbour this side newly sends to is pushed
-to within two minimum intervals.
+Each selected collection retains its existing Trickle-style timer: two to sixty
+seconds, doubling while quiet, with one transmit opportunity in the second half.
+A local records/evidence change restarts the minimum interval unless an incoming
+exchange is landing it. A successful changed receive resets it once, not for each
+intermediate snapshot. Held-set changes wait for the ordinary timer. A successful
+exchange followed by genuinely new local keys starts another immediately; a
+lagging published subset of the agreement does not. Failed exchanges wait for the
+timer. Timer inputs are physical serving observations, not delta roots.
 
-When C's root changes while no push of C's records or evidence is being
-received here, as after a local append, C's timer restarts at its two-second
-interval. A root that changes while such a push is received is that push
-landing and resets nothing; the receive resets the timer once when it lands,
-so the merged root goes out once instead of every intermediate root of a long
-push. A receive that lands without changing the root, the common case of an
-unchanged tree pushed again, resets nothing either: otherwise two neighbours
-would push each other every two seconds forever. A changed held set resets
-nothing: the next push carries it, so it reaches a Full neighbour within about
-two maximum intervals. A confirmed push whose tree changed while it ran,
-because a record was committed meanwhile, is followed by another at once from
-the root just confirmed. A push that ended any other way, failed, reset or
-timed out, is left to the timer however the tree moved, so retries to a
-neighbour that cannot land it are paced like any push; the timer does not see
-pushes end.
+The walks task uses only current connections and never dials. At most one exchange
+per peer, collection and kind runs at a time. Simultaneous opens preserve the
+stream opened by the smaller peer id and reset the other as a duplicate; a newer
+incoming stream can replace an existing incoming one. Both Open and Incoming
+require local selection and an active descriptor. Active peering flags determine
+send/receive directions; credentials provide fallback admission only when there
+is no active peering. A false send flag cannot be widened by another grant.
 
-A push runs only on the current connection to its neighbour, and the walks
-task never dials: a neighbour without a connection is pushed to once the
-candidate order next dials it (*Neighbours*). At most one push per peer,
-collection and tree runs at a time, and at most one push of each tree is
-received from a peer at a time: a second push of the same tree from a peer
-replaces the first, whose stream is reset. The sender pins its serving
-snapshot of C when the push starts, provided it sends C to the receiver (its
-peering for C sends to the receiver, or the receiver passes READ under the
-pinned evidence), and every node and value of the push comes from that
-snapshot, so a push cannot splice two moments together. The receiver admits a
-push only from a peer it receives C from: its peering for C receives from the
-peer, or the peer passes WRITE under the live evidence. A push it does not
-admit, or of a collection that is not active here, is refused by resetting
-the stream (`RESET_WALK_REFUSED`); `recon/1` and the connection stay.
+An agreement G is immutable PATCH state scoped to peer, collection, kind and
+connection. It contains only keys known held on both sides, retained after both
+LANDEDs and successful actual writes and stream finish. Failure clears local G
+without retracting landed values; close/deselection clears it and retires running
+drivers, so a stale completion cannot restore it. G is not durable. Fresh
+connections may compare full sets again, with equal-prefix pruning.
 
-The sender remembers, per neighbour and tree, the confirmed root: the root of
-the last push the neighbour confirmed landed. A tree whose root is still the
-confirmed one is pushed as ROOT then DONE, and the neighbour answers LANDED
-without a node crossing. A push that ends any other way, failed, reset or
-timed out, forgets the confirmed root: keeping it would repeat ROOT then DONE
-to a neighbour that cannot land it, such as one that restarted and holds no
-landed roots, until this side's tree moved. Forgetting costs the next push one
-root NODE, which the neighbour's HELD prunes. The receiver remembers the same
-thing from its side, the root of the last push of each tree from each peer
-that landed here, so a root it landed is held whole however its own tree grew
-since. Both memories are forgotten for a neighbour when the connection to it
-closes, so a reconnect starts from no confirmed root and costs one root NODE,
-and for a collection when it is deselected; neither is persisted: a restarted
-side pushes everything again, and its neighbours hold it.
-
-What a quiet collection costs is two `walk/1` streams a minute per neighbour
-this side sends to, its records and its evidence, and three to a Full
-neighbour, each ROOT, DONE and LANDED; the same two or three come back from a
-neighbour that sends. Those frames are what keeps a peered connection from
-going idle. The load is per collection and neighbour. A test runs 130
-collections between two quiet neighbours on one connection over 20 minutes of
-virtual time on the simulated transport and counts the streams each side
-opens on the wire, which must stay within a tenth above the design's
-estimate: 130 collections times ten neighbours at the sixty-second cap and
-two streams per root, about 43 streams a second per node at ten neighbours,
-or 4.3 per second per node and neighbour. One run opened 10,420 streams in
-those 20 minutes, 4.34 a second per node and neighbour, 43.4 at ten
-neighbours against the estimate of 43.3, and asked for no value.
+Successful symmetric exchanges compute the same union. An asymmetric final
+finish failure may clear G on only one side: these sound common-held lower bounds
+can temporarily differ, particularly while publication lags. Delta commitments
+remain independent and valid; ordinary publication and later exchanges can
+converge the bookkeeping. There is no base-negotiation or distributed durable
+receipt added here.
 
 ## Walk streams
 
-A `walk/1` stream carries one push: one tree of one collection, one way, from
-the side that opened the stream, the sender, to the side that accepted it,
-the receiver. The sender writes the stream's tag and an OPEN frame naming the
-collection and the tree (records `0`, authorization `1`, references `2`); the
-accept loop reads both and hands the stream to the walks task, which serves
-it from there. A stream that sends no OPEN within ten seconds, or arrives
-while no walks task runs, is reset (`RESET_WALK_FAILED`). Frames are laid out
-as on `recon/1`, a kind, a big-endian `u32` length and a payload of at most
-64 KiB; every key is 32 bytes relative to its tree's base (the collection
-handle, for authorization evidence), and integers are big-endian.
+The opener writes the stream tag and OPEN naming collection and kind (records
+`0`, authorization `1`, references `2`). The accept loop hands both halves to
+the walks task. Missing OPEN within ten seconds, or no task, resets the stream.
+Frames have a one-byte kind, big-endian u32 payload length, then at most 64 KiB.
+Keys are 32 bytes relative to the kind's base; authorization hashes bind the full
+collection32 || proof-id32 key. Integers are big-endian.
 
-| Kind | Frame | Payload | From |
-|---:|---|---|---|
-| `0x01` | OPEN | collection, tree (`u8`) | sender |
-| `0x02` | ROOT | root (zeros for the empty tree), leaf count | sender |
-| `0x03` | NODE | tag, prefix, node | sender |
-| `0x04` | LEAF | key | sender |
-| `0x05` | HELD | prefix, 256-bit child bitmap | receiver |
-| `0x06` | VALUE_REQUEST | key | receiver |
-| `0x07` | VALUE | key, bytes (at least one) | sender |
-| `0x08` | DONE | empty | sender |
-| `0x09` | LANDED | empty | receiver |
+| Kind | Frame | Payload |
+|---:|---|---|
+| `0x01` | OPEN | collection32, kind:u8 |
+| `0x03` | SUBTREE | depth:u8, prefix32, hash32, leaf-count:u64 |
+| `0x05` | VALUE_REQUEST | key32 |
+| `0x06` | VALUE | key32, nonempty encoded bytes |
+| `0x07` | DONE | empty |
+| `0x08` | LANDED | empty |
 
-A prefix is a length byte and at most 32 bytes. A node's tag says whether it
-is a branch (`1`) or a leaf (`2`); after the prefix comes its digest, then for
-a branch its leaf count, 32-byte representative, end depth and children, each
-an edge byte, a digest and a leaf count, running to the end of the frame, and
-for a leaf its key. A value is the bytes under a key, an encoded record or a
-proof, at most a leaf's size and never empty. A kind the reader does not
-know, or an OPEN of a tree it does not know, is skipped; a known kind whose
-payload does not parse is malformed and ends the push, not the connection.
+Every SUBTREE payload is 73 bytes, 78 including the frame header, regardless of
+fanout. Depth is 0..32; all prefix bytes outside depth must be zero. Depth0 is the
+ordinary empty-prefix delta-root announcement; an empty delta has zero hash and
+count. There is no ROOT, LEAF, NODE child array, HELD or reply bitmap.
+Unknown kinds are skipped; known malformed payloads fail only the exchange.
+The retired `0x02` and `0x04` kinds are not compatibility paths.
 
-The order is ROOT, then NODEs and LEAFs, then DONE; HELDs answer NODEs,
-VALUE_REQUESTs ask for leaves and VALUEs answer them, and LANDED ends the
-push. A ROOT is never answered. The sender walks its pinned tree depth first:
-every branch it reaches goes out as a NODE at its prefix, and every leaf as a
-LEAF naming its key, with no value. The receiver answers each NODE with a
-HELD for the same prefix whose bit `i` (byte `i / 8`, bit `i % 8`, least
-significant first) says it holds the child at branch byte `i` with the same
-digest and leaf count; the sender skips those subtrees and descends into the
-others, in ascending edge order. A child is compared by its locator, the
-branch's representative up to its end depth followed by the child's edge: the
-receiver looks up its own node at that locator and compares digest and count,
-so compressed paths need not line up, and a receiver whose tree branches
-elsewhere still holds such a child whole. The sender keeps at most 64 NODEs
-outstanding, sent with no HELD yet, and pauses its walk while that window is
-full. DONE follows the last answered NODE. Values stay pull: the receiver asks
-with VALUE_REQUEST for the leaves its live store lacks, checked against the
-newest snapshot as each LEAF arrives, so a value another push landed meanwhile
-is not asked for again, and the sender answers each from its pinned tree. A
-duplicate is harmless under union.
+Freeze native PATCH difference Δ = pinned minus G, or empty if not sending.
+Announce [] and then visit its actual compressed trie nodes continuously FIFO,
+putting children at the back in ascending edge order. Children are separate later
+announcements, never embedded metadata. A nonempty compressed root prefix is
+announced after [], including a singleton's full-depth key. FIFO concerns logical
+trie levels; compressed byte-prefix lengths need not be monotonic. There is no
+level barrier or wait for a transport round trip. DONE follows this traversal.
 
-The receiver keeps the locators the sender owes it, each with the digest and
-leaf count declared for it: the root's, from ROOT, then each accepted NODE's
-children it does not hold. A NODE is accepted only at a locator owed, once,
-and is checked against the digest declared there, so every node hash-chains
-to the pushed root; a LEAF only under the owed locator on its key's path,
-with one leaf and the digest its key binds, once. A push lands when that
-membership proof closes, every locator owed having been pushed, so that the
-leaves pushed plus the leaf counts of every child marked held are exactly the
-root's count, every value asked for landed without a failed insert, no fetch
-failed and no proof stayed deferred: the receiver sends LANDED, and the
-sender's pinned root becomes the confirmed one. A receiver whose own tree
-equals the pushed root, or that landed that root from the same sender before,
-holds everything: it answers every NODE with every child held, ignores every
-LEAF and counts the root's leaves at once, so ROOT then DONE lands with
-nothing in between, at a receiver that holds the tree or a superset of it.
-Anything else fails the push: a frame out of its place (a NODE, LEAF or DONE
-before the ROOT, a second ROOT, a NODE or LEAF at a locator the sender does
-not owe or owes no more, a VALUE nobody asked for, a frame after the end, or a
-frame only the other side sends), a NODE that is not canonical or is not the
-node declared at its locator, a LEAF whose key does not bind the digest
-declared, a VALUE that does not decode, is not under its key or is not
-evidence for C, a locator owed that was never pushed or a count that does not
-add up, a failed insert or fetch, a deferred proof, a HELD for no outstanding
-NODE, a VALUE_REQUEST for a key the pinned tree lacks, or a LANDED before
-DONE. The failing side resets the stream (`RESET_WALK_FAILED`); what landed
-stays, and the next push skips the subtrees that now match. A push or a
-receive also ends after 60 seconds without a frame from the other side while
-one is owed: before DONE, and after it for the values the receiver asked for.
-After DONE the sender waits for LANDED as long as the connection lives, since
-the receiver's fetches and landings take what time they take, and the
-receiver reads nothing but the values it asked for. The receiver's answers
-disclose where it differs from the sender, which is one more reason pushes
-are served only to peers the sender sends C to.
+A peer announcement matching our own delta at that prefix prunes its queued
+proper descendants. If we have not announced the prefix yet, our own matching
+announcement still goes out exactly once; if already sent, it is not duplicated.
+That statement concerns work remaining when the match arrives: network delay and
+unequal frontiers permit earlier in-flight descendants. FIFO alone supplies no
+universal one-level overshoot bound. Previously agreed siblings cost no frames
+because difference construction omits their keys. Independently acquired overlap
+uses the same prefix-matching rule.
 
-A record value must decode, with its signature, to a COMMIT or DERIVE naming
-C under the fingerprint it was asked for by. A proof value must match its id,
-verify its signatures and be evidence for C before it lands; a proof over a
-subordinate resource whose descriptor is missing fetches that descriptor from
-the sender, as described above, and lands with it if it routes the proof to
-C, or stays deferred. A references push carries no values: a held handle
-missing from the local held set joins it, one resident here noted held as it
-is, and another fetched by hash from the sender over `blob/1` and landed with
-its note. A fetch is held to progress, 60 seconds between any two chunks, and
-never to a bound on the whole, so a blob of any size lands at a steady rate. A
-failed fetch fails the push, and the blob stays in the next difference.
-Because a held set is a flat closure, one references push exposes the missing
-frontier at every depth.
+The receiver reconstructs ONLY the peer's delta in a separate typed PATCH,
+initially empty. An exact locally held subtree commitment can populate that
+portion; otherwise full-depth key announcements authenticate their own leaf
+digest, and values are pulled by key or reused from the latest live observation.
+Unknown intermediate hashes are provisional. At DONE, after all requested values,
+fetches and inserts finish, the reconstructed peer root/count AND every received
+prefix/hash/count must match, with canonical compressed prefixes. Count sums,
+frame counts and the local union are not membership proofs. Omitted leaves,
+foreign replacements at equal count, duplicate prefixes, wrong hashes and wrong
+prefixes cannot close. Exact non-root subtree inclusion currently enumerates its
+keys; only empty-prefix whole-tree inclusion uses a shared clone.
 
-Three bounds keep what a push costs the receiver. It asks for values 64 at a
-time, value requests and blob fetches together, and the leaves beyond that
-wait their turn. It answers NODEs only while fewer than 1,024 leaves wait to
-be asked for, so the sender's window of unanswered NODEs holds its push; a
-push with 32,768 leaves waiting, more than that window can push, is a flood
-and fails. So is one that leaves 32,768 locators owed or that many HELDs
-waiting to be sent, which only a sender pushing NODEs without waiting for
-their HELDs can reach: the NODE that would is refused before its children
-are owed. And it hands at most 1,024 values to landing ahead of their
-acknowledgement; while that many are with the landing task it reads no
-further, so QUIC's flow
-control holds the sender, and a sender whose receiver stops reading stalls
-instead of queueing without bound. A walk stream takes no request permit on
-either side, but it counts as in use on its connection: a draining connection
-waits for it, and so does eviction.
+Records must decode with valid signatures to COMMIT/DERIVE for the collection
+under the requested fingerprint. Proofs must match their id, signatures and
+collection evidence; a subordinate descriptor is fetched and checked, or the
+proof remains deferred and fails completion. References have no VALUE payload:
+resident blobs are noted held, absent ones fetched by hash and landed with their
+held note. All actual landing/fetch/deferred outcomes precede LANDED. A value
+request is served only from the immutable advertised delta. A receive-only side
+announces empty and cannot reveal its private pinned tree or cached G, nor serve
+ordinary values.
+
+After both LANDEDs, propose G' = G union Δlocal union Δpeer. The driver retains
+it only after actual queued writes and successful finish; an enqueue is not a
+receipt. The peer's LANDED separately acknowledges our send, even if our receive
+fails. Successful LANDED write separately acknowledges what landed here.
+Failures reset/stop the exchange and clear reusable G, while already landed
+data remains. Publication lag cannot shrink G: pinned subsets produce empty
+differences.
+
+Budgets grow on demand: FIFO positions, received prefix commitments and matched
+announcement indexes each allow 1,048,576 entries; the peer delta proof permits
+at most 1,048,576 leaves. Its advertised count is checked before exact-root reuse,
+so even a fresh identical larger set is refused. This is a real honest-large-delta
+limit, not just a hostile frontier bound or a claim of unbounded synchronization.
+Withheld-value demand has a separate 32,768-entry ceiling. Requests and blob fetches
+share 64 slots; at most 1,024 unacknowledged values go to landing before reading
+pauses and stream flow control applies.
+
+Incoming frame/value waits and blob fetches have 60-second progress deadlines,
+not total-transfer timeouts. After DONE, peer landing may take as long as the
+connection remains. Actual outgoing byte writes and final finish are separately
+progress-bounded/cancellable, including when a driver is retired. A walk takes no
+request permit but uses transport stream credit and counts as connection use.
+Small and scratch/sim gates do not establish many-collection live stream-credit
+liveness or throughput.
 
 ### Landing
 
@@ -1239,8 +1167,8 @@ collection is recomputed as if newly tracked. Short-lived readers of the same
 pile track nothing.
 
 Two Full neighbours push each other their held sets like any other tree
-(*Walk streams*): the receiver's HELD bitmaps prune what both hold, and an
-unchanged set is ROOT then DONE.
+(*Walk streams*): matching prefix commitments prune independently held overlap,
+and unchanged agreed sets send an empty-prefix empty delta, DONE and LANDED.
 
 This set is partial and conservative. A readable aligned word is not a
 typed semantic reference; an absent word says nothing about global residency.
@@ -1310,7 +1238,7 @@ tag. Mixed-version collection sync is not supported: deploy a cohort together.
 | `FIND_VALUE` | `dht/1` | `0x0F` | one iterative XOR-DHT lookup step: the K closest verified routes and bounded provider hints for one opaque key |
 | `PROVIDER_PUT` | `dht/1` | `0x06` | renew this endpoint's opaque provider lease; the answer says stored (`0x00`) or not stored (`0x01`) |
 | exact GET | `blob/1` | | locator-addressed, mutual-proof exact bearer transport |
-| push | `walk/1` | | one collection tree, pruned by the receiver's HELD bitmaps |
+| push | `walk/1` | | one bidirectional collection-kind delta, pruned by matching prefix commitments |
 
 `FIND_VALUE` answers in one reply what `FIND_NODE` and `PROVIDER_GET` (`0x0C`
 and `0x07`) answered in two rounds. Every `recon/1` frame is listed in *One
@@ -1385,10 +1313,10 @@ are not preemptible, so this cooperative boundary is not a shutdown-time bound.
 - A lost push does not consume the only opportunity: in every interval of at
   most a minute, each collection's timer pushes its trees again to each
   neighbour it sends to, and a push that did not land forgets its confirmed
-  root, so the next one walks the tree again and the receiver's bitmaps prune
-  what already landed. A neighbour lost to a failure is replaced by the next
+  agreement, so the next delta starts without that local base and matching
+  prefix commitments prune what already landed. A neighbour lost to a failure is replaced by the next
   candidate in the collection's order.
-- An invalid record, proof, PATCH node, or blob fails its push or fetch and
+- An invalid record, proof, subtree commitment, or blob fails its push or fetch and
   cannot retract previously accepted evidence; a malformed `recon/1` frame
   closes its connection, and a malformed `walk/1` frame ends its push.
 - Missing selected output/dependency blobs leave that realization unavailable;

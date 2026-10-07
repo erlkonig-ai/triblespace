@@ -42,9 +42,10 @@ use triblespace_net::transport::sim::{
     Crossed, SimConfig, SimConn, SimNet, SimRecvStream, SimSendStream, Taps,
 };
 use triblespace_net::transport::{Conn, Harness, PeerId, RecvStream, SendStream, Transport};
-use triblespace_net::walk_stream::{
-    FRAME_LEAF, FRAME_OPEN as FRAME_WALK_OPEN, FRAME_VALUE_REQUEST,
-};
+use triblespace_net::walk_stream::{FRAME_OPEN as FRAME_WALK_OPEN, FRAME_VALUE_REQUEST};
+
+// Test-only leaf classification from the uniform SUBTREE depth, not a wire kind.
+const FRAME_LEAF: u8 = 254;
 
 fn key(byte: u8) -> SigningKey {
     SigningKey::from_bytes(&[byte; 32])
@@ -210,7 +211,13 @@ fn walked(taps: &Taps, from: usize, peer: PeerId) -> (Vec<u8>, Vec<u8>) {
         crossed
             .iter()
             .filter(|crossed: &&Crossed| crossed.sent == sent)
-            .map(|crossed| crossed.kind)
+            .map(|crossed| {
+                if crossed.walk_depth == Some(32) {
+                    FRAME_LEAF
+                } else {
+                    crossed.kind
+                }
+            })
             .collect::<Vec<_>>()
     };
     (kinds(true), kinds(false))

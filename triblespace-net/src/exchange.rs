@@ -1,73 +1,39 @@
-//! One exchange of one collection tree with one neighbour: both sides'
-//! deltas on one `walk/1` stream (design: walk streams).
+//! Symmetric, continuous FIFO exchange of prefix/hash/count delta subtrees.
 //!
-//! Two neighbours that sync a collection keep, per tree, the AGREED tree:
-//! the union of the two trees they pinned for their last confirmed
-//! exchange, which both hold since. An exchange sends each side's delta
-//! against it, breadth first and without waiting for the other side. A side
-//! pins its snapshot and sends ROOT; then, from a queue of locators that
-//! starts at the root if its root differs from the agreed root, it sends
-//! every branch it reaches as a NODE and every leaf as a LEAF, and queues the
-//! children of each branch that differ from the agreed tree's node at their
-//! locator: a child equal to it is skipped, because the peer holds the
-//! agreed tree. A NODE's child list announces the digest of every child, and
-//! ROOT the root's. A side that hears an announcement of a locator whose
-//! digest its own tree has there drops that locator and everything queued
-//! under it, since the peer holds the subtree: "I have this" and "stop
-//! sending me this" are one message, and with the delta going breadth first
-//! announcements can prune work still queued. How much has already crossed
-//! depends on scheduling and network delay, not on FIFO alone. DONE ends a
-//! side's delta. The queue is always FIFO; exceeding [`FLOOD_LOCATORS`] fails
-//! the bounded exchange rather than silently changing traversal order.
+//! Each connection retains sound common-held agreement G. Asymmetric final
+//! failures can leave unequal local bases; both still contain only jointly
+//! held keys. A successful symmetric exchange computes the same union. An
+//! exchange freezes each sender's native PATCH difference Δ = pinned \ G.
+//! Its ordinary empty-prefix SUBTREE commits to Δ, not to the collection or
+//! to the union. Every visited subtree then announces only its prefix, hash
+//! and leaf count; children appear as separate later FIFO announcements.
+//! There are no full child arrays, level barriers, HELD frames or reply waits.
 //!
-//! The side that receives C from the peer lands the peer's delta as it
-//! arrives. It keeps the locators the peer owes it, each with the digest and
-//! leaf count declared for it: the root's, by ROOT, then every accepted
-//! NODE's children, except those it already holds at that locator in its
-//! pinned tree or in the agreed tree, which are accounted; so the children
-//! the peer skips as equal to the agreed tree and those it skips because
-//! this side announced them are accounted without a frame. A NODE is
-//! accepted only at a locator owed, checked against the digest declared
-//! there; a LEAF only under the owed locator on its key's path, with one
-//! leaf and the digest its key binds. A NODE or LEAF at a locator this side
-//! holds, sent before this side's announcement reached the peer, is checked
-//! against what this side holds and owes nothing. The values of leaves the
-//! live store lacks are asked for with VALUE_REQUEST, [`MAX_WALK_REQUESTS`]
-//! at a time, and land through the landing task; a held reference is noted
-//! held when its blob is resident and fetched by hash otherwise. A side
-//! sends LANDED once the peer's DONE is in, nothing is owed, the leaves
-//! pushed plus those accounted are the root's count, and every value asked
-//! for landed without a failed insert, fetch or deferred proof; a side that
-//! receives nothing lands nothing and sends LANDED right after the peer's
-//! DONE. A side that has sent and received LANDED has confirmed the
-//! exchange: the agreed tree preserves prior agreement and includes its
-//! pinned tree plus every leaf the peer sent, which the peer computes alike.
-//! An exchange that ends any other
-//! way forgets the agreed tree; what landed stays.
+//! A matching announcement is compared with our own Δ. We still announce
+//! that subtree once, but prune queued descendants and do not descend into
+//! it. Scheduling and network delay determine how much was already sent.
+//! G omission comes from the immutable difference itself, not wire siblings.
 //!
-//! A side that sends C to the peer streams its delta; one that does not
-//! sends an empty ROOT then DONE, without revealing its private tree's
-//! digest/count, and the agreed tree it keeps is the one it held
-//! plus what the peer sent, which is the peer's pinned tree while that tree
-//! only grows. Values are served only by a side that sends.
+//! The receiver reconstructs a peer-only Δ PATCH: initially empty, populated
+//! from received leaves and exact locally held subtree grafts. Typed values
+//! come from the latest serving observation or are pulled by key and checked.
+//! Every announced prefix/hash/count and the root must match that peer view
+//! before LANDED. Unknown intermediate hashes are provisional until this
+//! closure; leaf keys authenticate their own domain-separated digest on arrival.
+//! The local union is never the peer's membership proof.
 //!
-//! Separate bounds keep what an exchange costs. More than [`FLOOD_LOCATORS`]
-//! queued/owed locators or equal announcements, or [`FLOOD_WANTED`] leaves
-//! waiting for values, fails the exchange. Honest sufficiently wide trees
-//! can exceed the explicit locator budget too; this is not unbounded sync.
-//! Allocation grows with observed work, not eagerly to either ceiling.
-//! And while [`MAX_WALK_UNLANDED`]
-//! values are with the landing task the stream is not read
-//! ([`Exchange::want_read`]), so the transport's flow control holds the
-//! peer. The driver times its wait for a frame only while one is owed
-//! ([`Exchange::awaits`]): before the peer's DONE, and for the values asked
-//! for; after DONE the peer's LANDED takes what time its landings take.
+//! Successful agreement is G ∪ Δlocal ∪ Δpeer, after both LANDEDs and actual
+//! stream writes/finish succeed in the driver. Failure forgets reusable G;
+//! already landed values remain. Publication lag creates an empty difference
+//! for already agreed keys and cannot shrink G. Within a connection held trees
+//! are assumed to grow. A receive-only side advertises the empty delta and
+//! serves no value, including no private pinned digest/count.
 //!
-//! [`Exchange`] is that machine without its stream: [`crate::walk`] drives
-//! it, feeding it the peer's frames ([`Exchange::on_frame`]) and what
-//! landing and blob fetches report, and pulling the frames of its delta
-//! ([`Exchange::next_delta`]) as the stream takes them, so the stream's flow
-//! control is the only backpressure on the delta.
+//! State grows on demand within explicit budgets: FIFO positions, received
+//! commitments, matched announcements, and peer-delta leaves each have at
+//! most FLOOD_LOCATORS entries; withheld values have FLOOD_WANTED entries.
+//! Honest larger deltas can be refused too. Requests/fetches and pending
+//! landings retain their separate bounded windows and transport backpressure.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -81,25 +47,19 @@ use triblespace_core::patch::{Blake3Merkle, Entry, IdentitySchema, PATCH, PatchH
 use crate::channel::NetEvent;
 use crate::collection_activation::CollectionRepairOverlay;
 use crate::host::{CollectionSnapshot, StoreSnapshot};
-use crate::patch_repair::{
-    PatchBranch, PatchChild, PatchNode, PatchRepairRequest, PatchSummary, validate_patch_node,
-};
+use crate::patch_repair::PatchSummary;
 use crate::protocol::RawHash;
 use crate::walk::{
     Admit, KEY_BYTES, MAX_WALK_REQUESTS, MAX_WALK_UNLANDED, Value, WalkKind, admit_fetched,
-    admit_missing, admit_value, contains, local_summary, node, node_summary, summary, value,
+    admit_missing, admit_value, node_summary, summary, value,
 };
 use crate::walk_stream::Frame;
 
-/// Missing leaves waiting for values beyond which an exchange fails. This
-/// smaller bound is independent of the breadth-first locator frontier.
+/// Missing leaves awaiting a value beyond which the exchange fails.
 pub(crate) const FLOOD_WANTED: usize = 32 * 1024;
-/// Grow-on-demand FIFO/owed/announcement budget. Unlike a withheld-value
-/// flood, an honest wide frontier may exceed 32k before any leaf is sent.
+/// Grow-on-demand frontier and delta-proof budget, independent of value waits.
 const FLOOD_LOCATORS: usize = 1024 * 1024;
 
-/// A relative locator's length followed by its zero-padded bytes. The length
-/// distinguishes compressed prefixes from keys ending in zero bytes.
 fn locator_key(locator: &[u8]) -> [u8; KEY_BYTES + 1] {
     let mut key = [0; KEY_BYTES + 1];
     key[0] = u8::try_from(locator.len()).expect("a checked locator fits its key");
@@ -108,7 +68,8 @@ fn locator_key(locator: &[u8]) -> [u8; KEY_BYTES + 1] {
 }
 
 /// One kind's tree as both sides agreed on it: a persistent PATCH, the
-/// union of the two trees pinned for the last confirmed exchange, kept per
+/// prior acknowledged base plus both deltas of the last confirmed exchange,
+/// possibly ahead of lagging physical pins, kept per
 /// peer, collection and kind ([`crate::walk::Walks`]).
 #[derive(Clone)]
 pub(crate) enum Tree {
@@ -191,6 +152,46 @@ impl Tree {
         }
     }
 
+    /// Exactly the immutable set difference against the shared agreement.
+    fn difference(&self, agreed: &Self) -> Self {
+        match (self, agreed) {
+            (Self::Records(patch), Self::Records(agreed)) => {
+                Self::Records(patch.difference(agreed))
+            }
+            (Self::Authorization(collection, patch), Self::Authorization(_, agreed)) => {
+                Self::Authorization(*collection, patch.difference(agreed))
+            }
+            (Self::References(patch), Self::References(agreed)) => {
+                Self::References(patch.difference(agreed))
+            }
+            _ => unreachable!("one agreement contains one kind"),
+        }
+    }
+
+    /// The canonical prefix and immediate child prefixes of a local subtree.
+    /// These are traversal positions, never a child-list wire payload.
+    fn shape(&self, prefix: &[u8]) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
+        fn shape<const N: usize, V>(
+            patch: &PATCH<N, IdentitySchema, V, Blake3Merkle>,
+            base: &[u8],
+            prefix: &[u8],
+        ) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
+            let absolute = [base, prefix].concat();
+            let node = patch.merkle_node(&absolute)?;
+            let canonical = node.prefix().strip_prefix(base)?.to_vec();
+            let children = node
+                .children()
+                .map(|(_, child)| child.prefix().strip_prefix(base).unwrap().to_vec())
+                .collect();
+            Some((canonical, children))
+        }
+        match self {
+            Self::Records(patch) => shape(patch, &[], prefix),
+            Self::Authorization(collection, patch) => shape(patch, &collection.raw, prefix),
+            Self::References(patch) => shape(patch, &[], prefix),
+        }
+    }
+
     fn insert(&mut self, key: [u8; KEY_BYTES], value: Value) {
         match (self, value) {
             (Self::Records(patch), Value::Record(record)) => {
@@ -207,11 +208,14 @@ impl Tree {
         }
     }
 
-    /// Include a subtree accounted from our own pinned tree. A receive-only
-    /// side starts with no advertised keys, so already-held peer subtrees
-    /// still have to enter its next agreement. Traverse only that subtree,
-    /// not a shadow inventory of the live store.
+    /// Populate peer membership from an exact held subtree commitment.
+    /// A whole root shares its immutable PATCH; non-root inclusion currently
+    /// enumerates only that subtree, not a catalogue of the live store.
     fn include_at(&mut self, source: &Self, locator: &[u8]) {
+        if locator.is_empty() {
+            self.union(source.clone());
+            return;
+        }
         match (self, source) {
             (Self::Records(target), Self::Records(source)) => {
                 if let Some(node) = source.merkle_node(locator) {
@@ -248,113 +252,69 @@ fn empty() -> PatchSummary {
 #[derive(Debug)]
 pub(crate) enum Out {
     Send(Frame),
-    /// Values for the landing task, acknowledged with
-    /// [`Exchange::on_landed_ack`].
     Land(Vec<NetEvent>),
-    /// Fetch a blob by hash from the peer, answered with
-    /// [`Exchange::on_fetched`]: a held reference, or the routing descriptor
-    /// a deferred `proof` names.
     Fetch {
         handle: RawHash,
         proof: Option<CapabilityProof>,
     },
 }
 
-/// How an exchange ended.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Outcome {
-    /// Both sides sent LANDED: the agreed tree is the union.
     Confirmed,
     Failed(Failure),
 }
 
-/// Why an exchange failed. What landed stays, and the agreed tree is
-/// forgotten.
+/// What landed stays; any failure forgets reusable agreement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Failure {
-    /// The collection is not active here.
     Unavailable,
-    /// A frame out of its place: a node, leaf or end before the root, a
-    /// second root, a node or leaf at a locator the peer does not owe and
-    /// this side does not hold, a value nobody asked for, a value request
-    /// for a key the pinned tree lacks or from a peer this side does not
-    /// send to, a LANDED before this side's DONE or a second one, an OPEN, or
-    /// more queued/owed locators, waiting leaves or announcements than the
-    /// explicit resource budgets permit, including honest wider trees.
     Protocol,
-    /// A node is not canonical, or is not the node its parent (or the root)
-    /// declared at its locator.
+    /// A noncanonical prefix, wrong commitment or leaf digest.
     BadNode,
-    /// A value that does not decode, is not under its key, or is not
-    /// evidence for the collection.
     BadValue,
-    /// The leaves pushed and accounted do not add up to the root's count, or
-    /// a locator owed was never pushed.
+    /// The reconstructed peer delta is not its advertised complete tree.
     CountMismatch,
-    /// A value failed to land, or a held reference could not be fetched.
     InsertFailed,
-    /// A proof waits for a descriptor that did not arrive.
     DeferredProof,
 }
 
-/// An exchange as it ended, for the walks task to settle.
 pub(crate) struct Ended {
     pub(crate) sends: bool,
     pub(crate) receives: bool,
-    /// The peer's LANDED arrived: this side's delta is confirmed.
+    /// Directional receipt: the peer's LANDED, independently of shared G.
     pub(crate) confirmed: bool,
-    /// This side sent LANDED: the peer's delta landed whole.
     pub(crate) landed: bool,
-    /// This side's pinned root.
+    /// Physical pinned observation, not the advertised delta summary.
     pub(crate) root: PatchSummary,
-    /// The peer's root, if its ROOT arrived.
+    /// Logical peer held view G ∪ Δpeer, not a physical publication frontier.
     pub(crate) peer_root: Option<PatchSummary>,
-    /// The agreed tree, when both LANDEDs crossed.
     pub(crate) agreed: Option<Arc<Tree>>,
 }
 
-/// One exchange of one tree with one peer.
 pub(crate) struct Exchange {
     collection: CollectionHandle,
     kind: WalkKind,
     pinned: Arc<CollectionSnapshot>,
-    /// This side sends C to the peer: it streams its delta and serves
-    /// values.
     sends: bool,
-    /// This side receives C from the peer: it lands the peer's delta.
     receives: bool,
     agreed: Option<Arc<Tree>>,
-    /// The agreed tree this exchange ends with if it is confirmed: this
-    /// prior agreed union plus this side's pinned tree when it sends, and
-    /// every authenticated peer leaf or already-held subtree accounted.
-    next: Tree,
-    /// The store as of the last frame: what missing leaves are checked
-    /// against.
+    /// Immutable native PATCH difference pinned \ G, empty if not sending.
+    delta: Tree,
+    /// Essential protocol membership proof of ONLY the peer's delta. This
+    /// shares known immutable trees; it is not a catalogue of the local store.
+    peer: Tree,
     snapshot: Option<Arc<StoreSnapshot>>,
     root_sent: bool,
-    /// Locators of this side's delta still to send.
     queue: VecDeque<Vec<u8>>,
-    /// Locators the peer announced with the digest this side's tree has
-    /// there, not reached by the delta yet. Never more than
-    /// [`FLOOD_LOCATORS`].
     announced: PATCH<33, IdentitySchema, ()>,
     done_sent: bool,
     peer_root: Option<PatchSummary>,
-    /// The nodes the peer owes, by locator: the digest and leaf count
-    /// declared for each by its parent, or by ROOT for the root. Consumed
-    /// by the node or leaf pushed at each; DONE needs every one consumed.
-    /// Never more than [`FLOOD_LOCATORS`].
-    owed: PATCH<33, IdentitySchema, ([u8; 32], u64)>,
-    /// Leaves pushed, and the leaves of the subtrees accounted as held.
-    accounted: u64,
-    /// Missing leaves not yet asked for, in the order pushed. Never more
-    /// than [`FLOOD_WANTED`].
+    /// Every received commitment, once. Unknown hashes remain provisional.
+    commitments: PATCH<33, IdentitySchema, PatchSummary>,
     wanted: VecDeque<[u8; KEY_BYTES]>,
-    /// Value requests in flight.
     requests: PATCH<KEY_BYTES, IdentitySchema, ()>,
-    /// Blob fetches in flight.
     fetching: usize,
-    /// Values with the landing task.
     unlanded: usize,
     failed: u64,
     deferred: bool,
@@ -365,10 +325,6 @@ pub(crate) struct Exchange {
 }
 
 impl Exchange {
-    /// Start an exchange of C's `kind` tree against `agreed`, pinning
-    /// `pinned`. `sends` is whether this side sends C to the peer, `receives`
-    /// whether it receives C from it; the caller starts none when neither
-    /// holds.
     pub(crate) fn start(
         collection: CollectionHandle,
         kind: WalkKind,
@@ -377,32 +333,14 @@ impl Exchange {
         sends: bool,
         receives: bool,
     ) -> Self {
-        let mine = summary(kind, pinned.repair());
-        let next = if sends {
-            let pinned_tree = Tree::pinned(kind, pinned.repair());
-            if let Some(agreed) = &agreed {
-                // Within a connection the held trees grow. A published
-                // observation may lag already-acknowledged landings, but
-                // must never shrink our logically held agreed union.
-                let mut next = agreed.as_ref().clone();
-                next.union(pinned_tree);
-                next
-            } else {
-                pinned_tree
-            }
-        } else {
+        let mine = Tree::pinned(kind, pinned.repair());
+        let delta = if sends {
             agreed
-                .as_deref()
-                .cloned()
-                .unwrap_or_else(|| Tree::empty(kind, collection))
+                .as_ref()
+                .map_or_else(|| mine.clone(), |agreed| mine.difference(agreed))
+        } else {
+            Tree::empty(kind, collection)
         };
-        let mut queue = VecDeque::new();
-        if sends
-            && mine.root().is_some()
-            && agreed.as_ref().map(|agreed| agreed.summary()) != Some(mine)
-        {
-            queue.push_back(Vec::new());
-        }
         Self {
             collection,
             kind,
@@ -410,15 +348,15 @@ impl Exchange {
             sends,
             receives,
             agreed,
-            next,
+            delta,
+            peer: Tree::empty(kind, collection),
             snapshot: None,
             root_sent: false,
-            queue,
+            queue: VecDeque::new(),
             announced: PATCH::new(),
             done_sent: false,
             peer_root: None,
-            owed: PATCH::new(),
-            accounted: 0,
+            commitments: PATCH::new(),
             wanted: VecDeque::new(),
             requests: PATCH::new(),
             fetching: 0,
@@ -435,73 +373,52 @@ impl Exchange {
     pub(crate) fn receives(&self) -> bool {
         self.receives
     }
-
-    /// This side's advertised root: empty when it sends no tree.
-    pub(crate) fn root(&self) -> PatchSummary {
-        if self.sends {
-            summary(self.kind, self.pinned.repair())
-        } else {
-            empty()
-        }
-    }
-
     pub(crate) fn outcome(&self) -> Option<Outcome> {
         self.outcome
     }
 
-    /// The next frame of this side's delta, when the stream can take one:
-    /// ROOT first, then each node or leaf, then DONE, then nothing.
+    /// Root is an ordinary empty-prefix announcement. A singleton additionally
+    /// needs its full-depth key announcement. No read or reply gates this FIFO.
     pub(crate) fn next_delta(&mut self) -> Option<Frame> {
-        if self.outcome.is_some() {
+        if self.outcome.is_some() || self.done_sent {
             return None;
         }
-        if !self.root_sent {
+        let prefix = if !self.root_sent {
             self.root_sent = true;
-            return Some(Frame::Root {
-                summary: self.root(),
-            });
-        }
-        if self.done_sent {
-            return None;
-        }
-        let Some(locator) = self.queue.pop_front() else {
-            self.done_sent = true;
-            return Some(Frame::Done);
+            Vec::new()
+        } else {
+            match self.queue.pop_front() {
+                Some(prefix) => prefix,
+                None => {
+                    self.done_sent = true;
+                    return Some(Frame::Done);
+                }
+            }
         };
-        let visited = node(self.kind, self.pinned.repair(), &locator)
-            .expect("a pinned tree holds the nodes its own branches name");
-        let PatchNode::Branch { ref branch, .. } = visited else {
-            let PatchNode::Leaf { leaf, .. } = visited else {
-                unreachable!()
-            };
-            let key = leaf.key.try_into().expect("a walked key is 32 bytes");
-            return Some(Frame::Leaf { key });
-        };
-        for child in &branch.children {
-            let locator = child_locator(branch, child);
-            let announced = locator_key(&locator);
-            if self.announced.get(&announced).is_some() {
-                self.announced.remove(&announced);
-                continue;
-            }
-            let declared = declared(child).expect("a pinned branch's child is nonempty");
-            if self.agreed.as_ref().and_then(|agreed| agreed.at(&locator)) == Some(declared) {
-                continue;
-            }
-            self.queue.push_back(locator);
-            if self.queue.len() > FLOOD_LOCATORS {
-                self.fail(Failure::Protocol);
-                return None;
+        let declared = self.delta.at(&prefix).unwrap_or_else(empty);
+        if declared.root().is_some() {
+            let matched = self.announced.get(&locator_key(&prefix)).is_some();
+            self.announced.remove(&locator_key(&prefix));
+            if !matched {
+                let (canonical, mut children) = self.delta.shape(&prefix).expect("local subtree");
+                if prefix.is_empty() && !canonical.is_empty() {
+                    children = vec![canonical];
+                }
+                for child in children {
+                    self.queue.push_back(child);
+                    if self.queue.len() > FLOOD_LOCATORS {
+                        self.fail(Failure::Protocol);
+                        return None;
+                    }
+                }
             }
         }
-        debug_assert!(self.queue.len() <= FLOOD_LOCATORS);
-        Some(Frame::Node {
-            prefix: locator,
-            node: visited,
+        Some(Frame::Subtree {
+            prefix,
+            summary: declared,
         })
     }
 
-    /// Take one frame from the peer, seeing the live store as `snapshot`.
     pub(crate) fn on_frame(
         &mut self,
         frame: Frame,
@@ -519,7 +436,6 @@ impl Exchange {
         outs
     }
 
-    /// The landing task acknowledged values.
     pub(crate) fn on_landed_ack(&mut self, landed: u64, failed: u64) -> Vec<Out> {
         let mut outs = Vec::new();
         self.unlanded = self
@@ -530,7 +446,6 @@ impl Exchange {
         outs
     }
 
-    /// A blob fetch ended.
     pub(crate) fn on_fetched(
         &mut self,
         handle: RawHash,
@@ -545,172 +460,123 @@ impl Exchange {
         outs
     }
 
-    /// Whether the driver should read the next frame: not once the exchange
-    /// ended, and not while [`MAX_WALK_UNLANDED`] values are with the
-    /// landing task.
     pub(crate) fn want_read(&self) -> bool {
         self.outcome.is_none() && self.unlanded < MAX_WALK_UNLANDED
     }
 
-    /// Whether the peer owes this side a frame, so the driver times its
-    /// wait for one: before the peer's DONE, and after it the values asked
-    /// for. The peer's LANDED takes what time its landings take.
     pub(crate) fn awaits(&self) -> bool {
         !self.peer_done || !self.requests.is_empty()
     }
 
-    /// The exchange as it ended, however it ended.
     pub(crate) fn end(self) -> Ended {
         let confirmed = self.outcome == Some(Outcome::Confirmed);
+        let next = confirmed.then(|| self.union_tree());
+        let peer_root = self.peer_root.map(|_| {
+            let mut peer = self
+                .agreed
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(|| Tree::empty(self.kind, self.collection));
+            peer.union(self.peer);
+            peer.summary()
+        });
         Ended {
             sends: self.sends,
             receives: self.receives,
             confirmed: self.landed_received,
             landed: self.landed_sent,
             root: summary(self.kind, self.pinned.repair()),
-            peer_root: self.peer_root,
-            agreed: confirmed.then(|| Arc::new(self.next)),
+            peer_root,
+            agreed: next.map(Arc::new),
         }
+    }
+
+    fn union_tree(&self) -> Tree {
+        let mut union = self
+            .agreed
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| Tree::empty(self.kind, self.collection));
+        union.union(self.delta.clone());
+        union.union(self.peer.clone());
+        union
     }
 
     fn frame(&mut self, frame: Frame, outs: &mut Vec<Out>) -> Result<(), Failure> {
         match frame {
             Frame::Open { .. } => Err(Failure::Protocol),
-            Frame::Root { summary } => {
-                if self.peer_root.is_some() {
-                    return Err(Failure::Protocol);
-                }
-                self.peer_root = Some(summary);
-                if summary == crate::walk::summary(self.kind, self.pinned.repair()) {
-                    // The peer's tree is this side's: nothing below the
-                    // root is owed either way.
-                    self.queue.clear();
-                    if !self.sends {
-                        self.next
-                            .union(Tree::pinned(self.kind, self.pinned.repair()));
-                    }
-                }
-                if self.receives
-                    && let Some(digest) = summary.root()
-                {
-                    self.owe([(Vec::new(), digest, summary.leaf_count())])?;
-                }
-                Ok(())
-            }
-            Frame::Node { prefix, node } => {
-                let root = self.arriving()?;
-                let declared = PatchSummary::new(Some(node.digest()), node.leaf_count())
-                    .map_err(|_| Failure::BadNode)?;
-                let base = crate::walk::base(self.kind, self.collection);
-                let canonical =
-                    PatchRepairRequest::new(root, KEY_BYTES, prefix.clone(), node.digest())
-                        .map_err(|_| Failure::BadNode)?;
-                // Even an already-held or send-only announcement must bind
-                // its children/count to its digest before it can prune work.
-                validate_patch_node(&canonical, base.len() + KEY_BYTES, &base, &node, |_, ()| {
-                    Ok(())
-                })
-                .map_err(|_| Failure::BadNode)?;
-                let mine = local_summary(self.kind, self.pinned.repair(), &prefix);
-                // The children announce what the peer holds. They matter
-                // only where this side's delta may still reach: under a node
-                // this side holds, differently from the peer and from the
-                // agreed tree.
-                if self.sends
-                    && mine.is_some()
-                    && mine != Some(declared)
-                    && mine != self.agreed.as_ref().and_then(|agreed| agreed.at(&prefix))
-                    && let PatchNode::Branch { branch, .. } = &node
-                {
-                    self.announce(branch)?;
-                }
-                if !self.receives {
-                    return Ok(());
-                }
+            Frame::Subtree {
+                prefix,
+                summary: declared,
+            } => {
                 if prefix.len() > KEY_BYTES {
                     return Err(Failure::BadNode);
                 }
-                let owed_key = locator_key(&prefix);
-                let Some((digest, leaf_count)) = self.owed.get(&owed_key).copied() else {
-                    // In flight before this side's announcement reached the
-                    // peer: it is what this side holds, or a violation.
-                    if !self.holds(&prefix, declared) {
+                if self.peer_done {
+                    return Err(Failure::Protocol);
+                }
+                if prefix.is_empty() {
+                    if self.peer_root.is_some() {
                         return Err(Failure::Protocol);
                     }
-                    if let PatchNode::Leaf { leaf, .. } = node
-                        && let Ok(key) = <[u8; KEY_BYTES]>::try_from(leaf.key)
+                    self.peer_root = Some(declared);
+                } else {
+                    self.arriving()?;
+                    if declared.root().is_none() {
+                        return Err(Failure::BadNode);
+                    }
+                }
+                if declared.leaf_count() > FLOOD_LOCATORS as u64 {
+                    return Err(Failure::Protocol);
+                }
+                let key = locator_key(&prefix);
+                if self.commitments.get(&key).is_some() {
+                    return Err(Failure::Protocol);
+                }
+                if self.commitments.len() >= FLOOD_LOCATORS as u64 {
+                    return Err(Failure::Protocol);
+                }
+                self.commitments.insert(&Entry::with_value(&key, declared));
+
+                // Our outgoing DIFFERENCE is the only tree whose traversal
+                // this claim can prune. Still emit this prefix once ourselves.
+                if declared.root().is_some() && self.delta.at(&prefix) == Some(declared) {
+                    if self.announced.len() >= FLOOD_LOCATORS as u64 {
+                        return Err(Failure::Protocol);
+                    }
+                    self.announced.insert(&Entry::new(&key));
+                    self.queue
+                        .retain(|queued| queued == &prefix || !queued.starts_with(&prefix));
+                }
+                if !self.receives || declared.root().is_none() {
+                    return Ok(());
+                }
+                if prefix.len() == KEY_BYTES {
+                    let leaf: [u8; KEY_BYTES] = prefix.clone().try_into().unwrap();
+                    let base = crate::walk::base(self.kind, self.collection);
+                    if declared.leaf_count() != 1
+                        || declared.root()
+                            != Some(<Blake3Merkle as PatchHash>::leaf(&[base, prefix].concat()))
                     {
-                        self.remember(key)?;
+                        return Err(Failure::BadNode);
                     }
-                    return Ok(());
+                    return self.leaf(leaf);
+                }
+                // An exact held subtree can close this portion without any
+                // descendants, but only into the peer's separate delta view.
+                let held = if self.delta.at(&prefix) == Some(declared) {
+                    Some(self.delta.clone())
+                } else if self.agreed.as_ref().and_then(|tree| tree.at(&prefix)) == Some(declared) {
+                    self.agreed.as_deref().cloned()
+                } else {
+                    let pinned = Tree::pinned(self.kind, self.pinned.repair());
+                    (pinned.at(&prefix) == Some(declared)).then_some(pinned)
                 };
-                self.owed.remove(&owed_key);
-                if node.leaf_count() != leaf_count {
-                    return Err(Failure::BadNode);
+                if let Some(held) = held {
+                    self.peer.include_at(&held, &prefix);
+                    self.proof_budget()?;
                 }
-                let base = crate::walk::base(self.kind, self.collection);
-                let request = PatchRepairRequest::new(root, KEY_BYTES, prefix.clone(), digest)
-                    .map_err(|_| Failure::BadNode)?;
-                validate_patch_node(&request, base.len() + KEY_BYTES, &base, &node, |_, ()| {
-                    Ok(())
-                })
-                .map_err(|_| Failure::BadNode)?;
-                match node {
-                    PatchNode::Leaf { leaf, .. } => {
-                        let key =
-                            <[u8; KEY_BYTES]>::try_from(leaf.key).map_err(|_| Failure::BadNode)?;
-                        self.leaf(key)
-                    }
-                    PatchNode::Branch { branch, .. } => self.owe(
-                        branch
-                            .children
-                            .iter()
-                            .map(|child| {
-                                (
-                                    child_locator(&branch, child),
-                                    child.digest,
-                                    child.leaf_count,
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                    ),
-                }
-            }
-            Frame::Leaf { key } => {
-                self.arriving()?;
-                if !self.receives {
-                    return Ok(());
-                }
-                // The leaf owed at the longest locator on its key's path,
-                // once, with the digest its key binds.
-                let owed = (0..=KEY_BYTES)
-                    .rev()
-                    .find(|len| self.owed.get(&locator_key(&key[..*len])).is_some());
-                let Some(len) = owed else {
-                    // In flight before this side's announcement reached the
-                    // peer: a leaf this side holds, or a violation.
-                    let held = contains(self.kind, self.pinned.repair(), &key)
-                        || self
-                            .agreed
-                            .as_ref()
-                            .is_some_and(|agreed| agreed.at(&key).is_some());
-                    if !held {
-                        return Err(Failure::Protocol);
-                    }
-                    return self.remember(key).map(|_| ());
-                };
-                let owed_key = locator_key(&key[..len]);
-                let (digest, leaf_count) = *self
-                    .owed
-                    .get(&owed_key)
-                    .expect("the locator was just found");
-                self.owed.remove(&owed_key);
-                let base = crate::walk::base(self.kind, self.collection);
-                let absolute = [&base[..], &key[..]].concat();
-                if leaf_count != 1 || digest != <Blake3Merkle as PatchHash>::leaf(&absolute) {
-                    return Err(Failure::BadNode);
-                }
-                self.leaf(key)
+                Ok(())
             }
             Frame::Value { key, bytes } => {
                 if self.requests.get(&key).is_none() {
@@ -718,10 +584,16 @@ impl Exchange {
                 }
                 self.requests.remove(&key);
                 let live = self.live()?;
-                let evidence = live.repair().authorization_evidence();
-                let (value, admit) = admit_value(self.kind, self.collection, key, &bytes, evidence)
-                    .map_err(|_| Failure::BadValue)?;
-                self.next.insert(key, value);
+                let (value, admit) = admit_value(
+                    self.kind,
+                    self.collection,
+                    key,
+                    &bytes,
+                    live.repair().authorization_evidence(),
+                )
+                .map_err(|_| Failure::BadValue)?;
+                self.peer.insert(key, value);
+                self.proof_budget()?;
                 self.admit(admit, outs);
                 Ok(())
             }
@@ -729,18 +601,18 @@ impl Exchange {
                 if !self.sends {
                     return Err(Failure::Protocol);
                 }
-                let bytes = value(self.kind, self.pinned.repair(), key)
+                // Only the immutable advertised delta serves requests, never
+                // an unrelated private key or an omitted AGREED sibling.
+                let bytes = self
+                    .delta_value(key)
                     .and_then(|value| value.bytes(self.collection))
                     .ok_or(Failure::Protocol)?;
                 outs.push(Out::Send(Frame::Value { key, bytes }));
                 Ok(())
             }
             Frame::Done => {
-                let root = self.arriving()?;
+                self.arriving()?;
                 self.peer_done = true;
-                if self.receives && (!self.owed.is_empty() || self.accounted != root.leaf_count()) {
-                    return Err(Failure::CountMismatch);
-                }
                 Ok(())
             }
             Frame::Landed => {
@@ -753,8 +625,20 @@ impl Exchange {
         }
     }
 
-    /// The peer's root, while its delta arrives: after its ROOT and before
-    /// its DONE.
+    fn delta_value(&self, key: [u8; KEY_BYTES]) -> Option<Value> {
+        match &self.delta {
+            Tree::Records(patch) => patch.get(&key).copied().map(Value::Record),
+            Tree::Authorization(collection, patch) => {
+                let absolute: [u8; 64] = [collection.raw.as_slice(), key.as_slice()]
+                    .concat()
+                    .try_into()
+                    .unwrap();
+                patch.get(&absolute).cloned().map(Value::Proof)
+            }
+            Tree::References(_) => None,
+        }
+    }
+
     fn arriving(&self) -> Result<PatchSummary, Failure> {
         match self.peer_root {
             Some(root) if !self.peer_done => Ok(root),
@@ -762,7 +646,6 @@ impl Exchange {
         }
     }
 
-    /// The live snapshot of C.
     fn live(&self) -> Result<Arc<CollectionSnapshot>, Failure> {
         self.snapshot
             .as_ref()
@@ -770,96 +653,15 @@ impl Exchange {
             .ok_or(Failure::Unavailable)
     }
 
-    /// Whether this side holds the subtree `declared` at `locator`: in its
-    /// pinned tree, or in the agreed tree, which it holds too.
-    fn holds(&self, locator: &[u8], declared: PatchSummary) -> bool {
-        local_summary(self.kind, self.pinned.repair(), locator) == Some(declared)
-            || self.agreed.as_ref().and_then(|agreed| agreed.at(locator)) == Some(declared)
+    fn proof_budget(&self) -> Result<(), Failure> {
+        if self.peer.summary().leaf_count() > FLOOD_LOCATORS as u64 {
+            Err(Failure::Protocol)
+        } else {
+            Ok(())
+        }
     }
 
-    /// Take the children of a NODE the peer sent as announcements: each
-    /// whose digest this side's tree has at its locator is held by the peer,
-    /// so the locator and everything queued under it is dropped, and the
-    /// locator is kept to skip when its parent is visited.
-    fn announce(&mut self, branch: &PatchBranch) -> Result<(), Failure> {
-        let end = usize::from(branch.end_depth);
-        let base = &branch.representative[..end];
-        let mut equal = [false; 256];
-        let mut any = false;
-        for child in &branch.children {
-            let locator = child_locator(branch, child);
-            let mine = local_summary(self.kind, self.pinned.repair(), &locator);
-            if mine.is_some_and(|mine| mine.root() == Some(child.digest)) {
-                equal[usize::from(child.edge)] = true;
-                any = true;
-                if self.announced.len() >= FLOOD_LOCATORS as u64 {
-                    return Err(Failure::Protocol);
-                }
-                self.announced.insert(&Entry::new(&locator_key(&locator)));
-            }
-        }
-        if any {
-            let announced = &mut self.announced;
-            self.queue.retain(|queued| {
-                let under =
-                    queued.len() > end && queued[..end] == *base && equal[usize::from(queued[end])];
-                if under && queued.len() == end + 1 {
-                    announced.remove(&locator_key(queued));
-                }
-                !under
-            });
-        }
-        Ok(())
-    }
-
-    /// The peer declared the subtrees `children` at their locators: each
-    /// this side holds is accounted, the rest are owed, unless that would
-    /// exceed the explicit locator budget. An honest wider delta is refused
-    /// too; the map stays as it was rather than changing FIFO scheduling.
-    fn owe(
-        &mut self,
-        children: impl IntoIterator<Item = (Vec<u8>, [u8; 32], u64)>,
-    ) -> Result<(), Failure> {
-        let mut owed = Vec::new();
-        for (locator, digest, leaf_count) in children {
-            let declared =
-                PatchSummary::new(Some(digest), leaf_count).map_err(|_| Failure::BadNode)?;
-            if self.holds(&locator, declared) {
-                if !self.sends
-                    && local_summary(self.kind, self.pinned.repair(), &locator) == Some(declared)
-                {
-                    self.next
-                        .include_at(&Tree::pinned(self.kind, self.pinned.repair()), &locator);
-                }
-                self.accounted = self
-                    .accounted
-                    .checked_add(leaf_count)
-                    .ok_or(Failure::CountMismatch)?;
-            } else {
-                owed.push((locator, (digest, leaf_count)));
-            }
-        }
-        if self.owed.len() as usize + owed.len() > FLOOD_LOCATORS {
-            return Err(Failure::Protocol);
-        }
-        for (locator, declared) in owed {
-            let key = locator_key(&locator);
-            if self.owed.get(&key).is_some() {
-                return Err(Failure::BadNode);
-            }
-            self.owed.insert(&Entry::with_value(&key, declared));
-        }
-        Ok(())
-    }
-
-    /// Count one pushed leaf; one the live store lacks is wanted, and one it
-    /// holds joins the next agreed tree at once. More waiting leaves than
-    /// the explicit withheld-value budget permits fails the exchange.
     fn leaf(&mut self, key: [u8; KEY_BYTES]) -> Result<(), Failure> {
-        self.accounted = self
-            .accounted
-            .checked_add(1)
-            .ok_or(Failure::CountMismatch)?;
         if self.remember(key)? {
             return Ok(());
         }
@@ -870,15 +672,43 @@ impl Exchange {
         Ok(())
     }
 
-    /// A leaf the peer streamed joins the next agreed tree with the value
-    /// the live store holds for it, if any: whether it holds one.
+    /// Live held typed values avoid refetch even when publication moved since
+    /// our pin; only the declared leaf enters the independent peer proof.
     fn remember(&mut self, key: [u8; KEY_BYTES]) -> Result<bool, Failure> {
         let live = self.live()?;
         let Some(value) = value(self.kind, live.repair(), key) else {
             return Ok(false);
         };
-        self.next.insert(key, value);
+        self.peer.insert(key, value);
+        self.proof_budget()?;
         Ok(true)
+    }
+
+    /// Close actual membership, not frame counts or the local union hash.
+    fn verify_delta(&self) -> Result<(), Failure> {
+        let root = self.peer_root.ok_or(Failure::Protocol)?;
+        if self.peer.summary() != root {
+            return Err(Failure::CountMismatch);
+        }
+        for key in self.commitments.iter() {
+            let depth = usize::from(key[0]);
+            let prefix = &key[1..1 + depth];
+            let declared = *self.commitments.get(key).unwrap();
+            if self.peer.at(prefix).unwrap_or_else(empty) != declared {
+                return Err(Failure::BadNode);
+            }
+            if !prefix.is_empty()
+                && self
+                    .peer
+                    .shape(prefix)
+                    .as_ref()
+                    .map(|(canonical, _)| canonical.as_slice())
+                    != Some(prefix)
+            {
+                return Err(Failure::BadNode);
+            }
+        }
+        Ok(())
     }
 
     fn admit(&mut self, admit: Admit, outs: &mut Vec<Out>) {
@@ -900,8 +730,6 @@ impl Exchange {
         self.outcome = Some(Outcome::Failed(failure));
     }
 
-    /// Ask for wanted leaves while the window has room, send LANDED once the
-    /// peer's delta is in and landed, and end once both LANDEDs crossed.
     fn settle(&mut self, outs: &mut Vec<Out>) {
         if self.outcome.is_some() {
             return;
@@ -911,7 +739,10 @@ impl Exchange {
         {
             match admit_missing(self.kind, self.collection, key, self.snapshot.as_deref()) {
                 Some(admit) => {
-                    self.next.insert(key, Value::Handle);
+                    self.peer.insert(key, Value::Handle);
+                    if let Err(failure) = self.proof_budget() {
+                        return self.fail(failure);
+                    }
                     self.admit(admit, outs);
                 }
                 None => {
@@ -933,6 +764,11 @@ impl Exchange {
             if self.deferred {
                 return self.fail(Failure::DeferredProof);
             }
+            if self.receives
+                && let Err(failure) = self.verify_delta()
+            {
+                return self.fail(failure);
+            }
             self.landed_sent = true;
             outs.push(Out::Send(Frame::Landed));
         }
@@ -940,18 +776,6 @@ impl Exchange {
             self.outcome = Some(Outcome::Confirmed);
         }
     }
-}
-
-/// The locator of `child` under `branch`: the representative up to the end
-/// depth, then the child's edge.
-fn child_locator(branch: &PatchBranch, child: &PatchChild) -> Vec<u8> {
-    let mut locator = branch.representative[..usize::from(branch.end_depth)].to_vec();
-    locator.push(child.edge);
-    locator
-}
-
-fn declared(child: &PatchChild) -> Option<PatchSummary> {
-    PatchSummary::new(Some(child.digest), child.leaf_count).ok()
 }
 
 #[cfg(test)]
@@ -966,18 +790,38 @@ pub(crate) mod tests {
         CollectionStore,
     };
 
+    use crate::patch_repair::{PatchBranch, PatchChild, PatchNode};
+    use crate::walk::node;
+
     use crate::collection_delta::{decode_record, encode_record};
     use crate::walk::tests::walking::{Node, open};
-    use crate::walk::tests::{branches, paths};
+
+    fn root(summary: PatchSummary) -> Frame {
+        Frame::Subtree {
+            prefix: Vec::new(),
+            summary,
+        }
+    }
+
+    fn leaf(key: [u8; KEY_BYTES]) -> Frame {
+        Frame::Subtree {
+            prefix: key.to_vec(),
+            summary: PatchSummary::new(Some(<Blake3Merkle as PatchHash>::leaf(&key)), 1).unwrap(),
+        }
+    }
+
+    fn announcement(prefix: Vec<u8>, node: PatchNode<()>) -> Frame {
+        Frame::Subtree {
+            prefix,
+            summary: PatchSummary::new(Some(node.digest()), node.leaf_count()).unwrap(),
+        }
+    }
 
     fn roundtrip(frame: Frame) -> Frame {
         let (kind, payload) = frame.encode();
         Frame::decode(kind, &payload).unwrap().unwrap()
     }
 
-    /// One node and its exchange, driven by hand: every frame crosses the
-    /// codec, landings run as the landing task does unless held back, and
-    /// fetches are noted for the test to answer.
     pub(crate) struct Side {
         pub(crate) node: Node,
         pub(crate) exchange: Exchange,
@@ -1097,7 +941,9 @@ pub(crate) mod tests {
             self.sent
                 .iter()
                 .filter_map(|frame| match frame {
-                    Frame::Node { prefix, .. } => Some(prefix.clone()),
+                    Frame::Subtree { prefix, .. } if prefix.len() < KEY_BYTES => {
+                        Some(prefix.clone())
+                    }
                     _ => None,
                 })
                 .collect()
@@ -1108,7 +954,9 @@ pub(crate) mod tests {
             self.sent
                 .iter()
                 .filter_map(|frame| match frame {
-                    Frame::Leaf { key } => Some(*key),
+                    Frame::Subtree { prefix, .. } if prefix.len() == KEY_BYTES => {
+                        Some(prefix.as_slice().try_into().unwrap())
+                    }
                     _ => None,
                 })
                 .collect()
@@ -1124,13 +972,11 @@ pub(crate) mod tests {
 
         /// The agreed root the exchange ended with, if it confirmed.
         pub(crate) fn agreed(&self) -> Option<PatchSummary> {
-            (self.outcome() == Some(Outcome::Confirmed)).then(|| self.exchange.next.summary())
+            (self.outcome() == Some(Outcome::Confirmed))
+                .then(|| self.exchange.union_tree().summary())
         }
     }
 
-    /// Carry frames both ways, one each way in turn, until neither side has
-    /// anything to send: an exchange whose every announcement arrives as
-    /// early as the other side's delta allows.
     pub(crate) fn carry(a: &mut Side, b: &mut Side) {
         loop {
             let mut moved = false;
@@ -1148,9 +994,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Carry everything one side has to send before the other sends a
-    /// frame: a delta that goes out in one burst, as over a stream whose
-    /// round trip is longer than the burst.
     pub(crate) fn burst(a: &mut Side, b: &mut Side) {
         loop {
             let mut moved = false;
@@ -1175,7 +1018,6 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// The value under `key` at `node`, as its exchange serves it.
     fn value_of(
         node: &Node,
         collection: CollectionHandle,
@@ -1200,51 +1042,33 @@ pub(crate) mod tests {
         }
     }
 
-    /// `sender`'s `kind` tree of C as a scripted peer streams it, breadth
-    /// first and heeding no announcement: ROOT, every node and leaf, and
-    /// DONE, leaving out the leaves in `omit`.
     fn tree(
         sender: &Node,
         collection: CollectionHandle,
         kind: WalkKind,
         omit: &BTreeSet<[u8; 32]>,
     ) -> Vec<Frame> {
-        let overlay = sender.pinned(collection);
-        let overlay = overlay.repair();
-        let mut frames = vec![Frame::Root {
-            summary: summary(kind, overlay),
-        }];
-        let mut queue = VecDeque::new();
-        if summary(kind, overlay).root().is_some() {
-            queue.push_back(Vec::new());
-        }
-        while let Some(prefix) = queue.pop_front() {
-            match node(kind, overlay, &prefix).unwrap() {
-                PatchNode::Leaf { leaf, .. } => {
-                    let key = leaf.key.try_into().unwrap();
-                    if !omit.contains(&key) {
-                        frames.push(Frame::Leaf { key });
-                    }
-                }
-                node @ PatchNode::Branch { .. } => {
-                    let PatchNode::Branch { branch, .. } = &node else {
-                        unreachable!()
-                    };
-                    for child in &branch.children {
-                        queue.push_back(child_locator(branch, child));
-                    }
-                    frames.push(Frame::Node { prefix, node });
-                }
+        let mut exchange = Exchange::start(
+            collection,
+            kind,
+            sender.pinned(collection),
+            None,
+            true,
+            false,
+        );
+        let mut frames = Vec::new();
+        while let Some(frame) = exchange.next_delta() {
+            if let Frame::Subtree { prefix, .. } = &frame
+                && prefix.len() == KEY_BYTES
+                && omit.contains(&<[u8; 32]>::try_from(prefix.as_slice()).unwrap())
+            {
+                continue;
             }
+            frames.push(frame);
         }
-        frames.push(Frame::Done);
         frames
     }
 
-    /// Stream `sender`'s `kind` tree of C into `side` as a scripted peer,
-    /// answering every value request at once and the side's DONE with
-    /// LANDED, and leaving out the leaves in `omit`. Returns the frames
-    /// streamed, values included.
     fn stream(
         side: &mut Side,
         sender: &Node,
@@ -1299,10 +1123,6 @@ pub(crate) mod tests {
         streamed
     }
 
-    /// A tree the receiving side takes as the peer's, fabricated without a
-    /// PATCH: `wide` branches under the root, each of `deep` leaves, every
-    /// digest as the PATCH hashes it. The root and its NODE, then each
-    /// branch's NODE with its LEAFs.
     fn fabricated(wide: usize, deep: usize) -> (PatchSummary, Frame, Vec<(Frame, Vec<Frame>)>) {
         let tree_to_key = (0..KEY_BYTES).collect::<Vec<_>>();
         let branch = |representative: Vec<u8>, end_depth: usize, children: Vec<PatchChild>| {
@@ -1337,16 +1157,16 @@ pub(crate) mod tests {
         for edge in 0..wide {
             let edge = u8::try_from(edge).unwrap();
             let (mut leaves, mut under) = (Vec::new(), Vec::new());
-            for leaf in 0..deep {
+            for index in 0..deep {
                 let mut key = [0; KEY_BYTES];
                 key[0] = edge;
-                key[1] = u8::try_from(leaf).unwrap();
+                key[1] = u8::try_from(index).unwrap();
                 under.push(PatchChild {
                     edge: key[1],
                     digest: <Blake3Merkle as PatchHash>::leaf(&key),
                     leaf_count: 1,
                 });
-                leaves.push(Frame::Leaf { key });
+                leaves.push(leaf(key));
             }
             let mut representative = vec![0; KEY_BYTES];
             representative[0] = edge;
@@ -1356,27 +1176,13 @@ pub(crate) mod tests {
                 digest: node.digest(),
                 leaf_count: node.leaf_count(),
             });
-            branches.push((
-                Frame::Node {
-                    prefix: vec![edge],
-                    node,
-                },
-                leaves,
-            ));
+            branches.push((announcement(vec![edge], node), leaves));
         }
         let node = branch(vec![0; KEY_BYTES], 0, children);
         let root = PatchSummary::new(Some(node.digest()), node.leaf_count()).unwrap();
-        (
-            root,
-            Frame::Node {
-                prefix: Vec::new(),
-                node,
-            },
-            branches,
-        )
+        (root, announcement(Vec::new(), node), branches)
     }
 
-    /// A node holding `count` records of a fresh collection, observed.
     fn holding(
         byte: u8,
         name: &str,
@@ -1391,7 +1197,6 @@ pub(crate) mod tests {
         (node, collection, records)
     }
 
-    /// A node holding `records` of the collection `name`, observed.
     fn sharing(byte: u8, name: &str, records: &[CollectionRecord]) -> (Node, CollectionHandle) {
         let mut node = Node::new(byte);
         let collection = node.hold(name, open());
@@ -1402,188 +1207,86 @@ pub(crate) mod tests {
         (node, collection)
     }
 
-    /// A first exchange with an empty peer streams the whole tree: ROOT,
-    /// every branch as a NODE and every leaf as a LEAF, then DONE, without
-    /// a frame from the peer in between; the peer sends only its ROOT and
-    /// DONE, a request per value and LANDED. Both confirm, and both agree
-    /// on the full side's tree.
     #[test]
     fn a_first_exchange_streams_the_whole_tree_to_an_empty_peer() {
         let (full, collection, records) = holding(30, "whole", 300);
         let (empty, _) = sharing(31, "whole", &[]);
-        let root = summary(WalkKind::Records, full.pinned(collection).repair());
+        let expected = tree(&full, collection, WalkKind::Records, &BTreeSet::new());
+        let root_summary = summary(WalkKind::Records, full.pinned(collection).repair());
         let mut full = Side::both(full, collection, WalkKind::Records);
         let mut empty = Side::both(empty, collection, WalkKind::Records);
         burst(&mut full, &mut empty);
-
         assert_eq!(full.outcome(), Some(Outcome::Confirmed));
         assert_eq!(empty.outcome(), Some(Outcome::Confirmed));
-        assert_eq!(full.sent[0], Frame::Root { summary: root });
-        let mut expected = Vec::new();
-        branches(
-            full.node.pinned(collection).repair().records().patch(),
-            Vec::new(),
-            &mut expected,
-        );
-        let nodes = full.nodes();
-        assert!(expected.len() > 1);
-        assert_eq!(nodes.len(), expected.len());
-        assert_eq!(
-            nodes.iter().collect::<BTreeSet<_>>(),
-            expected.iter().collect::<BTreeSet<_>>()
-        );
-        assert_eq!(full.leaves().len(), records.len());
+        assert_eq!(full.sent[..expected.len()], expected);
         assert_eq!(
             full.leaves().into_iter().collect::<BTreeSet<_>>(),
             fingerprints(records.iter().copied())
         );
-        // The delta came before anything the peer sent after its ROOT.
-        let last_node = full
-            .sent
-            .iter()
-            .rposition(|frame| matches!(frame, Frame::Node { .. }))
-            .unwrap();
-        assert!(
-            full.sent[..last_node]
-                .iter()
-                .all(|frame| !matches!(frame, Frame::Value { .. }))
-        );
-        assert_eq!(
-            empty
-                .sent
-                .iter()
-                .filter(|frame| matches!(frame, Frame::Node { .. } | Frame::Leaf { .. }))
-                .count(),
-            0
-        );
+        assert_eq!(empty.nodes(), [Vec::<u8>::new()]);
+        assert!(empty.leaves().is_empty());
         assert_eq!(empty.requested(), fingerprints(records.iter().copied()));
-        assert_eq!(empty.count(|frame| *frame == Frame::Done), 1);
-        assert_eq!(empty.count(|frame| *frame == Frame::Landed), 1);
-        assert_eq!(empty.count(|frame| matches!(frame, Frame::Root { .. })), 1);
         assert_eq!(empty.sent.len(), 303);
-        for frame in &full.sent {
-            if let Frame::Value { key, bytes } = frame {
-                let record = decode_record(collection, bytes).unwrap();
-                assert_eq!(record.fingerprint().raw(), *key);
-            }
-        }
         assert_eq!(
             empty.node.records(collection),
             records.iter().copied().collect()
         );
-        assert_eq!(full.agreed(), Some(root));
-        assert_eq!(empty.agreed(), Some(root));
+        assert_eq!(full.agreed(), Some(root_summary));
+        assert_eq!(empty.agreed(), Some(root_summary));
+        eprintln!(
+            "PREFIX_FIRST_EMPTY leaves=300 subtree_frames={} reply_waits=0 scheduler=full_delta_burst_before_peer_replies",
+            full.nodes().len() + full.leaves().len()
+        );
     }
 
-    /// Against the agreed tree, an unchanged tree is ROOT then DONE, and
-    /// LANDED answers it; an empty tree is the same against nothing.
     #[test]
     fn an_unchanged_tree_against_the_agreed_tree_is_root_then_done() {
         let (a, collection, records) = holding(32, "same", 50);
         let (b, _) = sharing(33, "same", &records);
         let kind = WalkKind::Records;
-        let mut a = Side::both(a, collection, kind);
-        let mut b = Side::both(b, collection, kind);
-        carry(&mut a, &mut b);
-        assert_eq!(a.outcome(), Some(Outcome::Confirmed));
-        let agreed = Arc::new(Tree::pinned(kind, a.node.pinned(collection).repair()));
-        assert_eq!(a.agreed(), Some(agreed.summary()));
-
-        let mut a = Side::new(a.node, collection, kind, Some(agreed.clone()), true, true);
-        let mut b = Side::new(b.node, collection, kind, Some(agreed), true, true);
+        let agreed = Arc::new(Tree::pinned(kind, a.pinned(collection).repair()));
+        let mut a = Side::new(a, collection, kind, Some(agreed.clone()), true, true);
+        let mut b = Side::new(b, collection, kind, Some(agreed.clone()), true, true);
         carry(&mut a, &mut b);
         for side in [&a, &b] {
             assert_eq!(side.outcome(), Some(Outcome::Confirmed));
-            // ROOT, then DONE and LANDED, the answer to the peer's DONE
-            // going first.
-            assert_eq!(
-                side.sent[0],
-                Frame::Root {
-                    summary: summary(kind, side.node.pinned(collection).repair())
-                }
-            );
+            assert_eq!(side.sent[0], root(empty()));
             assert!(
                 side.sent[1..] == [Frame::Done, Frame::Landed]
-                    || side.sent[1..] == [Frame::Landed, Frame::Done],
-                "{:?}",
-                side.sent
+                    || side.sent[1..] == [Frame::Landed, Frame::Done]
             );
+            assert_eq!(side.agreed(), Some(agreed.summary()));
         }
-
         let (blank, collection) = sharing(34, "empty", &[]);
         let mut blank = Side::both(blank, collection, WalkKind::Authorization);
-        assert_eq!(blank.next(), Some(Frame::Root { summary: empty() }));
+        assert_eq!(blank.next(), Some(root(empty())));
         assert_eq!(blank.next(), Some(Frame::Done));
         assert_eq!(blank.next(), None);
     }
 
-    /// A tree the peer announces at a locator this side had already
-    /// descended below is not sent on: the announcement drops what was
-    /// queued under it, so nothing under that locator follows.
     #[test]
     fn a_match_that_arrives_mid_level_drops_the_work_queued_under_it() {
         let (a, collection, _) = holding(35, "mid", 300);
-        let kind = WalkKind::Records;
-        let mut a = Side::new(a, collection, kind, None, true, false);
-        assert!(matches!(a.next(), Some(Frame::Root { .. })));
-        let Some(Frame::Node { prefix, node: root }) = a.next() else {
-            panic!("the root node");
-        };
-        assert!(prefix.is_empty());
-        let PatchNode::Branch { branch, .. } = &root else {
-            panic!("300 records branch at the root");
-        };
-        // Level 1 is queued. Visit its first branch, which queues level 2
-        // under it.
+        let mut a = Side::new(a, collection, WalkKind::Records, None, true, false);
+        assert!(matches!(a.next(), Some(Frame::Subtree { prefix, .. }) if prefix.is_empty()));
         let first = loop {
             match a.next() {
-                Some(Frame::Node { prefix, .. }) => break prefix,
-                Some(Frame::Leaf { .. }) => continue,
-                other => panic!("some first byte branches: {other:?}"),
+                Some(Frame::Subtree { prefix, .. }) if prefix.len() < KEY_BYTES => break prefix,
+                Some(Frame::Subtree { .. }) => continue,
+                other => panic!("first branch: {other:?}"),
             }
         };
-        assert_eq!(first.len(), 1);
         assert!(
             a.exchange
                 .queue
                 .iter()
                 .any(|queued| queued.starts_with(&first))
         );
-
-        // The peer's root NODE, with the same digest at `first` and a
-        // digest of its own everywhere else.
-        let mut announced = branch.clone();
-        for child in &mut announced.children {
-            if child.edge != first[0] {
-                child.digest = [0xAA; 32];
-            }
-        }
-        let mut state = <Blake3Merkle as PatchHash>::begin_branch(
-            &announced.representative,
-            &(0..KEY_BYTES).collect::<Vec<_>>(),
-            usize::from(announced.end_depth),
-            announced.children.len(),
-            root.leaf_count(),
-        );
-        for child in &announced.children {
-            <Blake3Merkle as PatchHash>::push_child(
-                &mut state,
-                child.edge,
-                child.leaf_count,
-                child.digest,
-            );
-        }
-        let digest = <Blake3Merkle as PatchHash>::finish_branch(state);
-        a.hear(Frame::Root {
-            summary: PatchSummary::new(Some(digest), root.leaf_count()).unwrap(),
-        });
-        a.hear(Frame::Node {
-            prefix: Vec::new(),
-            node: PatchNode::Branch {
-                digest,
-                leaf_count: root.leaf_count(),
-                branch: announced,
-            },
+        let declared = a.exchange.delta.at(&first).unwrap();
+        a.hear(root(PatchSummary::new(Some([0xAA; 32]), 300).unwrap()));
+        a.hear(Frame::Subtree {
+            prefix: first.clone(),
+            summary: declared,
         });
         assert!(
             a.exchange
@@ -1591,40 +1294,34 @@ pub(crate) mod tests {
                 .iter()
                 .all(|queued| !queued.starts_with(&first))
         );
-        let mut rest = Vec::new();
         while let Some(frame) = a.next() {
-            rest.push(frame);
-        }
-        assert_eq!(rest.last(), Some(&Frame::Done));
-        for frame in &rest {
-            match frame {
-                Frame::Node { prefix, .. } => assert!(!prefix.starts_with(&first), "{prefix:?}"),
-                Frame::Leaf { key } => assert!(!key.starts_with(&first), "{key:?}"),
-                _ => {}
+            if let Frame::Subtree { prefix, .. } = frame {
+                assert!(!prefix.starts_with(&first));
             }
         }
-        // Every other level-1 child went on.
-        let below = rest
-            .iter()
-            .filter_map(|frame| match frame {
-                Frame::Node { prefix, .. } => Some(prefix[0]),
-                Frame::Leaf { key } => Some(key[0]),
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(below.len(), branch.children.len() - 1);
+        assert!(a.sent.contains(&Frame::Done));
     }
 
-    /// An announcement of the whole tree, the peer's ROOT with this side's
-    /// root, ends the delta at once.
     #[test]
     fn an_equal_root_announcement_ends_the_delta() {
         let (a, collection, _) = holding(36, "equal", 300);
         let kind = WalkKind::Records;
         let root = summary(kind, a.pinned(collection).repair());
         let mut a = Side::new(a, collection, kind, None, true, true);
-        assert_eq!(a.next(), Some(Frame::Root { summary: root }));
-        assert_eq!(a.feed(Frame::Root { summary: root }), []);
+        assert_eq!(
+            a.next(),
+            Some(Frame::Subtree {
+                prefix: Vec::new(),
+                summary: root
+            })
+        );
+        assert_eq!(
+            a.feed(Frame::Subtree {
+                prefix: Vec::new(),
+                summary: root
+            }),
+            []
+        );
         assert_eq!(a.next(), Some(Frame::Done));
         assert_eq!(a.feed(Frame::Done), [Frame::Landed]);
         assert_eq!(a.feed(Frame::Landed), []);
@@ -1632,8 +1329,6 @@ pub(crate) mod tests {
         assert_eq!(a.agreed(), Some(root));
     }
 
-    /// Two sides holding overlapping records end with the same agreed tree:
-    /// the union, which both now hold.
     #[test]
     fn both_sides_compute_the_same_agreed_tree() {
         let (a, collection, records) = holding(37, "union", 200);
@@ -1661,13 +1356,13 @@ pub(crate) mod tests {
             &[own[0].fingerprint().raw()[0]],
             &records[0].fingerprint().raw()[..2],
         ] {
-            assert_eq!(a.exchange.next.at(locator), b.exchange.next.at(locator));
+            assert_eq!(
+                a.exchange.union_tree().at(locator),
+                b.exchange.union_tree().at(locator)
+            );
         }
     }
 
-    /// A side that sends nothing agrees on the peer's tree: against it the
-    /// peer's unchanged tree is ROOT then DONE, however much more this side
-    /// holds.
     #[test]
     fn a_side_that_sends_nothing_agrees_on_the_peer_s_tree() {
         let (writer, collection, records) = holding(39, "one way", 20);
@@ -1682,12 +1377,15 @@ pub(crate) mod tests {
         assert_eq!(owner.outcome(), Some(Outcome::Confirmed));
         assert_eq!(owner.requested().len(), 10);
         assert_eq!(owner.node.records(collection).len(), 21);
-        assert_eq!(owner.sent.first(), Some(&Frame::Root { summary: empty() }));
+        assert_eq!(
+            owner.sent.first(),
+            Some(&Frame::Subtree {
+                prefix: Vec::new(),
+                summary: empty()
+            })
+        );
         assert!(
-            owner.sent.iter().all(|frame| !matches!(
-                frame,
-                Frame::Node { .. } | Frame::Leaf { .. } | Frame::Value { .. }
-            )),
+            owner.sent.iter().all(|frame| !matches!(frame, Frame::Subtree {prefix, summary} if !prefix.is_empty() || summary.leaf_count()!=0) && !matches!(frame, Frame::Value {..})),
             "a non-sending peer discloses no private tree or values"
         );
         assert_eq!(writer.node.records(collection).len(), 20);
@@ -1708,18 +1406,18 @@ pub(crate) mod tests {
         carry(&mut writer, &mut owner);
         assert_eq!(writer.outcome(), Some(Outcome::Confirmed));
         assert_eq!(owner.outcome(), Some(Outcome::Confirmed));
-        assert_eq!(
-            writer.sent,
-            [Frame::Root { summary: agreed }, Frame::Done, Frame::Landed]
-        );
+        assert_eq!(writer.sent, [root(empty()), Frame::Done, Frame::Landed]);
         assert_eq!(owner.sent.len(), 3);
-        assert_eq!(owner.sent.first(), Some(&Frame::Root { summary: empty() }));
+        assert_eq!(
+            owner.sent.first(),
+            Some(&Frame::Subtree {
+                prefix: Vec::new(),
+                summary: empty()
+            })
+        );
         assert_eq!(owner.agreed(), Some(agreed));
     }
 
-    /// Leaves a side lacks are asked for and land; it ends with the union
-    /// and says so, and so does the other side with the one record only
-    /// the first held.
     #[test]
     fn missing_leaves_are_requested_and_land() {
         let (sender, collection, records) = holding(41, "missing", 300);
@@ -1751,9 +1449,6 @@ pub(crate) mod tests {
         assert_eq!(sender.node.records(collection), union);
     }
 
-    /// A subtree the peer announces is neither streamed below its node nor
-    /// asked for: the sender's leaves under it never go out, and the peer
-    /// never asks for them.
     #[test]
     fn a_subtree_the_peer_announces_is_neither_streamed_nor_asked_for() {
         let (sender, collection, records) = holding(43, "pruned", 400);
@@ -1797,74 +1492,63 @@ pub(crate) mod tests {
         );
     }
 
-    /// The peer's root NODE announces exactly the children it holds, and
-    /// the delta goes on below every other one.
     #[test]
     fn the_root_node_s_announcements_prune_exactly_the_children_the_peer_holds() {
-        let (sender, collection, records) = holding(45, "bitmap", 3000);
-        let Some(PatchNode::Branch { branch, .. }) =
-            node(WalkKind::Records, sender.pinned(collection).repair(), &[])
-        else {
-            panic!("3000 records branch at the root");
-        };
-        assert_eq!(branch.end_depth, 0);
-        assert_eq!(
-            branch.children.len(),
-            256,
-            "3000 keys fill every branch byte"
-        );
+        let (sender, collection, records) = holding(45, "prefix overlap", 3000);
         let edges = [0, 7, 8, 255];
         let held = records
             .iter()
             .filter(|record| edges.contains(&record.fingerprint().raw()[0]))
             .copied()
             .collect::<Vec<_>>();
-        let (receiver, _) = sharing(46, "bitmap", &held);
-        let kind = WalkKind::Records;
-        let mut sender = Side::both(sender, collection, kind);
-        let mut receiver = Side::both(receiver, collection, kind);
+        let (receiver, _) = sharing(46, "prefix overlap", &held);
+        let mut sender = Side::both(sender, collection, WalkKind::Records);
+        let mut receiver = Side::both(receiver, collection, WalkKind::Records);
         carry(&mut sender, &mut receiver);
         assert_eq!(sender.outcome(), Some(Outcome::Confirmed));
-        let below = sender
-            .sent
-            .iter()
-            .filter_map(|frame| match frame {
-                Frame::Node { prefix, .. } if !prefix.is_empty() => Some(prefix[0]),
-                Frame::Leaf { key } => Some(key[0]),
-                _ => None,
-            })
-            .collect::<BTreeSet<u8>>();
-        assert_eq!(below.len(), 256 - edges.len());
+        assert_eq!(receiver.outcome(), Some(Outcome::Confirmed));
         for edge in edges {
-            assert!(!below.contains(&edge), "child {edge} was pruned");
+            let exact = sender
+                .nodes()
+                .iter()
+                .filter(|prefix| **prefix == vec![edge])
+                .count();
+            assert_eq!(exact, 1);
+            assert!(sender.leaves().iter().all(|key| key[0] != edge));
         }
         assert_eq!(receiver.requested().len(), records.len() - held.len());
-        // The receiver's delta is its root NODE, which the sender's root
-        // children announce whole, and nothing below it.
-        assert_eq!(receiver.nodes(), [Vec::<u8>::new()]);
-        assert!(receiver.leaves().is_empty());
+        assert!(
+            receiver
+                .leaves()
+                .iter()
+                .all(|key| held.iter().any(|record| record.fingerprint().raw() == *key))
+        );
+        eprintln!(
+            "PREFIX_PARTIAL_OVERLAP shared_leaves={} small_side_in_flight_leaf_announcements={} scheduler=one_frame_each_direction unequal_frontiers",
+            held.len(),
+            receiver.leaves().len()
+        );
+        assert_eq!(sender.agreed(), receiver.agreed());
     }
 
-    /// The delta goes breadth first: no NODE's prefix is shorter than the
-    /// one before it, so each level's announcements go out before the next
-    /// level does.
     #[test]
     fn the_delta_goes_breadth_first() {
         let (sender, collection, _) = holding(47, "breadth", 3000);
         let mut sender = Side::new(sender, collection, WalkKind::Records, None, true, false);
-        let mut depths = Vec::new();
-        while let Some(frame) = sender.next() {
-            if let Frame::Node { prefix, .. } = frame {
-                depths.push(prefix.len());
-            }
+        assert!(matches!(sender.next(), Some(Frame::Subtree { prefix, .. }) if prefix.is_empty()));
+        let mut positions = 0;
+        while !sender.exchange.queue.is_empty() {
+            let front = sender.exchange.queue.front().unwrap().clone();
+            let Some(Frame::Subtree { prefix, .. }) = sender.next() else {
+                panic!("queued position");
+            };
+            assert_eq!(prefix, front, "FIFO, including compressed leaf paths");
+            positions += 1;
         }
-        assert!(depths.len() > 256, "{}", depths.len());
-        assert!(depths.windows(2).all(|pair| pair[0] <= pair[1]));
-        assert!(sender.exchange.queue.is_empty());
+        assert!(positions > 256);
+        assert_eq!(sender.next(), Some(Frame::Done));
     }
 
-    /// A delta that leaves out a leaf does not add up to its root's count,
-    /// and fails at the end; what landed stays.
     #[test]
     fn the_count_proof_fails_on_a_delta_that_omits_a_leaf() {
         let (sender, collection, records) = holding(48, "omitted", 60);
@@ -1881,8 +1565,6 @@ pub(crate) mod tests {
         assert_eq!(receiver.node.records(collection).len(), 59);
     }
 
-    /// A value that fails to land, or does not decode, fails the exchange
-    /// without a LANDED; what landed stays.
     #[test]
     fn a_failed_insert_yields_no_landed() {
         let (sender, collection, _) = holding(50, "failed", 20);
@@ -1938,10 +1620,6 @@ pub(crate) mod tests {
         assert!(receiver.node.records(collection).is_empty());
     }
 
-    /// Values are asked for [`MAX_WALK_REQUESTS`] at a time, the leaves
-    /// beyond that waiting until a value arrives, while the stream is read
-    /// on; reading stops at [`MAX_WALK_UNLANDED`] values with the landing
-    /// task, and resumes as they land.
     #[test]
     fn requests_are_windowed_and_reading_stops_at_unlanded_values() {
         let (sender, collection, records) = holding(53, "window", MAX_WALK_UNLANDED as u64 + 100);
@@ -2013,82 +1691,48 @@ pub(crate) mod tests {
         );
     }
 
-    /// Frames out of their place fail the exchange: a node before the root,
-    /// a value nobody asked for, a LANDED before this side's DONE, a second
-    /// ROOT, an OPEN, a value request from a peer this side does not send
-    /// to or for a key the tree lacks, and a frame after the peer's DONE.
     #[test]
     fn frames_out_of_place_fail_the_exchange() {
-        let (sender, collection, _) = holding(55, "order", 1);
-        let kind = WalkKind::Records;
-        let root = summary(kind, sender.pinned(collection).repair());
-        let node = node(kind, sender.pinned(collection).repair(), &[]).unwrap();
+        let (sender, collection, records) = holding(55, "order", 1);
+        let root_summary = summary(WalkKind::Records, sender.pinned(collection).repair());
         let fresh = |byte| {
-            let (receiver, _) = sharing(byte, "order", &[]);
-            Side::both(receiver, collection, kind)
+            let (node, _) = sharing(byte, "order", &[]);
+            Side::both(node, collection, WalkKind::Records)
         };
-        let mut receiver = fresh(56);
-        receiver.feed(Frame::Node {
-            prefix: Vec::new(),
-            node: node.clone(),
-        });
-        assert_eq!(receiver.outcome(), Some(Outcome::Failed(Failure::Protocol)));
-
-        let mut receiver = fresh(57);
-        receiver.feed(Frame::Root { summary: root });
-        receiver.feed(Frame::Value {
-            key: [1; 32],
-            bytes: vec![0],
-        });
-        assert_eq!(receiver.outcome(), Some(Outcome::Failed(Failure::Protocol)));
-
         for frame in [
+            leaf(records[0].fingerprint().raw()),
             Frame::Landed,
-            Frame::Open { collection, kind },
+            Frame::Open {
+                collection,
+                kind: WalkKind::Records,
+            },
             Frame::ValueRequest { key: [9; 32] },
             Frame::Done,
+            Frame::Value {
+                key: [1; 32],
+                bytes: vec![0],
+            },
         ] {
-            let mut receiver = fresh(58);
-            receiver.feed(frame.clone());
-            assert_eq!(
-                receiver.outcome(),
-                Some(Outcome::Failed(Failure::Protocol)),
-                "{frame:?}"
-            );
+            let mut receiver = fresh(56);
+            receiver.feed(frame);
+            assert_eq!(receiver.outcome(), Some(Outcome::Failed(Failure::Protocol)));
         }
-        let mut receiver = fresh(59);
-        receiver.feed(Frame::Root { summary: root });
-        receiver.feed(Frame::Root { summary: root });
+        let mut receiver = fresh(57);
+        receiver.feed(root(root_summary));
+        receiver.feed(root(root_summary));
         assert_eq!(receiver.outcome(), Some(Outcome::Failed(Failure::Protocol)));
-
-        // A frame after the peer's DONE, and a LANDED twice.
-        let mut receiver = fresh(60);
-        receiver.feed(Frame::Root { summary: empty() });
+        let mut receiver = fresh(58);
+        receiver.feed(root(empty()));
         receiver.feed(Frame::Done);
-        while receiver.next().is_some() {}
-        assert_eq!(receiver.outcome(), None);
-        receiver.feed(Frame::Landed);
-        assert_eq!(receiver.outcome(), Some(Outcome::Confirmed));
-        let mut receiver = fresh(61);
-        receiver.feed(Frame::Root { summary: empty() });
-        receiver.feed(Frame::Done);
-        receiver.feed(Frame::Leaf { key: [1; 32] });
+        receiver.feed(leaf(records[0].fingerprint().raw()));
         assert_eq!(receiver.outcome(), Some(Outcome::Failed(Failure::Protocol)));
-
-        // A side that sends nothing serves no value, and a references
-        // exchange serves none either.
-        let (owner, _) = sharing(62, "order", &[]);
-        let mut owner = Side::new(owner, collection, kind, None, false, true);
-        owner.feed(Frame::ValueRequest { key: [9; 32] });
+        let mut owner = Side::new(sender, collection, WalkKind::Records, None, false, true);
+        owner.feed(Frame::ValueRequest {
+            key: records[0].fingerprint().raw(),
+        });
         assert_eq!(owner.outcome(), Some(Outcome::Failed(Failure::Protocol)));
-        let mut held = Side::new(sender, collection, WalkKind::References, None, true, true);
-        held.feed(Frame::ValueRequest { key: [9; 32] });
-        assert_eq!(held.outcome(), Some(Outcome::Failed(Failure::Protocol)));
     }
 
-    /// An exchange that ends before both LANDEDs crossed is not confirmed
-    /// and agrees on nothing, whether the peer never confirmed or the
-    /// stream closed mid-delta.
     #[test]
     fn an_exchange_that_ends_before_both_landed_is_not_confirmed() {
         let (sender, collection, _) = holding(63, "closed", 30);
@@ -2124,8 +1768,8 @@ pub(crate) mod tests {
         // Closed mid-delta: nothing confirmed, nothing landed.
         let (sender, collection, _) = holding(86, "closed", 30);
         let mut sender = Side::both(sender, collection, kind);
-        assert!(matches!(sender.next(), Some(Frame::Root { .. })));
-        assert!(matches!(sender.next(), Some(Frame::Node { .. })));
+        assert!(matches!(sender.next(), Some(Frame::Subtree { .. })));
+        assert!(matches!(sender.next(), Some(Frame::Subtree { .. })));
         let ended = sender.exchange.end();
         assert!(!ended.confirmed && !ended.landed && ended.agreed.is_none());
     }
@@ -2143,10 +1787,6 @@ pub(crate) mod tests {
         assert!(ended.agreed.is_none());
     }
 
-    /// A proof over another resource routed to C waits for that resource's
-    /// descriptor, fetched from the peer. An exchange whose fetch of it
-    /// fails does not confirm; the next lands the proof with the
-    /// descriptor.
     #[test]
     fn a_deferred_proof_fails_the_exchange_until_its_descriptor_arrives() {
         use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -2230,204 +1870,69 @@ pub(crate) mod tests {
         }
     }
 
-    /// A count proof closed by repeating a leaf is no proof: each leaf is
-    /// owed once, at the locator its parent declared. Sixty records, one
-    /// whose branch byte is its own, so the genuine root NODE owes its LEAF
-    /// alone at that byte: sent once it is asked for, sent again it fails
-    /// the exchange at once, the locator owed no more, and the count never
-    /// closes. And ROOT, sixty LEAFs and DONE with no NODE to owe them
-    /// under fails too.
     #[test]
     fn a_duplicated_or_foreign_leaf_does_not_close_the_count_proof() {
         let (sender, collection, records) = holding(68, "duplicated", 60);
-        let alone = records
-            .iter()
-            .find(|record| {
-                let edge = record.fingerprint().raw()[0];
-                records
-                    .iter()
-                    .filter(|other| other.fingerprint().raw()[0] == edge)
-                    .count()
-                    == 1
-            })
-            .copied()
-            .expect("some first byte is one record's own");
-        let kind = WalkKind::Records;
-        let root = summary(kind, sender.pinned(collection).repair());
-        let node = node(kind, sender.pinned(collection).repair(), &[]).unwrap();
-        let key = alone.fingerprint().raw();
-
         let (receiver, _) = sharing(69, "duplicated", &[]);
-        let mut receiver = Side::both(receiver, collection, kind);
-        receiver.feed(Frame::Root { summary: root });
-        receiver.feed(Frame::Node {
-            prefix: Vec::new(),
-            node,
-        });
-        assert_eq!(
-            receiver.feed(Frame::Leaf { key }),
-            [Frame::ValueRequest { key }]
-        );
-        assert_eq!(receiver.outcome(), None);
-        assert!(receiver.feed(Frame::Leaf { key }).is_empty());
+        let mut receiver = Side::both(receiver, collection, WalkKind::Records);
+        receiver.feed(root(summary(
+            WalkKind::Records,
+            sender.pinned(collection).repair(),
+        )));
+        let key = records[0].fingerprint().raw();
+        assert_eq!(receiver.feed(leaf(key)), [Frame::ValueRequest { key }]);
+        receiver.feed(leaf(key));
         assert_eq!(receiver.outcome(), Some(Outcome::Failed(Failure::Protocol)));
-        assert!(receiver.feed(Frame::Done).is_empty());
-        assert!(!receiver.sent.contains(&Frame::Landed));
-        assert_eq!(receiver.requested().len(), 1);
-
-        // Without a NODE, no leaf is owed at all.
-        let mut receiver = Side::both(receiver.node, collection, kind);
-        receiver.feed(Frame::Root { summary: root });
-        for record in &records {
-            receiver.feed(Frame::Leaf {
-                key: record.fingerprint().raw(),
-            });
-        }
-        receiver.feed(Frame::Done);
-        assert!(
-            matches!(receiver.outcome(), Some(Outcome::Failed(_))),
-            "{:?}",
-            receiver.outcome()
-        );
         assert!(!receiver.sent.contains(&Frame::Landed));
     }
 
-    /// A NODE at a locator its parent declared, canonical in itself and of
-    /// the leaf count declared there but not the node the parent's child
-    /// entry names, fails the exchange: a node is checked against the
-    /// digest its parent declared, so every node hash-chains to the root.
     #[test]
     fn a_node_whose_digest_is_not_the_parent_s_child_digest_fails_the_exchange() {
-        let (sender, collection, _) = holding(70, "chained", 400);
-        let mut other = Node::new(71);
-        other.hold("chained", open());
-        for data in 0..400 {
-            other.commit(collection, 400 + data);
-        }
-        other.observe();
-        let (receiver, _) = sharing(72, "chained", &[]);
-        let kind = WalkKind::Records;
-        let pinned = sender.pinned(collection);
-        let foreign = other.pinned(collection);
-        let root = summary(kind, pinned.repair());
-        let root_node = node(kind, pinned.repair(), &[]).unwrap();
-        let PatchNode::Branch { branch, .. } = &root_node else {
-            panic!("400 records branch at the root");
+        let (sender, collection, records) = holding(70, "commitment", 400);
+        let (receiver, _) = sharing(72, "commitment", &[]);
+        let mut frames = tree(&sender, collection, WalkKind::Records, &BTreeSet::new());
+        let changed = frames.iter_mut().find(|frame| matches!(frame, Frame::Subtree {prefix, summary} if !prefix.is_empty() && prefix.len()<KEY_BYTES && summary.leaf_count()>1)).unwrap();
+        let Frame::Subtree { summary, .. } = changed else {
+            unreachable!()
         };
-        assert_eq!(branch.end_depth, 0);
-        // A branch byte under which both trees branch with as many leaves,
-        // so that only the digest tells the foreign node from the declared
-        // one.
-        let (edge, foreign_node) = branch
-            .children
-            .iter()
-            .find_map(|child| {
-                let node = node(kind, foreign.repair(), &[child.edge])?;
-                (matches!(node, PatchNode::Branch { .. }) && node.leaf_count() == child.leaf_count)
-                    .then_some((child.edge, node))
-            })
-            .expect("400 records each: some first byte branches alike in both");
-        let declared = branch.children.iter().find(|child| child.edge == edge);
-        assert_ne!(
-            declared.map(|child| child.digest),
-            Some(foreign_node.digest())
-        );
-
-        let mut receiver = Side::both(receiver, collection, kind);
-        receiver.feed(Frame::Root { summary: root });
-        receiver.feed(Frame::Node {
-            prefix: Vec::new(),
-            node: root_node.clone(),
-        });
-        assert_eq!(receiver.outcome(), None);
-        receiver.feed(Frame::Node {
-            prefix: vec![edge],
-            node: foreign_node,
-        });
+        *summary = PatchSummary::new(Some([0xAB; 32]), summary.leaf_count()).unwrap();
+        let mut receiver = Side::both(receiver, collection, WalkKind::Records);
+        for frame in frames {
+            for reply in receiver.feed(frame) {
+                if let Frame::ValueRequest { key } = reply {
+                    receiver.feed(Frame::Value {
+                        key,
+                        bytes: value_of(&sender, collection, WalkKind::Records, key),
+                    });
+                }
+            }
+        }
+        assert_eq!(receiver.node.records(collection).len(), records.len());
         assert_eq!(receiver.outcome(), Some(Outcome::Failed(Failure::BadNode)));
+        assert!(!receiver.sent.contains(&Frame::Landed));
     }
 
-    /// A LEAF under no locator the peer owes, a key neither tree holds,
-    /// fails the exchange at once, and so does one under a locator owed
-    /// with one leaf whose key does not bind the digest declared there:
-    /// nothing is asked for, and nothing is remembered as landed from it. A
-    /// LEAF this side holds, in flight before its announcement reached the
-    /// peer, is taken as what it is.
     #[test]
     fn a_leaf_outside_the_peer_s_tree_fails_the_exchange() {
         let (sender, collection, records) = holding(73, "outside", 60);
         let (receiver, _) = sharing(74, "outside", &[]);
-        let kind = WalkKind::Records;
-        let pinned = sender.pinned(collection);
-        let root = summary(kind, pinned.repair());
-        let root_node = node(kind, pinned.repair(), &[]).unwrap();
-        let PatchNode::Branch { branch, .. } = &root_node else {
-            panic!("60 records branch at the root");
+        let mut receiver = Side::both(receiver, collection, WalkKind::Records);
+        receiver.feed(root(summary(
+            WalkKind::Records,
+            sender.pinned(collection).repair(),
+        )));
+        let key = records[0].fingerprint().raw();
+        let mut wrong = leaf(key);
+        let Frame::Subtree { summary, .. } = &mut wrong else {
+            unreachable!()
         };
-        // A key under a branch byte the tree does not use.
-        let edge = (0..=255u8)
-            .find(|edge| branch.children.iter().all(|child| child.edge != *edge))
-            .unwrap();
-        let mut key = [7; 32];
-        key[0] = edge;
-
-        let mut receiver = Side::both(receiver, collection, kind);
-        receiver.feed(Frame::Root { summary: root });
-        receiver.feed(Frame::Node {
-            prefix: Vec::new(),
-            node: root_node.clone(),
-        });
-        assert!(receiver.feed(Frame::Leaf { key }).is_empty());
-        assert_eq!(receiver.outcome(), Some(Outcome::Failed(Failure::Protocol)));
-        assert!(receiver.requested().is_empty());
-        assert!(!receiver.sent.contains(&Frame::Landed));
-
-        // A key under a branch byte the root owes with one leaf, which is
-        // not the key whose digest the root declared there.
-        let single = branch
-            .children
-            .iter()
-            .find(|child| child.leaf_count == 1)
-            .expect("60 records: some first byte holds one");
-        let mut key = [7; 32];
-        key[0] = single.edge;
-        assert!(
-            records
-                .iter()
-                .all(|record| record.fingerprint().raw() != key)
-        );
-        let mut receiver = Side::both(receiver.node, collection, kind);
-        receiver.feed(Frame::Root { summary: root });
-        receiver.feed(Frame::Node {
-            prefix: Vec::new(),
-            node: root_node.clone(),
-        });
-        assert!(receiver.feed(Frame::Leaf { key }).is_empty());
+        *summary = PatchSummary::new(Some([0xAA; 32]), 1).unwrap();
+        assert!(receiver.feed(wrong).is_empty());
         assert_eq!(receiver.outcome(), Some(Outcome::Failed(Failure::BadNode)));
         assert!(receiver.requested().is_empty());
-        assert!(!receiver.sent.contains(&Frame::Landed));
-        let ended = receiver.exchange.end();
-        assert!(!ended.landed && ended.agreed.is_none());
-
-        // A leaf this side holds, under no owed locator, is in flight.
-        let (holder, _) = sharing(75, "outside", &records[..1]);
-        let mut holder = Side::both(holder, collection, kind);
-        holder.feed(Frame::Root { summary: root });
-        holder.feed(Frame::Node {
-            prefix: Vec::new(),
-            node: root_node,
-        });
-        let held = records[0].fingerprint().raw();
-        assert!(holder.feed(Frame::Leaf { key: held }).is_empty());
-        assert_eq!(holder.outcome(), None);
-        assert!(holder.requested().is_empty());
+        assert!(receiver.exchange.end().agreed.is_none());
     }
 
-    /// A peer that streams leaves and withholds their values makes this
-    /// side queue what it wants to ask for. The stream stays read, since
-    /// only reading brings the values owed, and the queue fails the
-    /// exchange once it exceeds the explicit waiting-leaf budget. A
-    /// sixty-first leaf against a root of sixty fails at once, before DONE.
     #[test]
     fn a_leaf_flood_with_withheld_values_fails_the_exchange_and_an_overcount_fails_at_once() {
         let (receiver, collection) = sharing(76, "flood", &[]);
@@ -2435,8 +1940,11 @@ pub(crate) mod tests {
         assert!(root.leaf_count() as usize > FLOOD_WANTED + MAX_WALK_REQUESTS);
         let kind = WalkKind::Records;
         let mut receiver = Side::both(receiver, collection, kind);
-        receiver.feed(Frame::Root { summary: root });
-        assert!(receiver.feed(root_node).is_empty());
+        receiver.feed(Frame::Subtree {
+            prefix: Vec::new(),
+            summary: root,
+        });
+        let _ = root_node;
         let mut fed = 0;
         'flood: for (node, leaves) in branches {
             receiver.feed(node);
@@ -2462,7 +1970,7 @@ pub(crate) mod tests {
         assert_eq!(frames.pop(), Some(Frame::Done));
         let again = frames
             .iter()
-            .find(|frame| matches!(frame, Frame::Leaf { .. }))
+            .find(|frame| matches!(frame, Frame::Subtree { prefix, .. } if prefix.len()==KEY_BYTES))
             .unwrap()
             .clone();
         for frame in frames {
@@ -2478,26 +1986,18 @@ pub(crate) mod tests {
         assert!(!receiver.sent.contains(&Frame::Landed));
     }
 
-    /// A canonical wide frontier is not a withheld-value flood. All 65,536
-    /// leaf locators can be owed before any leaf arrives; DONE still cannot
-    /// close that membership proof while those locators remain.
     #[test]
     fn a_wide_owed_frontier_is_not_mistaken_for_withheld_values() {
         let (receiver, collection) = sharing(79, "nodes", &[]);
-        let (root, root_node, branches) = fabricated(256, 256);
+        let (declared, _, branches) = fabricated(256, 256);
         let mut receiver = Side::both(receiver, collection, WalkKind::Records);
-        receiver.feed(Frame::Root { summary: root });
-        assert!(receiver.feed(root_node).is_empty());
-        assert_eq!(receiver.exchange.owed.len(), 256);
-        for (node, _) in &branches {
-            // The branch's own locator is consumed, its 256 children owed.
-            let after = receiver.exchange.owed.len() - 1 + 256;
-            receiver.feed(node.clone());
-            assert!(receiver.exchange.owed.len() <= FLOOD_LOCATORS as u64);
-            assert_eq!(receiver.outcome(), None);
-            assert_eq!(receiver.exchange.owed.len(), after);
+        receiver.feed(root(declared));
+        for (branch, _) in &branches {
+            receiver.feed(branch.clone());
         }
-        assert_eq!(receiver.exchange.owed.len(), 65_536);
+        assert_eq!(receiver.exchange.commitments.len(), 257);
+        assert_eq!(receiver.outcome(), None);
+        assert!(receiver.exchange.wanted.is_empty());
         receiver.feed(Frame::Done);
         assert_eq!(
             receiver.outcome(),
@@ -2519,7 +2019,7 @@ pub(crate) mod tests {
         loop {
             let mut moved = false;
             if let Some(frame) = sender.next() {
-                if let Frame::Node { prefix, .. } = &frame {
+                if let Frame::Subtree { prefix, .. } = &frame {
                     depths.push(prefix.len());
                 }
                 peak = peak.max(sender.exchange.queue.len());
@@ -2535,10 +2035,13 @@ pub(crate) mod tests {
             }
         }
         assert!(peak > 32_768, "frontier only {peak}");
-        assert!(depths.windows(2).all(|pair| pair[0] <= pair[1]));
+        // Canonical compressed prefix lengths need not be monotonic in logical FIFO.
         assert_eq!(sender.outcome(), Some(Outcome::Confirmed));
         assert_eq!(receiver.outcome(), Some(Outcome::Confirmed));
-        assert!(receiver.exchange.owed.is_empty());
+        assert_eq!(
+            receiver.exchange.peer.summary(),
+            receiver.exchange.peer_root.unwrap()
+        );
         receiver.node.observe();
         assert_eq!(
             receiver.node.records(collection),
@@ -2579,11 +2082,14 @@ pub(crate) mod tests {
         for side in [&a, &b] {
             assert_eq!(side.outcome(), Some(Outcome::Confirmed));
             let announcements = side.sent.iter().filter(|frame| matches!(frame,
-                Frame::Node { prefix: at, node: PatchNode::Branch { branch, .. } }
-                if at.is_empty() && branch.children.iter().any(|child| child.edge == shared.edge && child.digest == shared.digest)
+                Frame::Subtree {prefix: at, summary} if at == &prefix && summary.root()==Some(shared.digest) && summary.leaf_count()==shared.leaf_count
             )).count();
             assert_eq!(announcements, 1);
-            assert!(side.nodes().iter().all(|at| !at.starts_with(&prefix)));
+            assert!(
+                side.nodes()
+                    .iter()
+                    .all(|at| at == &prefix || !at.starts_with(&prefix))
+            );
             assert!(side.leaves().iter().all(|key| !key.starts_with(&prefix)));
             assert_eq!(side.requested().len(), 1);
         }
@@ -2630,7 +2136,7 @@ pub(crate) mod tests {
             receiver
                 .heard
                 .iter()
-                .all(|frame| !matches!(frame, Frame::Leaf { key } if key[0] == child.edge))
+                .all(|frame| !matches!(frame, Frame::Subtree {prefix:key,..} if key.len()==32 && key[0] == child.edge))
         );
         assert_eq!(receiver.agreed(), Some(expected));
     }
@@ -2680,28 +2186,25 @@ pub(crate) mod tests {
         assert_eq!(writer.agreed(), Some(expected));
         assert_eq!(owner.agreed(), Some(expected));
         assert!(writer.requested().is_empty() && owner.requested().is_empty());
-        assert_eq!(owner.sent.first(), Some(&Frame::Root { summary: empty() }));
+        assert_eq!(
+            owner.sent.first(),
+            Some(&Frame::Subtree {
+                prefix: Vec::new(),
+                summary: empty()
+            })
+        );
     }
 
     #[test]
     fn an_already_held_node_authenticates_children_before_announcing_them() {
-        let (node, collection, _) = holding(97, "late canonical", 300);
-        let kind = WalkKind::Records;
-        let root = summary(kind, node.pinned(collection).repair());
-        let mut malformed = crate::walk::node(kind, node.pinned(collection).repair(), &[]).unwrap();
-        let PatchNode::Branch { branch, .. } = &mut malformed else {
-            panic!("the root branches");
-        };
-        branch.end_depth = 255; // Would panic if announce sliced first.
-        let mut side = Side::both(node, collection, kind);
-        side.feed(Frame::Root { summary: root });
-        assert!(side.exchange.owed.is_empty());
-        // Bypass the codec deliberately: the state machine protects its own
-        // canonical bounds even for an already-accounted in-flight node.
+        let (node, collection, _) = holding(97, "bounds", 300);
+        let declared = summary(WalkKind::Records, node.pinned(collection).repair());
+        let mut side = Side::both(node, collection, WalkKind::Records);
+        side.feed(root(declared));
         let outs = side.exchange.on_frame(
-            Frame::Node {
-                prefix: Vec::new(),
-                node: malformed,
+            Frame::Subtree {
+                prefix: vec![0; 33],
+                summary: declared,
             },
             Some(side.node.snapshot()),
         );
@@ -2720,60 +2223,22 @@ pub(crate) mod tests {
         assert!(sender.agreed().is_none());
     }
 
-    /// A ROOT equal to this side's tree is accounted whole and never
-    /// descended; one equal to the agreed tree too, at a side that holds
-    /// more now, so ROOT then DONE lands with nothing between. Without the
-    /// agreed tree a superset neither holds the root nor accounts for it,
-    /// and ROOT then DONE fails the count proof.
     #[test]
     fn an_equal_or_agreed_root_is_accounted_whole() {
         let (sender, collection, records) = holding(80, "equal", 50);
         let (receiver, _) = sharing(81, "equal", &records);
-        let kind = WalkKind::Records;
-        let root = summary(kind, sender.pinned(collection).repair());
-        let mut receiver = Side::both(receiver, collection, kind);
-        let streamed = stream(&mut receiver, &sender, collection, kind, &BTreeSet::new());
-        assert!(matches!(
-            &streamed[..],
-            [
-                Frame::Root { .. },
-                Frame::Node { .. },
-                ..,
-                Frame::Done,
-                Frame::Landed
-            ]
-        ));
-        assert_eq!(receiver.outcome(), Some(Outcome::Confirmed));
-        assert!(receiver.requested().is_empty());
-        // The peer's ROOT, heard first, announced the whole tree.
-        assert!(receiver.nodes().is_empty(), "{:?}", receiver.sent);
-        assert_eq!(receiver.agreed(), Some(root));
-        let agreed = Arc::new(Tree::pinned(kind, sender.pinned(collection).repair()));
-
-        // The side holds more than it agreed on: the agreed root still
-        // satisfies the count proof.
-        let mut superset = receiver.node;
-        superset.commit(collection, 100);
-        superset.observe();
-        let mut receiver = Side::new(superset, collection, kind, Some(agreed), false, true);
-        assert!(receiver.feed(Frame::Root { summary: root }).is_empty());
+        let declared = summary(WalkKind::Records, sender.pinned(collection).repair());
+        let mut receiver = Side::both(receiver, collection, WalkKind::Records);
+        receiver.feed(root(declared));
         assert_eq!(receiver.feed(Frame::Done), [Frame::Landed]);
-        assert!(receiver.exchange.owed.is_empty());
-
-        // Without that memory a superset neither holds the root nor
-        // accounts for it.
-        let mut receiver = Side::new(receiver.node, collection, kind, None, false, true);
-        assert!(receiver.feed(Frame::Root { summary: root }).is_empty());
-        assert!(receiver.feed(Frame::Done).is_empty());
-        assert_eq!(
-            receiver.outcome(),
-            Some(Outcome::Failed(Failure::CountMismatch))
-        );
+        while receiver.next().is_some() {}
+        receiver.feed(Frame::Landed);
+        assert_eq!(receiver.outcome(), Some(Outcome::Confirmed));
+        assert_eq!(receiver.agreed(), Some(declared));
+        assert_eq!(receiver.nodes(), [Vec::<u8>::new()]);
+        assert!(receiver.leaves().is_empty() && receiver.requested().is_empty());
     }
 
-    /// A side that gained records under a subtree the peer left unchanged
-    /// still accounts for that subtree: the peer skips it as equal to the
-    /// agreed tree, and this side holds the agreed tree.
     #[test]
     fn a_subtree_equal_to_the_agreed_tree_is_accounted_however_this_side_grew() {
         let (a, collection, records) = holding(82, "grew", 300);
@@ -2796,18 +2261,13 @@ pub(crate) mod tests {
         assert_eq!(b.outcome(), Some(Outcome::Confirmed));
         assert_eq!(a.requested(), fingerprints(three.iter().copied()));
         assert_eq!(b.requested(), fingerprints([one]));
-        let expected = paths(
-            a.node.pinned(collection).repair().records().patch(),
-            &[one.fingerprint().raw()],
-        );
+        let expected = BTreeSet::from([Vec::new()]);
         assert_eq!(a.nodes().into_iter().collect::<BTreeSet<_>>(), expected);
         assert_eq!(a.agreed(), b.agreed());
         assert_eq!(a.node.records(collection).len(), 304);
         assert_eq!(b.node.records(collection), a.node.records(collection));
     }
 
-    /// The pinned tree's values serve VALUE_REQUESTs, and a request for a
-    /// key the tree lacks fails the exchange.
     #[test]
     fn values_are_served_from_the_pinned_tree() {
         let (sender, collection, records) = holding(84, "served", 5);
@@ -2824,9 +2284,327 @@ pub(crate) mod tests {
         assert_eq!(sender.outcome(), Some(Outcome::Failed(Failure::Protocol)));
     }
 
-    /// The agreed tree of each kind summarises and locates like the
-    /// overlay's own tree, and an inserted key changes it as the overlay
-    /// would.
+    #[test]
+    fn matching_prefix_before_or_after_our_announcement_sends_it_once_not_its_recursion() {
+        for late in [false, true] {
+            let (sender, collection, _) = holding(115, "match order", 1000);
+            let mut side = Side::new(sender, collection, WalkKind::Records, None, true, false);
+            side.next().unwrap(); // [] first, with all logical children queued.
+            let prefix = side
+                .exchange
+                .queue
+                .iter()
+                .find(|prefix| prefix.len() < KEY_BYTES)
+                .unwrap()
+                .clone();
+            let declared = side.exchange.delta.at(&prefix).unwrap();
+            if late {
+                while !side
+                    .sent
+                    .iter()
+                    .any(|frame| matches!(frame,Frame::Subtree {prefix:at,..} if at==&prefix))
+                {
+                    side.next().unwrap();
+                }
+                assert!(side.exchange.queue.iter().any(|at| at.starts_with(&prefix)));
+            }
+            side.hear(root(PatchSummary::new(Some([0xAB; 32]), 1000).unwrap()));
+            side.hear(Frame::Subtree {
+                prefix: prefix.clone(),
+                summary: declared,
+            });
+            while side.next().is_some() {}
+            let own = side
+                .sent
+                .iter()
+                .filter(|frame| matches!(frame,Frame::Subtree {prefix:at,..} if at==&prefix))
+                .count();
+            assert_eq!(own, 1, "late={late}");
+            assert!(side.sent.iter().all(|frame| !matches!(frame,Frame::Subtree {prefix:at,..} if at.len()>prefix.len() && at.starts_with(&prefix))));
+        }
+    }
+
+    #[test]
+    fn a_compressed_delta_root_meets_the_same_prefix_inside_a_larger_delta() {
+        let (large, collection, records) = holding(116, "compressed overlap", 1000);
+        let tree = Tree::pinned(WalkKind::Records, large.pinned(collection).repair());
+        let (_, children) = tree.shape(&[]).unwrap();
+        let prefix = children
+            .into_iter()
+            .find(|prefix| prefix.len() < KEY_BYTES && tree.at(prefix).unwrap().leaf_count() > 1)
+            .unwrap();
+        let shared = records
+            .iter()
+            .filter(|record| record.fingerprint().raw().starts_with(&prefix))
+            .copied()
+            .collect::<Vec<_>>();
+        let (small, _) = sharing(117, "compressed overlap", &shared);
+        let mut large = Side::both(large, collection, WalkKind::Records);
+        let mut small = Side::both(small, collection, WalkKind::Records);
+        carry(&mut large, &mut small);
+        for side in [&large, &small] {
+            assert_eq!(side.outcome(), Some(Outcome::Confirmed));
+            assert_eq!(
+                side.sent
+                    .iter()
+                    .filter(|frame| matches!(frame,Frame::Subtree {prefix:at,..} if at==&prefix))
+                    .count(),
+                1
+            );
+        }
+        assert!(large.leaves().iter().all(|key| !key.starts_with(&prefix)));
+        assert_eq!(
+            small.sent[1],
+            Frame::Subtree {
+                prefix,
+                summary: small.exchange.delta.summary()
+            }
+        );
+        assert_eq!(large.agreed(), small.agreed());
+    }
+
+    #[test]
+    fn a_foreign_but_valid_leaf_cannot_replace_an_omitted_leaf_at_equal_count() {
+        let (sender, collection, records) = holding(118, "foreign membership", 2);
+        let (mut receiver, _) = sharing(119, "foreign membership", &[]);
+        let foreign = receiver.commit(collection, 1000);
+        receiver.observe();
+        let mut side = Side::both(receiver, collection, WalkKind::Records);
+        side.feed(root(summary(
+            WalkKind::Records,
+            sender.pinned(collection).repair(),
+        )));
+        let key = records[0].fingerprint().raw();
+        assert_eq!(side.feed(leaf(key)), [Frame::ValueRequest { key }]);
+        side.feed(Frame::Value {
+            key,
+            bytes: value_of(&sender, collection, WalkKind::Records, key),
+        });
+        assert!(side.feed(leaf(foreign.fingerprint().raw())).is_empty());
+        assert_eq!(side.exchange.peer.summary().leaf_count(), 2);
+        side.feed(Frame::Done);
+        assert_eq!(
+            side.outcome(),
+            Some(Outcome::Failed(Failure::CountMismatch))
+        );
+        assert!(!side.sent.contains(&Frame::Landed));
+        assert_eq!(
+            side.node.records(collection).len(),
+            2,
+            "actual valid landing remains"
+        );
+    }
+
+    #[test]
+    fn a_wrong_prefix_cannot_close_even_with_the_right_hash_and_count() {
+        let (sender, collection, records) = holding(120, "wrong prefix", 1000);
+        let (receiver, _) = sharing(121, "wrong prefix", &records);
+        let tree = Tree::pinned(WalkKind::Records, sender.pinned(collection).repair());
+        let (_, children) = tree.shape(&[]).unwrap();
+        let prefix = children
+            .into_iter()
+            .find(|prefix| prefix.len() < KEY_BYTES)
+            .unwrap();
+        let declared = tree.at(&prefix).unwrap();
+        let mut wrong = prefix.clone();
+        wrong[0] ^= 0x80;
+        let mut side = Side::both(receiver, collection, WalkKind::Records);
+        side.feed(root(tree.summary()));
+        side.feed(Frame::Subtree {
+            prefix: wrong,
+            summary: declared,
+        });
+        side.feed(Frame::Done);
+        assert_eq!(side.outcome(), Some(Outcome::Failed(Failure::BadNode)));
+        assert!(!side.sent.contains(&Frame::Landed));
+    }
+
+    #[test]
+    fn a_noncanonical_alias_of_a_compressed_prefix_cannot_close() {
+        let (sender, collection, records) = holding(122, "compressed alias", 3000);
+        let pair = records
+            .iter()
+            .enumerate()
+            .find_map(|(i, a)| {
+                records[i + 1..]
+                    .iter()
+                    .find(|b| a.fingerprint().raw()[..2] == b.fingerprint().raw()[..2])
+                    .map(|b| [*a, *b])
+            })
+            .unwrap();
+        let (holder, _) = sharing(123, "compressed alias", &pair);
+        let tree = Tree::pinned(WalkKind::Records, holder.pinned(collection).repair());
+        let (canonical, _) = tree.shape(&[]).unwrap();
+        assert!(canonical.len() >= 2);
+        let mut side = Side::both(holder, collection, WalkKind::Records);
+        side.feed(root(tree.summary()));
+        side.feed(Frame::Subtree {
+            prefix: canonical[..1].to_vec(),
+            summary: tree.summary(),
+        });
+        side.feed(Frame::Done);
+        assert_eq!(side.outcome(), Some(Outcome::Failed(Failure::BadNode)));
+        assert!(!side.sent.contains(&Frame::Landed));
+        drop(sender);
+    }
+
+    #[test]
+    fn a_declared_delta_above_the_honest_proof_budget_is_refused() {
+        let (node, collection) = sharing(124, "proof ceiling", &[]);
+        let mut side = Side::both(node, collection, WalkKind::Records);
+        side.feed(root(
+            PatchSummary::new(Some([0xAA; 32]), FLOOD_LOCATORS as u64 + 1).unwrap(),
+        ));
+        assert_eq!(side.outcome(), Some(Outcome::Failed(Failure::Protocol)));
+        assert!(side.exchange.peer.summary().root().is_none());
+        assert!(side.exchange.end().agreed.is_none());
+    }
+
+    #[test]
+    fn unequal_sound_bases_after_a_failed_finish_and_publication_lag_converge() {
+        let (a, collection, records) = holding(127, "unequal bases", 2);
+        let (b, _) = sharing(128, "unequal bases", &records[..1]);
+        let mut a = Side::both(a, collection, WalkKind::Records);
+        let mut b = Side::both(b, collection, WalkKind::Records);
+        b.observe_landings = false;
+        carry(&mut a, &mut b);
+        assert_eq!(a.outcome(), Some(Outcome::Confirmed));
+        assert_eq!(b.outcome(), Some(Outcome::Confirmed));
+        let complete = Arc::new(a.exchange.union_tree());
+        assert_eq!(
+            b.node.records(collection).len(),
+            2,
+            "both values actually landed despite lag"
+        );
+        assert_eq!(b.node.pinned(collection).repair().records().len(), 1);
+        // The separately tested real shutdown failure clears only B's G.
+        // A retains sound jointly-held knowledge; no connection policy changes.
+        let mut a = Side::new(
+            a.node,
+            collection,
+            WalkKind::Records,
+            Some(complete.clone()),
+            true,
+            true,
+        );
+        let mut b = Side::new(b.node, collection, WalkKind::Records, None, true, true);
+        carry(&mut a, &mut b);
+        assert_eq!(a.outcome(), Some(Outcome::Confirmed));
+        assert_eq!(b.outcome(), Some(Outcome::Confirmed));
+        assert_eq!(a.exchange.peer.summary().leaf_count(), 1);
+        assert_eq!(
+            b.exchange.peer.summary(),
+            empty(),
+            "empty delta is not a full collection"
+        );
+        assert_eq!(a.agreed(), Some(complete.summary()));
+        assert_eq!(
+            b.agreed().unwrap().leaf_count(),
+            1,
+            "unequal bookkeeping is permitted"
+        );
+        assert_eq!(
+            b.node.records(collection).len(),
+            2,
+            "no already-landed value is lost"
+        );
+        let b_base = Arc::new(b.exchange.union_tree());
+        b.node.observe();
+        let mut a = Side::new(
+            a.node,
+            collection,
+            WalkKind::Records,
+            Some(complete.clone()),
+            true,
+            true,
+        );
+        let mut b = Side::new(
+            b.node,
+            collection,
+            WalkKind::Records,
+            Some(b_base),
+            true,
+            true,
+        );
+        carry(&mut a, &mut b);
+        assert_eq!(a.outcome(), Some(Outcome::Confirmed));
+        assert_eq!(b.outcome(), Some(Outcome::Confirmed));
+        assert_eq!(a.agreed(), Some(complete.summary()));
+        assert_eq!(b.agreed(), Some(complete.summary()));
+        assert!(a.requested().is_empty() && b.requested().is_empty());
+    }
+
+    #[test]
+    fn first_contact_and_an_agreed_single_change_have_exact_wire_byte_receipts() {
+        fn receipt(label: &str, a: &Side, b: &Side) {
+            let bytes = |side: &Side| {
+                side.sent
+                    .iter()
+                    .map(|frame| 5 + frame.encode().1.len())
+                    .sum::<usize>()
+            };
+            let subtrees = |side: &Side| {
+                side.sent
+                    .iter()
+                    .filter(|frame| matches!(frame, Frame::Subtree { .. }))
+                    .count()
+            };
+            eprintln!(
+                "PREFIX_BYTES fixture={label} a_total={} b_total={} a_subtrees={} b_subtrees={} a_subtree_bytes={} b_subtree_bytes={} a_values={} b_values={} a_requests={} b_requests={} framing=5 payload=73 scheduler=one_frame_each_direction",
+                bytes(a),
+                bytes(b),
+                subtrees(a),
+                subtrees(b),
+                78 * subtrees(a),
+                78 * subtrees(b),
+                a.count(|f| matches!(f, Frame::Value { .. })),
+                b.count(|f| matches!(f, Frame::Value { .. })),
+                a.requested().len(),
+                b.requested().len()
+            );
+        }
+        let (a, collection, records) = holding(125, "bytes", 3000);
+        let (b, _) = sharing(126, "bytes", &[]);
+        let mut a = Side::both(a, collection, WalkKind::Records);
+        let mut b = Side::both(b, collection, WalkKind::Records);
+        b.observe_landings = false;
+        carry(&mut a, &mut b);
+        b.node.observe();
+        assert_eq!(a.outcome(), Some(Outcome::Confirmed));
+        assert_eq!(b.outcome(), Some(Outcome::Confirmed));
+        receipt("first_contact_3000_empty", &a, &b);
+        let agreed = Arc::new(a.exchange.union_tree());
+        let mut node = a.node;
+        let added = node.commit(collection, 9999);
+        node.observe();
+        let mut a = Side::new(
+            node,
+            collection,
+            WalkKind::Records,
+            Some(agreed.clone()),
+            true,
+            true,
+        );
+        let mut b = Side::new(
+            b.node,
+            collection,
+            WalkKind::Records,
+            Some(agreed),
+            true,
+            true,
+        );
+        carry(&mut a, &mut b);
+        assert_eq!(a.outcome(), Some(Outcome::Confirmed));
+        assert_eq!(b.outcome(), Some(Outcome::Confirmed));
+        assert_eq!(a.exchange.delta.summary().leaf_count(), 1);
+        assert_eq!(a.nodes(), [Vec::<u8>::new()]);
+        assert_eq!(a.leaves(), [added.fingerprint().raw()]);
+        assert_eq!(a.count(|f| matches!(f, Frame::Subtree { .. })), 2);
+        assert_eq!(b.requested(), fingerprints([added]));
+        assert_eq!(b.node.records(collection).len(), records.len() + 1);
+        receipt("agreed_3000_plus_one", &a, &b);
+    }
+
     #[test]
     fn the_agreed_tree_mirrors_the_overlay_s_tree() {
         let (mut node, collection, records) = holding(85, "tree", 40);
@@ -2841,7 +2619,7 @@ pub(crate) mod tests {
             for locator in [&[][..], &records[0].fingerprint().raw()[..1]] {
                 assert_eq!(
                     tree.at(locator),
-                    local_summary(kind, pinned.repair(), locator)
+                    crate::walk::local_summary(kind, pinned.repair(), locator)
                 );
             }
         }

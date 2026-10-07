@@ -1,85 +1,52 @@
-//! The frames of `walk/1`, the stream one exchange of a collection's tree
-//! rides.
+//! The frames of one bidirectional FIFO delta-subtree exchange.
 //!
-//! A `walk/1` stream carries one collection's tree of one kind both ways:
-//! each side's delta against the tree the two agreed on, and each side's
-//! requests for the values the other's delta names. A frame is its kind
-//! (one byte), a big-endian `u32` payload length and the payload, at most
-//! [`crate::recon::MAX_RECON_FRAME_BYTES`], the framing
-//! [`crate::connection`] reads and writes.
+//! | kind | frame         | payload                         |
+//! |------|---------------|---------------------------------|
+//! | 0x01 | OPEN          | collection32, walk kind:u8      |
+//! | 0x03 | SUBTREE       | depth:u8, prefix32, hash32, u64  |
+//! | 0x05 | VALUE_REQUEST | key32                           |
+//! | 0x06 | VALUE         | key32, nonempty bytes           |
+//! | 0x07 | DONE          | empty                           |
+//! | 0x08 | LANDED        | empty                           |
 //!
-//! | kind | frame         | payload                                | from   |
-//! |------|---------------|----------------------------------------|--------|
-//! | 0x01 | OPEN          | collection, walk kind (u8)             | opener |
-//! | 0x02 | ROOT          | summary: root, leaf count              | both   |
-//! | 0x03 | NODE          | tag, prefix, node                      | both   |
-//! | 0x04 | LEAF          | key                                    | both   |
-//! | 0x05 | VALUE_REQUEST | key                                    | both   |
-//! | 0x06 | VALUE         | key, bytes (at least one)              | both   |
-//! | 0x07 | DONE          | empty                                  | both   |
-//! | 0x08 | LANDED        | empty                                  | both   |
+//! SUBTREE has exactly73 payload bytes, or78 bytes with the ordinary five-byte
+//! frame header. Integers are big-endian. Prefix bytes outside depth are zero;
+//! depth0 is the ordinary empty-prefix delta-root commitment. An empty delta
+//! has zero hash/count. A nonempty delta root can be compressed or a singleton;
+//! its descendants arrive as more SUBTREE frames, not embedded child arrays.
+//! Root/leaf have no separate frame kinds. Retired0x02/0x04 are unknown.
 //!
-//! The opener sends OPEN; then each side sends its ROOT and the NODEs and
-//! LEAFs of its delta, breadth first, and DONE. A NODE at a prefix carries
-//! the node there, whose children announce, by digest, what the side holds
-//! under it; a LEAF names a leaf by key alone. Values stay pull: a side
-//! asks with VALUE_REQUEST for the leaves it lacks, and a VALUE answers one.
-//! LANDED says everything a side asked for landed; once both have crossed,
-//! the exchange is confirmed ([`crate::exchange`]).
-//!
-//! A prefix is a length byte and at most 32 bytes. A summary and a node are
-//! laid out by [`crate::walk`]'s own code; a node's tag byte says whether it
-//! is a branch or a leaf. Integers are big-endian. A kind this reader does
-//! not know, or an OPEN of a walk kind it does not know, is skipped; a known
-//! kind whose payload does not parse is malformed, and so is a VALUE without
-//! bytes.
+//! A kind or OPEN walk kind not understood is skipped. A known payload must
+//! decode completely and canonically; malformed frames end only the exchange.
 
 use triblespace_core::collection::CollectionHandle;
 
 use crate::collection_wire::MAX_COLLECTION_LEAF_BYTES;
-use crate::patch_repair::{PatchNode, PatchSummary};
+use crate::patch_repair::PatchSummary;
 use crate::recon::Malformed;
-use crate::walk::{Reader, WalkKind, node_tag, push_node, push_summary};
+use crate::walk::{Reader, WalkKind, push_summary};
 
-/// The opener's first frame: the collection and the kind of tree exchanged.
 pub const FRAME_OPEN: u8 = 0x01;
-/// The summary of a side's pinned tree.
-pub const FRAME_ROOT: u8 = 0x02;
-/// One node of a side's delta, at its prefix.
-pub const FRAME_NODE: u8 = 0x03;
-/// One leaf of a side's delta, by key.
-pub const FRAME_LEAF: u8 = 0x04;
-/// A side asks for the value under a key.
+pub const FRAME_SUBTREE: u8 = 0x03;
 pub const FRAME_VALUE_REQUEST: u8 = 0x05;
-/// The value under a key.
 pub const FRAME_VALUE: u8 = 0x06;
-/// A side sent its whole delta.
 pub const FRAME_DONE: u8 = 0x07;
-/// Everything a side asked for landed.
 pub const FRAME_LANDED: u8 = 0x08;
+pub const SUBTREE_BYTES: usize = 1 + 32 + 32 + 8;
 
-/// One frame of a `walk/1` stream.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Frame {
     Open {
         collection: CollectionHandle,
         kind: WalkKind,
     },
-    Root {
-        summary: PatchSummary,
-    },
-    /// A node at a prefix. A leaf carries its key, not its value.
-    Node {
+    Subtree {
         prefix: Vec<u8>,
-        node: PatchNode<()>,
-    },
-    Leaf {
-        key: [u8; 32],
+        summary: PatchSummary,
     },
     ValueRequest {
         key: [u8; 32],
     },
-    /// Never empty: a value is at least one byte.
     Value {
         key: [u8; 32],
         bytes: Vec<u8>,
@@ -89,7 +56,6 @@ pub(crate) enum Frame {
 }
 
 impl Frame {
-    /// The frame's kind and payload.
     pub(crate) fn encode(&self) -> (u8, Vec<u8>) {
         let mut payload = Vec::new();
         let kind = match self {
@@ -98,18 +64,14 @@ impl Frame {
                 payload.push(kind.wire());
                 FRAME_OPEN
             }
-            Self::Root { summary } => {
+            Self::Subtree { prefix, summary } => {
+                assert!(prefix.len() <= 32, "a local subtree prefix fits its key");
+                payload.push(prefix.len() as u8);
+                let mut padded = [0; 32];
+                padded[..prefix.len()].copy_from_slice(prefix);
+                payload.extend_from_slice(&padded);
                 push_summary(&mut payload, *summary);
-                FRAME_ROOT
-            }
-            Self::Node { prefix, node } => {
-                payload.push(node_tag(node));
-                push_node(&mut payload, prefix, node);
-                FRAME_NODE
-            }
-            Self::Leaf { key } => {
-                payload.extend_from_slice(key);
-                FRAME_LEAF
+                FRAME_SUBTREE
             }
             Self::ValueRequest { key } => {
                 payload.extend_from_slice(key);
@@ -126,8 +88,6 @@ impl Frame {
         (kind, payload)
     }
 
-    /// Decode one frame. `None` is a kind, or an Open of a walk kind, this
-    /// reader does not know.
     pub(crate) fn decode(kind: u8, payload: &[u8]) -> Result<Option<Self>, Malformed> {
         let mut rest = Reader(payload);
         let frame = match kind {
@@ -138,15 +98,27 @@ impl Frame {
                 };
                 Self::Open { collection, kind }
             }
-            FRAME_ROOT => Self::Root {
-                summary: rest.summary()?,
-            },
-            FRAME_NODE => {
-                let tag = rest.byte()?;
-                let (prefix, node) = rest.node(tag)?;
-                Self::Node { prefix, node }
+            FRAME_SUBTREE => {
+                if payload.len() != SUBTREE_BYTES {
+                    return Err(Malformed("subtree payload is not73 bytes"));
+                }
+                let depth = usize::from(rest.byte()?);
+                if depth > 32 {
+                    return Err(Malformed("subtree depth exceeds its key"));
+                }
+                let prefix = rest.hash()?;
+                if prefix[depth..].iter().any(|byte| *byte != 0) {
+                    return Err(Malformed("subtree prefix has nonzero padding"));
+                }
+                let summary = rest.summary()?;
+                if depth != 0 && summary.root().is_none() {
+                    return Err(Malformed("only the empty prefix may name an empty delta"));
+                }
+                Self::Subtree {
+                    prefix: prefix[..depth].to_vec(),
+                    summary,
+                }
             }
-            FRAME_LEAF => Self::Leaf { key: rest.hash()? },
             FRAME_VALUE_REQUEST => Self::ValueRequest { key: rest.hash()? },
             FRAME_VALUE => {
                 let key = rest.hash()?;
@@ -175,8 +147,6 @@ impl Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::patch_repair::{PatchBranch, PatchChild, PatchLeaf};
     use crate::recon::MAX_RECON_FRAME_BYTES;
 
     fn roundtrip(frame: Frame) -> Vec<u8> {
@@ -186,40 +156,6 @@ mod tests {
         payload
     }
 
-    fn branch(prefix: Vec<u8>, children: u8) -> Frame {
-        Frame::Node {
-            prefix,
-            node: PatchNode::Branch {
-                digest: [1; 32],
-                leaf_count: 1 << 40,
-                branch: PatchBranch {
-                    representative: vec![2; 32],
-                    end_depth: 31,
-                    children: (0..children)
-                        .map(|edge| PatchChild {
-                            edge,
-                            digest: [edge; 32],
-                            leaf_count: u64::from(edge) + 1,
-                        })
-                        .collect(),
-                },
-            },
-        }
-    }
-
-    fn leaf(prefix: Vec<u8>) -> Frame {
-        Frame::Node {
-            prefix,
-            node: PatchNode::Leaf {
-                digest: [3; 32],
-                leaf: PatchLeaf {
-                    key: vec![4; 32],
-                    value: (),
-                },
-            },
-        }
-    }
-
     #[test]
     fn every_frame_round_trips() {
         for kind in [
@@ -227,24 +163,33 @@ mod tests {
             WalkKind::Authorization,
             WalkKind::References,
         ] {
-            let open = roundtrip(Frame::Open {
-                collection: CollectionHandle::new([7; 32]),
-                kind,
-            });
-            assert_eq!(open.len(), 33);
+            assert_eq!(
+                roundtrip(Frame::Open {
+                    collection: CollectionHandle::new([7; 32]),
+                    kind
+                })
+                .len(),
+                33
+            );
         }
-        roundtrip(Frame::Root {
-            summary: PatchSummary::new(None, 0).unwrap(),
-        });
-        roundtrip(Frame::Root {
-            summary: PatchSummary::new(Some([5; 32]), 600).unwrap(),
-        });
-        roundtrip(branch(Vec::new(), 255));
-        roundtrip(branch(vec![6; 31], 2));
-        roundtrip(branch(vec![6; 32], 0));
-        roundtrip(leaf(Vec::new()));
-        roundtrip(leaf(vec![8; 32]));
-        roundtrip(Frame::Leaf { key: [9; 32] });
+        for depth in 0..=32 {
+            assert_eq!(
+                roundtrip(Frame::Subtree {
+                    prefix: vec![6; depth],
+                    summary: PatchSummary::new(Some([5; 32]), 600).unwrap(),
+                })
+                .len(),
+                SUBTREE_BYTES
+            );
+        }
+        assert_eq!(
+            roundtrip(Frame::Subtree {
+                prefix: Vec::new(),
+                summary: PatchSummary::new(None, 0).unwrap()
+            })
+            .len(),
+            73
+        );
         roundtrip(Frame::ValueRequest { key: [12; 32] });
         roundtrip(Frame::Value {
             key: [13; 32],
@@ -258,22 +203,39 @@ mod tests {
         assert!(roundtrip(Frame::Landed).is_empty());
     }
 
-    /// The kinds are 0x01 to 0x08 in the order of the table: no HELD exists.
     #[test]
-    fn the_kinds_are_dense_from_open_to_landed() {
+    fn subtree_wire_size_is_constant_and_has_no_child_array() {
+        for count in [1, 2, 256, 70_000, u64::MAX] {
+            for depth in [0, 1, 31, 32] {
+                let payload = roundtrip(Frame::Subtree {
+                    prefix: vec![6; depth],
+                    summary: PatchSummary::new(Some([9; 32]), count).unwrap(),
+                });
+                assert_eq!(payload.len(), 73);
+                assert_eq!(payload.len() + 5, 78);
+                assert_eq!(payload[0], depth as u8);
+                assert!(payload[1 + depth..33].iter().all(|byte| *byte == 0));
+                assert_eq!(&payload[33..65], &[9; 32]);
+                assert_eq!(&payload[65..], &count.to_be_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn root_and_leaf_have_no_special_wire_kind() {
         assert_eq!(
             [
                 FRAME_OPEN,
-                FRAME_ROOT,
-                FRAME_NODE,
-                FRAME_LEAF,
+                FRAME_SUBTREE,
                 FRAME_VALUE_REQUEST,
                 FRAME_VALUE,
                 FRAME_DONE,
                 FRAME_LANDED
             ],
-            [1, 2, 3, 4, 5, 6, 7, 8]
+            [1, 3, 5, 6, 7, 8]
         );
+        assert_eq!(Frame::decode(0x02, &[]), Ok(None));
+        assert_eq!(Frame::decode(0x04, &[]), Ok(None));
         assert_eq!(Frame::decode(0x09, &[]), Ok(None));
     }
 
@@ -284,47 +246,43 @@ mod tests {
             kind: WalkKind::Records,
         }
         .encode();
-        let (_, root) = Frame::Root {
+        let (_, subtree) = Frame::Subtree {
+            prefix: vec![6; 3],
             summary: PatchSummary::new(Some([5; 32]), 2).unwrap(),
         }
         .encode();
-        let mut empty_root_with_leaves = root.clone();
-        empty_root_with_leaves[..32].fill(0);
-        let mut root_without_leaves = root.clone();
-        root_without_leaves[32..].fill(0);
-        let (_, node) = branch(vec![6; 3], 4).encode();
-        let mut third_node_tag = node.clone();
-        third_node_tag[0] = 3;
-        let mut long_prefix = node.clone();
-        long_prefix[1] = 33;
+        let mut deep = subtree.clone();
+        deep[0] = 33;
+        let mut padding = subtree.clone();
+        padding[32] = 1;
+        let mut empty_child = subtree.clone();
+        empty_child[33..].fill(0);
+        let mut no_count = subtree.clone();
+        no_count[65..].fill(0);
+        let mut no_hash = subtree.clone();
+        no_hash[33..65].fill(0);
         let (_, value) = Frame::Value {
             key: [13; 32],
-            bytes: vec![14; 2],
+            bytes: vec![14],
         }
         .encode();
         let (_, too_large) = Frame::Value {
             key: [13; 32],
-            bytes: vec![14; MAX_COLLECTION_LEAF_BYTES],
+            bytes: vec![14; MAX_COLLECTION_LEAF_BYTES + 1],
         }
         .encode();
-        let too_large = [&too_large[..], &[0]].concat();
         for (kind, payload) in [
             (FRAME_OPEN, &open[..32]),
             (FRAME_OPEN, &[&open[..], &[0]].concat()[..]),
-            (FRAME_ROOT, &root[..39]),
-            (FRAME_ROOT, &[&root[..], &[0]].concat()[..]),
-            (FRAME_ROOT, &empty_root_with_leaves[..]),
-            (FRAME_ROOT, &root_without_leaves[..]),
-            (FRAME_NODE, &node[..node.len() - 1]),
-            (FRAME_NODE, &[&node[..], &[0]].concat()[..]),
-            (FRAME_NODE, &third_node_tag[..]),
-            (FRAME_NODE, &long_prefix[..]),
-            (FRAME_NODE, &node[..36]),
-            (FRAME_LEAF, &node[..31]),
-            (FRAME_LEAF, &node[..33]),
-            (FRAME_VALUE_REQUEST, &node[..31]),
-            (FRAME_VALUE_REQUEST, &node[..33]),
-            // A value is at least one byte.
+            (FRAME_SUBTREE, &subtree[..72]),
+            (FRAME_SUBTREE, &[&subtree[..], &[0]].concat()[..]),
+            (FRAME_SUBTREE, &deep[..]),
+            (FRAME_SUBTREE, &padding[..]),
+            (FRAME_SUBTREE, &empty_child[..]),
+            (FRAME_SUBTREE, &no_count[..]),
+            (FRAME_SUBTREE, &no_hash[..]),
+            (FRAME_VALUE_REQUEST, &subtree[..31]),
+            (FRAME_VALUE_REQUEST, &subtree[..33]),
             (FRAME_VALUE, &value[..32]),
             (FRAME_VALUE, &value[..31]),
             (FRAME_VALUE, &too_large[..]),
@@ -337,11 +295,11 @@ mod tests {
                 payload.len()
             );
         }
-        let mut unknown_walk_kind = open.clone();
-        unknown_walk_kind[32] = 3;
-        assert_eq!(Frame::decode(FRAME_OPEN, &unknown_walk_kind), Ok(None));
+        let mut unknown = open.clone();
+        unknown[32] = 3;
+        assert_eq!(Frame::decode(FRAME_OPEN, &unknown), Ok(None));
         assert_eq!(Frame::decode(0x7F, b"anything"), Ok(None));
-        assert_eq!(Frame::decode(0x00, &[]), Ok(None));
+        assert_eq!(Frame::decode(0, &[]), Ok(None));
     }
 }
 
@@ -361,7 +319,6 @@ mod sim_tests {
         ConnectionTable, MAX_REQUESTS_GLOBAL, MAX_REQUESTS_PER_CONNECTION, RESET_UNKNOWN,
         RESET_WALK_FAILED, Service, open_walk, read_frame, write_frame,
     };
-    use crate::patch_repair::{PatchBranch, PatchChild};
     use crate::protocol::{PILE_SYNC_ALPN, TAG_WALK, send_u8};
     use crate::transport::sim::{SimConfig, SimNet, SimTransport};
     use crate::transport::{Conn, PeerId, RecvStream, SendStream, Transport, reset_code};
@@ -461,7 +418,8 @@ mod sim_tests {
         {
             let collection = CollectionHandle::new([index as u8; 32]);
             let (mut send, _recv) = open_walk(&connection, collection, kind).await.unwrap();
-            let root = Frame::Root {
+            let root = Frame::Subtree {
+                prefix: Vec::new(),
                 summary: PatchSummary::new(Some([5; 32]), 600).unwrap(),
             };
             let (frame, payload) = root.encode();
@@ -542,28 +500,15 @@ mod sim_tests {
         let accepted = acceptor.incoming.recv().await.unwrap().conn;
         let (mut send, _recv) = dialed.open_bi().await.unwrap();
         let (_send, mut recv) = accepted.accept_bi().await.unwrap();
-        // Two hundred full branches: about two megabytes, more than a
-        // stream's credit.
-        let (frame, payload) = Frame::Node {
+        // Twenty thousand constant-sized announcements exceed stream credit;
+        // no hidden representative or child array is needed for the fixture.
+        let (frame, payload) = Frame::Subtree {
             prefix: vec![6; 3],
-            node: PatchNode::Branch {
-                digest: [1; 32],
-                leaf_count: 256,
-                branch: PatchBranch {
-                    representative: vec![2; 32],
-                    end_depth: 4,
-                    children: (0..=255)
-                        .map(|edge| PatchChild {
-                            edge,
-                            digest: [edge; 32],
-                            leaf_count: 1,
-                        })
-                        .collect(),
-                },
-            },
+            summary: PatchSummary::new(Some([1; 32]), 256).unwrap(),
         }
         .encode();
-        let frames = 200;
+        assert_eq!(payload.len(), SUBTREE_BYTES);
+        let frames = 20_000;
         let writer = async {
             for _ in 0..frames {
                 write_frame(&mut send, frame, &payload).await.unwrap();

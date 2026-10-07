@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Stream collection-kind PATCH differences against connection-scoped agreement
+  as fixed 73-byte prefix/hash/leaf-count announcements, without full child
+  lists or special root/leaf frames. Reconstruct and close the peer delta before
+  LANDED; preserve symmetric FIFO pruning and actual write/finish receipts.
+  Generation 30 remains source-only, with no live rollout.
+
 - W8 source candidate: bidirectional collection-tree exchanges replace
   one-way HELD walks, using continuous FIFO deltas and authenticated subtree
   pruning. Shared PATCH agreement is confirmed only after both LANDEDs and

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Replace W8 child-array NODE exchange with uniform 73-byte SUBTREE payloads
+  (depth, zero-padded prefix32, hash32, leaf-count:u64). Roots/leaves use that
+  same format. Native PATCH differences omit prior agreed keys; independently
+  held matching prefixes each announce once and prune remaining recursion.
+  Separate peer-only reconstruction validates root and every commitment before
+  typed landing completion and LANDED. The grow-on-demand proof limit is a real
+  1,048,576-leaf delta ceiling, including matched roots; non-root held subtree
+  inclusion enumerates keys. Connection-scoped sound agreement survives only
+  successful actual writes/finish, with asymmetric-failure bookkeeping qualified.
+  Generation 30 is unchanged; no deployed cohort or live scale claim.
+
 - W8: one bidirectional `walk/1` exchange per collection/tree, with continuous
   FIFO deltas, authenticated subtree announcements, key-based value pulls,
   and a shared pinned-tree union only after both LANDEDs. Failure forgets

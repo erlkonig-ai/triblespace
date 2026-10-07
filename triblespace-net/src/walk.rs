@@ -6,7 +6,7 @@
 //! tree the two agreed on last time, breadth first and without waiting, and
 //! lands the other's ([`crate::exchange`]). Both LANDEDs crossing confirms
 //! it, and the agreed tree for that peer, collection and kind becomes the
-//! union of the two pinned trees, which both hold; an exchange that ends any
+//! prior agreement plus both deltas, which both hold; an exchange that ends any
 //! other way forgets it, and what landed stays. Agreed trees are forgotten
 //! for a peer when a connection to it closes, and for a collection when it
 //! is deselected; none is persisted.
@@ -71,10 +71,9 @@ use crate::exchange::{Ended, Exchange, Out, Outcome, Tree};
 use crate::health::Health;
 use crate::host::{CollectionSnapshot, METADATA_BLOB_BYTES, StoreSnapshot};
 use crate::landing::{LandSlot, Landed};
-use crate::patch_repair::{
-    PatchBranch, PatchChild, PatchLeaf, PatchNode, PatchNodeResponse, PatchSummary,
-    patch_node_response,
-};
+use crate::patch_repair::PatchSummary;
+#[cfg(test)]
+use crate::patch_repair::{PatchNode, PatchNodeResponse, patch_node_response};
 use crate::protocol::{
     MAX_EXACT_BLOB_BYTES, RawHash, TAG_BLOB, fetch_get_blob_stream_with_limit, send_u8,
 };
@@ -84,11 +83,6 @@ use crate::walk_stream::Frame;
 
 /// Bytes of every key a walk enumerates, relative to its kind's base.
 pub(crate) const KEY_BYTES: usize = 32;
-/// One child of a branch: edge, digest and leaf count.
-const CHILD_BYTES: usize = 1 + 32 + 8;
-
-const BRANCH: u8 = 1;
-const LEAF: u8 = 2;
 
 /// What a walk enumerates.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -139,45 +133,6 @@ pub(crate) fn push_summary(payload: &mut Vec<u8>, summary: PatchSummary) {
     payload.extend_from_slice(&summary.leaf_count().to_be_bytes());
 }
 
-/// Append a prefix: a length byte and the bytes.
-pub(crate) fn push_prefix(payload: &mut Vec<u8>, prefix: &[u8]) {
-    let length = u8::try_from(prefix.len()).expect("a prefix fits its key");
-    payload.push(length);
-    payload.extend_from_slice(prefix);
-}
-
-/// The tag [`Reader::node`] reads a node back under: whether it is a branch
-/// or a leaf.
-pub(crate) fn node_tag(node: &PatchNode<()>) -> u8 {
-    match node {
-        PatchNode::Branch { .. } => BRANCH,
-        PatchNode::Leaf { .. } => LEAF,
-    }
-}
-
-/// Append a node after its tag: its prefix, its digest, and a branch's leaf
-/// count, representative, end depth and children, or a leaf's key. The
-/// children run to the end of the frame, so a node is the last thing in it.
-pub(crate) fn push_node(payload: &mut Vec<u8>, prefix: &[u8], node: &PatchNode<()>) {
-    push_prefix(payload, prefix);
-    payload.extend_from_slice(&node.digest());
-    match node {
-        PatchNode::Branch {
-            leaf_count, branch, ..
-        } => {
-            payload.extend_from_slice(&leaf_count.to_be_bytes());
-            payload.extend_from_slice(&branch.representative);
-            payload.push(branch.end_depth);
-            for child in &branch.children {
-                payload.push(child.edge);
-                payload.extend_from_slice(&child.digest);
-                payload.extend_from_slice(&child.leaf_count.to_be_bytes());
-            }
-        }
-        PatchNode::Leaf { leaf, .. } => payload.extend_from_slice(&leaf.key),
-    }
-}
-
 /// The unread rest of a walk frame.
 pub(crate) struct Reader<'a>(pub(crate) &'a [u8]);
 
@@ -203,15 +158,6 @@ impl Reader<'_> {
         Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
 
-    /// A prefix as [`push_prefix`] writes it, at most a key long.
-    pub(crate) fn prefix(&mut self) -> Result<Vec<u8>, Malformed> {
-        let length = usize::from(self.byte()?);
-        if length > KEY_BYTES {
-            return Err(Malformed("walk node prefix longer than its key"));
-        }
-        self.take(length)
-    }
-
     /// A summary as [`push_summary`] writes it.
     pub(crate) fn summary(&mut self) -> Result<PatchSummary, Malformed> {
         let root = self.hash()?;
@@ -220,52 +166,6 @@ impl Reader<'_> {
         let root = (root != [0; 32]).then_some(root);
         PatchSummary::new(root, count)
             .map_err(|_| Malformed("walk summary root and count disagree"))
-    }
-
-    /// A node as [`push_node`] writes it after `tag`, its prefix first. It
-    /// takes the rest of the frame.
-    pub(crate) fn node(&mut self, tag: u8) -> Result<(Vec<u8>, PatchNode<()>), Malformed> {
-        let leaf = match tag {
-            LEAF => true,
-            BRANCH => false,
-            _ => return Err(Malformed("walk node neither branch nor leaf")),
-        };
-        let prefix = self.prefix()?;
-        let digest = self.hash()?;
-        let node = if leaf {
-            PatchNode::Leaf {
-                digest,
-                leaf: PatchLeaf {
-                    key: self.take(KEY_BYTES)?,
-                    value: (),
-                },
-            }
-        } else {
-            let leaf_count = self.u64()?;
-            let representative = self.take(KEY_BYTES)?;
-            let end_depth = self.byte()?;
-            if self.0.len() % CHILD_BYTES != 0 {
-                return Err(Malformed("walk branch children overrun their frame"));
-            }
-            let mut children = Vec::with_capacity(self.0.len() / CHILD_BYTES);
-            while !self.0.is_empty() {
-                children.push(PatchChild {
-                    edge: self.byte()?,
-                    digest: self.hash()?,
-                    leaf_count: self.u64()?,
-                });
-            }
-            PatchNode::Branch {
-                digest,
-                leaf_count,
-                branch: PatchBranch {
-                    representative,
-                    end_depth,
-                    children,
-                },
-            }
-        };
-        Ok((prefix, node))
     }
 }
 
@@ -303,8 +203,8 @@ pub(crate) struct Walks {
     /// The collections the last snapshot selected: one that leaves the
     /// selection is forgotten.
     selected: PATCH<32, IdentitySchema, ()>,
-    /// The agreed tree of each peer, collection and kind: the union of the
-    /// two trees pinned for the last confirmed exchange, which both hold.
+    /// Connection-scoped sound common-held keys: prior acknowledged base
+    /// plus both completed deltas, possibly ahead of lagging physical pins.
     agreed: PATCH<65, IdentitySchema, Arc<Tree>>,
 }
 
@@ -663,6 +563,7 @@ pub(crate) fn summary(kind: WalkKind, overlay: &CollectionRepairOverlay) -> Patc
 
 /// The summary of the subtree at `prefix` of a kind's PATCH, relative to its
 /// base, if present: what a subtree held here is compared with.
+#[cfg(test)]
 pub(crate) fn local_summary(
     kind: WalkKind,
     overlay: &CollectionRepairOverlay,
@@ -685,24 +586,8 @@ pub(crate) fn node_summary<const KEY_LEN: usize, V>(
     })
 }
 
-pub(crate) fn contains(kind: WalkKind, overlay: &CollectionRepairOverlay, key: &[u8]) -> bool {
-    let Ok(key) = <[u8; KEY_BYTES]>::try_from(key) else {
-        return false;
-    };
-    match kind {
-        WalkKind::Records => overlay
-            .records()
-            .get(CollectionRecordFingerprint::from_raw(key))
-            .is_some(),
-        WalkKind::Authorization => overlay
-            .authorization_evidence()
-            .get(CapabilityProofId::new(key))
-            .is_some(),
-        WalkKind::References => overlay.blob_inventory().get(&key).is_some(),
-    }
-}
-
 /// The node at `prefix` of a kind's PATCH, relative to its base, if present.
+#[cfg(test)]
 pub(crate) fn node(
     kind: WalkKind,
     overlay: &CollectionRepairOverlay,
@@ -1712,15 +1597,17 @@ pub(crate) mod tests {
         out: &mut Vec<Vec<u8>>,
     ) {
         let node = patch.merkle_node(&prefix).unwrap();
-        if node.is_leaf() {
-            return;
+        if prefix.is_empty() {
+            out.push(Vec::new()); // Uniform root exists even for a singleton.
+            if !node.prefix().is_empty() {
+                branches(patch, node.prefix().to_vec(), out);
+                return;
+            }
+        } else if !node.is_leaf() {
+            out.push(prefix);
         }
-        let base = node.representative()[..node.end_depth()].to_vec();
-        out.push(prefix);
-        for (edge, _) in node.children() {
-            let mut child = base.clone();
-            child.push(edge);
-            branches(patch, child, out);
+        for (_, child) in node.children() {
+            branches(patch, child.prefix().to_vec(), out);
         }
     }
 
@@ -1729,11 +1616,14 @@ pub(crate) mod tests {
         patch: &PATCH<32, IdentitySchema, CollectionRecord, Blake3Merkle>,
         keys: &[[u8; 32]],
     ) -> std::collections::BTreeSet<Vec<u8>> {
+        // Only the native delta keys, not paths through unchanged collection siblings.
+        let mut delta = PATCH::new();
+        for key in keys {
+            delta.insert(&Entry::with_value(key, *patch.get(key).unwrap()));
+        }
         let mut all = Vec::new();
-        branches(patch, Vec::new(), &mut all);
-        all.into_iter()
-            .filter(|locator| keys.iter().any(|key| key.starts_with(locator)))
-            .collect()
+        branches(&delta, Vec::new(), &mut all);
+        all.into_iter().collect()
     }
 
     /// What a peer and this side agreed on is forgotten when a connection to
@@ -1880,7 +1770,7 @@ pub(crate) mod tests {
         );
         // Connection interrupted before either LANDED, after a previously
         // confirmed exchange. The end is not a confirmation of old memory.
-        assert!(matches!(exchange.next_delta(), Some(Frame::Root { .. })));
+        assert!(matches!(exchange.next_delta(), Some(Frame::Subtree { .. })));
         let ended = exchange.end();
         assert!(!ended.confirmed && ended.agreed.is_none());
         node.walks
@@ -1903,8 +1793,10 @@ pub(crate) mod tests {
             .unwrap();
         assert!(pair.confirmed.records.is_none());
         let mut retry = node.walks.start(peer, collection, kind).unwrap();
-        assert!(matches!(retry.next_delta(), Some(Frame::Root { .. })));
-        assert!(matches!(retry.next_delta(), Some(Frame::Leaf { .. })));
+        assert!(matches!(retry.next_delta(), Some(Frame::Subtree { .. })));
+        assert!(
+            matches!(retry.next_delta(), Some(Frame::Subtree { prefix, .. }) if prefix.len()==KEY_BYTES)
+        );
     }
 
     /// Walk streams driven through the walks task over the simulated
@@ -1932,10 +1824,13 @@ pub(crate) mod tests {
         use crate::landing::Land;
         use crate::protocol::{TAG_BLOB, TAG_WALK, serve_get_blob};
         use crate::transport::sim::{Crossed, SimConfig, SimNet, Tapped, Taps};
-        use crate::walk_stream::{
-            FRAME_DONE, FRAME_LANDED, FRAME_LEAF, FRAME_NODE, FRAME_OPEN, FRAME_ROOT,
-            FRAME_VALUE_REQUEST,
-        };
+        use crate::walk_stream::{FRAME_DONE, FRAME_LANDED, FRAME_OPEN, FRAME_VALUE_REQUEST};
+
+        // Test-only classifications decoded from the actual uniform payload,
+        // not wire kinds. This keeps root/branch/key assertions distinct.
+        const FRAME_ROOT: u8 = 252;
+        const FRAME_NODE: u8 = 253;
+        const FRAME_LEAF: u8 = 254;
 
         #[derive(Clone)]
         struct NoRequests;
@@ -2017,6 +1912,33 @@ pub(crate) mod tests {
         }
 
         impl SendStream for FailLanded {
+            fn reset(&mut self, code: u32) {
+                self.0.reset(code);
+            }
+        }
+
+        struct FailFinish(Tx, Arc<Mutex<bool>>);
+
+        impl AsyncWrite for FailFinish {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Pin::new(&mut self.0).poll_write(cx, buf)
+            }
+            fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.0).poll_flush(cx)
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                *self.1.lock().unwrap() = true;
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "scripted stream finish failure",
+                )))
+            }
+        }
+        impl SendStream for FailFinish {
             fn reset(&mut self, code: u32) {
                 self.0.reset(code);
             }
@@ -2467,37 +2389,23 @@ pub(crate) mod tests {
                     .bytes(collection)
                     .unwrap(),
             };
-            write(
-                send,
-                Frame::Root {
-                    summary: summary(kind, overlay),
-                },
-            )
-            .await;
-            let mut queue = VecDeque::from([Vec::new()]);
-            while let Some(prefix) = queue.pop_front() {
-                match node(kind, overlay, &prefix).unwrap() {
-                    PatchNode::Leaf { leaf, .. } => {
-                        let key = <[u8; 32]>::try_from(leaf.key).unwrap();
-                        if omit != Some(key) {
-                            write(send, Frame::Leaf { key }).await;
-                        }
-                    }
-                    sent @ PatchNode::Branch { .. } => {
-                        let PatchNode::Branch { branch, .. } = sent.clone() else {
-                            unreachable!()
-                        };
-                        let end = usize::from(branch.end_depth);
-                        for child in &branch.children {
-                            let mut locator = branch.representative[..end].to_vec();
-                            locator.push(child.edge);
-                            queue.push_back(locator);
-                        }
-                        write(send, Frame::Node { prefix, node: sent }).await;
-                    }
+            let mut exchange = Exchange::start(
+                collection,
+                kind,
+                sender.pinned(collection),
+                None,
+                true,
+                false,
+            );
+            while let Some(frame) = exchange.next_delta() {
+                if let Frame::Subtree { prefix, .. } = &frame
+                    && prefix.len() == 32
+                    && omit == Some(prefix.as_slice().try_into().unwrap())
+                {
+                    continue;
                 }
+                write(send, frame).await;
             }
-            write(send, Frame::Done).await;
             loop {
                 match read(recv).await {
                     Some(Frame::Landed) => return (true, heard),
@@ -2518,7 +2426,7 @@ pub(crate) mod tests {
                             return (false, heard);
                         }
                     }
-                    Some(Frame::Root { .. } | Frame::Node { .. } | Frame::Leaf { .. }) => {}
+                    Some(Frame::Subtree { .. }) => {}
                     Some(other) => panic!("waiting for Landed: {other:?}"),
                     None => return (false, heard),
                 }
@@ -2617,7 +2525,14 @@ pub(crate) mod tests {
             let root = summary(WalkKind::Records, overlay.repair());
 
             let (mut first, _first_recv, first_reset) = receiving.open(sender.id(), collection);
-            write(&mut first, Frame::Root { summary: root }).await;
+            write(
+                &mut first,
+                Frame::Subtree {
+                    prefix: Vec::new(),
+                    summary: root,
+                },
+            )
+            .await;
             let (mut second, mut second_recv, second_reset) =
                 receiving.open(sender.id(), collection);
             assert_eq!(reset(&first_reset).await, Some(RESET_WALK_FAILED));
@@ -2655,7 +2570,10 @@ pub(crate) mod tests {
             assert!(receiving.records(collection).len() < 20);
             let health = receiving.health(collection, sender.id()).unwrap();
             assert_eq!((health.receives.ok, health.receives.failed), (0, 1));
-            assert_eq!((health.pushes.ok, health.pushes.failed), (0, 1));
+            // The scripted peer already acknowledged our empty outgoing
+            // delta. Its omitted incoming leaf fails reception/agreement,
+            // not that independently successful directional write receipt.
+            assert_eq!((health.pushes.ok, health.pushes.failed), (1, 0));
             assert!(!health.receives.last_ok);
         }
 
@@ -2672,7 +2590,12 @@ pub(crate) mod tests {
                 crossed
                     .iter()
                     .filter(|crossed| crossed.sent == sent)
-                    .map(|crossed| crossed.kind)
+                    .map(|crossed| match crossed.walk_depth {
+                        Some(0) => FRAME_ROOT,
+                        Some(32) => FRAME_LEAF,
+                        Some(_) => FRAME_NODE,
+                        None => crossed.kind,
+                    })
                     .collect::<Vec<_>>()
             };
             (kinds(true), kinds(false))
@@ -2746,7 +2669,10 @@ pub(crate) mod tests {
             let pinned = full.lander.node.lock().unwrap().pinned(collection);
             branches(pinned.repair().records().patch(), Vec::new(), &mut expected);
             assert!(expected.len() > 1);
-            assert_eq!(count(&sent, FRAME_NODE), expected.len());
+            assert_eq!(
+                count(&sent, FRAME_ROOT) + count(&sent, FRAME_NODE),
+                expected.len()
+            );
             assert_eq!(count(&sent, FRAME_LEAF), records.len());
 
             // Zero waits. Stream data crosses the simulated transport
@@ -2761,7 +2687,8 @@ pub(crate) mod tests {
             let (mut send, mut recv, _) = full.open(stranger, collection);
             write(
                 &mut send,
-                Frame::Root {
+                Frame::Subtree {
+                    prefix: Vec::new(),
                     summary: PatchSummary::new(None, 0).unwrap(),
                 },
             )
@@ -2776,15 +2703,17 @@ pub(crate) mod tests {
                     break;
                 }
             }
-            assert!(matches!(delta[0], Frame::Root { .. }));
+            assert!(matches!(delta[0], Frame::Subtree { .. }));
             let nodes = delta
                 .iter()
-                .filter(|frame| matches!(frame, Frame::Node { .. }))
+                .filter(|frame| matches!(frame, Frame::Subtree {prefix,..} if prefix.len()<32))
                 .count();
             let leaves = delta
                 .iter()
                 .filter_map(|frame| match frame {
-                    Frame::Leaf { key } => Some(*key),
+                    Frame::Subtree { prefix: key, .. } if key.len() == 32 => {
+                        Some(key.as_slice().try_into().unwrap())
+                    }
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -3005,7 +2934,8 @@ pub(crate) mod tests {
             });
             write(
                 &mut send,
-                Frame::Root {
+                Frame::Subtree {
+                    prefix: Vec::new(),
                     summary: PatchSummary::new(None, 0).unwrap(),
                 },
             )
@@ -3101,7 +3031,8 @@ pub(crate) mod tests {
             });
             write(
                 &mut send,
-                Frame::Root {
+                Frame::Subtree {
+                    prefix: Vec::new(),
                     summary: PatchSummary::new(None, 0).unwrap(),
                 },
             )
@@ -3109,9 +3040,11 @@ pub(crate) mod tests {
             let mut keys = Vec::new();
             loop {
                 match read(&mut recv).await {
-                    Some(Frame::Leaf { key }) => keys.push(key),
+                    Some(Frame::Subtree { prefix: key, .. }) if key.len() == 32 => {
+                        keys.push(<[u8; 32]>::try_from(key).unwrap())
+                    }
                     Some(Frame::Done) => break,
-                    Some(Frame::Root { .. } | Frame::Node { .. }) => {}
+                    Some(Frame::Subtree { .. }) => {}
                     other => panic!("our delta: {other:?}"),
                 }
             }
@@ -3143,6 +3076,106 @@ pub(crate) mod tests {
             assert!(!duplicate);
             assert!(ended.confirmed, "the peer's directional receipt arrived");
             assert!(!ended.landed, "our failed write is not a receipt");
+            assert!(ended.agreed.is_none());
+            assert_eq!(*reset.lock().unwrap(), Some(RESET_WALK_FAILED));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_failed_finish_after_writing_landed_cannot_leave_a_shared_agreement() {
+            let net = SimNet::new(0x3A28, SimConfig::default());
+            let mut node = Node::new(103);
+            let collection = node.hold("LANDED write failure", open());
+            node.commit(collection, 1);
+            node.observe();
+            let kind = WalkKind::Records;
+            let exchange =
+                Exchange::start(collection, kind, node.pinned(collection), None, true, true);
+            let hosted = Hosted::new(node, &net);
+            let (landing, _landings) = mpsc::unbounded_channel();
+            let (commands, _commands) = mpsc::unbounded_channel();
+            let driver = Driver {
+                connections: hosted.table.clone(),
+                snapshots: hosted.lander.snapshots.subscribe(),
+                landing,
+                commands,
+                id: 1,
+                peer: Node::new(104).id(),
+                collection,
+                kind,
+            };
+            let (script, driven) = tokio::io::duplex(1 << 20);
+            let (mut recv, mut send) = tokio::io::split(script);
+            let (driven_recv, driven_send) = tokio::io::split(driven);
+            let reset = Arc::new(Mutex::new(None));
+            let attempted = Arc::new(Mutex::new(false));
+            let (_acks, acked) = mpsc::unbounded_channel();
+            let (_replace, replaced) = oneshot::channel();
+            let task_attempted = attempted.clone();
+            let task_reset = reset.clone();
+            let task = tokio::spawn(async move {
+                drive(
+                    &driver,
+                    exchange,
+                    Box::new(FailFinish(
+                        Tx(driven_send, task_reset.clone()),
+                        task_attempted,
+                    )),
+                    Box::new(Rx(driven_recv, task_reset)),
+                    acked,
+                    replaced,
+                )
+                .await
+            });
+            write(
+                &mut send,
+                Frame::Subtree {
+                    prefix: Vec::new(),
+                    summary: PatchSummary::new(None, 0).unwrap(),
+                },
+            )
+            .await;
+            let mut keys = Vec::new();
+            loop {
+                match read(&mut recv).await {
+                    Some(Frame::Subtree { prefix: key, .. }) if key.len() == 32 => {
+                        keys.push(<[u8; 32]>::try_from(key).unwrap())
+                    }
+                    Some(Frame::Done) => break,
+                    Some(Frame::Subtree { .. }) => {}
+                    other => panic!("our delta: {other:?}"),
+                }
+            }
+            for key in keys {
+                write(&mut send, Frame::ValueRequest { key }).await;
+                let Some(Frame::Value { key: served, bytes }) = read(&mut recv).await else {
+                    panic!("requested value");
+                };
+                assert_eq!(served, key);
+                assert_eq!(
+                    decode_record(collection, &bytes)
+                        .unwrap()
+                        .fingerprint()
+                        .raw(),
+                    key
+                );
+            }
+            // The peer acknowledges our delta before ending its empty one.
+            write(&mut send, Frame::Landed).await;
+            write(&mut send, Frame::Done).await;
+            let (ended, duplicate) = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("failed write wakes/finishes the driver")
+                .unwrap();
+            assert!(
+                *attempted.lock().unwrap(),
+                "a real stream shutdown was attempted"
+            );
+            assert!(!duplicate);
+            assert!(ended.confirmed, "the peer's directional receipt arrived");
+            assert!(
+                ended.landed,
+                "LANDED really crossed before the failed finish"
+            );
             assert!(ended.agreed.is_none());
             assert_eq!(*reset.lock().unwrap(), Some(RESET_WALK_FAILED));
         }
@@ -3320,7 +3353,11 @@ pub(crate) mod tests {
                 let pinned = side.lander.node.lock().unwrap().pinned(collection);
                 let expected = paths(pinned.repair().records().patch(), own);
                 assert!(expected.contains(&Vec::new()));
-                assert_eq!(count(&sent, FRAME_NODE), expected.len(), "{sent:?}");
+                assert_eq!(
+                    count(&sent, FRAME_ROOT) + count(&sent, FRAME_NODE),
+                    expected.len(),
+                    "{sent:?}"
+                );
                 assert_eq!(count(&sent, FRAME_LEAF), 10);
                 eprintln!(
                     "W8_AGREED_SHARED peer={other:?} nodes={} leaves=10 value_requests_sent=10 value_requests_received=10 fixture=prior_agreement_plus_10_unique_each scheduler=sim_zero_stream_latency",
@@ -3374,7 +3411,11 @@ pub(crate) mod tests {
                 assert_eq!(count(&sent, FRAME_VALUE_REQUEST), asked);
                 let pinned = side.lander.node.lock().unwrap().pinned(collection);
                 let expected = paths(pinned.repair().records().patch(), own);
-                assert_eq!(count(&sent, FRAME_NODE), expected.len(), "{sent:?}");
+                assert_eq!(
+                    count(&sent, FRAME_ROOT) + count(&sent, FRAME_NODE),
+                    expected.len(),
+                    "{sent:?}"
+                );
                 assert_eq!(count(&sent, FRAME_LEAF), own.len());
                 eprintln!(
                     "W8_INCREMENTAL peer={other:?} nodes={} leaves={} value_requests_sent={asked} value_requests_received={} scheduler=sim_zero_stream_latency",
