@@ -282,7 +282,7 @@ where
         .await
 }
 
-async fn fetch_get_blob_stream_with_limit<W, R>(
+pub(crate) async fn fetch_get_blob_stream_with_limit<W, R>(
     send: &mut W,
     recv: &mut R,
     requester: PeerId,

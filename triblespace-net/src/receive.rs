@@ -36,7 +36,10 @@
 //! [`MAX_WALK_UNLANDED`] values are with the landing task, so the driver
 //! stops reading and QUIC flow control holds the sender. The stream is read
 //! on while a value is owed to it: only reading brings the value, so
-//! stopping for owed values would wait forever.
+//! stopping for owed values would wait forever. After DONE it is read only
+//! while a value asked for is still to come, and the driver times its wait
+//! for a frame only while one is owed ([`Receive::awaits`]): the fetches
+//! and landings that follow DONE take what time they take.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -230,10 +233,22 @@ impl Receive {
     }
 
     /// Whether the driver should read the next frame: not while
-    /// [`MAX_WALK_UNLANDED`] values are with the landing task, and not once
-    /// the push ended.
+    /// [`MAX_WALK_UNLANDED`] values are with the landing task, not once the
+    /// push ended, and not after DONE unless a value asked for is still to
+    /// come: then nothing is owed either way, and the fetches and landings
+    /// left take what time they take.
     pub(crate) fn want_read(&self) -> bool {
-        self.outcome.is_none() && self.unlanded < MAX_WALK_UNLANDED
+        self.outcome.is_none()
+            && self.unlanded < MAX_WALK_UNLANDED
+            && (!self.done || !self.requests.is_empty())
+    }
+
+    /// Whether the sender owes this side a frame while this side owes it
+    /// nothing, so the driver times its wait for one: before DONE the next
+    /// node, leaf or DONE, unless a HELD is withheld here and the sender's
+    /// walk waits on it; after DONE the values asked for.
+    pub(crate) fn awaits(&self) -> bool {
+        !self.requests.is_empty() || (!self.done && self.held.is_empty())
     }
 
     pub(crate) fn outcome(&self) -> Option<Outcome> {

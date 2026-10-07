@@ -163,6 +163,11 @@ impl Push {
         Ok(frames)
     }
 
+    /// Whether DONE went out: the walk is over, and only LANDED is owed.
+    pub(crate) fn done(&self) -> bool {
+        self.done
+    }
+
     /// The push's outcome once its stream ended, however it ended.
     pub(crate) fn outcome(self) -> Outcome {
         Outcome {
