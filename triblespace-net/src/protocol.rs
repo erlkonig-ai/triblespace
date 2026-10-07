@@ -30,18 +30,22 @@ use crate::transport::PeerId;
 /// DERIVE, capability and authorization records and never a MERGE, and the
 /// blob component is the held set. A generation-27 peer would serve MERGEs
 /// and an inventory with another meaning, so it is refused at the handshake.
-/// Generation 29 replaces the gossip wake plane and the `repair/0` session
-/// with one connection per peer and its typed streams: `recon/1` carries
-/// peerings and the grant exchange, `walk/1` streams carry pushes of
-/// collection trees, and `dht/1` answers `FIND_VALUE`. A generation-28 peer
-/// speaks none of them, so it is refused at the handshake too.
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/29";
+/// Generation 29 replaced the gossip wake plane and the `repair/0` session
+/// with one connection per peer and its typed streams: `recon/1` carried
+/// peerings, the grant exchange and every collection's announcements and
+/// pull walks, and `dht/1` answers `FIND_VALUE`. A generation-28 peer speaks
+/// none of them, so it is refused at the handshake too.
+/// Generation 30 moves collection sync off `recon/1`: each side pushes its
+/// collection trees on `walk/1` streams of its own, and `recon/1` carries
+/// peerings and the grant exchange only. A generation-29 peer announces on
+/// `recon/1` and opens no `walk/1` stream, so it is refused at the handshake.
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/30";
 
 // Stream type tags — first byte on each stream, read before any admission
 // permit is taken. An unknown tag resets only its own stream.
 // 0x01 was branch-list; 0x03 was blob-children; 0x04 was branch-head;
 // 0x05 was connection AUTH; 0x0D was record/AUTH-only collection repair;
-// 0x0E was `repair/0`, the collection repair session that walks on `recon/1`
+// 0x0E was `repair/0`, the collection repair session that pushes on `walk/1`
 // replaced; 0x06, 0x07 and 0x0C were the DHT operations, now under `dht/1`.
 // None are accepted. Incompatible stream layouts require a fresh byte, so the
 // two whose layout is unchanged keep theirs.

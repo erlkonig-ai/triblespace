@@ -7,11 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- Transport generation `/triblespace/pile-sync/29` (sync redesign M13):
-  one connection per peer whose `recon/1` stream carries peerings,
-  announcements, pull walks and the grant exchange, with `FIND_VALUE` on
-  `dht/1`, in place of the gossip wake plane and the `repair/0` session.
-  Generation-28 peers are refused at the handshake; deploy a cohort together.
+- Transport generation `/triblespace/pile-sync/30` (sync redesign, walk
+  streams): each side pushes its collection trees, records, authorization
+  evidence and, between two Full neighbours, the held set, on `walk/1`
+  streams of its own, pruned by the receiver's HELD bitmaps; the receiver
+  asks for the values it lacks, and its LANDED confirms the pushed root, so
+  an unchanged tree is ROOT then DONE. A per-collection timer paces the
+  pushes, two seconds after a local append and doubling to sixty, and a
+  push that fails forgets its confirmed root. `recon/1` carries peerings and
+  the grant exchange only; announcements, pull walks, walk numbers, End
+  frames and the held digest are gone. Generation 29 (M13), which put one
+  connection per peer with `recon/1` and `FIND_VALUE` on `dht/1` in place of
+  the gossip wake plane and the `repair/0` session, announced and pulled on
+  `recon/1`; it and generation 28 are refused at the handshake. Deploy a
+  cohort together.
 
 - Close a connection when its `recon/1` ends (JP's design question,
   2026-10-06). A connection carries exactly one `recon/1`, the dialler's,

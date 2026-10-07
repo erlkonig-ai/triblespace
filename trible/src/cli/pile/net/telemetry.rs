@@ -577,12 +577,6 @@ impl Publisher {
         let live = health.is_fresh(triblespace_core::clock::mono_now(), h::HOST_MAX_AGE);
         let serving = &health.blob_serving;
         let publication = &health.publication;
-        let repair_active = health
-            .collections
-            .iter()
-            .flat_map(|collection| &collection.peers)
-            .filter(|peer| peer.in_flight)
-            .count() as u64;
         let mut facts = entity! {
             metadata::tag: &t::KIND_SAMPLE,
             t::attrs::subject*: self.subjects[0].clone(),
@@ -615,7 +609,10 @@ impl Publisher {
             h::attrs::session: &self.session,
             metadata::created_at: created,
             t::attrs::elapsed_ns: elapsed_ns,
-            t::attrs::active?: live.then_some(repair_active),
+            // Host health records the ends of pushes and receives, not the
+            // ones in flight, so the repair subject's active count stays
+            // absent rather than estimated.
+            t::attrs::active?: None::<u64>,
         };
         facts += entity! {
             metadata::tag: &t::KIND_SAMPLE,

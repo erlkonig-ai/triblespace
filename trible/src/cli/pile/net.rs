@@ -702,14 +702,17 @@ fn run_sync(
                 collection
                     .peers
                     .iter()
-                    .filter(|repair| repair.peer != node)
-                    .map(|repair| {
-                        (
-                            repair.peer,
-                            collection.collection.raw,
-                            repair.last_completed_at,
-                            repair.last_failure_at,
-                        )
+                    .filter(|pair| pair.peer != node)
+                    .map(|pair| {
+                        // A round is the later of the pair's last push and
+                        // last receive; it completed when that end was a
+                        // push the peer confirmed or a receive that landed
+                        // whole.
+                        let ends = [pair.pushes, pair.receives];
+                        let at = ends.iter().filter_map(|ends| ends.last_at).max();
+                        let ok = ends.iter().any(|ends| ends.last_at == at && ends.last_ok);
+                        let failed_at = if ok { None } else { at };
+                        (pair.peer, collection.collection.raw, at, failed_at)
                     })
             });
             for (remote, count) in completed_rounds(rounds, &mut rounds_seen) {
@@ -739,8 +742,9 @@ fn run_sync(
 }
 
 /// The line printed, on stderr and without colour, for each peer with which
-/// at least one collection repair round completed without failure since the
-/// previous check: `reconciled with peer <endpoint id hex>: <n> collections`.
+/// at least one collection's last push was confirmed or last receive landed
+/// whole since the previous check: `reconciled with peer <endpoint id hex>:
+/// <n> collections`.
 /// The prefix and shape are stable for scripts.
 fn reconciled_line(peer: &[u8; 32], collections: usize) -> String {
     format!(

@@ -7,11 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- Sync redesign: transport generation `/triblespace/pile-sync/29`. Each
-  collection a pile selects is peered, announced and pulled on one `recon/1`
-  stream per connection; gossip wakes, repair sessions, configured peers and
-  the held-set walker are gone, and generation-28 peers are refused at the
-  handshake. See the `triblespace-net`, `triblespace-core` and `trible`
+- Sync redesign: transport generation `/triblespace/pile-sync/30`. Each
+  collection a pile selects is peered on one `recon/1` stream per connection
+  and its trees are pushed on `walk/1` streams; gossip wakes, repair
+  sessions, announcements, pull walks, configured peers and the held-set
+  walker are gone, and generation-28 and generation-29 peers are refused at
+  the handshake. See the `triblespace-net`, `triblespace-core` and `trible`
   changelogs.
 
 - Avoid repeated blob-closure walks during selected collection compaction;
