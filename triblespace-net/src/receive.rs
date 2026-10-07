@@ -1369,10 +1369,11 @@ mod tests {
 
     /// A count proof closed by repeating a leaf is no proof: each leaf is
     /// expected once, at the locator its parent declared. Sixty records,
-    /// the receiver holding one whose branch byte is its own: the genuine
-    /// root NODE, that record's LEAF fifty-nine times and DONE fails the
-    /// push instead of landing it, and so does ROOT, sixty LEAFs and DONE
-    /// with no NODE to expect them under.
+    /// one whose branch byte is its own, so the genuine root NODE owes its
+    /// LEAF alone at that byte: pushed once it is asked for, pushed again
+    /// it fails the push at once, the locator owed no more, and the count
+    /// never closes. And ROOT, sixty LEAFs and DONE with no NODE to expect
+    /// them under fails too.
     #[test]
     fn a_duplicated_or_foreign_leaf_does_not_close_the_count_proof() {
         let mut sender = Node::new(52);
@@ -1394,13 +1395,12 @@ mod tests {
             })
             .copied()
             .expect("some first byte is one record's own");
-        receiver.store.insert(alone).unwrap();
         sender.observe();
         receiver.observe();
         let overlay = sender.serving().collection(collection).unwrap();
         let root = crate::walk::summary(WalkKind::Records, overlay.repair());
         let node = crate::walk::node(WalkKind::Records, overlay.repair(), &[]).unwrap();
-        let held = alone.fingerprint().raw();
+        let key = alone.fingerprint().raw();
 
         let mut harness = Harness::new(receiver, collection, WalkKind::Records);
         harness.feed(Frame::Root { summary: root });
@@ -1408,17 +1408,19 @@ mod tests {
             prefix: Vec::new(),
             node,
         });
-        for _ in 1..60 {
-            harness.feed(Frame::Leaf { key: held });
-        }
-        harness.feed(Frame::Done);
-        assert!(
-            matches!(harness.receive.outcome(), Some(Outcome::Failed(_))),
-            "{:?}",
-            harness.receive.outcome()
+        assert_eq!(
+            harness.feed(Frame::Leaf { key }),
+            [Frame::ValueRequest { key }]
         );
+        assert_eq!(harness.receive.outcome(), None);
+        assert!(harness.feed(Frame::Leaf { key }).is_empty());
+        assert_eq!(
+            harness.receive.outcome(),
+            Some(Outcome::Failed(Failure::Protocol))
+        );
+        assert!(harness.feed(Frame::Done).is_empty());
         assert!(!harness.sent.contains(&Frame::Landed));
-        assert!(harness.requested().is_empty());
+        assert_eq!(harness.requested().len(), 1);
 
         // Without a NODE, no leaf is expected at all.
         let mut harness = Harness::new(harness.node, collection, WalkKind::Records);
@@ -1437,10 +1439,11 @@ mod tests {
         assert!(!harness.sent.contains(&Frame::Landed));
     }
 
-    /// A NODE at a locator its parent declared, canonical in itself but not
-    /// the node the parent's child entry names, fails the push and gets no
-    /// HELD: a node is checked against the digest its parent declared, so
-    /// every node hash-chains to the root.
+    /// A NODE at a locator its parent declared, canonical in itself and of
+    /// the leaf count declared there but not the node the parent's child
+    /// entry names, fails the push and gets no HELD: a node is checked
+    /// against the digest its parent declared, so every node hash-chains
+    /// to the root.
     #[test]
     fn a_node_whose_digest_is_not_the_parent_s_child_digest_fails_the_push() {
         let mut sender = Node::new(54);
@@ -1464,15 +1467,23 @@ mod tests {
             panic!("400 records branch at the root");
         };
         assert_eq!(branch.end_depth, 0);
-        // A branch byte under which both trees branch.
+        // A branch byte under which both trees branch with as many leaves,
+        // so that only the digest tells the foreign node from the declared
+        // one.
         let (edge, foreign_node) = branch
             .children
             .iter()
             .find_map(|child| {
                 let node = crate::walk::node(WalkKind::Records, foreign.repair(), &[child.edge])?;
-                matches!(node, PatchNode::Branch { .. }).then_some((child.edge, node))
+                (matches!(node, PatchNode::Branch { .. }) && node.leaf_count() == child.leaf_count)
+                    .then_some((child.edge, node))
             })
-            .expect("400 records each: some first byte branches in both");
+            .expect("400 records each: some first byte branches alike in both");
+        let declared = branch.children.iter().find(|child| child.edge == edge);
+        assert_ne!(
+            declared.map(|child| child.digest),
+            Some(foreign_node.digest())
+        );
 
         let mut harness = Harness::new(receiver, collection, WalkKind::Records);
         harness.feed(Frame::Root { summary: root });
@@ -1493,17 +1504,19 @@ mod tests {
     }
 
     /// A LEAF under no locator the sender owes, a key the pushed tree does
-    /// not hold, fails the push at once: nothing is asked for, and nothing
-    /// is remembered as landed from it.
+    /// not hold, fails the push at once, and so does one under a locator
+    /// owed with one leaf whose key does not bind the digest declared
+    /// there: nothing is asked for, and nothing is remembered as landed
+    /// from it.
     #[test]
     fn a_leaf_outside_the_pushed_tree_fails_the_push() {
         let mut sender = Node::new(57);
         let mut receiver = Node::new(58);
         let collection = sender.hold("outside", open());
         receiver.hold("outside", open());
-        for data in 0..60 {
-            sender.commit(collection, data);
-        }
+        let records = (0..60)
+            .map(|data| sender.commit(collection, data))
+            .collect::<Vec<_>>();
         sender.observe();
         receiver.observe();
         let pinned = sender.serving().collection(collection).unwrap();
@@ -1530,6 +1543,35 @@ mod tests {
         assert_eq!(
             harness.receive.outcome(),
             Some(Outcome::Failed(Failure::Protocol))
+        );
+        assert!(harness.requested().is_empty());
+        assert!(!harness.sent.contains(&Frame::Landed));
+
+        // A key under a branch byte the root owes with one leaf, which is
+        // not the key whose digest the root declared there.
+        let single = branch
+            .children
+            .iter()
+            .find(|child| child.leaf_count == 1)
+            .expect("60 records: some first byte holds one");
+        let mut key = [7; 32];
+        key[0] = single.edge;
+        assert!(
+            records
+                .iter()
+                .all(|record| record.fingerprint().raw() != key)
+        );
+        let mut harness = Harness::new(harness.node, collection, WalkKind::Records);
+        harness.feed(Frame::Root { summary: root });
+        harness.feed(Frame::Node {
+            prefix: Vec::new(),
+            node: root_node,
+        });
+        let replies = harness.feed(Frame::Leaf { key });
+        assert!(replies.is_empty(), "{replies:?}");
+        assert_eq!(
+            harness.receive.outcome(),
+            Some(Outcome::Failed(Failure::BadNode))
         );
         assert!(harness.requested().is_empty());
         assert!(!harness.sent.contains(&Frame::Landed));
