@@ -7,20 +7,25 @@
 //! compared with the live tree and with the root of the last push from the
 //! same sender that landed here: while it equals either, every pushed node
 //! is answered with every child held and pushed leaves are ignored, so the
-//! root alone satisfies the count proof and a push of ROOT then DONE lands
-//! at once, at a receiver that holds the tree or a superset of it. Otherwise
-//! every pushed node is answered with the children the
-//! live tree holds under the same digest, whose subtrees the sender then
-//! skips, and every pushed leaf whose value the live store lacks is asked
-//! for and lands as it arrives. A held reference carries no value: one
-//! resident here is noted held as it is, another is fetched by hash.
+//! root alone satisfies the proof and a push of ROOT then DONE lands at
+//! once, at a receiver that holds the tree or a superset of it. Otherwise
+//! the receiver keeps the locators the sender owes it, each with the digest
+//! and leaf count declared for it: the root's by ROOT, then every accepted
+//! node's children the live tree does not hold under the same digest and
+//! count, whose subtrees the sender skips. A node is accepted only at a
+//! locator owed and checked against the digest declared there, so every
+//! node hash-chains to the root; a leaf only under a locator owed with one
+//! leaf and the digest its key binds; and each locator is owed once. Every
+//! pushed leaf whose value the live store lacks is asked for and lands as
+//! it arrives. A held reference carries no value: one resident here is
+//! noted held as it is, another is fetched by hash.
 //!
-//! The push ends in one of two ways. It lands when its count proof closes
-//! (the leaves pushed plus the leaves of every skipped subtree are exactly
-//! the root's count), every value asked for landed without a failed insert,
-//! no fetch failed and no proof stayed deferred: [`Frame::Landed`] goes back,
-//! and the sender confirms its root. Anything else fails it, and what landed
-//! stays.
+//! The push ends in one of two ways. It lands when its membership proof
+//! closes (every locator owed was pushed, so the leaves pushed plus the
+//! leaves of every skipped subtree are exactly the root's count), every
+//! value asked for landed without a failed insert, no fetch failed and no
+//! proof stayed deferred: [`Frame::Landed`] goes back, and the sender
+//! confirms its root. Anything else fails it, and what landed stays.
 //!
 //! Three bounds keep what a push costs here. Values are asked for
 //! [`MAX_WALK_REQUESTS`] at a time, and the leaves beyond that wait their
@@ -31,13 +36,14 @@
 //! holds the sender. The stream is read on while a value is owed to it: only
 //! reading brings the value, so stopping for owed values would wait forever.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::capability::CapabilityProof;
 use triblespace_core::collection::CollectionHandle;
+use triblespace_core::patch::{Blake3Merkle, PatchHash};
 
 use crate::channel::NetEvent;
 use crate::host::{CollectionSnapshot, StoreSnapshot};
@@ -83,16 +89,18 @@ pub(crate) enum Failure {
     /// The collection is not active here.
     Unavailable,
     /// A frame out of its place: a node, leaf or end before the root, a
-    /// second root, a value nobody asked for, a frame after the end, or one
-    /// only a receiver sends.
+    /// second root, a node or leaf at a locator the sender does not owe or
+    /// owes no more, a value nobody asked for, a frame after the end, or
+    /// one only a receiver sends.
     Protocol,
-    /// A pushed node is not canonical, or the root node does not match the
-    /// pushed root.
+    /// A pushed node is not canonical, or is not the node its parent (or
+    /// the root) declared at its locator.
     BadNode,
     /// A value that does not decode, is not under its key, or is not
     /// evidence for the collection.
     BadValue,
-    /// The leaves pushed and skipped do not add up to the root's count.
+    /// The leaves pushed and skipped do not add up to the root's count, or
+    /// a locator owed was never pushed.
     CountMismatch,
     /// A value failed to land, or a held reference could not be fetched.
     InsertFailed,
@@ -116,6 +124,10 @@ pub(crate) struct Receive {
     equal: bool,
     /// Leaves pushed, and the leaves of the subtrees skipped as held.
     accounted: u64,
+    /// The nodes the sender owes, by locator: the digest and leaf count
+    /// declared for each by its parent, or by ROOT for the root. Consumed
+    /// by the node or leaf pushed at each; DONE needs every one consumed.
+    expected: HashMap<Vec<u8>, ([u8; 32], u64)>,
     /// Replies to pushed nodes, sent while few leaves wait.
     held: VecDeque<Frame>,
     /// Missing leaves not yet asked for, in the order pushed.
@@ -152,6 +164,7 @@ impl Receive {
             landed,
             equal: false,
             accounted: 0,
+            expected: HashMap::new(),
             held: VecDeque::new(),
             wanted: VecDeque::new(),
             requests: HashSet::new(),
@@ -242,6 +255,9 @@ impl Receive {
                 {
                     self.equal = true;
                     self.accounted = summary.leaf_count();
+                } else if let Some(root) = summary.root() {
+                    self.expected
+                        .insert(Vec::new(), (root, summary.leaf_count()));
                 }
             }
             Frame::Node { prefix, node } => {
@@ -254,10 +270,15 @@ impl Receive {
                     });
                     return Ok(());
                 }
+                // The node declared at this locator, owed once.
+                let (digest, leaf_count) =
+                    self.expected.remove(&prefix).ok_or(Failure::Protocol)?;
+                if node.leaf_count() != leaf_count {
+                    return Err(Failure::BadNode);
+                }
                 let base = crate::walk::base(self.kind, self.collection);
-                let request =
-                    PatchRepairRequest::new(root, KEY_BYTES, prefix.clone(), node.digest())
-                        .map_err(|_| Failure::BadNode)?;
+                let request = PatchRepairRequest::new(root, KEY_BYTES, prefix.clone(), digest)
+                    .map_err(|_| Failure::BadNode)?;
                 validate_patch_node(&request, base.len() + KEY_BYTES, &base, &node, |_, ()| {
                     Ok(())
                 })
@@ -273,7 +294,8 @@ impl Receive {
                         // A child is held when the live subtree under its
                         // locator is the same set: compressed paths need not
                         // line up, so the live node at `prefix` may branch
-                        // elsewhere and still hold the child whole.
+                        // elsewhere and still hold the child whole. The
+                        // others are owed at their locators.
                         let end = usize::from(branch.end_depth);
                         for child in &branch.children {
                             let mut locator = branch.representative[..end].to_vec();
@@ -287,6 +309,12 @@ impl Receive {
                                     .accounted
                                     .checked_add(child.leaf_count)
                                     .ok_or(Failure::CountMismatch)?;
+                            } else if self
+                                .expected
+                                .insert(locator, (child.digest, child.leaf_count))
+                                .is_some()
+                            {
+                                return Err(Failure::BadNode);
                             }
                         }
                     }
@@ -296,6 +324,21 @@ impl Receive {
             Frame::Leaf { key } => {
                 self.pushing()?;
                 if !self.equal {
+                    // The leaf owed at the longest locator on its key's
+                    // path, once, with the digest its key binds.
+                    let locator = (0..=KEY_BYTES)
+                        .rev()
+                        .find(|len| self.expected.contains_key(&key[..*len]))
+                        .ok_or(Failure::Protocol)?;
+                    let (digest, leaf_count) = self
+                        .expected
+                        .remove(&key[..locator])
+                        .expect("the locator was just found");
+                    let base = crate::walk::base(self.kind, self.collection);
+                    let absolute = [&base[..], &key[..]].concat();
+                    if leaf_count != 1 || digest != <Blake3Merkle as PatchHash>::leaf(&absolute) {
+                        return Err(Failure::BadNode);
+                    }
                     self.leaf(key, &live)?;
                 }
             }
@@ -311,7 +354,7 @@ impl Receive {
             Frame::Done => {
                 let root = self.pushing()?;
                 self.done = true;
-                if self.accounted != root.leaf_count() {
+                if !self.expected.is_empty() || self.accounted != root.leaf_count() {
                     return Err(Failure::CountMismatch);
                 }
             }
@@ -604,6 +647,44 @@ mod tests {
         pushed
     }
 
+    /// The sender's `kind` tree of C as a receiver holding nothing hears
+    /// it: ROOT, then every node and leaf depth first, without DONE.
+    fn tree(sender: &Node, collection: CollectionHandle, kind: WalkKind) -> Vec<Frame> {
+        let overlay = sender.serving().collection(collection).unwrap();
+        let overlay = overlay.repair();
+        let mut frames = vec![Frame::Root {
+            summary: crate::walk::summary(kind, overlay),
+        }];
+        let mut stack = vec![Vec::new()];
+        while let Some(prefix) = stack.pop() {
+            match crate::walk::node(kind, overlay, &prefix).unwrap() {
+                PatchNode::Leaf { leaf, .. } => frames.push(Frame::Leaf {
+                    key: leaf.key.try_into().unwrap(),
+                }),
+                node @ PatchNode::Branch { .. } => {
+                    let PatchNode::Branch { branch, .. } = &node else {
+                        unreachable!()
+                    };
+                    let end = usize::from(branch.end_depth);
+                    for child in branch.children.iter().rev() {
+                        let mut locator = branch.representative[..end].to_vec();
+                        locator.push(child.edge);
+                        stack.push(locator);
+                    }
+                    frames.push(Frame::Node { prefix, node });
+                }
+            }
+        }
+        frames
+    }
+
+    /// The value requests among a receiver's replies.
+    fn requested(replies: Vec<Frame>) -> impl Iterator<Item = Frame> {
+        replies
+            .into_iter()
+            .filter(|reply| matches!(reply, Frame::ValueRequest { .. }))
+    }
+
     fn leaves(frames: &[Frame]) -> BTreeSet<[u8; 32]> {
         frames
             .iter()
@@ -869,12 +950,12 @@ mod tests {
         receiver.hold("failed", open());
         receiver.observe();
         let mut harness = Harness::new(receiver, collection, WalkKind::Records);
-        let overlay = sender.serving().collection(collection).unwrap();
-        let root = crate::walk::summary(WalkKind::Records, overlay.repair());
-        harness.feed(Frame::Root { summary: root });
-        let key = [1; 32];
-        let requests = harness.feed(Frame::Leaf { key });
-        assert_eq!(requests, [Frame::ValueRequest { key }]);
+        let Some(Frame::ValueRequest { key }) = tree(&sender, collection, WalkKind::Records)
+            .into_iter()
+            .find_map(|frame| requested(harness.feed(frame)).next())
+        else {
+            panic!("a value was requested");
+        };
         let merge = CollectionRecord::Merge(
             CollectionMerge::sign(
                 &sender.key,
@@ -911,16 +992,12 @@ mod tests {
         sender.observe();
         receiver.observe();
         let overlay = sender.serving().collection(collection).unwrap();
-        let root = crate::walk::summary(WalkKind::Records, overlay.repair());
         let mut harness = Harness::new(receiver, collection, WalkKind::Records);
         harness.hold = true;
-        harness.feed(Frame::Root { summary: root });
         let mut requests = Vec::new();
-        for record in &records {
+        for frame in tree(&sender, collection, WalkKind::Records) {
             assert!(harness.receive.want_read(), "a value is owed");
-            requests.extend(harness.feed(Frame::Leaf {
-                key: record.fingerprint().raw(),
-            }));
+            requests.extend(requested(harness.feed(frame)));
         }
         assert_eq!(requests.len(), MAX_WALK_REQUESTS);
         assert_eq!(
@@ -935,7 +1012,7 @@ mod tests {
                 key,
                 bytes: value(WalkKind::Records, overlay.repair(), key),
             };
-            requests.extend(harness.feed(value));
+            requests.extend(requested(harness.feed(value)));
             answered += 1;
             if !harness.receive.want_read() {
                 break;
@@ -953,7 +1030,7 @@ mod tests {
                 key,
                 bytes: value(WalkKind::Records, overlay.repair(), key),
             };
-            requests.extend(harness.feed(value));
+            requests.extend(requested(harness.feed(value)));
         }
         harness.feed(Frame::Done);
         assert_eq!(harness.receive.outcome(), Some(Outcome::Landed));
@@ -972,27 +1049,41 @@ mod tests {
         let mut receiver = Node::new(45);
         let collection = sender.hold("wanted", open());
         receiver.hold("wanted", open());
-        let records = (0..MAX_WANTED as u64 + MAX_WALK_REQUESTS as u64 + 1)
-            .map(|data| sender.commit(collection, data))
-            .collect::<Vec<_>>();
+        // Two more than the window and the wanted bound together: a branch
+        // of two is pushed last, after every other leaf.
+        for data in 0..(MAX_WANTED + MAX_WALK_REQUESTS + 3) as u64 {
+            sender.commit(collection, data);
+        }
         sender.observe();
         receiver.observe();
         let overlay = sender.serving().collection(collection).unwrap();
-        let root = crate::walk::summary(WalkKind::Records, overlay.repair());
-        let node = crate::walk::node(WalkKind::Records, overlay.repair(), &[]).unwrap();
+        let frames = tree(&sender, collection, WalkKind::Records);
+        let late = frames
+            .iter()
+            .find_map(|frame| match frame {
+                Frame::Node { prefix, node } if prefix.len() == 1 && node.leaf_count() == 2 => {
+                    Some(prefix[0])
+                }
+                _ => None,
+            })
+            .expect("some branch byte holds exactly two records");
+        let under = |frame: &Frame| match frame {
+            Frame::Node { prefix, .. } => prefix.first() == Some(&late),
+            Frame::Leaf { key } => key[0] == late,
+            _ => false,
+        };
         let mut harness = Harness::new(receiver, collection, WalkKind::Records);
-        harness.feed(Frame::Root { summary: root });
         let mut requests = Vec::new();
-        for record in &records {
-            requests.extend(harness.feed(Frame::Leaf {
-                key: record.fingerprint().raw(),
-            }));
+        for frame in frames.iter().filter(|frame| !under(frame)) {
+            requests.extend(requested(harness.feed(frame.clone())));
         }
         assert_eq!(harness.receive.wanted.len(), MAX_WANTED + 1);
-        let replies = harness.feed(Frame::Node {
-            prefix: Vec::new(),
-            node,
-        });
+        let node = frames
+            .iter()
+            .find(|frame| matches!(frame, Frame::Node { prefix, .. } if *prefix == [late]))
+            .unwrap()
+            .clone();
+        let replies = harness.feed(node);
         assert!(replies.is_empty(), "{replies:?}");
         // One value lets one more leaf be asked for, which leaves exactly
         // MAX_WANTED waiting: still too many. The next one frees the reply.
@@ -1016,7 +1107,7 @@ mod tests {
         let replies = answer(&mut harness, &mut requests);
         assert!(replies.iter().any(|reply| matches!(
             reply,
-            Frame::Held { prefix, children } if prefix.is_empty() && *children == [0; 32]
+            Frame::Held { prefix, children } if *prefix == [late] && *children == [0; 32]
         )));
     }
 
@@ -1150,5 +1241,181 @@ mod tests {
             assert_eq!(evidence(&harness.node).is_some(), attempt == 1);
             receiver = harness.node;
         }
+    }
+
+    /// A count proof closed by repeating a leaf is no proof: each leaf is
+    /// expected once, at the locator its parent declared. Sixty records,
+    /// the receiver holding one whose branch byte is its own: the genuine
+    /// root NODE, that record's LEAF fifty-nine times and DONE fails the
+    /// push instead of landing it, and so does ROOT, sixty LEAFs and DONE
+    /// with no NODE to expect them under.
+    #[test]
+    fn a_duplicated_or_foreign_leaf_does_not_close_the_count_proof() {
+        let mut sender = Node::new(52);
+        let mut receiver = Node::new(53);
+        let collection = sender.hold("duplicated", open());
+        receiver.hold("duplicated", open());
+        let records = (0..60)
+            .map(|data| sender.commit(collection, data))
+            .collect::<Vec<_>>();
+        let alone = records
+            .iter()
+            .find(|record| {
+                let edge = record.fingerprint().raw()[0];
+                records
+                    .iter()
+                    .filter(|other| other.fingerprint().raw()[0] == edge)
+                    .count()
+                    == 1
+            })
+            .copied()
+            .expect("some first byte is one record's own");
+        receiver.store.insert(alone).unwrap();
+        sender.observe();
+        receiver.observe();
+        let overlay = sender.serving().collection(collection).unwrap();
+        let root = crate::walk::summary(WalkKind::Records, overlay.repair());
+        let node = crate::walk::node(WalkKind::Records, overlay.repair(), &[]).unwrap();
+        let held = alone.fingerprint().raw();
+
+        let mut harness = Harness::new(receiver, collection, WalkKind::Records);
+        harness.feed(Frame::Root { summary: root });
+        harness.feed(Frame::Node {
+            prefix: Vec::new(),
+            node,
+        });
+        for _ in 1..60 {
+            harness.feed(Frame::Leaf { key: held });
+        }
+        harness.feed(Frame::Done);
+        assert!(
+            matches!(harness.receive.outcome(), Some(Outcome::Failed(_))),
+            "{:?}",
+            harness.receive.outcome()
+        );
+        assert!(!harness.sent.contains(&Frame::Landed));
+        assert!(harness.requested().is_empty());
+
+        // Without a NODE, no leaf is expected at all.
+        let mut harness = Harness::new(harness.node, collection, WalkKind::Records);
+        harness.feed(Frame::Root { summary: root });
+        for record in &records {
+            harness.feed(Frame::Leaf {
+                key: record.fingerprint().raw(),
+            });
+        }
+        harness.feed(Frame::Done);
+        assert!(
+            matches!(harness.receive.outcome(), Some(Outcome::Failed(_))),
+            "{:?}",
+            harness.receive.outcome()
+        );
+        assert!(!harness.sent.contains(&Frame::Landed));
+    }
+
+    /// A NODE at a locator its parent declared, canonical in itself but not
+    /// the node the parent's child entry names, fails the push and gets no
+    /// HELD: a node is checked against the digest its parent declared, so
+    /// every node hash-chains to the root.
+    #[test]
+    fn a_node_whose_digest_is_not_the_parent_s_child_digest_fails_the_push() {
+        let mut sender = Node::new(54);
+        let mut other = Node::new(55);
+        let mut receiver = Node::new(56);
+        let collection = sender.hold("chained", open());
+        other.hold("chained", open());
+        receiver.hold("chained", open());
+        for data in 0..400 {
+            sender.commit(collection, data);
+            other.commit(collection, 400 + data);
+        }
+        sender.observe();
+        other.observe();
+        receiver.observe();
+        let pinned = sender.serving().collection(collection).unwrap();
+        let foreign = other.serving().collection(collection).unwrap();
+        let root = crate::walk::summary(WalkKind::Records, pinned.repair());
+        let root_node = crate::walk::node(WalkKind::Records, pinned.repair(), &[]).unwrap();
+        let PatchNode::Branch { branch, .. } = &root_node else {
+            panic!("400 records branch at the root");
+        };
+        assert_eq!(branch.end_depth, 0);
+        // A branch byte under which both trees branch.
+        let (edge, foreign_node) = branch
+            .children
+            .iter()
+            .find_map(|child| {
+                let node = crate::walk::node(WalkKind::Records, foreign.repair(), &[child.edge])?;
+                matches!(node, PatchNode::Branch { .. }).then_some((child.edge, node))
+            })
+            .expect("400 records each: some first byte branches in both");
+
+        let mut harness = Harness::new(receiver, collection, WalkKind::Records);
+        harness.feed(Frame::Root { summary: root });
+        let replies = harness.feed(Frame::Node {
+            prefix: Vec::new(),
+            node: root_node.clone(),
+        });
+        assert!(matches!(&replies[..], [Frame::Held { .. }]), "{replies:?}");
+        let replies = harness.feed(Frame::Node {
+            prefix: vec![edge],
+            node: foreign_node,
+        });
+        assert!(replies.is_empty(), "{replies:?}");
+        assert_eq!(
+            harness.receive.outcome(),
+            Some(Outcome::Failed(Failure::BadNode))
+        );
+    }
+
+    /// A LEAF under no locator the sender owes, a key the pushed tree does
+    /// not hold, fails the push at once: nothing is asked for, and nothing
+    /// is remembered as landed from it.
+    #[test]
+    fn a_leaf_outside_the_pushed_tree_fails_the_push() {
+        let mut sender = Node::new(57);
+        let mut receiver = Node::new(58);
+        let collection = sender.hold("outside", open());
+        receiver.hold("outside", open());
+        for data in 0..60 {
+            sender.commit(collection, data);
+        }
+        sender.observe();
+        receiver.observe();
+        let pinned = sender.serving().collection(collection).unwrap();
+        let root = crate::walk::summary(WalkKind::Records, pinned.repair());
+        let root_node = crate::walk::node(WalkKind::Records, pinned.repair(), &[]).unwrap();
+        let PatchNode::Branch { branch, .. } = &root_node else {
+            panic!("60 records branch at the root");
+        };
+        // A key under a branch byte the tree does not use.
+        let edge = (0..=255u8)
+            .find(|edge| branch.children.iter().all(|child| child.edge != *edge))
+            .unwrap();
+        let mut key = [7; 32];
+        key[0] = edge;
+
+        let mut harness = Harness::new(receiver, collection, WalkKind::Records);
+        harness.feed(Frame::Root { summary: root });
+        harness.feed(Frame::Node {
+            prefix: Vec::new(),
+            node: root_node.clone(),
+        });
+        let replies = harness.feed(Frame::Leaf { key });
+        assert!(replies.is_empty(), "{replies:?}");
+        assert_eq!(
+            harness.receive.outcome(),
+            Some(Outcome::Failed(Failure::Protocol))
+        );
+        assert!(harness.requested().is_empty());
+        assert!(!harness.sent.contains(&Frame::Landed));
+        // Reported as it ended, the walks remember no landed root from it.
+        let now = crate::clock::mono_now();
+        let root = harness.receive.root();
+        let mut node = harness.node;
+        node.walks
+            .received(sender.id(), collection, WalkKind::Records, root, false, now);
+        let health = node.health.snapshot();
+        assert_eq!(health.collections[0].peers[0].received.records, None);
     }
 }

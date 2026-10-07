@@ -1543,8 +1543,13 @@ pub(crate) mod tests {
         }
 
         async fn write<W: AsyncWrite + Unpin>(send: &mut W, frame: Frame) {
+            assert!(try_write(send, frame).await, "the stream is open");
+        }
+
+        /// Write a frame; whether the stream took it.
+        async fn try_write<W: AsyncWrite + Unpin>(send: &mut W, frame: Frame) -> bool {
             let (kind, payload) = frame.encode();
-            write_frame(send, kind, &payload).await.unwrap();
+            write_frame(send, kind, &payload).await.is_ok()
         }
 
         async fn read<R: AsyncRead + Unpin>(recv: &mut R) -> Option<Frame> {
@@ -1566,18 +1571,22 @@ pub(crate) mod tests {
         /// Push `sender`'s records of C over the stream as a sender does,
         /// skipping what each reply says is held and answering value
         /// requests, until the receiver says everything landed or ends the
-        /// stream, or `cut` values were answered. Returns whether it landed.
+        /// stream, or `cut` values were answered; the leaf `omit` names is
+        /// left out. Returns whether it landed, and how many value requests
+        /// it heard.
         async fn push(
             sender: &Node,
             collection: CollectionHandle,
             send: &mut WriteHalf<DuplexStream>,
             recv: &mut ReadHalf<DuplexStream>,
             cut: usize,
-        ) -> bool {
+            omit: Option<[u8; 32]>,
+        ) -> (bool, usize) {
             let kind = WalkKind::Records;
             let overlay = sender.serving().collection(collection).unwrap();
             let overlay = overlay.repair();
             let mut answered = 0;
+            let mut heard = 0;
             let value = |key| Frame::Value {
                 key,
                 bytes: value(kind, overlay, key).unwrap(),
@@ -1594,7 +1603,9 @@ pub(crate) mod tests {
                 match node(kind, overlay, &prefix).unwrap() {
                     PatchNode::Leaf { leaf, .. } => {
                         let key = <[u8; 32]>::try_from(leaf.key).unwrap();
-                        write(send, Frame::Leaf { key }).await;
+                        if omit != Some(key) {
+                            write(send, Frame::Leaf { key }).await;
+                        }
                     }
                     pushed @ PatchNode::Branch { .. } => {
                         let PatchNode::Branch { branch, .. } = pushed.clone() else {
@@ -1617,8 +1628,9 @@ pub(crate) mod tests {
                                     break children;
                                 }
                                 Some(Frame::ValueRequest { key }) => {
+                                    heard += 1;
                                     if answered == cut {
-                                        return false;
+                                        return (false, heard);
                                     }
                                     answered += 1;
                                     write(send, value(key)).await;
@@ -1640,17 +1652,22 @@ pub(crate) mod tests {
             write(send, Frame::Done).await;
             loop {
                 match read(recv).await {
-                    Some(Frame::Landed) => return true,
+                    Some(Frame::Landed) => return (true, heard),
                     Some(Frame::ValueRequest { key }) => {
+                        heard += 1;
                         if answered == cut {
-                            return false;
+                            return (false, heard);
                         }
                         answered += 1;
-                        write(send, value(key)).await;
+                        // A request read after the receiver ended the push
+                        // can no longer be answered.
+                        if !try_write(send, value(key)).await {
+                            return (false, heard);
+                        }
                     }
                     Some(Frame::Held { .. }) => {}
                     Some(other) => panic!("waiting for Landed: {other:?}"),
-                    None => return false,
+                    None => return (false, heard),
                 }
             }
         }
@@ -1682,7 +1699,11 @@ pub(crate) mod tests {
             let mut receiving = Hosted::new(receiver, &SimNet::new(1, SimConfig::default()));
 
             let (mut send, mut recv, landed) = receiving.open(sender.id(), collection);
-            assert!(push(&sender, collection, &mut send, &mut recv, usize::MAX).await);
+            assert!(
+                push(&sender, collection, &mut send, &mut recv, usize::MAX, None)
+                    .await
+                    .0
+            );
             assert!(read(&mut recv).await.is_none(), "the stream finished");
             assert_eq!(*landed.lock().unwrap(), None);
             assert_eq!(receiving.records(collection), records);
@@ -1714,7 +1735,11 @@ pub(crate) mod tests {
             // A second push of the same tree is held whole at its first
             // node.
             let (mut send, mut recv, _) = receiving.open(sender.id(), collection);
-            assert!(push(&sender, collection, &mut send, &mut recv, usize::MAX).await);
+            assert!(
+                push(&sender, collection, &mut send, &mut recv, usize::MAX, None)
+                    .await
+                    .0
+            );
 
             let (_send, _recv, refusal) = receiving.open(sender.id(), refused);
             assert_eq!(reset(&refusal).await, Some(RESET_WALK_REFUSED));
@@ -1745,24 +1770,34 @@ pub(crate) mod tests {
             assert_eq!(reset(&first_reset).await, Some(RESET_WALK_FAILED));
 
             // The second pushes every leaf but one.
-            write(&mut second, Frame::Root { summary: root }).await;
-            for record in &records[1..] {
-                write(
-                    &mut second,
-                    Frame::Leaf {
-                        key: record.fingerprint().raw(),
-                    },
-                )
-                .await;
-            }
-            write(&mut second, Frame::Done).await;
+            let omitted = records[0].fingerprint().raw();
+            let (landed, heard) = push(
+                &sender,
+                collection,
+                &mut second,
+                &mut second_recv,
+                usize::MAX,
+                Some(omitted),
+            )
+            .await;
+            assert!(!landed);
             assert_eq!(reset(&second_reset).await, Some(RESET_WALK_FAILED));
             // Its value requests went out before the end failed it.
-            let mut requested = 0;
+            let mut requested = heard;
             while let Some(Frame::ValueRequest { .. }) = read(&mut second_recv).await {
                 requested += 1;
             }
             assert_eq!(requested, 19);
+            for _ in 0..500 {
+                if receiving
+                    .health(collection, sender.id())
+                    .is_some_and(|health| health.receives.failed == 2)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(receiving.records(collection).len() < 20);
             let health = receiving.health(collection, sender.id()).unwrap();
             assert_eq!((health.receives.ok, health.receives.failed), (0, 2));
             assert!(!health.receives.last_ok);
@@ -1972,7 +2007,11 @@ pub(crate) mod tests {
             impl Future<Output = Option<u32>>,
         ) {
             let (mut send, mut recv, reset_code) = receiver.open(sender.id(), collection);
-            assert!(!push(sender, collection, &mut send, &mut recv, 50).await);
+            assert!(
+                !push(sender, collection, &mut send, &mut recv, 50, None)
+                    .await
+                    .0
+            );
             (send, recv, async move { reset(&reset_code).await })
         }
     }
