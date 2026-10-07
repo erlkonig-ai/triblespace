@@ -1034,6 +1034,11 @@ async fn accept_loop<T: Transport, S: Service>(
     if let Some(table) = shared.upgrade() {
         table.table.lock().unwrap().remove(&state);
         if state.announced.load(Ordering::SeqCst) {
+            // The walks forget what the peer confirmed and what landed
+            // from it.
+            if let Some(walks) = table.walks.get() {
+                walks.closed(state.peer);
+            }
             let service = table.service.clone();
             drop(table);
             service.recon(ReconEvent::Closed(Link { state })).await;

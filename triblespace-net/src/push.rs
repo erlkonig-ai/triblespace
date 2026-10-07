@@ -60,7 +60,9 @@ pub(crate) struct Failed(pub(crate) &'static str);
 
 /// The confirmed roots of this side's pushes: per peer, collection and kind,
 /// the root of the last push the peer confirmed landed. Never persisted: a
-/// restarted side pushes everything again, and the neighbour holds it.
+/// restarted side pushes everything again, and the neighbour holds it. A
+/// peer's roots are forgotten when a connection to it closes, and a
+/// collection's when it is deselected ([`crate::walk::Walks`]).
 #[derive(Default)]
 pub(crate) struct ConfirmedRoots(HashMap<PushKey, PatchSummary>);
 
@@ -81,6 +83,11 @@ impl ConfirmedRoots {
         } else {
             self.0.remove(&key);
         }
+    }
+
+    /// Keep the roots `keep` says to, and forget the rest.
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&PushKey) -> bool) {
+        self.0.retain(|key, _| keep(key));
     }
 }
 

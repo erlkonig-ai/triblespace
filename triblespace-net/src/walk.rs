@@ -12,7 +12,9 @@
 //! unchanged tree is pushed as alone next time; the receiver remembers the
 //! roots that landed from each peer the same way, so a root it landed is
 //! held whole however its own tree grew since. A push that ends any other
-//! way leaves the confirmed root as it was, and what landed stays.
+//! way forgets the confirmed root, and what landed stays. Both memories
+//! are forgotten for a peer when a connection to it closes, and for a
+//! collection when it is deselected.
 //!
 //! The kinds of tree are the collection's records, its authorization
 //! evidence (keyed by proof id under the collection) and the blobs it holds,
@@ -288,6 +290,9 @@ pub(crate) enum Event {
 pub(crate) struct Walks {
     health: Health,
     snapshot: Option<Arc<StoreSnapshot>>,
+    /// The collections the last snapshot selected: one that leaves the
+    /// selection is forgotten.
+    selected: HashSet<RawHash>,
     /// Pushes running, by peer, collection and kind.
     pushes: HashSet<PushKey>,
     confirmed: ConfirmedRoots,
@@ -301,6 +306,7 @@ impl Walks {
         Self {
             health,
             snapshot: None,
+            selected: HashSet::new(),
             pushes: HashSet::new(),
             confirmed: ConfirmedRoots::default(),
             landed: HashMap::new(),
@@ -390,9 +396,38 @@ impl Walks {
         });
     }
 
+    /// A connection to `peer` closed: what it confirmed and what landed
+    /// from it are forgotten. A peer that restarted holds no landed roots,
+    /// so a ROOT then DONE it is pushed fails until this side's tree moves;
+    /// forgetting costs the next push one root NODE, which the peer's HELD
+    /// prunes, and a root the peer pushes again is held whole once it
+    /// lands.
+    pub(crate) fn closed(&mut self, peer: PeerId) {
+        self.landed.retain(|(from, ..), _| *from != peer);
+        self.confirmed.retain(|(to, ..)| *to != peer);
+    }
+
     /// Take the latest serving snapshot: what new pushes pin, and what an
-    /// incoming push is admitted against.
+    /// incoming push is admitted against. A collection it no longer
+    /// selects is forgotten for every peer.
     pub(crate) fn observe(&mut self, snapshot: Arc<StoreSnapshot>) {
+        let selected = snapshot
+            .active()
+            .filter(|collection| snapshot.selected(*collection).is_some())
+            .map(|collection| collection.raw)
+            .collect::<HashSet<_>>();
+        let dropped = self
+            .selected
+            .difference(&selected)
+            .copied()
+            .collect::<HashSet<_>>();
+        if !dropped.is_empty() {
+            self.landed
+                .retain(|(_, collection, _), _| !dropped.contains(collection));
+            self.confirmed
+                .retain(|(_, collection, _)| !dropped.contains(collection));
+        }
+        self.selected = selected;
         self.snapshot = Some(snapshot);
     }
 
@@ -702,6 +737,12 @@ impl WalksHandle {
         });
     }
 
+    /// A connection to `peer` closed: what the peer confirmed and what
+    /// landed from it are forgotten.
+    pub(crate) fn closed(&self, peer: PeerId) {
+        let _ = self.0.send(Command::Closed { peer });
+    }
+
     /// A `walk/1` stream `peer` opened for C's `kind` tree, after its tag
     /// and Open frame were read. The stream is refused unless this side
     /// receives C from the peer, and reset when the walks task is gone.
@@ -736,6 +777,8 @@ pub(crate) enum Command {
         collection: CollectionHandle,
         kind: WalkKind,
     },
+    /// A connection to the peer closed.
+    Closed { peer: PeerId },
     /// A push's stream ended.
     Pushed {
         peer: PeerId,
@@ -856,6 +899,7 @@ impl<T: Transport, S: Service> Task<T, S> {
                 collection,
                 kind,
             } => self.push(peer, collection, kind),
+            Command::Closed { peer } => self.walks.closed(peer),
             Command::Pushed {
                 peer,
                 collection,
@@ -1250,10 +1294,14 @@ pub(crate) mod tests {
 
         use ed25519_dalek::SigningKey;
         use iroh_base::EndpointId;
+        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+        use triblespace_core::collection::selection::{
+            CONFIG_COLLECTION_NAME, write_sync_selection,
+        };
         use triblespace_core::collection::{
-            AdmissionPolicy, CollectionCommit, CollectionData, CollectionPolicy, CollectionRead,
-            CollectionRecord, CollectionStore, CollectionStoreExt, HeldStore,
-            empty_metadata_handle,
+            AdmissionPolicy, Collection, CollectionCommit, CollectionData, CollectionPolicy,
+            CollectionRead, CollectionRecord, CollectionStore, CollectionStoreExt, HeldStore,
+            empty_metadata_handle, private_policy,
         };
         use triblespace_core::patch::Entry as PatchEntry;
         use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -1270,10 +1318,13 @@ pub(crate) mod tests {
             CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open)
         }
 
-        /// One node: its store, its active collections and its walks.
+        /// One node: its store, its configuration, its active collections
+        /// and its walks.
         pub(crate) struct Node {
             pub(crate) key: SigningKey,
             pub(crate) store: MemoryRepo,
+            /// The pile's configuration collection, where selections live.
+            config: Collection<SimpleArchive>,
             pub(crate) active: ActiveCollections,
             pub(crate) walks: Walks,
             pub(crate) health: Health,
@@ -1284,11 +1335,16 @@ pub(crate) mod tests {
                 let key = key(byte);
                 let health =
                     Health::new(EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap());
+                let mut store = MemoryRepo::default();
+                let config = store
+                    .collection(CONFIG_COLLECTION_NAME, private_policy(key.verifying_key()))
+                    .unwrap();
                 Self {
                     walks: Walks::new(health.clone()),
                     health,
                     key,
-                    store: MemoryRepo::default(),
+                    store,
+                    config,
                     active: ActiveCollections::new(),
                 }
             }
@@ -1297,8 +1353,8 @@ pub(crate) mod tests {
                 self.key.verifying_key().to_bytes()
             }
 
-            /// Hold the collection `name` names: active here, and observed
-            /// by health.
+            /// Hold the collection `name` names: active here, selected for
+            /// sync, and observed by health.
             pub(crate) fn hold(
                 &mut self,
                 name: &str,
@@ -1306,6 +1362,7 @@ pub(crate) mod tests {
             ) -> CollectionHandle {
                 let collection = self.store.collection(name, policy).unwrap().handle();
                 self.active.insert(&PatchEntry::new(&collection.raw));
+                self.select(collection, true);
                 self.health.update(|health| {
                     health.collections.push(CollectionHealth {
                         collection,
@@ -1316,6 +1373,19 @@ pub(crate) mod tests {
                 });
                 self.observe();
                 collection
+            }
+
+            /// Select or unselect the collection for sync in the pile's
+            /// configuration; the next observation sees it.
+            pub(crate) fn select(&mut self, collection: CollectionHandle, selected: bool) {
+                write_sync_selection(
+                    &mut self.store,
+                    self.config,
+                    &self.key,
+                    collection,
+                    selected,
+                )
+                .unwrap();
             }
 
             pub(crate) fn commit(
@@ -1394,6 +1464,70 @@ pub(crate) mod tests {
                 (landed, failed)
             }
         }
+    }
+
+    /// What a peer confirmed and what landed from it are forgotten when a
+    /// connection to it closes, so a peer that restarted is not pushed
+    /// ROOT then DONE it cannot land; and a collection's roots, for every
+    /// peer, when the collection is deselected.
+    #[test]
+    fn landed_and_confirmed_roots_are_pruned_when_a_peering_ends_or_collection_is_dropped() {
+        use walking::{Node, open};
+
+        let mut node = Node::new(63);
+        let kept = node.hold("kept", open());
+        let dropped = node.hold("dropped", open());
+        node.commit(kept, 1);
+        node.commit(dropped, 1);
+        node.observe();
+        let (a, b) = (Node::new(64).id(), Node::new(65).id());
+        let kind = WalkKind::Records;
+        let now = crate::clock::mono_now();
+        let pairs = [(a, kept), (a, dropped), (b, kept), (b, dropped)];
+        let remember = |node: &mut Node| {
+            for (peer, collection) in pairs {
+                let root = summary(
+                    kind,
+                    node.serving().collection(collection).unwrap().repair(),
+                );
+                let outcome = push::Outcome {
+                    root,
+                    confirmed: true,
+                };
+                node.walks.pushed(peer, collection, kind, outcome, now);
+                node.walks
+                    .received(peer, collection, kind, Some(root), true, now);
+            }
+        };
+        let remembered = |node: &Node, peer: PeerId, collection: CollectionHandle| {
+            let key = (peer, collection.raw, kind);
+            (
+                node.walks.confirmed.root(key).is_some(),
+                node.walks.landed.contains_key(&key),
+            )
+        };
+        remember(&mut node);
+        for (peer, collection) in pairs {
+            assert_eq!(remembered(&node, peer, collection), (true, true));
+        }
+
+        // A connection to A closes: A's roots go, B's stay.
+        node.walks.closed(a);
+        assert_eq!(remembered(&node, a, kept), (false, false));
+        assert_eq!(remembered(&node, a, dropped), (false, false));
+        assert_eq!(remembered(&node, b, kept), (true, true));
+        assert_eq!(remembered(&node, b, dropped), (true, true));
+
+        // One collection is deselected: its roots go for every peer, and
+        // the other's stay, over this observation and the next.
+        remember(&mut node);
+        node.select(dropped, false);
+        node.observe();
+        node.observe();
+        assert_eq!(remembered(&node, a, dropped), (false, false));
+        assert_eq!(remembered(&node, b, dropped), (false, false));
+        assert_eq!(remembered(&node, a, kept), (true, true));
+        assert_eq!(remembered(&node, b, kept), (true, true));
     }
 
     /// Walk streams driven through the walks task over the simulated
