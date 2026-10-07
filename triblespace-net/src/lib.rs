@@ -39,6 +39,7 @@ pub mod peer;
 pub(crate) mod peering;
 pub mod protocol;
 pub mod provider;
+pub(crate) mod push;
 pub mod recon;
 pub mod reconcile;
 pub(crate) mod routing;

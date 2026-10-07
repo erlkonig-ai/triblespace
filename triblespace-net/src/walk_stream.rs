@@ -20,9 +20,10 @@
 //!
 //! The sender opens with OPEN and its ROOT, then pushes the nodes of its
 //! tree the receiver has not confirmed, each a NODE at a prefix. The
-//! receiver answers each NODE with a HELD whose bit `i` says it holds the
-//! child at branch byte `i` with the same digest, and the sender skips those
-//! subtrees. A LEAF names a leaf by key alone. Values stay pull: the receiver
+//! receiver answers each NODE with a HELD whose bit `i` (byte `i / 8`, bit
+//! `i % 8`, least significant first: [`hold`] sets it and [`held`] reads it)
+//! says it holds the child at branch byte `i` with the same digest, and the
+//! sender skips those subtrees. A LEAF names a leaf by key alone. Values stay pull: the receiver
 //! asks with VALUE_REQUEST for the leaves it lacks, and a VALUE answers one.
 //! DONE ends the push, and LANDED says everything the receiver asked for
 //! landed: the pushed root is then the one the sender knows the receiver
@@ -191,6 +192,19 @@ impl Frame {
     }
 }
 
+/// Whether the held-children bitmap of a HELD frame marks the child at
+/// `edge`: bit `edge` is byte `edge / 8`, bit `edge % 8`, least significant
+/// first. The receiver builds the bitmap with [`hold`], and the sender reads
+/// it with this.
+pub(crate) fn held(children: &[u8; 32], edge: u8) -> bool {
+    children[usize::from(edge >> 3)] & (1 << (edge & 7)) != 0
+}
+
+/// Mark the child at `edge` in the held-children bitmap of a HELD frame.
+pub(crate) fn hold(children: &mut [u8; 32], edge: u8) {
+    children[usize::from(edge >> 3)] |= 1 << (edge & 7);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,6 +301,33 @@ mod tests {
         });
         assert!(roundtrip(Frame::Done).is_empty());
         assert!(roundtrip(Frame::Landed).is_empty());
+    }
+
+    /// The held bitmap puts branch byte `i` at byte `i / 8`, bit `i % 8`,
+    /// least significant first, and a HELD carries it as it is.
+    #[test]
+    fn held_bits_are_byte_i_over_8_bit_i_mod_8_least_significant_first() {
+        let mut children = [0; 32];
+        for edge in [0, 7, 8, 9, 255] {
+            assert!(!held(&children, edge));
+            hold(&mut children, edge);
+            assert!(held(&children, edge));
+        }
+        let mut expected = [0; 32];
+        expected[0] = 0b1000_0001;
+        expected[1] = 0b0000_0011;
+        expected[31] = 0b1000_0000;
+        assert_eq!(children, expected);
+        assert!(!held(&children, 10) && !held(&children, 254));
+        assert_eq!(
+            (0..=255).filter(|edge| held(&children, *edge)).count(),
+            5
+        );
+        let payload = roundtrip(Frame::Held {
+            prefix: vec![1, 2, 3],
+            children,
+        });
+        assert_eq!(payload[4..], children);
     }
 
     /// A node is laid out as the pull walk lays it out, after its tag.

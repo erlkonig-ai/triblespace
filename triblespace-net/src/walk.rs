@@ -82,6 +82,7 @@ use crate::patch_repair::{
     PatchRepairWalker, PatchSummary, patch_node_response, validate_patch_node,
 };
 use crate::protocol::{MAX_EXACT_BLOB_BYTES, RawHash, op_get_blob_with_limit};
+use crate::push::{ConfirmedRoots, Outcome, Push, PushKey};
 use crate::recon::{FRAME_WALK_END, FRAME_WALK_REQUEST, FRAME_WALK_RESPONSE, Frame, Malformed};
 use crate::transport::{Conn, PeerId, RecvStream as _, SendStream as _, Transport};
 
@@ -812,6 +813,9 @@ pub(crate) struct Walks {
     record_pulls: HashMap<(PeerId, RawHash), RecordPull>,
     /// By connection id, collection and kind.
     served: HashMap<(u64, RawHash, WalkKind), Served>,
+    /// Pushes running on `walk/1` streams, by peer, collection and kind.
+    pushes: HashSet<PushKey>,
+    confirmed: ConfirmedRoots,
     outputs: Vec<Output>,
 }
 
@@ -824,8 +828,45 @@ impl Walks {
             numbers: HashMap::new(),
             record_pulls: HashMap::new(),
             served: HashMap::new(),
+            pushes: HashSet::new(),
+            confirmed: ConfirmedRoots::default(),
             outputs: Vec::new(),
         }
+    }
+
+    /// Start a push of C's `kind` tree to `peer` on a `walk/1` stream of the
+    /// caller's: the push and its first frames, if this side sends C to the
+    /// peer and no push of this kind to it runs. [`Walks::pushed`] ends it.
+    #[allow(dead_code)] // until the walks task opens `walk/1` streams
+    pub(crate) fn push(
+        &mut self,
+        peer: PeerId,
+        collection: CollectionHandle,
+        kind: WalkKind,
+    ) -> Option<(Push, Vec<crate::walk_stream::Frame>)> {
+        let key = (peer, collection.raw, kind);
+        if self.pushes.contains(&key) {
+            return None;
+        }
+        let pinned = self
+            .local(collection)
+            .filter(|pinned| self.sends(peer, pinned))?;
+        self.pushes.insert(key);
+        Some(Push::start(kind, pinned, self.confirmed.root(key)))
+    }
+
+    /// The push of C's `kind` tree to `peer` ended, confirmed or not.
+    #[allow(dead_code)] // until the walks task opens `walk/1` streams
+    pub(crate) fn pushed(
+        &mut self,
+        peer: PeerId,
+        collection: CollectionHandle,
+        kind: WalkKind,
+        outcome: Outcome,
+    ) {
+        let key = (peer, collection.raw, kind);
+        self.pushes.remove(&key);
+        self.confirmed.settle(key, outcome);
     }
 
     /// Take the latest serving snapshot: what new walks pin and what a
@@ -1378,7 +1419,7 @@ fn base(kind: WalkKind, collection: CollectionHandle) -> Vec<u8> {
     }
 }
 
-fn summary(kind: WalkKind, overlay: &CollectionRepairOverlay) -> PatchSummary {
+pub(crate) fn summary(kind: WalkKind, overlay: &CollectionRepairOverlay) -> PatchSummary {
     match kind {
         WalkKind::Records => overlay.records().summary(),
         WalkKind::Authorization => overlay.authorization_evidence().summary(),
@@ -1425,7 +1466,11 @@ fn contains(kind: WalkKind, overlay: &CollectionRepairOverlay, key: &[u8]) -> bo
 }
 
 /// The node or value a request asks of a pinned snapshot, if present.
-fn answer(kind: WalkKind, overlay: &CollectionRepairOverlay, request: Request) -> Option<Response> {
+pub(crate) fn answer(
+    kind: WalkKind,
+    overlay: &CollectionRepairOverlay,
+    request: Request,
+) -> Option<Response> {
     match request {
         Request::Open => None,
         Request::Node(prefix) => {
