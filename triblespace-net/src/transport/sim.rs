@@ -33,14 +33,21 @@
 //! [`SimNet::revive`]. Faults affect *delivery*, never identity —
 //! `Conn::remote_id` always reports the true dialer, so
 //! identity-dependent per-request READ(C) subject binding is exercised honestly.
+//!
+//! # Observation
+//!
+//! [`SimNet::tap`] joins through a [`Tapped`] transport, whose streams note
+//! every frame crossing a `recon/1` or `walk/1` stream in its [`Taps`]: a
+//! test counts what a protocol put on the wire without the protocol
+//! reporting it.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::io;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
@@ -52,6 +59,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use super::{Alpn, Conn, Harness, Incoming, PeerId, Transport};
+use crate::protocol::{TAG_RECON, TAG_WALK};
 
 /// Bytes one direction of a stream holds unread before its writer blocks:
 /// the credit QUIC grants each stream, noq-proto 1.2.0's default
@@ -763,6 +771,292 @@ impl Conn for SimConn {
     fn close(&self, _code: u32, _reason: &[u8]) {
         self.closed.store(true, Ordering::SeqCst);
         self.notify_close.notify_waiters();
+    }
+}
+
+/// A frame that crossed a stream of a [`Tapped`] transport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Crossed {
+    /// The remote peer of the stream's connection.
+    pub peer: PeerId,
+    /// The stream, numbered across the tap as streams are opened and
+    /// accepted.
+    pub stream: u64,
+    /// The stream's tag: its first byte, which its opener wrote.
+    pub tag: u8,
+    /// Whether the tapped side sent the frame.
+    pub sent: bool,
+    /// The frame's kind byte.
+    pub kind: u8,
+}
+
+/// Every frame that crossed a `recon/1` or `walk/1` stream of a [`Tapped`]
+/// transport, in the order its halves saw them.
+#[derive(Clone, Default)]
+pub struct Taps(Arc<Mutex<Vec<Crossed>>>);
+
+impl Taps {
+    pub fn crossed(&self) -> Vec<Crossed> {
+        self.0.lock().unwrap().clone()
+    }
+
+    /// How many frames crossed so far.
+    pub fn len(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The frames that crossed since the first `from` did, on streams to
+    /// `peer`, with their tag.
+    pub fn since(&self, from: usize, peer: PeerId, tag: u8) -> Vec<Crossed> {
+        self.0.lock().unwrap()[from..]
+            .iter()
+            .filter(|crossed| crossed.peer == peer && crossed.tag == tag)
+            .copied()
+            .collect()
+    }
+}
+
+impl SimNet {
+    /// Join the network as `key` through a tap: the transport is a
+    /// [`SimTransport`] whose streams note every frame crossing them.
+    pub fn tap(&self, key: &SigningKey) -> (Harness<Tapped>, Taps) {
+        let Harness {
+            transport,
+            mut incoming,
+        } = self.join(key);
+        let tapped = Tapped {
+            inner: transport,
+            taps: Taps::default(),
+            streams: Arc::new(AtomicU64::new(0)),
+        };
+        let (forward, accepted) = mpsc::channel(1024);
+        let wrapping = tapped.clone();
+        tokio::spawn(async move {
+            while let Some(Incoming { alpn, conn }) = incoming.recv().await {
+                let conn = wrapping.conn(conn);
+                if forward.send(Incoming { alpn, conn }).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let taps = tapped.taps.clone();
+        (
+            Harness {
+                transport: tapped,
+                incoming: accepted,
+            },
+            taps,
+        )
+    }
+}
+
+/// A [`SimTransport`] whose streams note every frame crossing them in its
+/// [`Taps`].
+#[derive(Clone)]
+pub struct Tapped {
+    inner: SimTransport,
+    taps: Taps,
+    streams: Arc<AtomicU64>,
+}
+
+impl Tapped {
+    fn conn(&self, inner: SimConn) -> TappedConn {
+        TappedConn {
+            inner,
+            taps: self.taps.clone(),
+            streams: self.streams.clone(),
+        }
+    }
+}
+
+impl Transport for Tapped {
+    type Conn = TappedConn;
+
+    fn local_id(&self) -> PeerId {
+        self.inner.local_id()
+    }
+
+    async fn dial(&self, peer: PeerId, alpn: Alpn) -> anyhow::Result<TappedConn> {
+        Ok(self.conn(self.inner.dial(peer, alpn).await?))
+    }
+
+    async fn shutdown(&self) {
+        self.inner.shutdown().await
+    }
+}
+
+#[derive(Clone)]
+pub struct TappedConn {
+    inner: SimConn,
+    taps: Taps,
+    streams: Arc<AtomicU64>,
+}
+
+impl TappedConn {
+    /// The halves of one stream, which share its tag; `opened` says this
+    /// side opened it and writes the tag.
+    fn halves(
+        &self,
+        (send, recv): (SimSendStream, SimRecvStream),
+        opened: bool,
+    ) -> (TappedSend, TappedRecv) {
+        let tag = Arc::new(OnceLock::new());
+        let stream = self.streams.fetch_add(1, Ordering::Relaxed);
+        let tap = |sent| Tap {
+            taps: self.taps.clone(),
+            peer: self.inner.remote_id(),
+            stream,
+            tag: tag.clone(),
+            first: sent == opened,
+            sent,
+            buffer: Vec::new(),
+        };
+        (
+            TappedSend {
+                inner: send,
+                tap: tap(true),
+            },
+            TappedRecv {
+                inner: recv,
+                tap: tap(false),
+            },
+        )
+    }
+}
+
+impl Conn for TappedConn {
+    type SendHalf = TappedSend;
+    type RecvHalf = TappedRecv;
+
+    fn remote_id(&self) -> PeerId {
+        self.inner.remote_id()
+    }
+
+    async fn open_bi(&self) -> anyhow::Result<(TappedSend, TappedRecv)> {
+        Ok(self.halves(self.inner.open_bi().await?, true))
+    }
+
+    async fn accept_bi(&self) -> Option<(TappedSend, TappedRecv)> {
+        Some(self.halves(self.inner.accept_bi().await?, false))
+    }
+
+    fn close(&self, code: u32, reason: &[u8]) {
+        self.inner.close(code, reason)
+    }
+}
+
+/// One half's view of its stream: the tag the halves share, and the bytes
+/// of a frame not yet whole.
+struct Tap {
+    taps: Taps,
+    peer: PeerId,
+    stream: u64,
+    tag: Arc<OnceLock<u8>>,
+    /// The tag is this half's first byte.
+    first: bool,
+    sent: bool,
+    buffer: Vec<u8>,
+}
+
+impl Tap {
+    /// Note `bytes` crossing: the tag first, then whole frames of the
+    /// framing `recon/1` and `walk/1` share. Other tags are not parsed.
+    fn note(&mut self, mut bytes: &[u8]) {
+        if self.first && self.tag.get().is_none() {
+            let Some((&tag, rest)) = bytes.split_first() else {
+                return;
+            };
+            let _ = self.tag.set(tag);
+            bytes = rest;
+        }
+        self.buffer.extend_from_slice(bytes);
+        let Some(&tag) = self.tag.get() else {
+            return;
+        };
+        if tag != TAG_RECON && tag != TAG_WALK {
+            self.buffer.clear();
+            return;
+        }
+        while let Some(length) = self.buffer.get(1..5) {
+            let length = 5 + u32::from_be_bytes(length.try_into().unwrap()) as usize;
+            if self.buffer.len() < length {
+                break;
+            }
+            let kind = self.buffer[0];
+            self.buffer.drain(..length);
+            self.taps.0.lock().unwrap().push(Crossed {
+                peer: self.peer,
+                stream: self.stream,
+                tag,
+                sent: self.sent,
+                kind,
+            });
+        }
+    }
+}
+
+pub struct TappedSend {
+    inner: SimSendStream,
+    tap: Tap,
+}
+
+pub struct TappedRecv {
+    inner: SimRecvStream,
+    tap: Tap,
+}
+
+impl AsyncWrite for TappedSend {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(written)) = polled {
+            this.tap.note(&buf[..written]);
+        }
+        polled
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+impl super::SendStream for TappedSend {
+    fn reset(&mut self, code: u32) {
+        self.inner.reset(code)
+    }
+}
+
+impl AsyncRead for TappedRecv {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = polled {
+            this.tap.note(&buf.filled()[before..]);
+        }
+        polled
+    }
+}
+
+impl super::RecvStream for TappedRecv {
+    fn stop(&mut self, code: u32) {
+        self.inner.stop(code)
     }
 }
 
