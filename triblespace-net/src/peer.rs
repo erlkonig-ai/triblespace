@@ -664,6 +664,23 @@ where
         StoreGuard(self.store.lock().expect("store mutex"))
     }
 
+    /// Withdraw the published observation and explicitly stop/join the native
+    /// host. Call off UI/runtime threads, after cancelling outstanding local
+    /// acquisition futures. Retained readers cannot restart a closed host.
+    pub fn shutdown_and_join(&mut self) -> anyhow::Result<()> {
+        self.sender.clear_snapshot();
+        self.last_store_snapshot = None;
+        let started = {
+            let mut host = self.host.lock().expect("host mutex");
+            host.state = HostState::Closed;
+            host.started.take()
+        };
+        match started {
+            Some(started) => started.shutdown_and_join(),
+            None => Ok(()),
+        }
+    }
+
     /// Withdraw serving snapshots and release host ownership before returning
     /// the local backend. This does not itself flush or close the backend.
     pub fn into_store(mut self) -> S {
@@ -1432,6 +1449,80 @@ mod tests {
                 .count(),
             1
         );
+        peer.close().unwrap();
+    }
+
+    #[test]
+    fn explicit_native_shutdown_joins_and_releases_its_socket() {
+        let key = SigningKey::from_bytes(&[86; 32]);
+        let mut config = foreground_config();
+        config.bind = Some("127.0.0.1:0".parse().unwrap());
+        let mut peer = Peer::new(MemoryRepo::default(), key, config).unwrap();
+        let sockets = peer.bound_sockets();
+        assert!(!sockets.is_empty());
+        // A retained snapshot must not keep the application endpoint alive.
+        let retained = peer.snapshot().unwrap();
+        peer.shutdown_and_join().unwrap();
+        peer.shutdown_and_join().unwrap();
+        for socket in sockets {
+            let rebound = std::net::UdpSocket::bind(socket).unwrap();
+            drop(rebound);
+        }
+        assert!(matches!(peer.host.lock().unwrap().state, HostState::Closed));
+        drop(retained);
+        peer.close().unwrap();
+    }
+
+    #[test]
+    fn explicit_native_shutdown_cancels_stalled_leech_acquisition_and_releases_socket() {
+        let blackhole = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let absent = crate::identity::iroh_secret(&SigningKey::from_bytes(&[87; 32])).public();
+        let mut config = foreground_config();
+        config.bind = Some("127.0.0.1:0".parse().unwrap());
+        config.peers = vec![
+            iroh_base::EndpointAddr::from(absent).with_ip_addr(blackhole.local_addr().unwrap()),
+        ];
+        let mut source = MemoryRepo::default();
+        let missing = source
+            .put::<UnknownBlob, _>(Bytes::from_source(
+                b"stalled native shutdown fixture".to_vec(),
+            ))
+            .unwrap();
+        let mut peer = Leech::lazy(
+            MemoryRepo::default(),
+            SigningKey::from_bytes(&[88; 32]),
+            config,
+        );
+        let retained = peer.snapshot().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let fetch = peer.acquire(missing);
+            tokio::pin!(fetch);
+            tokio::select! {
+                _ = &mut fetch => panic!("the blackhole acquisition must still be pending"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            }
+            // Dropping the admitted future is the application's cancellation seam.
+        });
+        let sockets = peer.peer.bound_sockets();
+        assert!(
+            !sockets.is_empty(),
+            "the lazy acquisition started a real host"
+        );
+        let before = std::time::Instant::now();
+        peer.shutdown_and_join().unwrap();
+        assert!(before.elapsed() < std::time::Duration::from_secs(7));
+        for socket in sockets {
+            drop(std::net::UdpSocket::bind(socket).unwrap());
+        }
+        assert!(matches!(
+            peer.peer.host.lock().unwrap().state,
+            HostState::Closed
+        ));
+        drop(retained);
         peer.close().unwrap();
     }
 

@@ -442,6 +442,22 @@ and the provider-first endpoint-bound bearer exchange is unchanged. An ordinary
 Peer with a zero publication budget or ReadOnly reconciliation still serves
 its inventory; those settings are not aliases for Leech.
 
+Native applications can call `Peer::shutdown_and_join` or
+`Leech::shutdown_and_join` after cancelling their outstanding acquisition
+futures. Call this blocking boundary off UI and runtime threads. It withdraws
+serving, prevents retained readers from starting a new host, revokes their live
+acquisition capability and joins the host after transport shutdown. A dormant
+leech remains dormant. Already captured local snapshot bytes stay readable;
+the application still flushes or closes its backend separately.
+
+The `trible::maintenance::Driver` shares the CLI's maintenance implementation
+without opening storage, creating a runtime or spawning workers. The caller
+selects native `Target`s, schedules `tick`, and receives actual operation-boundary
+`Event`s. An unchanged observation emits no work events. Dropping an in-flight
+tick cancels the owned future, and the next tick retries incomplete work;
+synchronous encoding calls can only yield at their existing boundaries. Drop
+the driver before closing storage to release its retained immutable snapshots.
+
 Record retention is a separate lifetime rule: a retained non-blob
 record strongly retains every directly referenced blob which is resident, but
 does not fetch an absent one; proofs reference stable capability definitions,

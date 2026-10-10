@@ -389,6 +389,7 @@ fn counted_pass(
     (interests, recorded)
 }
 
+#[path = "counts/scoped.rs"]
 mod scoped;
 
 fn selected_records(

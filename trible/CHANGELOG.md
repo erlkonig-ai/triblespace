@@ -14,6 +14,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- Expose `maintenance::Driver`, native target selection and operation-boundary
+  events for caller-owned stores. The CLI uses the same driver; dropping a tick
+  cancels its work without leaving a detached worker. Process CPU observations
+  are available through `process::process_cpu_ns`.
+
 - `pile compact --drop-collection NAME_OR_FULL_HANDLE` leaves selected collections
   and their resident descriptor descendants behind in a fresh destination. This
   explicitly enables reachability GC, including raw orphan removal, while keeping

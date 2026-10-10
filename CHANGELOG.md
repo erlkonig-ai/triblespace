@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Expose the CLI's collection maintenance as a caller-owned library driver with
+  native work events and cancellation, and add explicit network host shutdown
+  and join for applications that own their runtime and storage lifetimes.
+
 - Avoid repeated blob-closure walks during selected collection compaction;
   consume the preflight's frozen rewrite selection once, deduplicate queued
   children at discovery, and report selection/copy phases and retained payload bytes.

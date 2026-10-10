@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add explicit `shutdown_and_join` for `Peer`, `Leech` and the started host.
+  Withdraw serving, close future host activation, revoke retained acquisition
+  capabilities, stop the transport and join its runtime thread. The caller
+  still cancels outstanding acquisitions and closes its own storage separately.
+
 ## [0.47.1] - 2026-10-03
 
 - Warm recognized names and resource-policy definition blobs for explicitly
