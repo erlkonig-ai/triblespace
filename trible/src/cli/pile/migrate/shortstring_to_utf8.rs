@@ -1,4 +1,4 @@
-//! `trible pile collection backfill-text`: give old short-text facts their
+//! `trible pile migrate <PILE> shortstring-to-utf8`: give old short-text facts their
 //! blob-text twins.
 //!
 //! Text attributes used to be declared with the 32-byte inline `ShortString`
@@ -44,16 +44,16 @@ use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::encodings::UnknownInline;
 use triblespace_core::inline::{Inline, InlineEncoding};
 use triblespace_core::macros::{entity, find};
-use triblespace_core::{and, temp};
 use triblespace_core::metadata;
 use triblespace_core::prelude::TriblePattern;
 use triblespace_core::query::Variable;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::SnapshotSource;
 use triblespace_core::trible::{Fragment, Trible, TribleSet};
+use triblespace_core::{and, temp};
 
+use super::super::collection::{handle_hex, open_resolved};
 use super::super::open_refreshed;
-use super::{handle_hex, open_resolved};
 
 /// The retired `ShortString` inline encoding's id, as its `MetaDescribe`
 /// declared it. Kept as a constant so old ids stay derivable after the type is
@@ -69,10 +69,8 @@ pub const SHORT_STRING_ENCODING: Id = id_hex!("2D848DB0AF112DB226A6BF1A3640D019"
 /// gets one, in a single commit signed by the key. Nothing is deleted or
 /// rewritten, and a second run writes nothing. Values that do not decode as a
 /// ShortString are counted and listed, and get no twin.
-#[derive(clap::Args)]
-pub struct BackfillTextArgs {
-    /// Path to the pile file to update.
-    pub pile: PathBuf,
+#[derive(clap::Args, Debug)]
+pub struct ShortstringToUtf8Args {
     /// Collection holding the old facts: name, or descriptor handle (`name:`
     /// / `blake3:` to disambiguate).
     pub collection: String,
@@ -119,7 +117,8 @@ impl Pair {
             Declared::Pinned => anchor,
             Declared::Anchored => anchored_id(anchor, SHORT_STRING_ENCODING),
         };
-        let new = triblespace_core::attribute::Attribute::<Handle<UTF8String>>::anchored(anchor).id();
+        let new =
+            triblespace_core::attribute::Attribute::<Handle<UTF8String>>::anchored(anchor).id();
         Self {
             declared,
             anchor,
@@ -327,16 +326,17 @@ fn parse_pairs(pinned: &[String], anchored: &[String]) -> Result<Vec<Pair>> {
     Ok(pairs)
 }
 
-pub fn run_backfill_text(args: BackfillTextArgs) -> Result<()> {
+pub fn run(pile_path: PathBuf, args: ShortstringToUtf8Args) -> Result<()> {
     let pairs = parse_pairs(&args.pinned, &args.anchored)?;
-    let key_path = triblespace_core::signing_key_file::resolve_path(args.key.as_deref(), &args.pile);
+    let key_path =
+        triblespace_core::signing_key_file::resolve_path(args.key.as_deref(), &pile_path);
     let signer = match triblespace_core::signing_key_file::load_existing(&key_path) {
         Ok(key) => Some(key),
         Err(_) if args.dry_run => None,
         Err(error) => bail!("load signing key {}: {error}", key_path.display()),
     };
 
-    let mut pile = open_refreshed(&args.pile)?;
+    let mut pile = open_refreshed(&pile_path)?;
     let res = (|| -> Result<()> {
         let collection = open_resolved::<SimpleArchive>(&mut pile, &args.collection)?;
         println!("collection: blake3:{}", handle_hex(collection.handle()));
@@ -430,10 +430,16 @@ mod tests {
     /// The pairs recorded when the attributes moved: one anchored, one pinned.
     #[test]
     fn pairs_reproduce_the_recorded_moves() {
-        let field_name = Pair::new(Declared::Anchored, id_hex!("097951EF7FC4C64A4AE9ADBD9ED89482"));
+        let field_name = Pair::new(
+            Declared::Anchored,
+            id_hex!("097951EF7FC4C64A4AE9ADBD9ED89482"),
+        );
         assert_eq!(field_name.old, id_hex!("5549CA93F5AF696728172789F1EEBFD0"));
         assert_eq!(field_name.new, id_hex!("1DEC73A8171524D4668AED337F8625FA"));
-        let rdf_lang = Pair::new(Declared::Pinned, id_hex!("904DCA1F8C0BF087B02C0581F69EDF4D"));
+        let rdf_lang = Pair::new(
+            Declared::Pinned,
+            id_hex!("904DCA1F8C0BF087B02C0581F69EDF4D"),
+        );
         assert_eq!(rdf_lang.old, id_hex!("904DCA1F8C0BF087B02C0581F69EDF4D"));
         assert_eq!(rdf_lang.new, id_hex!("8AFACC1C2E28546AC73EFE57B47A302A"));
     }
@@ -463,17 +469,31 @@ mod tests {
         let mut pile = Pile::open(&path)?;
         let collection = pile.collection("legacy-text", direct(&key))?;
 
-        let pinned = Pair::new(Declared::Pinned, id_hex!("8A4BE2C4D0E90D2B9EE0E1A07ECA2CFA"));
-        let anchored = Pair::new(Declared::Anchored, id_hex!("097951EF7FC4C64A4AE9ADBD9ED89482"));
+        let pinned = Pair::new(
+            Declared::Pinned,
+            id_hex!("8A4BE2C4D0E90D2B9EE0E1A07ECA2CFA"),
+        );
+        let anchored = Pair::new(
+            Declared::Anchored,
+            id_hex!("097951EF7FC4C64A4AE9ADBD9ED89482"),
+        );
         let thirty_two = "abcdefghijklmnopqrstuvwxyz012345";
         assert_eq!(thirty_two.len(), 32);
 
         let mut old = TribleSet::new();
         old.insert(&old_fact(entity(1), pinned.old, short(b"hello")));
-        old.insert(&old_fact(entity(2), pinned.old, short(thirty_two.as_bytes())));
+        old.insert(&old_fact(
+            entity(2),
+            pinned.old,
+            short(thirty_two.as_bytes()),
+        ));
         old.insert(&old_fact(entity(3), anchored.old, short(b"")));
         old.insert(&old_fact(entity(4), anchored.old, short(&[0xC3, 0x28])));
-        old.insert(&old_fact(entity(5), anchored.old, short("grüße".as_bytes())));
+        old.insert(&old_fact(
+            entity(5),
+            anchored.old,
+            short("grüße".as_bytes()),
+        ));
         pile.commit(collection, &key, Fragment::from(old.clone()))?;
         pile.flush()?;
         let before = std::fs::metadata(&path)?.len();
@@ -485,19 +505,40 @@ mod tests {
         pile.flush()?;
         assert_eq!(std::fs::metadata(&path)?.len(), before);
 
-        let first = backfill(&mut pile, collection, &[pinned, anchored], Some(&key), false)?;
+        let first = backfill(
+            &mut pile,
+            collection,
+            &[pinned, anchored],
+            Some(&key),
+            false,
+        )?;
         assert!(first.commit.is_some());
         assert_eq!(first.twins, 4);
-        let [p, a] = &first.reports[..] else { panic!("two reports") };
-        assert_eq!((p.seen, p.present, p.written, p.undecodable.len()), (2, 0, 2, 0));
-        assert_eq!((a.seen, a.present, a.written, a.undecodable.len()), (3, 0, 2, 1));
+        let [p, a] = &first.reports[..] else {
+            panic!("two reports")
+        };
+        assert_eq!(
+            (p.seen, p.present, p.written, p.undecodable.len()),
+            (2, 0, 2, 0)
+        );
+        assert_eq!(
+            (a.seen, a.present, a.written, a.undecodable.len()),
+            (3, 0, 2, 1)
+        );
         assert_eq!(a.undecodable[0].entity, entity(4));
-        assert!(a.undecodable[0].reason.contains("UTF-8"), "{}", a.undecodable[0].reason);
+        assert!(
+            a.undecodable[0].reason.contains("UTF-8"),
+            "{}",
+            a.undecodable[0].reason
+        );
 
         // Every twin reads back through the view, text through its blob.
         let snapshot = pile.snapshot()?;
         let view: TribleSet = collection.read(&snapshot).map_err(|e| anyhow!("{e}"))?;
-        assert!(old.iter().all(|fact| view.contains(fact)), "old facts are untouched");
+        assert!(
+            old.iter().all(|fact| view.contains(fact)),
+            "old facts are untouched"
+        );
         for (entity_id, pair, text) in [
             (entity(1), pinned, "hello"),
             (entity(2), pinned, thirty_two),
@@ -518,12 +559,23 @@ mod tests {
         // A second run finds every twin present and commits nothing.
         pile.flush()?;
         let after_first = std::fs::metadata(&path)?.len();
-        let second = backfill(&mut pile, collection, &[pinned, anchored], Some(&key), false)?;
+        let second = backfill(
+            &mut pile,
+            collection,
+            &[pinned, anchored],
+            Some(&key),
+            false,
+        )?;
         assert!(second.commit.is_none());
         assert_eq!(second.twins, 0);
-        let [p, a] = &second.reports[..] else { panic!("two reports") };
+        let [p, a] = &second.reports[..] else {
+            panic!("two reports")
+        };
         assert_eq!((p.seen, p.present, p.written), (2, 2, 0));
-        assert_eq!((a.seen, a.present, a.written, a.undecodable.len()), (3, 2, 0, 1));
+        assert_eq!(
+            (a.seen, a.present, a.written, a.undecodable.len()),
+            (3, 2, 0, 1)
+        );
         pile.flush()?;
         assert_eq!(std::fs::metadata(&path)?.len(), after_first);
         pile.close()?;
@@ -539,7 +591,10 @@ mod tests {
         let stranger = SigningKey::from_bytes(&[4; 32]);
         let mut pile = Pile::open(&path)?;
         let collection = pile.collection("legacy-text", direct(&owner))?;
-        let pair = Pair::new(Declared::Pinned, id_hex!("8A4BE2C4D0E90D2B9EE0E1A07ECA2CFA"));
+        let pair = Pair::new(
+            Declared::Pinned,
+            id_hex!("8A4BE2C4D0E90D2B9EE0E1A07ECA2CFA"),
+        );
         let mut old = TribleSet::new();
         old.insert(&old_fact(entity(1), pair.old, short(b"x")));
         pile.commit(collection, &owner, Fragment::from(old))?;
@@ -562,7 +617,10 @@ mod tests {
         let path = directory.path().join("text.pile");
         std::fs::File::create(&path)?;
         let key = triblespace_core::signing_key_file::init(&directory.path().join("self.key"))?;
-        let pair = Pair::new(Declared::Anchored, id_hex!("5E3F4C5973047A386688FCFB5C29B03E"));
+        let pair = Pair::new(
+            Declared::Anchored,
+            id_hex!("5E3F4C5973047A386688FCFB5C29B03E"),
+        );
         {
             let mut pile = Pile::open(&path)?;
             let collection = pile.collection("telemetry", direct(&key))?;
@@ -571,17 +629,16 @@ mod tests {
             pile.commit(collection, &key, Fragment::from(old))?;
             pile.close()?;
         }
-        let args = |dry_run| BackfillTextArgs {
-            pile: path.clone(),
+        let args = |dry_run| ShortstringToUtf8Args {
             collection: "telemetry".to_owned(),
             pinned: Vec::new(),
             anchored: vec!["5E3F4C5973047A386688FCFB5C29B03E".to_owned()],
             key: Some(directory.path().join("self.key")),
             dry_run,
         };
-        run_backfill_text(args(true))?;
-        run_backfill_text(args(false))?;
-        run_backfill_text(args(false))?;
+        run(path.clone(), args(true))?;
+        run(path.clone(), args(false))?;
+        run(path.clone(), args(false))?;
 
         let mut pile = Pile::open(&path)?;
         pile.refresh()?;
@@ -590,7 +647,11 @@ mod tests {
         let view: TribleSet = collection.read(&snapshot).map_err(|e| anyhow!("{e}"))?;
         let handle: Inline<Handle<UTF8String>> =
             IntoBlob::<UTF8String>::to_blob("worker-one").get_handle();
-        assert!(view.contains(&Trible::new(ExclusiveId::force_ref(&entity(9)), &pair.new, &handle)));
+        assert!(view.contains(&Trible::new(
+            ExclusiveId::force_ref(&entity(9)),
+            &pair.new,
+            &handle
+        )));
         assert_eq!(view.len(), 2);
         drop(snapshot);
         pile.close()?;
@@ -601,9 +662,8 @@ mod tests {
     fn the_subcommand_parses_as_documented() {
         use clap::Parser;
         let parsed = super::super::Command::try_parse_from([
-            "collection",
-            "backfill-text",
-            "self.pile",
+            "migrate",
+            "shortstring-to-utf8",
             "telemetry",
             "--pinned",
             "8A4BE2C4D0E90D2B9EE0E1A07ECA2CFA",
@@ -614,8 +674,8 @@ mod tests {
             "--dry-run",
         ])
         .expect("parses");
-        let super::super::Command::BackfillText(args) = parsed else {
-            panic!("backfill-text parses to its own variant");
+        let super::super::Command::ShortstringToUtf8(args) = parsed else {
+            panic!("shortstring-to-utf8 parses to its own variant");
         };
         assert_eq!(args.collection, "telemetry");
         assert_eq!(args.pinned.len(), 1);

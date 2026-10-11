@@ -19,7 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
-- `pile collection backfill-text <PILE> <COLLECTION> [--pinned HEX]...
+- `pile migrate <PILE> shortstring-to-utf8 <COLLECTION> [--pinned HEX]...
   [--anchored HEX]... [--key KEY] [--dry-run]` appends the
   `Handle<UTF8String>` twin of every old `ShortString` fact in a collection's
   current view, in one commit its WRITE policy must admit. Old ids come from

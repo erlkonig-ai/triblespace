@@ -9,6 +9,7 @@ use triblespace_core::repo::{BlobStoreGet, SnapshotSource};
 mod branch_to_collection;
 mod clean;
 mod lattice_v3;
+mod shortstring_to_utf8;
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Migration {
@@ -73,6 +74,20 @@ pub enum Command {
     /// believed foundation's payload must be resident. `--dry-run` decides
     /// the same frames and blobs, writes nothing and prints the same report.
     LatticeV3(lattice_v3::LatticeV3Args),
+    /// Append the Handle<UTF8String> twin of every old ShortString fact.
+    ///
+    /// Text attributes moved off the 32-byte ShortString encoding, and the
+    /// encoding is part of an attribute's id, so old facts sit under ids new
+    /// code no longer reads. Name each retired declaration by its hex:
+    /// `--pinned HEX` for `"HEX" unsafe as ..: ShortString` (old id = HEX),
+    /// `--anchored HEX` for `"HEX" as ..: ShortString` (old id derived from
+    /// HEX and ShortString). The new id is derived from HEX and
+    /// Handle<UTF8String>. Every old fact in the collection's current view
+    /// whose twin is absent gets one, text stored as a blob, in a single
+    /// commit the collection's WRITE must admit. Nothing is deleted or
+    /// rewritten, a second run writes nothing, and values that do not decode
+    /// are counted and listed rather than dropped.
+    ShortstringToUtf8(shortstring_to_utf8::ShortstringToUtf8Args),
     /// Re-sign one verified legacy branch as native collection commits.
     ///
     /// This is deliberately a same-pile migration: one frozen pin observation
@@ -115,6 +130,7 @@ pub fn run(pile_path: PathBuf, cmd: Command) -> Result<()> {
         Command::Reframe { into } => reframe(&pile_path, &into),
         Command::Clean(args) => clean::run(pile_path, args),
         Command::LatticeV3(args) => lattice_v3::run(pile_path, args),
+        Command::ShortstringToUtf8(args) => shortstring_to_utf8::run(pile_path, args),
         Command::BranchToCollection {
             branch,
             collection_name,
