@@ -21,9 +21,6 @@ use std::convert::TryInto;
 use hex::FromHex;
 use hex::FromHexError;
 
-#[cfg(feature = "proptest")]
-use proptest::prelude::RngCore;
-
 /// A inline encoding for an abstract 128-bit identifier.
 /// This identifier is generated with high entropy and is suitable for use as a unique identifier.
 ///
@@ -313,9 +310,12 @@ impl proptest::strategy::Strategy for RandomGenId {
         &self,
         runner: &mut proptest::prelude::prop::test_runner::TestRunner,
     ) -> proptest::prelude::prop::strategy::NewTree<Self> {
-        let rng = runner.rng();
-        let mut id = [0; 16];
-        rng.fill_bytes(&mut id[..]);
+        // Drawn through proptest's own `any` strategy rather than the runner's
+        // rng trait: `fill_bytes` moved from `RngCore` (proptest 1.11, rand 0.9)
+        // to `Rng` (1.12, rand 0.10), and the root Cargo.lock is untracked, so
+        // a fresh resolve may pick either.
+        use proptest::strategy::ValueTree;
+        let id = proptest::prelude::any::<RawId>().new_tree(runner)?.current();
 
         Ok(IdValueTree(id))
     }
