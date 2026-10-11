@@ -17,13 +17,18 @@
 //! [m]: triblespace_search::bm25::BM25Index::matches
 //! [s]: triblespace_search::bm25::BM25Index::score
 
+use anybytes::View;
 use triblespace_core::and;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::examples::literature;
 use triblespace_core::find;
 use triblespace_core::id::{ExclusiveId, Id};
+use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::inline::Inline;
 use triblespace_core::inline::IntoInline;
 use triblespace_core::macros::{entity, pattern};
-use triblespace_core::trible::TribleSet;
+use triblespace_core::repo::{BlobStoreGet, SnapshotSource};
+use triblespace_core::trible::{Fragment, TribleSet};
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::tokens::hash_tokens;
@@ -47,7 +52,8 @@ fn main() {
         (id(25), other_author, "Linear algebra"),
     ];
 
-    let mut kb = TribleSet::new();
+    // A fragment keeps the title blobs beside the facts that reference them.
+    let mut kb = Fragment::empty();
     kb += entity! { ExclusiveId::force_ref(&target_author) @
         literature::firstname: "Target",
         literature::lastname: "Author",
@@ -66,10 +72,16 @@ fn main() {
 
     // BM25 over titles, pulled straight out of the KB via a
     // pattern query — no shadow datamodel.
+    let blobs = kb.blobs().clone().snapshot().expect("blob snapshot");
+    let kb: TribleSet = kb.into_facts();
     let titles: Vec<(Id, String)> = find!(
-        (b: Id, title: String),
+        (b: Id, title: Inline<Handle<UTF8String>>),
         pattern!(&kb, [{ ?b @ literature::title: ?title }])
     )
+    .map(|(b, title)| {
+        let text: View<str> = blobs.get(title).expect("resident title blob");
+        (b, text.as_ref().to_owned())
+    })
     .collect();
     let mut bm25 = BM25Builder::new();
     for (b, title) in &titles {

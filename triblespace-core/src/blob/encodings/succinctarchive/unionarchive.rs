@@ -412,7 +412,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::blob::encodings::utf8string::UTF8String;
     use crate::examples::literature;
+    use crate::inline::encodings::hash::Handle;
     use crate::prelude::*;
 
     use super::*;
@@ -434,15 +436,20 @@ mod tests {
             [&left, &right].into_iter().map(Into::into).collect();
         let union = UnionArchive::new(segments);
 
-        let mut names: Vec<String> = find!(
-            name: String,
+        let mut names: Vec<[u8; 32]> = find!(
+            name: Inline<_>,
             pattern!(&union, [{ _?person @ literature::firstname: ?name }])
         )
+        .map(|name| name.raw)
         .collect();
         names.sort();
+        let ada: Inline<Handle<UTF8String>> = "Ada".to_inline();
+        let grace: Inline<Handle<UTF8String>> = "Grace".to_inline();
+        let mut expected = [ada.raw, grace.raw];
+        expected.sort();
 
         assert_eq!(union.segment_count(), 2);
-        assert_eq!(names, ["Ada", "Grace"]);
+        assert_eq!(names, expected);
     }
 
     #[test]

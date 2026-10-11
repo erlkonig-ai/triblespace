@@ -4,8 +4,9 @@
 //!
 //! ```
 //! # use triblespace_core::prelude::*;
-//! # use triblespace_core::prelude::inlineencodings::ShortString;
-//! let results = find!((x: Inline<ShortString>), x.is("foo".to_inline())).collect::<Vec<_>>();
+//! # use triblespace_core::prelude::blobencodings::UTF8String;
+//! # use triblespace_core::prelude::inlineencodings::Handle;
+//! let results = find!((x: Inline<Handle<UTF8String>>), x.is("foo".to_inline())).collect::<Vec<_>>();
 //! ```
 //!
 //! Variables are converted via [`TryFromInline`](crate::inline::TryFromInline). By default,
@@ -2391,9 +2392,10 @@ mod parallel {
 ///
 /// ```
 /// # use triblespace_core::prelude::*;
-/// # use triblespace_core::prelude::inlineencodings::ShortString;
+/// # use triblespace_core::prelude::blobencodings::UTF8String;
+/// # use triblespace_core::prelude::inlineencodings::Handle;
 /// // Filter semantics — rows where conversion fails are skipped:
-/// let results = find!((x: Inline<ShortString>), x.is("foo".to_inline())).collect::<Vec<_>>();
+/// let results = find!((x: Inline<Handle<UTF8String>>), x.is("foo".to_inline())).collect::<Vec<_>>();
 /// ```
 #[macro_export]
 macro_rules! find {
@@ -2484,8 +2486,7 @@ pub use temp;
 
 #[cfg(test)]
 mod tests {
-    use inlineencodings::ShortString;
-
+    use crate::prelude::blobencodings::UTF8String;
     use crate::prelude::inlineencodings::*;
     use crate::prelude::*;
 
@@ -2514,7 +2515,7 @@ mod tests {
 
         attributes! {
             "8143F46E812E88C4544E7094080EC523" unsafe as loves: inlineencodings::GenId;
-            "D6E0F2A6E5214E1330565B4D4138E55C" unsafe as name: inlineencodings::ShortString;
+            "D6E0F2A6E5214E1330565B4D4138E55C" as name: inlineencodings::Handle<blobencodings::UTF8String>;
         }
     }
 
@@ -2598,35 +2599,35 @@ mod tests {
         use crate::prelude::*;
 
         attributes! {
-            "A19EC1D9DD534BA9896223A457A6B9C9" unsafe as name: inlineencodings::ShortString;
+            "A19EC1D9DD534BA9896223A457A6B9C9" as name: inlineencodings::Handle<blobencodings::UTF8String>;
             "C21DE0AA5BA3446AB886C9640BA60244" unsafe as friend: inlineencodings::GenId;
         }
     }
 
     #[test]
     fn and_set() {
-        let mut books = HashSet::<String>::new();
-        let mut movies = HashSet::<Inline<ShortString>>::new();
+        let mut books = HashSet::<Inline<Handle<UTF8String>>>::new();
+        let mut movies = HashSet::<Inline<Handle<UTF8String>>>::new();
 
-        books.insert("LOTR".to_string());
-        books.insert("Dragonrider".to_string());
-        books.insert("Highlander".to_string());
+        books.insert("LOTR".to_inline());
+        books.insert("Dragonrider".to_inline());
+        books.insert("Highlander".to_inline());
 
         movies.insert("LOTR".to_inline());
         movies.insert("Highlander".to_inline());
 
         let inter: Vec<_> =
-            find!((a: Inline<ShortString>), and!(books.has(a), movies.has(a))).collect();
+            find!((a: Inline<Handle<UTF8String>>), and!(books.has(a), movies.has(a))).collect();
 
         assert_eq!(inter.len(), 2);
 
         let cross: Vec<_> =
-            find!((a: Inline<ShortString>, b: Inline<ShortString>), and!(books.has(a), movies.has(b))).collect();
+            find!((a: Inline<Handle<UTF8String>>, b: Inline<Handle<UTF8String>>), and!(books.has(a), movies.has(b))).collect();
 
         assert_eq!(cross.len(), 6);
 
-        let one: Vec<_> = find!((a: Inline<ShortString>),
-            and!(books.has(a), a.is(ShortString::inline_from("LOTR")))
+        let one: Vec<_> = find!((a: Inline<Handle<UTF8String>>),
+            and!(books.has(a), a.is(Handle::<UTF8String>::inline_from("LOTR")))
         )
         .collect();
 
@@ -2702,7 +2703,7 @@ mod tests {
         let r: Vec<_> = find! {
             (string: Inline<_>, number: Inline<_>),
             and!(
-                string.is(ShortString::inline_from("Hello World!")),
+                string.is(Handle::<UTF8String>::inline_from("Hello World!")),
                 number.is(I256BE::inline_from(42))
             )
         }
@@ -2762,7 +2763,7 @@ mod tests {
         .collect();
 
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].0.try_from_inline::<&str>().unwrap(), "Alice");
+        assert_eq!(matches[0].0, "Alice".to_inline());
     }
 
     #[test]
@@ -2771,13 +2772,10 @@ mod tests {
         use std::rc::Rc;
 
         let mut ctx = VariableContext::new();
-        let a = ctx.next_variable::<ShortString>();
-        let b = ctx.next_variable::<ShortString>();
+        let a = ctx.next_variable::<I256BE>();
+        let b = ctx.next_variable::<I256BE>();
 
-        let base = and!(
-            a.is(ShortString::inline_from("A")),
-            b.is(ShortString::inline_from("B"))
-        );
+        let base = and!(a.is(I256BE::inline_from(1)), b.is(I256BE::inline_from(2)));
 
         let mut wrapper = crate::debug::query::EstimateOverrideConstraint::new(base);
         wrapper.set_estimate(a.index, 10);

@@ -661,7 +661,8 @@ use std::collections::HashSet;
 use triblespace::core::examples::literature;
 use triblespace::core::query::ContainsConstraint;
 use triblespace::prelude::*;
-use triblespace::prelude::inlineencodings::ShortString;
+use triblespace::prelude::blobencodings::UTF8String;
+use triblespace::prelude::inlineencodings::Handle;
 
 fn main() {
     let mut kb = TribleSet::new();
@@ -678,7 +679,7 @@ fn main() {
         literature::title: "Dune",
     };
 
-    let mut allowed = HashSet::<Inline<ShortString>>::new();
+    let mut allowed = HashSet::<Inline<Handle<UTF8String>>>::new();
     allowed.insert("Frank".to_inline());
 
     let results: Vec<_> = find!((title: Inline<_>, firstname: Inline<_>),

@@ -491,12 +491,12 @@ impl IdOwner {
     ///
     /// ```
     /// use triblespace_core::prelude::*;
-    /// use inlineencodings::ShortString;
+    /// use inlineencodings::U256BE;
     /// use triblespace_core::id_hex;
     ///
     /// let mut owner = IdOwner::new();
     /// let owned_id = owner.defer_insert(fucid());
-    /// let trible = Trible::new(&owned_id, &id_hex!("7830D7B3C2DCD44EB3FA68C93D06B973"), &ShortString::inline_from("Hello, World!"));
+    /// let trible = Trible::new(&owned_id, &id_hex!("7830D7B3C2DCD44EB3FA68C93D06B973"), &U256BE::inline_from(42u64));
     /// ```
     pub fn defer_insert(&self, id: ExclusiveId) -> OwnedId<'_> {
         OwnedId {
@@ -657,10 +657,11 @@ impl ContainsConstraint<'static, GenId> for &IdOwner {
 
 #[cfg(test)]
 mod tests {
+    use crate::blob::encodings::utf8string::UTF8String;
     use crate::examples::literature;
     use crate::id::ExclusiveId;
     use crate::inline::encodings::genid::GenId;
-    use crate::inline::encodings::shortstring::ShortString;
+    use crate::inline::encodings::hash::Handle;
     use crate::prelude::*;
     use crate::query::Query;
     use crate::query::VariableContext;
@@ -690,7 +691,7 @@ mod tests {
         }
 
         let mut r: Vec<_> = find!(
-            (author: ExclusiveId, name: String),
+            (author: ExclusiveId, name: Inline<Handle<UTF8String>>),
             and!(
                 local_ids(author),
                 pattern!(&kb, [
@@ -701,9 +702,12 @@ mod tests {
         )
         .map(|(_, n)| n)
         .collect();
-        r.sort();
+        r.sort_by_key(|name| name.raw);
+        let mut expected: Vec<Inline<Handle<UTF8String>>> =
+            vec!["Isaac".to_inline(), "Jules".to_inline()];
+        expected.sort_by_key(|name| name.raw);
 
-        assert_eq!(vec!["Isaac", "Jules"], r);
+        assert_eq!(expected, r);
     }
 
     #[test]
@@ -730,7 +734,7 @@ mod tests {
             };
         }
         let author = ctx.next_variable::<GenId>();
-        let name = ctx.next_variable::<ShortString>();
+        let name = ctx.next_variable::<Handle<UTF8String>>();
 
         let base = and!(
             local_ids(author),
@@ -741,13 +745,14 @@ mod tests {
         wrapper.set_estimate(author.index, 100);
         wrapper.set_estimate(name.index, 1);
 
-        let q: Query<_, _, _> = Query::new(wrapper, |binding| {
-            Some(name.extract(binding).try_from_inline::<String>().unwrap())
-        });
+        let q: Query<_, _, _> = Query::new(wrapper, |binding| Some(*name.extract(binding)));
         // Query scheduling may change result order; this regression is about
         // completeness under deliberately misleading estimates.
-        let mut r: Vec<_> = q.collect();
-        r.sort();
-        assert_eq!(r, vec!["Isaac", "Jules"]);
+        let mut r: Vec<Inline<Handle<UTF8String>>> = q.collect();
+        r.sort_by_key(|name| name.raw);
+        let mut expected: Vec<Inline<Handle<UTF8String>>> =
+            vec!["Isaac".to_inline(), "Jules".to_inline()];
+        expected.sort_by_key(|name| name.raw);
+        assert_eq!(r, expected);
     }
 }

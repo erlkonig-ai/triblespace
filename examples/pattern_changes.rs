@@ -7,9 +7,9 @@ pub mod literature {
 
     attributes! {
         "8F180883F9FD5F787E9E0AF0DF5866B9" unsafe as author: inlineencodings::GenId;
-        "0DBB530B37B966D137C50B943700EDB2" unsafe as firstname: inlineencodings::ShortString;
-        "6BAA463FD4EAF45F6A103DB9433E4545" unsafe as lastname: inlineencodings::ShortString;
-        "A74AA63539354CDA47F387A4C3A8D54C" unsafe as title: inlineencodings::ShortString;
+        "0DBB530B37B966D137C50B943700EDB2" as firstname: inlineencodings::Handle<blobencodings::UTF8String>;
+        "6BAA463FD4EAF45F6A103DB9433E4545" as lastname: inlineencodings::Handle<blobencodings::UTF8String>;
+        "A74AA63539354CDA47F387A4C3A8D54C" as title: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }
 
@@ -25,15 +25,17 @@ fn main() {
     let mut changed = initial.into_facts();
     let mut full = changed.clone();
 
-    let all_titles: Vec<String> = find!(
-        title: String,
+    // Text attributes hold the content handle of their text, so a title
+    // compares with the handle of a string without reading any blob.
+    let all_titles: Vec<Inline<_>> = find!(
+        title: Inline<_>,
         pattern_changes!(&full, &changed, [
             { _?author @ literature::firstname: "Frank" },
             { _?book @ literature::author: _?author, literature::title: ?title }
         ])
     )
     .collect();
-    assert_eq!(all_titles, vec!["Dune".to_string()]);
+    assert_eq!(all_titles, vec!["Dune".to_inline()]);
 
     // A later collection observation contributes one monotonic delta.
     changed = entity! {
@@ -44,15 +46,15 @@ fn main() {
     full += changed.clone();
 
     // Only Dune Messiah shows up — Dune was in the previous observation.
-    let new_titles: Vec<String> = find!(
-        title: String,
+    let new_titles: Vec<Inline<_>> = find!(
+        title: Inline<_>,
         pattern_changes!(&full, &changed, [
             { _?author @ literature::firstname: "Frank" },
             { _?book @ literature::author: _?author, literature::title: ?title }
         ])
     )
     .collect();
-    assert_eq!(new_titles, vec!["Dune Messiah".to_string()]);
-    println!("New titles: {new_titles:?}");
+    assert_eq!(new_titles, vec!["Dune Messiah".to_inline()]);
+    println!("{} new title(s)", new_titles.len());
     // ANCHOR_END: pattern_changes_example
 }

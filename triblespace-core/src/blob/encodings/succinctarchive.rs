@@ -3674,7 +3674,6 @@ mod tests {
     use crate::blob::IntoBlob;
     use crate::id::fucid;
     use crate::inline::IntoInline;
-    use crate::inline::TryToInline;
     use crate::prelude::*;
     use crate::query::find;
     use crate::trible::Trible;
@@ -3732,8 +3731,8 @@ mod tests {
 
         attributes! {
             "328edd7583de04e2bedd6bd4fd50e651" as loves: inlineencodings::GenId;
-            "328147856cc1984f0806dbb824d2b4cb" as name: inlineencodings::ShortString;
-            "328f2c33d2fdd675e733388770b2d6c4" as title: inlineencodings::ShortString;
+            "328147856cc1984f0806dbb824d2b4cb" as name: inlineencodings::Handle<blobencodings::UTF8String>;
+            "328f2c33d2fdd675e733388770b2d6c4" as title: inlineencodings::Handle<blobencodings::UTF8String>;
         }
     }
 
@@ -4089,10 +4088,7 @@ mod tests {
             }])
         )
         .collect();
-        assert_eq!(
-            vec![((&juliet).to_inline(), "Juliet".try_to_inline().unwrap(),)],
-            r
-        );
+        assert_eq!(vec![((&juliet).to_inline(), "Juliet".to_inline(),)], r);
     }
 
     #[test]

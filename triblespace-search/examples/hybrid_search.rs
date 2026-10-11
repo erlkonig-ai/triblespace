@@ -37,9 +37,8 @@ use triblespace_search::schemas::{put_embedding, Embedding};
 use triblespace_search::tokens::hash_tokens;
 
 // Example-local attribute id — minted with `trible genid`. The
-// title stays in the local `papers` vector (some of them exceed
-// ShortString's 30-byte limit and UTF8String would be overkill
-// for an example); the KB only needs the paper→embedding link.
+// title stays in the local `papers` vector; the KB only needs the
+// paper→embedding link.
 mod attrs {
     use super::*;
 

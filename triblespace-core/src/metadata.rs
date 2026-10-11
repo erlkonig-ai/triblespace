@@ -15,7 +15,7 @@ use triblespace_core_macros::attributes;
 
 /// Describes a runtime *instance* — emits metadata about a specific value (an
 /// `Attribute<S>` with its id+name+usage, etc.). For describing a Rust *type*
-/// itself (schema metadata for `ShortString`, `Handle<T>`, …) use
+/// itself (schema metadata for `GenId`, `Handle<T>`, …) use
 /// [`MetaDescribe`].
 ///
 /// `describe` returns a [`Fragment`] that's self-contained — its
@@ -39,7 +39,7 @@ pub trait Describe {
 }
 
 /// Describes a Rust *type* — emits schema metadata about the type itself
-/// without needing an instance (`ShortString`, `Handle<T>`, …). For
+/// without needing an instance (`GenId`, `Handle<T>`, …). For
 /// describing a runtime value use [`Describe`].
 ///
 /// Same self-contained Fragment contract as [`Describe`]: the
@@ -196,9 +196,6 @@ attributes! {
     "A56350FD00EC220B4567FE15A5CD68B8" unsafe as source: inlineencodings::Handle<UTF8String>;
     /// Optional module path for the usage annotation (from `module_path!()`).
     "BCB94C7439215641A3E9760CE3F4F432" unsafe as source_module: inlineencodings::Handle<UTF8String>;
-    /// Preferred JSON representation (e.g. string, number, bool, object, ref, blob).
-    /// Preferred JSON representation hint (e.g. `"string"`, `"number"`, `"bool"`, `"object"`).
-    "A7AFC8C0FAD017CE7EC19587AF682CFF" unsafe as json_kind: inlineencodings::ShortString;
     /// Generic tag edge: link any entity to a tag entity (by Id). Reusable across domains.
     "91C50E9FBB1F73E892EBD5FFDE46C251" unsafe as tag: inlineencodings::GenId;
     /// When an entity was created.

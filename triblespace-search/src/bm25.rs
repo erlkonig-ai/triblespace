@@ -68,8 +68,8 @@ const DEFAULT_B: f32 = 0.75;
 /// - `BM25Builder<GenId, WordHash>` — classic text search
 ///   keyed by entity id; terms come from
 ///   [`crate::tokens::hash_tokens`] et al.
-/// - `BM25Builder<ShortString, WordHash>` — title-indexed
-///   search.
+/// - `BM25Builder<Handle<UTF8String>, WordHash>` — keyed by a
+///   text value (a title), compared by content handle.
 /// - `BM25Builder<GenId, GenId>` — entity co-occurrence; terms
 ///   are themselves entity ids ("which fragments cite X?").
 ///
@@ -127,7 +127,7 @@ impl<D: InlineEncoding, T: InlineEncoding> BM25Builder<D, T> {
     /// common text-search shape:
     ///
     /// ```ignore
-    /// let mut b: BM25Builder<ShortString> = BM25Builder::new();
+    /// let mut b: BM25Builder<Handle<UTF8String>> = BM25Builder::new();
     /// ```
     pub fn new() -> Self {
         Self {
@@ -706,15 +706,16 @@ mod tests {
 
     #[test]
     fn insert_indexes_by_string_key() {
-        use triblespace_core::inline::encodings::shortstring::ShortString;
+        use triblespace_core::blob::encodings::utf8string::UTF8String;
+        use triblespace_core::inline::encodings::hash::Handle;
         use triblespace_core::inline::{Inline, IntoInline};
 
-        let mut b: BM25Builder<ShortString> = BM25Builder::new();
-        let red: Inline<ShortString> = "red".to_inline();
-        let blue: Inline<ShortString> = "blue".to_inline();
+        let mut b: BM25Builder<Handle<UTF8String>> = BM25Builder::new();
+        let red: Inline<Handle<UTF8String>> = "red".to_inline();
+        let blue: Inline<Handle<UTF8String>> = "blue".to_inline();
         // Two docs keyed by string value rather than entity id.
         // The doc body is the token stream; the *key* is a
-        // `Inline<ShortString>`, so a later query can find "docs
+        // `Inline<Handle<UTF8String>>`, so a later query can find "docs
         // whose key/field value is 'red'".
         b.insert(red, hash_tokens("a tomato is red"));
         b.insert(blue, hash_tokens("the ocean is blue"));
@@ -726,10 +727,10 @@ mod tests {
         let blue_hits: Vec<_> = idx.query_term(&hash_tokens("blue")[0]).collect();
         assert_eq!(red_hits.len(), 1);
         assert_eq!(blue_hits.len(), 1);
-        // Keys come back as `Inline<ShortString>` since that's the
+        // Keys come back as `Inline<Handle<UTF8String>>` since that's the
         // doc schema; compare against the expected key.
-        let red_raw: Inline<ShortString> = "red".to_inline();
-        let blue_raw: Inline<ShortString> = "blue".to_inline();
+        let red_raw: Inline<Handle<UTF8String>> = "red".to_inline();
+        let blue_raw: Inline<Handle<UTF8String>> = "blue".to_inline();
         assert_eq!(red_hits[0].0, red_raw);
         assert_eq!(blue_hits[0].0, blue_raw);
     }

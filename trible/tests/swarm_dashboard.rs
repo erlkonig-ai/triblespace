@@ -33,7 +33,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("colony.pile");
+        let path = directory.path().join("swarm.pile");
         let key = directory.path().join("self.key");
         std::fs::File::create(&path).unwrap();
         let signer = triblespace_core::signing_key_file::init(&key).unwrap();
@@ -95,6 +95,7 @@ impl Fixture {
             .unwrap();
         let reports = telemetry::observe(
             &facts,
+            &snapshot,
             triblespace_core::clock::epoch_now()
                 .to_tai_duration()
                 .total_nanoseconds(),

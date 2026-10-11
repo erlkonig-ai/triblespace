@@ -87,7 +87,7 @@ to the caller."
 ```rust,ignore
 // `x` is filtered (rows where conversion fails are skipped).
 // `y` is passed through as Result (no filtering).
-find!((x: i32, y: Inline<ShortString>?),
+find!((x: i32, y: Inline<Handle<UTF8String>>?),
       and!(x.is(1.into()), y.is("foo".to_inline())))
 ```
 
@@ -345,8 +345,8 @@ Parenthesised expressions remain supported for explicit literals.
 # mod literature {
 #     use triblespace::prelude::*;
 #     attributes! {
-#         "0DBB530B37B966D137C50B943700EDB2" as firstname: inlineencodings::ShortString;
-#         "6BAA463FD4EAF45F6A103DB9433E4545" as lastname: inlineencodings::ShortString;
+#         "0DBB530B37B966D137C50B943700EDB2" as firstname: inlineencodings::Handle<blobencodings::UTF8String>;
+#         "6BAA463FD4EAF45F6A103DB9433E4545" as lastname: inlineencodings::Handle<blobencodings::UTF8String>;
 #     }
 # }
 let mut kb = TribleSet::new();
@@ -367,8 +367,8 @@ scoped to the pattern:
 # mod literature {
 #     use triblespace::prelude::*;
 #     attributes! {
-#         "0DBB530B37B966D137C50B943700EDB2" as firstname: inlineencodings::ShortString;
-#         "6BAA463FD4EAF45F6A103DB9433E4545" as lastname: inlineencodings::ShortString;
+#         "0DBB530B37B966D137C50B943700EDB2" as firstname: inlineencodings::Handle<blobencodings::UTF8String>;
+#         "6BAA463FD4EAF45F6A103DB9433E4545" as lastname: inlineencodings::Handle<blobencodings::UTF8String>;
 #     }
 # }
 let mut kb = TribleSet::new();
@@ -394,7 +394,7 @@ To share a hidden binding across multiple patterns, declare it once with
 # mod social {
 #     use triblespace::prelude::*;
 #     attributes! {
-#         "A19EC1D9DD534BA9896223A457A6B9C9" as name: inlineencodings::ShortString;
+#         "A19EC1D9DD534BA9896223A457A6B9C9" as name: inlineencodings::Handle<blobencodings::UTF8String>;
 #         "C21DE0AA5BA3446AB886C9640BA60244" as friend: inlineencodings::GenId;
 #     }
 # }
@@ -449,25 +449,28 @@ into a [`TribleSet`](triblespace::core::trible::TribleSet).
 use std::collections::HashSet;
 
 use triblespace::prelude::*;
-use triblespace::prelude::inlineencodings::ShortString;
+use triblespace::prelude::blobencodings::UTF8String;
+use triblespace::prelude::inlineencodings::Handle;
 use triblespace::core::query::hashsetconstraint::SetConstraint;
 
+type Tag = Handle<UTF8String>;
+
 struct ExternalTags<'a> {
-    tags: &'a HashSet<String>,
+    tags: &'a HashSet<Inline<Tag>>,
 }
 
-impl<'a> ContainsConstraint<'a, ShortString> for ExternalTags<'a> {
-    type Constraint = SetConstraint<ShortString, &'a HashSet<String>, String>;
+impl<'a> ContainsConstraint<'a, Tag> for ExternalTags<'a> {
+    type Constraint = SetConstraint<Tag, &'a HashSet<Inline<Tag>>, Inline<Tag>>;
 
-    fn has(self, variable: Variable<ShortString>) -> Self::Constraint {
+    fn has(self, variable: Variable<Tag>) -> Self::Constraint {
         SetConstraint::new(variable, self.tags)
     }
 }
 
-let tags: HashSet<String> = ["rust", "datalog"].into_iter().map(String::from).collect();
+let tags: HashSet<Inline<Tag>> = ["rust", "datalog"].into_iter().map(|tag| tag.to_inline()).collect();
 let external = ExternalTags { tags: &tags };
 let matches: Vec<_> =
-    find!((tag: Inline<ShortString>), external.has(tag)).collect();
+    find!((tag: Inline<Tag>), external.has(tag)).collect();
 ```
 
 The example wraps an external `HashSet` so it can be queried directly.  A

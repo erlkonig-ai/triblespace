@@ -13,13 +13,14 @@
 //! for the reasoning and the costs, and [`CurrencyUnit`] for how to declare a
 //! currency of your own.
 
+use crate::blob::encodings::utf8string::UTF8String;
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
+use crate::inline::encodings::hash::Handle;
 use crate::inline::encodings::iu256::U256BE;
 use crate::inline::encodings::rord256::OrderedRatioError;
 use crate::inline::encodings::rord256::ROrd256;
-use crate::inline::encodings::shortstring::ShortString;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::inline::TryFromInline;
@@ -55,7 +56,7 @@ attributes! {
     /// same encoding id and therefore the same attribute ids, with no
     /// coordination: two codebases that both declare EUR interoperate without
     /// having agreed on anything.
-    "CE4138C8D49DE483673E21822D63E6C4" as pub code: ShortString;
+    "CE4138C8D49DE483673E21822D63E6C4" as pub code: Handle<UTF8String>;
     /// The exponent of a currency's customary minor unit — 2 for EUR, 0 for
     /// JPY, 8 for BTC.
     ///
@@ -99,9 +100,8 @@ pub trait CurrencyUnit: 'static {
     /// three uppercase letters; nothing enforces that, because the enforcing
     /// table would be a copy of a registry that changes without asking this
     /// crate — and because a ticker the registry has never heard of should
-    /// cost four lines rather than a release of this crate. It must fit in a
-    /// [`ShortString`] (32 bytes, no interior NUL), which every code in use
-    /// does by a wide margin.
+    /// cost four lines rather than a release of this crate. It is stored as
+    /// `UTF8String` text, so there is no length ceiling.
     const CODE: &'static str;
 
     /// The exponent of the currency's customary minor unit: 2 for EUR (cents),

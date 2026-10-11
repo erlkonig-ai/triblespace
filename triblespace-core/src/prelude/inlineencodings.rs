@@ -48,7 +48,8 @@ pub use crate::inline::encodings::r256::R256BE;
 pub use crate::inline::encodings::r256::R256LE;
 /// Re-export of [`RangeInclusiveU128`] and [`RangeU128`].
 pub use crate::inline::encodings::range::{RangeInclusiveU128, RangeU128};
-/// Re-export of [`ShortString`].
+/// Re-export of [`ShortString`] (deprecated; use `Handle<UTF8String>`).
+#[allow(deprecated)]
 pub use crate::inline::encodings::shortstring::ShortString;
 /// Re-export of [`NsDuration`].
 pub use crate::inline::encodings::time::NsDuration;

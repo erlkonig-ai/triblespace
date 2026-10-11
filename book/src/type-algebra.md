@@ -11,7 +11,7 @@ The macros used to define attributes, entities, and queries map directly onto fa
 Each attribute introduced with `attributes!` defines an **atomic type** — a unary relation between an entity identifier and the attribute’s value:
 
 ```text
-"A74AA..." as pub title : ShortString
+"A74AA..." as pub title : Handle<UTF8String>
 ```
 
 Formally this is a function `title : Id → ValueTitle`, or, in relational terms, the set `{ (id, value) }`.

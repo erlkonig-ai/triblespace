@@ -17,15 +17,16 @@
 //! for general-purpose schema-erased iteration over an entity.
 
 use std::collections::HashSet;
-use triblespace::prelude::inlineencodings::ShortString;
+use triblespace::prelude::blobencodings::UTF8String;
+use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
 
 mod ns {
     use triblespace::prelude::*;
     attributes! {
-        "1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A" unsafe as name: inlineencodings::ShortString;
+        "1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A" as name: inlineencodings::Handle<blobencodings::UTF8String>;
         "2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B2B" unsafe as friend: inlineencodings::GenId;
-        "3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C" unsafe as nickname: inlineencodings::ShortString;
+        "3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C3C" as nickname: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }
 
@@ -119,7 +120,8 @@ fn free_attribute_value_is_byte_addressable() {
     let alice = fucid();
     set += entity! { &alice @ ns::name: "alice" };
 
-    let expected: Inline<ShortString> = ShortString::inline_from("alice".to_string());
+    let expected: Inline<Handle<UTF8String>> =
+        Handle::<UTF8String>::inline_from("alice".to_string());
     let mut found: Option<Inline<UnknownInline>> = None;
     for (_attr, val) in find!(
         (attr: Id, val: Inline<UnknownInline>),

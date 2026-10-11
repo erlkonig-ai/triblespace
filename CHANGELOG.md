@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Deprecate the inline `ShortString` encoding and move every text attribute in
+  the workspace to `Handle<UTF8String>`: `rdf_lang`, `money::code` (so every
+  `Currency<C>` encoding id changes), the macro instrumentation attributes,
+  network telemetry labels, the tracing sink's `category` and `field_name`,
+  the BM25 tokenizer and semantic compute descriptor arguments, the
+  `examples::literature` names and the bench ledger. Anchored declarations
+  keep their hex and derive new ids; literal-pinned ones drop `unsafe` so the
+  hex becomes an anchor. Old rows stay in piles under the old ids. Removes the
+  32-byte workarounds (dropped long `rdf_lang` literals, the telemetry
+  `"span"` category fallback and dropped long field names, the bench ledger's
+  `clip32`, and the worker-label length guards). Deletes the producerless
+  `metadata::json_kind` and `repo::short_message`. `pattern!` can match a
+  `Handle<UTF8String>` attribute against a plain string (the text's content
+  handle), and `entity!` accepts borrowed `&str`/`&String` for blob text.
+  `telemetry::observe` takes a blob reader for its labels.
+
 - Expose the CLI's collection maintenance as a caller-owned library driver with
   native work events and cancellation, and add explicit network host shutdown
   and join for applications that own their runtime and storage lifetimes.

@@ -6,6 +6,14 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+- `bm25_tokenizer` and `semantic_compute` store their names as
+  `Handle<UTF8String>` (ids derived anew from the same anchors), so BM25 and
+  semantic descriptors get new identities and derived indexes need a rebuild.
+  A loaded descriptor carries no blobs, so binding recognises the closed name
+  sets by content handle (`Bm25Tokenizer::from_name_handle`,
+  `semantic_attributes::compute_class`); a compute class outside
+  `COMPUTE_CLASSES` no longer binds.
+
 - `semantic_wemm::WemmIndex` maps content windows: mapping
   `WEMM_CONTENT_WINDOWS_TO_NVFP4` (`3D288D450426ABD3FFF0D2C05887C09D`, minted
   with `trible genid` 2026-10-06) replaces `C2218047C697B76F657619C33B0B560D`,

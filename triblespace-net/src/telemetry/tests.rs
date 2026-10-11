@@ -55,6 +55,7 @@ fn metric(report: &WorkerReport, wanted: Metric) -> &MetricValue {
 fn reports(facts: &Fragment, now_seconds: i128, max_age_seconds: u64) -> Vec<WorkerReport> {
     observe(
         facts.facts(),
+        &triblespace_core::repo::SnapshotSource::snapshot(&mut facts.blobs().clone()).unwrap(),
         now_seconds * NS as i128,
         Duration::from_secs(max_age_seconds),
     )
@@ -609,7 +610,12 @@ fn telemetry_collection_roundtrip_is_an_ordinary_read_without_appends() {
     let snapshot = pile.snapshot().unwrap();
     let admitted: TribleSet = collection.read(&snapshot).unwrap();
     assert_eq!(
-        observe(&admitted, 101 * NS as i128, Duration::from_secs(30)),
+        observe(
+            &admitted,
+            &snapshot,
+            101 * NS as i128,
+            Duration::from_secs(30)
+        ),
         expected,
     );
     drop(snapshot);
@@ -669,6 +675,8 @@ fn generated_history_keeps_latest_reports_fixed_while_counting_header_work() {
                    expected_entities: usize,
                    expected_witnesses: usize| {
         let facts = input.facts();
+        let blobs =
+            triblespace_core::repo::SnapshotSource::snapshot(&mut input.blobs().clone()).unwrap();
 
         // Count the actual typed header witnesses, not tags or report IDs.
         // This separate query and its entity set are outside the timed region;
@@ -697,6 +705,7 @@ fn generated_history_keeps_latest_reports_fixed_while_counting_header_work() {
             let started = Instant::now();
             let observed = observe(
                 black_box(facts),
+                &blobs,
                 NOW_SECONDS * NS as i128,
                 Duration::from_secs(MAX_AGE_SECONDS),
             );

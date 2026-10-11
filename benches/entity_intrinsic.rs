@@ -3,90 +3,92 @@ use std::hint::black_box;
 use triblespace::core::metadata;
 use triblespace::prelude::*;
 
+// Fixed-size inline values, so the bench measures intrinsic-id construction
+// rather than blob hashing.
 mod bench_attr {
-    use triblespace::prelude::inlineencodings::ShortString;
+    use triblespace::prelude::inlineencodings::U256BE;
     use triblespace::prelude::*;
 
     attributes! {
-        pub field_01: ShortString;
-        pub field_02: ShortString;
-        pub field_03: ShortString;
-        pub field_04: ShortString;
-        pub field_05: ShortString;
-        pub field_06: ShortString;
-        pub field_07: ShortString;
-        pub field_08: ShortString;
-        pub field_09: ShortString;
-        pub field_10: ShortString;
-        pub field_11: ShortString;
-        pub field_12: ShortString;
-        pub field_13: ShortString;
-        pub field_14: ShortString;
-        pub field_15: ShortString;
-        pub field_16: ShortString;
-        pub repeated: ShortString;
+        pub field_01: U256BE;
+        pub field_02: U256BE;
+        pub field_03: U256BE;
+        pub field_04: U256BE;
+        pub field_05: U256BE;
+        pub field_06: U256BE;
+        pub field_07: U256BE;
+        pub field_08: U256BE;
+        pub field_09: U256BE;
+        pub field_10: U256BE;
+        pub field_11: U256BE;
+        pub field_12: U256BE;
+        pub field_13: U256BE;
+        pub field_14: U256BE;
+        pub field_15: U256BE;
+        pub field_16: U256BE;
+        pub repeated: U256BE;
     }
 }
 
 fn required_entity(arity: usize) -> Fragment {
     match arity {
-        1 => entity! { bench_attr::field_01: "01" },
+        1 => entity! { bench_attr::field_01: 1u64 },
         3 => entity! {
-            bench_attr::field_01: "01",
-            bench_attr::field_02: "02",
-            bench_attr::field_03: "03",
+            bench_attr::field_01: 1u64,
+            bench_attr::field_02: 2u64,
+            bench_attr::field_03: 3u64,
         },
         5 => entity! {
-            bench_attr::field_01: "01",
-            bench_attr::field_02: "02",
-            bench_attr::field_03: "03",
-            bench_attr::field_04: "04",
-            bench_attr::field_05: "05",
+            bench_attr::field_01: 1u64,
+            bench_attr::field_02: 2u64,
+            bench_attr::field_03: 3u64,
+            bench_attr::field_04: 4u64,
+            bench_attr::field_05: 5u64,
         },
         8 => entity! {
-            bench_attr::field_01: "01",
-            bench_attr::field_02: "02",
-            bench_attr::field_03: "03",
-            bench_attr::field_04: "04",
-            bench_attr::field_05: "05",
-            bench_attr::field_06: "06",
-            bench_attr::field_07: "07",
-            bench_attr::field_08: "08",
+            bench_attr::field_01: 1u64,
+            bench_attr::field_02: 2u64,
+            bench_attr::field_03: 3u64,
+            bench_attr::field_04: 4u64,
+            bench_attr::field_05: 5u64,
+            bench_attr::field_06: 6u64,
+            bench_attr::field_07: 7u64,
+            bench_attr::field_08: 8u64,
         },
         16 => entity! {
-            bench_attr::field_01: "01",
-            bench_attr::field_02: "02",
-            bench_attr::field_03: "03",
-            bench_attr::field_04: "04",
-            bench_attr::field_05: "05",
-            bench_attr::field_06: "06",
-            bench_attr::field_07: "07",
-            bench_attr::field_08: "08",
-            bench_attr::field_09: "09",
-            bench_attr::field_10: "10",
-            bench_attr::field_11: "11",
-            bench_attr::field_12: "12",
-            bench_attr::field_13: "13",
-            bench_attr::field_14: "14",
-            bench_attr::field_15: "15",
-            bench_attr::field_16: "16",
+            bench_attr::field_01: 1u64,
+            bench_attr::field_02: 2u64,
+            bench_attr::field_03: 3u64,
+            bench_attr::field_04: 4u64,
+            bench_attr::field_05: 5u64,
+            bench_attr::field_06: 6u64,
+            bench_attr::field_07: 7u64,
+            bench_attr::field_08: 8u64,
+            bench_attr::field_09: 9u64,
+            bench_attr::field_10: 10u64,
+            bench_attr::field_11: 11u64,
+            bench_attr::field_12: 12u64,
+            bench_attr::field_13: 13u64,
+            bench_attr::field_14: 14u64,
+            bench_attr::field_15: 15u64,
+            bench_attr::field_16: 16u64,
         },
         _ => unreachable!("unsupported required arity"),
     }
 }
 
-fn repeated_values(arity: usize, half_duplicates: bool) -> Vec<String> {
+fn repeated_values(arity: usize, half_duplicates: bool) -> Vec<u64> {
     (0..arity)
         .map(|i| {
             let value = if half_duplicates { i / 2 } else { i };
-            format!("v{value:03}")
+            value as u64
         })
         .collect()
 }
 
-fn repeated_entity(values: &[String]) -> Fragment {
+fn repeated_entity(values: &[u64]) -> Fragment {
     entity! {
-        bench_attr::repeated*: values.iter().map(String::as_str),
+        bench_attr::repeated*: values.iter().copied(),
     }
 }
 
@@ -116,31 +118,31 @@ fn bench_construction(c: &mut Criterion) {
     repeated.finish();
 }
 
-fn aggregate_inputs(entity_count: usize) -> Vec<[String; 3]> {
-    (0..entity_count)
-        .map(|i| [format!("a{i:06}"), format!("b{i:06}"), format!("c{i:06}")])
+fn aggregate_inputs(entity_count: usize) -> Vec<[u64; 3]> {
+    (0..entity_count as u64)
+        .map(|i| [3 * i, 3 * i + 1, 3 * i + 2])
         .collect()
 }
 
-fn aggregate_fragment(inputs: &[[String; 3]]) -> Fragment {
+fn aggregate_fragment(inputs: &[[u64; 3]]) -> Fragment {
     let mut aggregate = Fragment::empty();
     for values in inputs {
         aggregate += entity! {
-            bench_attr::field_01: values[0].as_str(),
-            bench_attr::field_02: values[1].as_str(),
-            bench_attr::field_03: values[2].as_str(),
+            bench_attr::field_01: values[0],
+            bench_attr::field_02: values[1],
+            bench_attr::field_03: values[2],
         };
     }
     aggregate
 }
 
-fn aggregate_set(inputs: &[[String; 3]]) -> TribleSet {
+fn aggregate_set(inputs: &[[u64; 3]]) -> TribleSet {
     let mut aggregate = TribleSet::new();
     for values in inputs {
         aggregate += entity! {
-            bench_attr::field_01: values[0].as_str(),
-            bench_attr::field_02: values[1].as_str(),
-            bench_attr::field_03: values[2].as_str(),
+            bench_attr::field_01: values[0],
+            bench_attr::field_02: values[1],
+            bench_attr::field_03: values[2],
         };
     }
     aggregate

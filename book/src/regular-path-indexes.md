@@ -36,10 +36,10 @@ use triblespace_paths::{PathExpr, PathIndex, Step};
 
 mod social {
     use triblespace::prelude::*;
-    use triblespace::prelude::inlineencodings::{GenId, ShortString};
+    use triblespace::prelude::inlineencodings::{GenId, Handle};
 
     attributes! {
-        "A19EC1D9DD534BA9896223A457A6B9C9" as pub name: ShortString;
+        "A19EC1D9DD534BA9896223A457A6B9C9" as pub name: Handle<blobencodings::UTF8String>;
         "C21DE0AA5BA3446AB886C9640BA60244" as pub friend: GenId;
     }
 }

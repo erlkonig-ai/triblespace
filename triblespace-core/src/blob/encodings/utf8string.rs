@@ -15,8 +15,8 @@ use anybytes::View;
 
 /// Arbitrary-length UTF-8 text stored as a blob.
 ///
-/// Use for text that does not fit in the 32-byte [`ShortString`](crate::inline::encodings::shortstring::ShortString)
-/// value boundary — documents, prompts, JSON payloads, logs, etc.
+/// The text encoding for attributes of every length — names, labels, tags,
+/// documents, prompts, JSON payloads, logs, etc.
 /// Reference it from tribles via a [`Handle<UTF8String>`](crate::inline::encodings::hash::Handle).
 pub struct UTF8String {}
 
@@ -52,13 +52,25 @@ where
     }
 }
 
-impl Encodes<&'static str> for UTF8String
+/// Borrowed text of any lifetime. The bytes are copied into the blob, which
+/// costs one pass over text that is hashed in full anyway.
+impl<'a> Encodes<&'a str> for UTF8String
 where
     crate::inline::encodings::hash::Handle<UTF8String>: crate::inline::InlineEncoding,
 {
     type Output = Blob<UTF8String>;
-    fn encode(source: &'static str) -> Blob<UTF8String> {
-        Blob::new(source.into())
+    fn encode(source: &'a str) -> Blob<UTF8String> {
+        Blob::new(source.to_owned().into())
+    }
+}
+
+impl<'a> Encodes<&'a String> for UTF8String
+where
+    crate::inline::encodings::hash::Handle<UTF8String>: crate::inline::InlineEncoding,
+{
+    type Output = Blob<UTF8String>;
+    fn encode(source: &'a String) -> Blob<UTF8String> {
+        Blob::new(source.clone().into())
     }
 }
 
@@ -69,6 +81,32 @@ where
     type Output = Blob<UTF8String>;
     fn encode(source: String) -> Blob<UTF8String> {
         Blob::new(source.into())
+    }
+}
+
+/// Text as the HANDLE of its blob, without keeping the blob. This is what lets
+/// a query constrain a `Handle<UTF8String>` attribute with a plain string:
+/// `pattern!(&set, [{ ?e @ attr: "text" }])` compares content addresses, the
+/// same 32 bytes `entity!` writes for that text. A content address, not a
+/// derived id: equal text is equal handle by construction.
+impl<'a> Encodes<&'a str> for crate::inline::encodings::hash::Handle<UTF8String> {
+    type Output = crate::inline::Inline<crate::inline::encodings::hash::Handle<UTF8String>>;
+    fn encode(source: &'a str) -> Self::Output {
+        <UTF8String as Encodes<&'a str>>::encode(source).get_handle()
+    }
+}
+
+impl Encodes<String> for crate::inline::encodings::hash::Handle<UTF8String> {
+    type Output = crate::inline::Inline<crate::inline::encodings::hash::Handle<UTF8String>>;
+    fn encode(source: String) -> Self::Output {
+        <UTF8String as Encodes<String>>::encode(source).get_handle()
+    }
+}
+
+impl<'a> Encodes<&'a String> for crate::inline::encodings::hash::Handle<UTF8String> {
+    type Output = crate::inline::Inline<crate::inline::encodings::hash::Handle<UTF8String>>;
+    fn encode(source: &'a String) -> Self::Output {
+        <UTF8String as Encodes<&'a String>>::encode(source).get_handle()
     }
 }
 

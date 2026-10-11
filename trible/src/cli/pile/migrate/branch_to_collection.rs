@@ -22,8 +22,8 @@ use triblespace_core::collection::{
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::inline::encodings::shortstring::ShortString;
-use triblespace_core::inline::{Inline, InlineEncoding, TryFromInline};
+use triblespace_core::inline::encodings::UnknownInline;
+use triblespace_core::inline::{Inline, InlineEncoding};
 use triblespace_core::metadata;
 use triblespace_core::repo::pile::{Pile, PileSnapshot};
 use triblespace_core::repo::{self, BlobStoreGet, CommitHandle, PinSnapshotSource, SnapshotSource};
@@ -201,7 +201,9 @@ fn resolve_branch(
 ///
 /// This is intentionally local to the one-way migration. Keeping the decoder
 /// here avoids preserving a public legacy branch-construction API merely to
-/// resolve old names.
+/// resolve old names. The value is decoded from its raw 32 bytes (UTF-8,
+/// NUL-terminated, zero-padded: the retired `ShortString` layout), so the
+/// migration does not depend on that encoding type.
 fn legacy_branch_name(facts: &TribleSet, branch: Id) -> Result<Option<String>> {
     let Ok(subject) = repo::branch::branch_entity(facts, branch) else {
         return Ok(None);
@@ -211,9 +213,13 @@ fn legacy_branch_name(facts: &TribleSet, branch: Id) -> Result<Option<String>> {
         .iter()
         .filter(|fact| fact.e() == &subject && fact.a() == &attribute)
         .map(|fact| {
-            let value = ShortString::validate(*fact.v::<ShortString>())
-                .map_err(|error| anyhow!("invalid legacy branch name: {error:?}"))?;
-            String::try_from_inline(&value)
+            let raw = &fact.v::<UnknownInline>().raw;
+            let len = raw.iter().position(|&byte| byte == 0).unwrap_or(raw.len());
+            if raw[len..].iter().any(|&byte| byte != 0) {
+                bail!("invalid legacy branch name: bytes after its terminator");
+            }
+            std::str::from_utf8(&raw[..len])
+                .map(str::to_owned)
                 .map_err(|error| anyhow!("invalid UTF-8 in legacy branch name: {error}"))
         });
     let Some(name) = names.next().transpose()? else {
@@ -682,11 +688,13 @@ mod tests {
     #[test]
     fn hex_shaped_legacy_name_falls_back_from_absent_id() -> Result<()> {
         mod legacy {
+            use triblespace_core::inline::encodings::UnknownInline;
             use triblespace_core::macros::attributes;
-            use triblespace_core::prelude::inlineencodings;
 
+            // The legacy row's id, pinned; its value is written raw in the
+            // retired 32-byte NUL-terminated layout.
             attributes! {
-                "2E26F8BA886495A8DF04ACF0ED3ACBD4" unsafe as name: inlineencodings::ShortString;
+                "2E26F8BA886495A8DF04ACF0ED3ACBD4" unsafe as name: UnknownInline;
             }
         }
 
@@ -694,9 +702,11 @@ mod tests {
         let mut pile = Pile::open(file.path())?;
         let branch = Id::new([0xE9; 16]).unwrap();
         let hex_name = "ABABABABABABABABABABABABABABABAB";
+        let mut legacy_bytes = [0u8; 32];
+        legacy_bytes[..hex_name.len()].copy_from_slice(hex_name.as_bytes());
         let legacy_meta = triblespace_core::macros::entity! {
             repo::branch: branch,
-            legacy::name: hex_name,
+            legacy::name: Inline::<UnknownInline>::new(legacy_bytes),
         }
         .into_facts();
         let legacy_meta = pile.put::<SimpleArchive, _>(legacy_meta)?;

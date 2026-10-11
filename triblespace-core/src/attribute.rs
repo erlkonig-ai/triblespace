@@ -372,7 +372,7 @@ mod tests {
     use crate::blob::IntoBlob;
     use crate::id::Id;
     use crate::inline::encodings::hash::Handle;
-    use crate::inline::encodings::shortstring::ShortString;
+    use crate::inline::encodings::iu256::U256BE;
     use crate::inline::Inline;
     use crate::macros::{entity, find, pattern};
     use crate::metadata::{self, Describe, MetaDescribe};
@@ -382,11 +382,11 @@ mod tests {
     // would compile and never be taken.
     crate::macros::attributes! {
         /// Anchored: same literal as `pinned_probe`, derived id.
-        "5F3C1A0E7B294D6685A0C1F2E3D40912" as anchored_probe: ShortString;
+        "5F3C1A0E7B294D6685A0C1F2E3D40912" as anchored_probe: U256BE;
         /// Same anchor, different schema — must be a different attribute.
         "5F3C1A0E7B294D6685A0C1F2E3D40912" as anchored_probe_other: Handle<UTF8String>;
         /// Pinned: the id is the literal verbatim.
-        "5F3C1A0E7B294D6685A0C1F2E3D40912" unsafe as pinned_probe: ShortString;
+        "5F3C1A0E7B294D6685A0C1F2E3D40912" unsafe as pinned_probe: U256BE;
     }
 
     /// The anchored form derives; it does not pin.
@@ -417,10 +417,7 @@ mod tests {
     #[test]
     fn anchored_arm_matches_the_constructor() {
         let a = Id::from_hex("5F3C1A0E7B294D6685A0C1F2E3D40912").unwrap();
-        assert_eq!(
-            anchored_probe.raw(),
-            Attribute::<ShortString>::anchored(a).raw()
-        );
+        assert_eq!(anchored_probe.raw(), Attribute::<U256BE>::anchored(a).raw());
     }
 
     /// This change must not move any existing attribute id.
@@ -447,8 +444,8 @@ mod tests {
     fn anchored_is_deterministic() {
         let a = Id::from_hex("2ADC6462A7F70E230558C5D681E38768").unwrap();
         assert_eq!(
-            Attribute::<ShortString>::anchored(a).raw(),
-            Attribute::<ShortString>::anchored(a).raw()
+            Attribute::<U256BE>::anchored(a).raw(),
+            Attribute::<U256BE>::anchored(a).raw()
         );
     }
 
@@ -458,10 +455,10 @@ mod tests {
     #[test]
     fn anchored_changes_with_schema() {
         let a = Id::from_hex("2ADC6462A7F70E230558C5D681E38768").unwrap();
-        let short = Attribute::<ShortString>::anchored(a);
+        let number = Attribute::<U256BE>::anchored(a);
         let handle =
             Attribute::<Handle<crate::blob::encodings::utf8string::UTF8String>>::anchored(a);
-        assert_ne!(short.raw(), handle.raw());
+        assert_ne!(number.raw(), handle.raw());
     }
 
     /// Different anchors stay different under one schema — so `weight` and
@@ -472,8 +469,8 @@ mod tests {
         let a = Id::from_hex("2ADC6462A7F70E230558C5D681E38768").unwrap();
         let b = Id::from_hex("23178058559C762BB4B1FEAA36B3566D").unwrap();
         assert_ne!(
-            Attribute::<ShortString>::anchored(a).raw(),
-            Attribute::<ShortString>::anchored(b).raw()
+            Attribute::<U256BE>::anchored(a).raw(),
+            Attribute::<U256BE>::anchored(b).raw()
         );
     }
 
@@ -481,17 +478,17 @@ mod tests {
     ///
     /// `From` validates only that the fragment is rooted, so a caller may hand
     /// it facts that contradict the phantom type. Here the Rust type says
-    /// `ShortString` while the stored encoding says otherwise, and it is
+    /// `U256BE` while the stored encoding says otherwise, and it is
     /// accepted. `anchored` cannot express that, because it emits the fact from
     /// `S` itself.
     #[test]
     fn from_fragment_permits_a_lying_schema() {
-        let lying = Attribute::<ShortString>::from_fragment_unchecked(entity! {
+        let lying = Attribute::<U256BE>::from_fragment_unchecked(entity! {
             metadata::value_encoding:
                 <Handle<crate::blob::encodings::utf8string::UTF8String> as MetaDescribe>::id(),
         });
-        let honest = Attribute::<ShortString>::from_fragment_unchecked(entity! {
-            metadata::value_encoding: <ShortString as MetaDescribe>::id(),
+        let honest = Attribute::<U256BE>::from_fragment_unchecked(entity! {
+            metadata::value_encoding: <U256BE as MetaDescribe>::id(),
         });
         // Same phantom type, different identity: one of them is lying about
         // what it stores, and nothing at construction noticed.
@@ -504,9 +501,9 @@ mod tests {
     #[test]
     fn pinned_form_ignores_the_schema() {
         let a = Id::from_hex("2ADC6462A7F70E230558C5D681E38768").unwrap();
-        let short = Attribute::<ShortString>::from_fragment_unchecked(entity! {
+        let number = Attribute::<U256BE>::from_fragment_unchecked(entity! {
             crate::id::ExclusiveId::force_ref(&a) @
-                metadata::value_encoding: <ShortString as MetaDescribe>::id(),
+                metadata::value_encoding: <U256BE as MetaDescribe>::id(),
         });
         let handle = Attribute::<Handle<crate::blob::encodings::utf8string::UTF8String>>::from_fragment_unchecked(
             entity! {
@@ -516,11 +513,11 @@ mod tests {
             },
         );
         // Both are just the anchor. A re-typed attribute keeps its id.
-        assert_eq!(short.raw(), handle.raw());
-        assert_eq!(short.id(), a);
+        assert_eq!(number.raw(), handle.raw());
+        assert_eq!(number.id(), a);
         // Whereas anchored separates them.
         assert_ne!(
-            Attribute::<ShortString>::anchored(a).raw(),
+            Attribute::<U256BE>::anchored(a).raw(),
             Attribute::<Handle<crate::blob::encodings::utf8string::UTF8String>>::anchored(a).raw()
         );
     }
@@ -529,13 +526,13 @@ mod tests {
     fn dynamic_field_is_deterministic() {
         let h1 = "title".to_blob().get_handle();
         let h2 = "title".to_blob().get_handle();
-        let a1 = Attribute::<ShortString>::from_fragment_unchecked(entity! {
+        let a1 = Attribute::<U256BE>::from_fragment_unchecked(entity! {
             metadata::name:         h1,
-            metadata::value_encoding: <ShortString as MetaDescribe>::id(),
+            metadata::value_encoding: <U256BE as MetaDescribe>::id(),
         });
-        let a2 = Attribute::<ShortString>::from_fragment_unchecked(entity! {
+        let a2 = Attribute::<U256BE>::from_fragment_unchecked(entity! {
             metadata::name:         h2,
-            metadata::value_encoding: <ShortString as MetaDescribe>::id(),
+            metadata::value_encoding: <U256BE as MetaDescribe>::id(),
         });
 
         assert_eq!(a1.raw(), a2.raw());
@@ -546,13 +543,13 @@ mod tests {
     fn dynamic_field_changes_with_name() {
         let h_title = "title".to_blob().get_handle();
         let h_author = "author".to_blob().get_handle();
-        let title = Attribute::<ShortString>::from_fragment_unchecked(entity! {
+        let title = Attribute::<U256BE>::from_fragment_unchecked(entity! {
             metadata::name:         h_title,
-            metadata::value_encoding: <ShortString as MetaDescribe>::id(),
+            metadata::value_encoding: <U256BE as MetaDescribe>::id(),
         });
-        let author = Attribute::<ShortString>::from_fragment_unchecked(entity! {
+        let author = Attribute::<U256BE>::from_fragment_unchecked(entity! {
             metadata::name:         h_author,
-            metadata::value_encoding: <ShortString as MetaDescribe>::id(),
+            metadata::value_encoding: <U256BE as MetaDescribe>::id(),
         });
 
         assert_ne!(title.raw(), author.raw());
@@ -561,25 +558,25 @@ mod tests {
     #[test]
     fn dynamic_field_changes_with_schema() {
         let h = "title".to_blob().get_handle();
-        let short = Attribute::<ShortString>::from_fragment_unchecked(entity! {
+        let number = Attribute::<U256BE>::from_fragment_unchecked(entity! {
             metadata::name:         h,
-            metadata::value_encoding: <ShortString as MetaDescribe>::id(),
+            metadata::value_encoding: <U256BE as MetaDescribe>::id(),
         });
         let handle = Attribute::<Handle<UTF8String>>::from_fragment_unchecked(entity! {
             metadata::name:         h,
             metadata::value_encoding: <Handle<UTF8String> as MetaDescribe>::id(),
         });
 
-        assert_ne!(short.raw(), handle.raw());
+        assert_ne!(number.raw(), handle.raw());
     }
 
     #[test]
     fn describe_preserves_identity_iri() {
         let iri = "http://example.org/foo".to_string();
         let iri_handle: Inline<Handle<UTF8String>> = iri.to_blob().get_handle();
-        let attr = Attribute::<ShortString>::from_fragment_unchecked(entity! {
+        let attr = Attribute::<U256BE>::from_fragment_unchecked(entity! {
             metadata::iri:          iri_handle,
-            metadata::value_encoding: <ShortString as crate::metadata::MetaDescribe>::id(),
+            metadata::value_encoding: <U256BE as crate::metadata::MetaDescribe>::id(),
         });
         let attr_id = attr.id();
 

@@ -82,7 +82,10 @@ fn main() {
         name: Inline<_>,
         pattern!(&view, [{ _?person @ literature::firstname: ?name }])
     )
-    .map(|name| name.try_from_inline::<String>().expect("short string"))
+    .map(|name| {
+        let text: View<str> = snapshot.get(name).expect("resident name blob");
+        text.as_ref().to_owned()
+    })
     .collect();
     names.sort();
 

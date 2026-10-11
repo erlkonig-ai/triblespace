@@ -20,7 +20,7 @@ pub(crate) struct Options {
     /// Uses the node key; does not create a descriptor or activate replication.
     #[arg(long, value_name = "HANDLE")]
     telemetry_collection: Option<String>,
-    /// Distinguish simultaneous workers on the same endpoint (at most 32 UTF-8 bytes).
+    /// Distinguish simultaneous workers on the same endpoint.
     #[arg(long, value_name = "NAME", default_value = "sync")]
     telemetry_worker: String,
 }
@@ -218,7 +218,7 @@ mod tests {
         let now = triblespace_core::clock::epoch_now()
             .to_tai_duration()
             .total_nanoseconds();
-        let reports = t::observe(&facts, now, Duration::from_secs(180));
+        let reports = t::observe(&facts, &snapshot, now, Duration::from_secs(180));
         assert_eq!(reports.len(), 5);
         assert!(reports
             .iter()
@@ -311,6 +311,7 @@ mod tests {
             .unwrap();
         let before = t::observe(
             first.facts(),
+            &triblespace_core::repo::SnapshotSource::snapshot(&mut first.blobs().clone()).unwrap(),
             now.to_tai_duration().total_nanoseconds(),
             Duration::from_secs(180),
         );
@@ -366,6 +367,7 @@ mod tests {
         joined += second;
         let reports = t::observe(
             joined.facts(),
+            &triblespace_core::repo::SnapshotSource::snapshot(&mut joined.blobs().clone()).unwrap(),
             later.to_tai_duration().total_nanoseconds(),
             Duration::from_secs(180),
         );
@@ -421,6 +423,7 @@ mod tests {
             .unwrap();
         let reports = t::observe(
             failed.facts(),
+            &triblespace_core::repo::SnapshotSource::snapshot(&mut failed.blobs().clone()).unwrap(),
             later.to_tai_duration().total_nanoseconds(),
             Duration::from_secs(180),
         );
@@ -464,6 +467,7 @@ mod tests {
         joined += fresh_session;
         assert!(t::observe(
             joined.facts(),
+            &triblespace_core::repo::SnapshotSource::snapshot(&mut joined.blobs().clone()).unwrap(),
             restarted.to_tai_duration().total_nanoseconds(),
             Duration::from_secs(180)
         )
@@ -500,11 +504,7 @@ impl Publisher {
         let node = signer.verifying_key();
         let handle = super::parse_collection(&handle)
             .map_err(|_| anyhow!("telemetry destination is not a collection handle"))?;
-        let worker: Inline<inlineencodings::ShortString> = options
-            .telemetry_worker
-            .as_str()
-            .try_to_inline()
-            .map_err(|_| anyhow!("telemetry worker label is too long"))?;
+        let worker = options.telemetry_worker.as_str();
         if options.telemetry_worker.is_empty()
             || options.telemetry_worker.chars().any(char::is_control)
         {

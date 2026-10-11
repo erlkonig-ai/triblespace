@@ -1,24 +1,28 @@
 use triblespace::core::id::{Id, ID_LEN};
 use triblespace::core::inline::RawInline;
-use triblespace::prelude::inlineencodings::ShortString;
+use triblespace::prelude::blobencodings::UTF8String;
+use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
 
 use std::collections::BTreeSet;
 
 mod fields {
-    use triblespace::prelude::inlineencodings::ShortString;
+    use triblespace::prelude::blobencodings::UTF8String;
+    use triblespace::prelude::inlineencodings::Handle;
     use triblespace::prelude::*;
 
     // Golden-vector fixture IDs minted with `trible genid` on 2026-08-07.
     attributes! {
-        "2751005841B8C6B799E24D12B58B950B" unsafe as pub alpha: ShortString;
-        "0177C46AF9CA63B1AB039F73E3A65D2D" unsafe as pub beta: ShortString;
+        "2751005841B8C6B799E24D12B58B950B" as pub alpha: Handle<UTF8String>;
+        "0177C46AF9CA63B1AB039F73E3A65D2D" as pub beta: Handle<UTF8String>;
     }
 }
 
 fn encoded(value: &str) -> RawInline {
+    // The value in the row is the text's content handle; the blob rides
+    // beside it in the fragment and is not part of the row.
     let (inline, blob) = fields::alpha.encoded_from(value).into_parts();
-    assert!(blob.is_none());
+    assert!(blob.is_some());
     inline.raw
 }
 
@@ -75,7 +79,11 @@ fn intrinsic_root_hashes_canonical_nil_attribute_value_rows() {
     assert_eq!(fragment.root(), Some(canonical_row_id(pairs.clone())));
     assert_eq!(
         fragment.root(),
-        Id::from_hex("30BC3B11909CDDB8204F995D38D9DB14"),
+        // Re-pinned 2026-10-11 when the fixture moved from ShortString to
+        // Handle<UTF8String> values (anchored attribute ids, content-handle
+        // values). The algorithm is unchanged: `canonical_row_id` above
+        // recomputes it independently from the rows.
+        Id::from_hex("4949BAEB0ED412D0E65A341B222193F5"),
         "Identity Epoch 2 golden vector changed"
     );
     assert_ne!(fragment.root(), Some(legacy_pair_id(pairs)));
@@ -146,8 +154,8 @@ fn intrinsic_root_is_reproducible_plain_id_not_an_owned_write_capability() {
 }
 
 #[test]
-fn short_string_encoding_used_by_the_oracle_is_exact() {
-    let expected: Inline<ShortString> = ShortString::inline_from("alpha");
+fn text_encoding_used_by_the_oracle_is_the_content_handle() {
+    let expected: Inline<Handle<UTF8String>> = Handle::<UTF8String>::inline_from("alpha");
     assert_eq!(encoded("alpha"), expected.raw);
 }
 

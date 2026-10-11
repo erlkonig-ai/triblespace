@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- Telemetry worker labels have no 32-byte limit; the maintenance worker label
+  refuses control characters like the network one. The legacy branch-name
+  reader in `pile migrate branch-to-collection` decodes the retired 32-byte
+  layout from raw bytes instead of through `ShortString`.
+
 - Selected collection compaction consumes its exact preflight selection without
   repeating the filter or blob walk. Report scan, selection and copy phases,
   plus retained blob payload bytes (not total framed output size).

@@ -12,12 +12,17 @@
 //! cargo run --example compose_bm25_and_pattern
 //! ```
 
+use anybytes::View;
 use triblespace_core::and;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::examples::literature;
 use triblespace_core::find;
 use triblespace_core::id::{ExclusiveId, Id};
+use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::inline::Inline;
 use triblespace_core::macros::{entity, pattern};
-use triblespace_core::trible::TribleSet;
+use triblespace_core::repo::{BlobStoreGet, SnapshotSource};
+use triblespace_core::trible::{Fragment, TribleSet};
 
 use triblespace_search::bm25::BM25Builder;
 use triblespace_search::tokens::hash_tokens;
@@ -36,7 +41,8 @@ fn main() {
     let book_c = id(22);
     let book_d = id(23);
 
-    let mut kb = TribleSet::new();
+    // A fragment keeps the title blobs beside the facts that reference them.
+    let mut kb = Fragment::empty();
     kb += entity! { ExclusiveId::force_ref(&target_author) @
         literature::firstname: "Target",
         literature::lastname: "Author",
@@ -68,10 +74,16 @@ fn main() {
     // Query the KB for (book, title) pairs; feed them straight
     // into BM25Builder. No shadow datamodel — titles stay in the
     // KB as the source of truth.
+    let blobs = kb.blobs().clone().snapshot().expect("blob snapshot");
+    let kb: TribleSet = kb.into_facts();
     let titles: Vec<(Id, String)> = find!(
-        (b: Id, title: String),
+        (b: Id, title: Inline<Handle<UTF8String>>),
         pattern!(&kb, [{ ?b @ literature::title: ?title }])
     )
+    .map(|(b, title)| {
+        let text: View<str> = blobs.get(title).expect("resident title blob");
+        (b, text.as_ref().to_owned())
+    })
     .collect();
     let mut bm25 = BM25Builder::new();
     for (b, title) in &titles {

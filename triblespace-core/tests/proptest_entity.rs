@@ -1,12 +1,21 @@
 use proptest::collection::vec;
 use proptest::prelude::*;
 use triblespace_core::id::rngid;
+use triblespace_core::prelude::blobencodings::UTF8String;
+use triblespace_core::prelude::inlineencodings::Handle;
 use triblespace_core::prelude::*;
+
+/// A name as stored: the content handle of its text.
+type Text = Inline<Handle<UTF8String>>;
+
+fn text(name: &str) -> Text {
+    name.to_inline()
+}
 
 mod test_ns {
     use triblespace_core::prelude::*;
     attributes! {
-        "CC00000000000000CC00000000000001" unsafe as pub name: inlineencodings::ShortString;
+        "CC00000000000000CC00000000000001" as pub name: inlineencodings::Handle<blobencodings::UTF8String>;
         "CC00000000000000CC00000000000002" unsafe as pub link: inlineencodings::GenId;
         "CC00000000000000CC00000000000003" unsafe as pub count: inlineencodings::U256BE;
     }
@@ -20,13 +29,13 @@ proptest! {
         let e = rngid();
         let set: TribleSet = entity! { &e @ test_ns::name: name.as_str() }.into();
 
-        let results: Vec<String> = find!(
-            n: String,
+        let results: Vec<Text> = find!(
+            n: Text,
             pattern!(&set, [{ test_ns::name: ?n }])
         ).collect();
 
         prop_assert_eq!(results.len(), 1);
-        prop_assert_eq!(&results[0], &name);
+        prop_assert_eq!(results[0], text(&name));
     }
 
     #[test]
@@ -54,12 +63,12 @@ proptest! {
         }.into();
 
         // Query name
-        let names: Vec<String> = find!(
-            n: String,
+        let names: Vec<Text> = find!(
+            n: Text,
             pattern!(&set, [{ test_ns::name: ?n }])
         ).collect();
         prop_assert_eq!(names.len(), 1);
-        prop_assert_eq!(&names[0], &name);
+        prop_assert_eq!(names[0], text(&name));
 
         // Query link
         let links: Vec<Inline<_>> = find!(
@@ -80,16 +89,16 @@ proptest! {
             set += entity! { &e @ test_ns::name: name.as_str() };
         }
 
-        let results: Vec<String> = find!(
-            n: String,
+        let results: Vec<Text> = find!(
+            n: Text,
             pattern!(&set, [{ test_ns::name: ?n }])
         ).collect();
 
         // Bag semantics: one row per complete binding, so each entity is a
         // witness even when names collide; deduplication belongs to the
         // consumer.
-        let expected: std::collections::BTreeSet<_> = names.iter().collect();
-        let actual: std::collections::BTreeSet<_> = results.iter().collect();
+        let expected: std::collections::BTreeSet<Text> = names.iter().map(|n| text(n)).collect();
+        let actual: std::collections::BTreeSet<Text> = results.iter().copied().collect();
         prop_assert_eq!(&actual, &expected);
         prop_assert_eq!(results.len(), names.len());
     }
@@ -108,8 +117,8 @@ proptest! {
         set += entity! { &dst @ test_ns::name: dst_name.as_str() };
 
         // Join: find names of entities linked from src
-        let results: Vec<String> = find!(
-            name: String,
+        let results: Vec<Text> = find!(
+            name: Text,
             pattern!(&set, [
                 { _?source @ test_ns::name: src_name.as_str(), test_ns::link: _?target },
                 { _?target @ test_ns::name: ?name }
@@ -117,7 +126,7 @@ proptest! {
         ).collect();
 
         prop_assert_eq!(results.len(), 1);
-        prop_assert_eq!(&results[0], &dst_name);
+        prop_assert_eq!(results[0], text(&dst_name));
     }
 
     // ── Fragment root ──────────────────────────────────────────────────
@@ -155,8 +164,8 @@ proptest! {
         set += entity! { &decoy @ test_ns::name: "decoy" };
 
         // temp! creates a join variable that doesn't leak into results
-        let results: Vec<String> = find!(
-            name: String,
+        let results: Vec<Text> = find!(
+            name: Text,
             temp!((target), pattern!(&set, [
                 { _?source @ test_ns::name: src_name.as_str(), test_ns::link: ?target },
                 { ?target @ test_ns::name: ?name }
@@ -165,7 +174,7 @@ proptest! {
 
         // Should find dst_name but not "decoy"
         prop_assert_eq!(results.len(), 1);
-        prop_assert_eq!(&results[0], &dst_name);
+        prop_assert_eq!(results[0], text(&dst_name));
     }
 
     // ── _? local variables enforce equality ────────────────────────────
@@ -191,8 +200,8 @@ proptest! {
 
         // _?e in both entity and value positions — the macro now
         // desugars this to a fresh variable + EqualityConstraint.
-        let results: Vec<String> = find!(
-            name: String,
+        let results: Vec<Text> = find!(
+            name: Text,
             pattern!(&set, [
                 { _?e @ test_ns::name: ?name, test_ns::link: _?e }
             ])
@@ -200,7 +209,7 @@ proptest! {
 
         prop_assert_eq!(results.len(), 1,
             "expected 1 self-linker, got {:?}", results);
-        prop_assert_eq!(&results[0], self_linker.as_ref().unwrap());
+        prop_assert_eq!(results[0], text(self_linker.as_ref().unwrap()));
     }
 
     #[test]
@@ -223,8 +232,8 @@ proptest! {
         }
 
         // ?e in both entity and value positions (projected variable)
-        let results: Vec<(Inline<_>, String)> = find!(
-            (e: Inline<_>, name: String),
+        let results: Vec<(Inline<_>, Text)> = find!(
+            (e: Inline<_>, name: Text),
             pattern!(&set, [
                 { ?e @ test_ns::name: ?name, test_ns::link: ?e }
             ])
@@ -267,9 +276,9 @@ proptest! {
         // All child names should be queryable
         for name in &child_names {
             let found = find!(
-                n: String,
+                n: Text,
                 pattern!(&set, [{ test_ns::name: ?n }])
-            ).any(|n| n == *name);
+            ).any(|n| n == text(name));
             prop_assert!(found, "child name {:?} not found", name);
         }
     }
@@ -321,8 +330,8 @@ proptest! {
         set += entity! { &decoy @ test_ns::name: "decoy", test_ns::link: &other };
 
         // _?target joins across two entity clauses
-        let results: Vec<String> = find!(
-            name: String,
+        let results: Vec<Text> = find!(
+            name: Text,
             pattern!(&set, [
                 { _?source @ test_ns::name: ?name, test_ns::link: _?target },
                 { _?target @ test_ns::name: "hub" }
@@ -331,10 +340,10 @@ proptest! {
 
         // Should find all names that link to hub, but not "decoy"
         for name in &names {
-            prop_assert!(results.contains(name),
+            prop_assert!(results.contains(&text(name)),
                 "missing {:?} from join results", name);
         }
-        prop_assert!(!results.contains(&"decoy".to_string()),
+        prop_assert!(!results.contains(&text("decoy")),
             "decoy should not appear in results");
     }
 }

@@ -78,6 +78,7 @@ impl<S: Store> Fixture<S> {
             .unwrap();
         telemetry::observe(
             &facts,
+            &snapshot,
             triblespace_core::clock::epoch_now()
                 .to_tai_duration()
                 .total_nanoseconds(),
@@ -225,10 +226,6 @@ fn options_are_opt_in_and_require_valid_explicit_scope() {
     for invalid in [
         Options {
             telemetry_worker: None,
-            ..valid.clone()
-        },
-        Options {
-            telemetry_worker: Some("x".repeat(33)),
             ..valid.clone()
         },
         Options {

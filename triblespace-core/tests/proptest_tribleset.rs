@@ -1,18 +1,22 @@
 use proptest::collection::vec;
 use proptest::prelude::*;
 use std::collections::BTreeSet;
-use triblespace_core::inline::encodings::shortstring::ShortString;
 use triblespace_core::inline::encodings::UnknownInline;
+use triblespace_core::prelude::blobencodings::UTF8String;
+use triblespace_core::prelude::inlineencodings::Handle;
 use triblespace_core::prelude::*;
 use triblespace_core::query::TriblePattern;
 use triblespace_core::query::Variable;
 use triblespace_core::trible::Trible;
 
+/// A label as stored: the content handle of its text.
+type Text = Inline<Handle<UTF8String>>;
+
 mod test_ns {
     use triblespace_core::prelude::*;
     attributes! {
         "AA00000000000000AA00000000000001" unsafe as pub link: inlineencodings::GenId;
-        "AA00000000000000AA00000000000002" unsafe as pub label: inlineencodings::ShortString;
+        "AA00000000000000AA00000000000002" as pub label: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }
 
@@ -179,8 +183,8 @@ proptest! {
             base += entity! { &e @ test_ns::label: label.as_str() };
         }
         let empty = TribleSet::new();
-        let results: Vec<String> = find!(
-            label: String,
+        let results: Vec<Text> = find!(
+            label: Text,
             pattern_changes!(&base, &empty, [
                 { test_ns::label: ?label }
             ])
@@ -198,12 +202,12 @@ proptest! {
             let e = rngid();
             set += entity! { &e @ test_ns::label: label.as_str() };
         }
-        let mut pattern_results: Vec<String> = find!(
-            label: String,
+        let mut pattern_results: Vec<Text> = find!(
+            label: Text,
             pattern!(&set, [{ test_ns::label: ?label }])
         ).collect();
-        let mut changes_results: Vec<String> = find!(
-            label: String,
+        let mut changes_results: Vec<Text> = find!(
+            label: Text,
             pattern_changes!(&set, &set, [
                 { test_ns::label: ?label }
             ])
@@ -253,8 +257,8 @@ proptest! {
         // Query: find labels of entities that link to the first base entity
         if !base_entities.is_empty() {
             let target_val = (&base_entities[0]).to_inline();
-            let changes: Vec<String> = find!(
-                label: String,
+            let changes: Vec<Text> = find!(
+                label: Text,
                 pattern_changes!(&full, &delta, [
                     { _?e @ test_ns::link: target_val, test_ns::label: ?label }
                 ])
@@ -262,8 +266,8 @@ proptest! {
 
             // All results must be from entities that have at least one
             // trible in the delta
-            let _base_labels: Vec<String> = find!(
-                label: String,
+            let _base_labels: Vec<Text> = find!(
+                label: Text,
                 pattern!(&base, [
                     { _?e @ test_ns::link: target_val, test_ns::label: ?label }
                 ])
@@ -277,8 +281,8 @@ proptest! {
                 // We can't easily check which trible is from delta, but we
                 // CAN check: if a label is ONLY in base (entity has no
                 // delta tribles), it should NOT appear.
-                let in_delta_labels: Vec<String> = find!(
-                    label: String,
+                let in_delta_labels: Vec<Text> = find!(
+                    label: Text,
                     pattern!(&delta, [{ test_ns::label: ?label }])
                 ).collect();
                 let in_delta_links = find!(
@@ -394,13 +398,13 @@ proptest! {
         let delta = full.difference(&base);
 
         // pattern_changes with computed delta should return only the new labels
-        let changes: BTreeSet<Inline<ShortString>> = find!(
-            label: Inline<ShortString>,
+        let changes: BTreeSet<Text> = find!(
+            label: Text,
             pattern_changes!(&full, &delta, [
                 { test_ns::label: ?label }
             ])
         ).collect();
-        let expected: BTreeSet<Inline<ShortString>> = delta_labels
+        let expected: BTreeSet<Text> = delta_labels
             .iter()
             .map(|label| label.as_str().to_inline())
             .collect();
@@ -425,14 +429,14 @@ proptest! {
             delta += entity! { &e @ test_ns::label: label.as_str() };
         }
         let full = base + delta.clone();
-        let changes: Vec<String> = find!(
-            label: String,
+        let changes: Vec<Text> = find!(
+            label: Text,
             pattern_changes!(&full, &delta, [
                 { test_ns::label: ?label }
             ])
         ).collect();
-        let all: Vec<String> = find!(
-            label: String,
+        let all: Vec<Text> = find!(
+            label: Text,
             pattern!(&full, [{ test_ns::label: ?label }])
         ).collect();
         // Every pattern_changes result must exist in the full pattern

@@ -22,11 +22,11 @@ use triblespace::prelude::*;
 
 mod social {
     use triblespace::prelude::*;
-    use triblespace::prelude::inlineencodings::{GenId, ShortString};
+    use triblespace::prelude::inlineencodings::{GenId, Handle};
 
     attributes! {
         /// A person's display name.
-        "A74AA63539354CDA47F387A4C3A8D54C" as pub name: ShortString;
+        "A74AA63539354CDA47F387A4C3A8D54C" as pub name: Handle<blobencodings::UTF8String>;
 
         /// Another person this person knows.
         pub friend: GenId;
@@ -65,9 +65,9 @@ entity.
 # use triblespace::prelude::*;
 # mod social {
 #     use triblespace::prelude::*;
-#     use triblespace::prelude::inlineencodings::ShortString;
+#     use triblespace::prelude::inlineencodings::Handle;
 #     attributes! {
-#         "A74AA63539354CDA47F387A4C3A8D54C" as pub name: ShortString;
+#         "A74AA63539354CDA47F387A4C3A8D54C" as pub name: Handle<blobencodings::UTF8String>;
 #     }
 # }
 let alice = fucid();
@@ -91,9 +91,9 @@ an absent optional field contributes no row.
 # use triblespace::prelude::*;
 # mod social {
 #     use triblespace::prelude::*;
-#     use triblespace::prelude::inlineencodings::ShortString;
+#     use triblespace::prelude::inlineencodings::Handle;
 #     attributes! {
-#         "A74AA63539354CDA47F387A4C3A8D54C" as pub name: ShortString;
+#         "A74AA63539354CDA47F387A4C3A8D54C" as pub name: Handle<blobencodings::UTF8String>;
 #     }
 # }
 let facts = entity! { _
@@ -132,9 +132,9 @@ query constraint.
 # use triblespace::prelude::*;
 # mod social {
 #     use triblespace::prelude::*;
-#     use triblespace::prelude::inlineencodings::{GenId, ShortString};
+#     use triblespace::prelude::inlineencodings::{GenId, Handle};
 #     attributes! {
-#         "A74AA63539354CDA47F387A4C3A8D54C" as pub name: ShortString;
+#         "A74AA63539354CDA47F387A4C3A8D54C" as pub name: Handle<blobencodings::UTF8String>;
 #         "B74AA63539354CDA47F387A4C3A8D54C" as pub friend: GenId;
 #     }
 # }
@@ -171,9 +171,9 @@ Use [`find!`](triblespace::core::macros::find) when you want rows back.
 # use triblespace::prelude::*;
 # mod social {
 #     use triblespace::prelude::*;
-#     use triblespace::prelude::inlineencodings::ShortString;
+#     use triblespace::prelude::inlineencodings::Handle;
 #     attributes! {
-#         "A74AA63539354CDA47F387A4C3A8D54C" as pub name: ShortString;
+#         "A74AA63539354CDA47F387A4C3A8D54C" as pub name: Handle<blobencodings::UTF8String>;
 #     }
 # }
 # let mut kb = TribleSet::new();
@@ -184,8 +184,9 @@ let names: Vec<Inline<_>> = find!(
     pattern!(&kb, [{ _?person @ social::name: ?name }])
 ).collect();
 
-let first: &str = names[0].try_from_inline().unwrap();
-assert_eq!(first, "Alice");
+// A text value is the content handle of its blob: compare it with the
+// handle of a string, or read the text from the blob store that holds it.
+assert_eq!(names[0], "Alice".to_inline());
 ```
 
 There are three common shapes:
@@ -208,9 +209,9 @@ Typed projections happen in the head:
 # use triblespace::prelude::*;
 # mod social {
 #     use triblespace::prelude::*;
-#     use triblespace::prelude::inlineencodings::ShortString;
+#     use triblespace::prelude::inlineencodings::Handle;
 #     attributes! {
-#         "A74AA63539354CDA47F387A4C3A8D54C" as pub name: ShortString;
+#         "A74AA63539354CDA47F387A4C3A8D54C" as pub name: Handle<blobencodings::UTF8String>;
 #     }
 # }
 # let mut kb = TribleSet::new();
@@ -235,9 +236,9 @@ Use [`exists!`](triblespace::core::prelude::exists) when you only need yes/no.
 # use triblespace::prelude::*;
 # mod social {
 #     use triblespace::prelude::*;
-#     use triblespace::prelude::inlineencodings::ShortString;
+#     use triblespace::prelude::inlineencodings::Handle;
 #     attributes! {
-#         "A74AA63539354CDA47F387A4C3A8D54C" as pub name: ShortString;
+#         "A74AA63539354CDA47F387A4C3A8D54C" as pub name: Handle<blobencodings::UTF8String>;
 #     }
 # }
 # let mut kb = TribleSet::new();

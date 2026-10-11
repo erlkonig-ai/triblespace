@@ -10,11 +10,18 @@ use triblespace_core::query::{
 };
 use triblespace_core::trible::{Fragment, Trible};
 
+/// A label as stored: the content handle of its text.
+type Text = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
+
+fn text(label: &str) -> Text {
+    label.to_inline()
+}
+
 mod test_ns {
     use triblespace_core::prelude::*;
     attributes! {
         "BB00000000000000BB00000000000001" unsafe as pub link: inlineencodings::GenId;
-        "BB00000000000000BB00000000000002" unsafe as pub label: inlineencodings::ShortString;
+        "BB00000000000000BB00000000000002" as pub label: inlineencodings::Handle<blobencodings::UTF8String>;
         "BB00000000000000BB00000000000003" unsafe as pub other_link: inlineencodings::GenId;
     }
 }
@@ -359,15 +366,15 @@ proptest! {
         }
 
         // Pick a subset to allow
-        let allowed: HashSet<String> = labels.iter().take(2).cloned().collect();
+        let allowed: HashSet<Text> = labels.iter().take(2).map(|label| text(label)).collect();
 
-        let all: Vec<String> = find!(
-            label: String,
+        let all: Vec<Text> = find!(
+            label: Text,
             pattern!(&set, [{ test_ns::label: ?label }])
         ).collect();
 
-        let filtered: Vec<String> = find!(
-            label: String,
+        let filtered: Vec<Text> = find!(
+            label: Text,
             and!(
                 allowed.has(label),
                 pattern!(&set, [{ test_ns::label: ?label }])
@@ -478,8 +485,8 @@ proptest! {
         }
 
         // Without ignore!: get both name and entity
-        let full_results: Vec<(Inline<_>, String)> = find!(
-            (entity: Inline<_>, name: String),
+        let full_results: Vec<(Inline<_>, Text)> = find!(
+            (entity: Inline<_>, name: Text),
             pattern!(&set, [
                 { ?entity @ test_ns::label: ?name, test_ns::link: _?target },
                 { _?target @ test_ns::label: "hub" }
@@ -487,8 +494,8 @@ proptest! {
         ).collect();
 
         // With temp! (equivalent of ignore for our purposes): get just name
-        let name_only: Vec<String> = find!(
-            name: String,
+        let name_only: Vec<Text> = find!(
+            name: Text,
             pattern!(&set, [
                 { _?entity @ test_ns::label: ?name, test_ns::link: _?target },
                 { _?target @ test_ns::label: "hub" }
@@ -496,7 +503,7 @@ proptest! {
         ).collect();
 
         // Both should find the same names
-        let mut full_names: Vec<String> = full_results.into_iter().map(|(_, n)| n).collect();
+        let mut full_names: Vec<Text> = full_results.into_iter().map(|(_, n)| n).collect();
         let mut names_only_sorted = name_only.clone();
         full_names.sort();
         names_only_sorted.sort();
@@ -505,7 +512,7 @@ proptest! {
 
         // And should find all expected names
         for name in &names {
-            prop_assert!(name_only.contains(name),
+            prop_assert!(name_only.contains(&text(name)),
                 "missing {:?}", name);
         }
     }
@@ -546,20 +553,18 @@ proptest! {
         values in proptest::collection::hash_set("[a-z]{1,6}", 1..15),
     ) {
         use triblespace_core::query::sortedsliceconstraint::SortedSlice;
-        use triblespace_core::inline::encodings::shortstring::ShortString;
-
-        let hash: HashSet<String> = values;
-        let mut sorted_vals: Vec<String> = hash.iter().cloned().collect();
+        let hash: HashSet<Text> = values.iter().map(|value| text(value)).collect();
+        let mut sorted_vals: Vec<Text> = hash.iter().cloned().collect();
         sorted_vals.sort();
         let slice = SortedSlice::new(&sorted_vals).unwrap();
 
-        let mut hash_results: Vec<Inline<ShortString>> = find!(
-            v: Inline<ShortString>,
+        let mut hash_results: Vec<Text> = find!(
+            v: Text,
             hash.has(v)
         ).collect();
 
-        let mut slice_results: Vec<Inline<ShortString>> = find!(
-            v: Inline<ShortString>,
+        let mut slice_results: Vec<Text> = find!(
+            v: Text,
             slice.has(v)
         ).collect();
 
@@ -590,30 +595,28 @@ proptest! {
         // `&mut [T]` (and anything that derefs to one) should sort on
         // `.has()` and produce the same rows as a pre-sorted `SortedSlice`.
         use triblespace_core::query::sortedsliceconstraint::SortedSlice;
-        use triblespace_core::inline::encodings::shortstring::ShortString;
-
-        let mut shuffled: Vec<String> = values.into_iter().collect();
+        let mut shuffled: Vec<Text> = values.iter().map(|value| text(value)).collect();
         // Scramble deterministically so we have something to sort.
         shuffled.sort_by(|a, b| b.cmp(a));
         let mut sorted = shuffled.clone();
         sorted.sort();
 
         let presorted = SortedSlice::new(&sorted).unwrap();
-        let mut expected: Vec<Inline<ShortString>> = find!(
-            v: Inline<ShortString>,
+        let mut expected: Vec<Text> = find!(
+            v: Text,
             presorted.has(v)
         ).collect();
 
         // &mut [T] — direct impl path.
-        let mut actual_slice: Vec<Inline<ShortString>> = find!(
-            v: Inline<ShortString>,
+        let mut actual_slice: Vec<Text> = find!(
+            v: Text,
             (&mut shuffled[..]).has(v)
         ).collect();
 
         // Reshuffle and exercise &mut Vec<T> — should reach the impl via DerefMut.
         shuffled.sort_by(|a, b| b.cmp(a));
-        let mut actual_vec: Vec<Inline<ShortString>> = find!(
-            v: Inline<ShortString>,
+        let mut actual_vec: Vec<Text> = find!(
+            v: Text,
             (&mut shuffled).has(v)
         ).collect();
 

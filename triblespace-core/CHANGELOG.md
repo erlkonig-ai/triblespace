@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Deprecate `ShortString`; it stays compiling so downstream crates and old
+  rows keep working. `rdf_lang`, `money::code` (changing every `Currency<C>`
+  encoding id) and the `examples::literature` names are `Handle<UTF8String>`
+  now, derived from their existing hex as anchors. N-Triples import no longer
+  drops literals whose language tag exceeds 32 bytes. `UTF8String` encodes any
+  borrowed `&str` or `&String`, and `Handle<UTF8String>` encodes a string to
+  its content handle, so `pattern!` matches a text attribute against a plain
+  string. Delete the producerless `metadata::json_kind` and
+  `repo::short_message`.
+
 - Add a consume-once prepared filtered rewrite bound to its exact source
   snapshot. Planning and copying can share frame selection and retention;
   corruption refusal and validated copying are unchanged. Enqueue each child

@@ -13,7 +13,6 @@ use triblespace_core_macros::attributes;
 
 use crate::blob::encodings::utf8string::UTF8String;
 use crate::inline::encodings::hash::Handle;
-use crate::inline::encodings::shortstring::ShortString;
 
 attributes! {
     /// The canonical RDF URI for an entity. Use this when importing data
@@ -25,11 +24,11 @@ attributes! {
     /// BCP-47 language tag for a reified language-tagged literal entity.
     ///
     /// RDF's `"text"@lang` form is reified as a small entity with two
-    /// attributes — `rdf_lang` (the BCP-47 tag, fits in a `ShortString`)
-    /// and `rdf_text` (the lexical form, hashed as a `UTF8String` blob).
+    /// attributes — `rdf_lang` (the BCP-47 tag) and `rdf_text` (the
+    /// lexical form), both `UTF8String` blobs referenced by handle.
     /// Two literals with the same `(lang, text)` pair derive the same
     /// intrinsic id, giving content-addressed deduplication for free.
-    "904DCA1F8C0BF087B02C0581F69EDF4D" unsafe as pub rdf_lang: ShortString;
+    "904DCA1F8C0BF087B02C0581F69EDF4D" as pub rdf_lang: Handle<UTF8String>;
 
     /// Lexical form of a reified language-tagged literal entity. See
     /// [`rdf_lang`] for the full encoding rationale.

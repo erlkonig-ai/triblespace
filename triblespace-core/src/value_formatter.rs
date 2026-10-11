@@ -302,7 +302,7 @@ mod tests {
         let handle = store.put(wasm).expect("put wasm module");
         let snapshot = store.snapshot().expect("blob snapshot");
 
-        let schema_id = crate::inline::encodings::shortstring::ShortString::id();
+        let schema_id = crate::inline::encodings::genid::GenId::id();
         let schema_entity = crate::id::ExclusiveId::force_ref(&schema_id);
         let space = crate::macros::entity! { schema_entity @
             metadata::value_formatter: handle,
@@ -323,6 +323,8 @@ mod tests {
     }
 
     #[test]
+    // ShortString is deprecated but still ships its formatter until removal.
+    #[allow(deprecated)]
     fn builtins_emit_and_run() {
         use crate::blob::encodings::utf8string::UTF8String;
         use crate::inline::encodings::boolean::Boolean;

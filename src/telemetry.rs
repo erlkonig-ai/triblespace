@@ -53,7 +53,7 @@ use crate::core::collection::{AdmissionPolicy, Collection, CollectionPolicy, Col
 use crate::core::metadata;
 use crate::core::repo::pile::{Pile, ReadError};
 use crate::prelude::blobencodings::UTF8String;
-use crate::prelude::inlineencodings::{GenId, Handle, ShortString, U256BE};
+use crate::prelude::inlineencodings::{GenId, Handle, U256BE};
 use crate::prelude::*;
 use ed25519_dalek::SigningKey;
 use rand_core06::OsRng;
@@ -75,7 +75,7 @@ pub mod schema {
         "3E062AA7E3554C8F2DB94883CE639BFE" unsafe as pub session: GenId;
         "146E5AA2F7CB3D8B654BC7742A13CAB3" unsafe as pub parent: GenId;
         "CCB0147D20C4C6FCAC0E3D87FAFF71D1" unsafe as pub name: Handle<UTF8String>;
-        "8A4BE2C4D0E90D2B9EE0E1A07ECA2CFA" unsafe as pub category: ShortString;
+        "8A4BE2C4D0E90D2B9EE0E1A07ECA2CFA" as pub category: Handle<UTF8String>;
         "E11A84A30CC112650DC860B66B8BD8A9" unsafe as pub begin_ns: U256BE;
         "2786FA563372FB6EF469EC7710719A49" unsafe as pub end_ns: U256BE;
         "7593602383D0B0D21BBE382A67E5BD9F" unsafe as pub duration_ns: U256BE;
@@ -89,11 +89,10 @@ pub mod schema {
         "CB99FD67D62C020DDE788F6281393131" as pub field: GenId;
         /// The tracing field's name, as written at the callsite.
         ///
-        /// Inline rather than a handle because this is the key a consumer
-        /// queries by, and an inline value compares directly inside
-        /// `pattern!`. Fields whose names exceed the inline bound are not
-        /// captured.
-        "097951EF7FC4C64A4AE9ADBD9ED89482" as pub field_name: ShortString;
+        /// This is the key a consumer queries by. `pattern!` compares it
+        /// against a plain string through the text's content handle, so names
+        /// of any length are captured.
+        "097951EF7FC4C64A4AE9ADBD9ED89482" as pub field_name: Handle<UTF8String>;
         /// The field's value, rendered as text.
         ///
         /// Text because the layer cannot know a consumer's encodings, and a
@@ -153,10 +152,6 @@ pub mod schema {
 
         protocol
     }
-}
-
-fn is_valid_short(value: &str) -> bool {
-    value.as_bytes().len() <= 32 && !value.as_bytes().iter().any(|b| *b == 0)
 }
 
 struct ThreadTelemetry {
@@ -320,12 +315,7 @@ impl FieldCapture {
         if name == "source" && self.source.is_none() {
             self.source = Some(value.clone());
         }
-        // A name that does not fit inline cannot be the queryable key this is
-        // for, and silently storing it under a different shape would be worse
-        // than not storing it.
-        if is_valid_short(name) {
-            self.fields.push((name, value));
-        }
+        self.fields.push((name, value));
     }
 }
 
@@ -447,11 +437,6 @@ where
 
         let target = meta.target();
         let category = target.split("::").next().unwrap_or(target);
-        let category = if !category.is_empty() && is_valid_short(category) {
-            category
-        } else {
-            "span"
-        };
 
         span_begin(
             &mut state.batch,
@@ -913,8 +898,8 @@ mod tests {
 
         let facts = cold_read_facts(&path);
 
-        let categories: Vec<Inline<ShortString>> = find!(
-            category: Inline<ShortString>,
+        let categories: Vec<Inline<Handle<UTF8String>>> = find!(
+            category: Inline<Handle<UTF8String>>,
             pattern!(&facts, [{ observed @ schema::category: ?category }])
         )
         .collect();

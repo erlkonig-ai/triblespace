@@ -54,7 +54,7 @@ mod wiki {
 
     attributes! {
         "F27792C7AF218F1BAE047650DF560B95"
-            as pub title: inlineencodings::ShortString;
+            as pub title: inlineencodings::Handle<blobencodings::UTF8String>;
         "512F2ABC687A4E42916C19E6A552B285"
             as pub body: inlineencodings::Handle<blobencodings::UTF8String>;
         // `index` rotated again 2026-08-03 alongside the
@@ -116,9 +116,10 @@ fn seed(pile: &mut Pile) -> Result<TribleSet, Box<dyn Error>> {
 
     let mut kb = TribleSet::new();
     for (id, title, body) in &docs {
+        let title_handle = pile.put::<blobencodings::UTF8String, _>(title.to_string())?;
         let body_handle = pile.put::<blobencodings::UTF8String, _>(body.to_string())?;
         kb += entity! { ExclusiveId::force_ref(id) @
-            wiki::title: *title,
+            wiki::title: title_handle,
             wiki::body: body_handle,
         };
     }
@@ -186,15 +187,17 @@ fn query(
     // each row through `idx.score` after collecting, then sort.
     use triblespace_core::inline::IntoInline;
     let tokens = hash_tokens(text);
-    let mut rows: Vec<(Id, f32, String)> = find!(
-        (doc: Id, title: String),
+    let mut rows: Vec<(Id, f32, String)> = Vec::new();
+    for (doc, title) in find!(
+        (doc: Id, title: Inline<Handle<blobencodings::UTF8String>>),
         and!(
             idx.matches(doc, &tokens, 0.0),
             pattern!(kb, [{ ?doc @ wiki::title: ?title }])
         )
-    )
-    .map(|(doc, title)| (doc, idx.score(&doc.to_inline(), &tokens), title))
-    .collect();
+    ) {
+        let title: View<str> = snapshot.get(title)?;
+        rows.push((doc, idx.score(&doc.to_inline(), &tokens), title.to_string()));
+    }
     rows.sort_unstable_by(|left, right| {
         right
             .1

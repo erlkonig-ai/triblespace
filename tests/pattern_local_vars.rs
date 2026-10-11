@@ -6,8 +6,8 @@ pub mod names {
     use triblespace::prelude::*;
 
     attributes! {
-        "D02189E4C5A74E84B0FCBFDE3C533A0B" unsafe as first: inlineencodings::ShortString;
-        "8F2E5E6A6D9C42F2A4BF6471C5FBF5E0" unsafe as last: inlineencodings::ShortString;
+        "D02189E4C5A74E84B0FCBFDE3C533A0B" as first: inlineencodings::Handle<blobencodings::UTF8String>;
+        "8F2E5E6A6D9C42F2A4BF6471C5FBF5E0" as last: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }
 
@@ -24,8 +24,8 @@ mod library {
     use triblespace::prelude::*;
 
     attributes! {
-        "6E7843FC4D9C428EBF5C9C86CB8C33C4" unsafe as title: inlineencodings::ShortString;
-        "3E51B9E2E4C14D2DA0DC6B0ACB5CBF56" unsafe as subtitle: inlineencodings::ShortString;
+        "6E7843FC4D9C428EBF5C9C86CB8C33C4" as title: inlineencodings::Handle<blobencodings::UTF8String>;
+        "3E51B9E2E4C14D2DA0DC6B0ACB5CBF56" as subtitle: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }
 

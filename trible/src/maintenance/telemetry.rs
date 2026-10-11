@@ -27,7 +27,7 @@ pub struct Options {
     /// Never creates a descriptor or grant.
     #[arg(long, requires = "telemetry_worker")]
     pub telemetry_collection: Option<String>,
-    /// Stable worker label, at most 32 UTF-8 bytes
+    /// Stable worker label
     #[arg(long, requires = "telemetry_collection")]
     pub telemetry_worker: Option<String>,
     /// Minimum seconds between telemetry attempts (default 60); final close adds one sample
@@ -79,11 +79,10 @@ impl Options {
         };
         let collection = parse_collection_handle(&handle).map_err(|_| Failure::Parameters)?;
         let worker = self.telemetry_worker.ok_or(Failure::Parameters)?;
-        let _: Inline<inlineencodings::ShortString> = worker
-            .as_str()
-            .try_to_inline()
-            .map_err(|_| Failure::Parameters)?;
-        if worker.is_empty() || self.telemetry_interval_secs == Some(0) {
+        if worker.is_empty()
+            || worker.chars().any(char::is_control)
+            || self.telemetry_interval_secs == Some(0)
+        {
             return Err(Failure::Parameters);
         }
         Ok(Some(Config {
