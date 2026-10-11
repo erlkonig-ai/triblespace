@@ -37,8 +37,8 @@ mod ns {
     use triblespace_core::prelude::*;
     attributes! {
         "9AC1C1DB25E0FE02FE302C96300EBEA1" unsafe as pub knows: inlineencodings::GenId;
-        "D401D639C2DE979CD77D7BB277B3DE2E" unsafe as pub label: inlineencodings::ShortString;
-        "20D8DCFDFDA35E52E3ED4CD2E0A66D52" unsafe as pub note: inlineencodings::ShortString;
+        "D401D639C2DE979CD77D7BB277B3DE2E" as pub label: inlineencodings::Handle<blobencodings::UTF8String>;
+        "20D8DCFDFDA35E52E3ED4CD2E0A66D52" as pub note: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }
 

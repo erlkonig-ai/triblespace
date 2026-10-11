@@ -50,33 +50,34 @@ bits), use `TryToInline` / `TryFromInline` — kept as separate traits because t
 error type is per‑source.
 
 ```rust
-use triblespace::core::inline::encodings::shortstring::ShortString;
-use triblespace::core::inline::{TryFromInline, TryToInline, Inline};
+use triblespace::core::inline::encodings::iu256::U256BE;
+use triblespace::core::inline::{Inline, IntoInline, TryFromInline, TryToInline};
 
-struct Username(String);
+struct Percent(u8);
 
-impl TryToInline<ShortString> for Username {
+impl TryToInline<U256BE> for Percent {
     type Error = &'static str;
 
-    fn try_to_inline(self) -> Result<Inline<ShortString>, Self::Error> {
-        if self.0.is_empty() {
-            Err("username must not be empty")
+    fn try_to_inline(self) -> Result<Inline<U256BE>, Self::Error> {
+        if self.0 > 100 {
+            Err("a percentage is at most 100")
         } else {
-            self.0
-                .as_str()
-                .try_to_inline()
-                .map_err(|_| "username too long or contains NULs")
+            Ok(u64::from(self.0).to_inline())
         }
     }
 }
 
-impl TryFromInline<'_, ShortString> for Username {
+impl TryFromInline<'_, U256BE> for Percent {
     type Error = &'static str;
 
-    fn try_from_inline(value: &Inline<ShortString>) -> Result<Self, Self::Error> {
-        String::try_from_inline(value)
-            .map(Username)
-            .map_err(|_| "invalid utf-8 or too long")
+    fn try_from_inline(value: &Inline<U256BE>) -> Result<Self, Self::Error> {
+        let n = <u64 as TryFromInline<U256BE>>::try_from_inline(value)
+            .map_err(|_| "not a percentage")?;
+        u8::try_from(n)
+            .ok()
+            .filter(|n| *n <= 100)
+            .map(Percent)
+            .ok_or("not a percentage")
     }
 }
 ```
@@ -84,7 +85,7 @@ impl TryFromInline<'_, ShortString> for Username {
 ### Encoding identifiers
 
 Every encoding declares a unique 128‑bit identifier, accessible via the
-`MetaDescribe::id` method (for example, `ShortString::id()`).
+`MetaDescribe::id` method (for example, `U256BE::id()`).
 Persisting these IDs keeps serialized data self describing so other tooling can
 make sense of the payload without linking against your Rust types. Dynamic
 language bindings (like the Python crate) inspect the stored encoding identifier
@@ -111,7 +112,9 @@ obligation that the encoding still agrees with all rows under that id.
 
 The crate provides the following inline encodings out of the box:
 - `GenId` &ndash; an abstract 128 bit identifier.
-- `ShortString` &ndash; a UTF-8 string up to 32 bytes.
+- `ShortString` &ndash; a UTF-8 string up to 32 bytes. **Deprecated**: declare
+  text attributes as `Handle<UTF8String>`; the type remains only so old rows
+  stay decodable while downstream crates migrate.
 - `U256BE` / `U256LE` &ndash; 256-bit unsigned integers.
 - `I256BE` / `I256LE` &ndash; 256-bit signed integers.
 - `R256BE` / `R256LE` &ndash; 256-bit rational numbers.
@@ -135,12 +138,12 @@ The crate provides the following inline encodings out of the box:
 ```rust
 # use triblespace::prelude::*;
 use triblespace::core::metadata::MetaDescribe;
-use triblespace::core::inline::encodings::shortstring::ShortString;
+use triblespace::core::inline::encodings::iu256::U256BE;
 use triblespace::core::inline::{IntoInline, InlineEncoding};
 
-let v: Inline<ShortString> = "hi".to_inline();
+let v: Inline<U256BE> = 42u64.to_inline();
 let raw_bytes = v.raw; // Persist alongside the encoding's metadata id.
-let encoding_id = ShortString::id(); // derived via describe(&mut scratch).root()
+let encoding_id = U256BE::id(); // derived via describe(&mut scratch).root()
 ```
 
 ## Built‑in blob encodings
@@ -290,14 +293,13 @@ What are you storing?
 ├─ A tag, category, or enum-like classifier?
 │  └─ metadata::tag (GenId) — tags are entities with their own ID.
 │     Use metadata::name to give them a human-readable label.
-│     ⚠ Do NOT define a separate ShortString tag attribute —
+│     ⚠ Do NOT define a separate text tag attribute —
 │     use the canonical metadata::tag and mint tag IDs.
 │
-├─ A short label or display name?
-│  ├─ Fits in 32 bytes (≤32 UTF-8 bytes)?
-│  │  └─ ShortString
-│  └─ Longer text?
-│     └─ Handle<UTF8String>  (blob)
+├─ Text of any length (a label, a name, prose)?
+│  └─ Handle<UTF8String>  (blob; the handle is its content
+│     address, so equal text is an equal value and pattern!
+│     can match it against a plain string)
 │
 ├─ Money?
 │  └─ Currency<C> — an exact rational, one encoding per
@@ -346,8 +348,9 @@ What are you storing?
 **Rules of thumb:**
 - If two values should be joinable (appear in the same query variable), they must
   share an encoding. Choose the most specific encoding that covers both uses.
-- Prefer `ShortString` over `UTF8String` when the text fits — inline values avoid
-  a blob lookup.
+- Store text as `Handle<UTF8String>`. A query can constrain it with a plain
+  string, because the handle is the text's content address; reading the text
+  back is a blob lookup.
 - Use `GenId` for relationships between entities. Never store entity references as
   strings.
 - When in doubt between an inline encoding and a blob, ask: "will I ever want to

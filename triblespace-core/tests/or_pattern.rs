@@ -28,22 +28,38 @@ use proptest::prelude::*;
 use std::collections::HashSet;
 use triblespace_core::id::rngid;
 use triblespace_core::inline::encodings::genid::GenId;
+use triblespace_core::prelude::blobencodings::UTF8String;
+use triblespace_core::prelude::inlineencodings::Handle;
 use triblespace_core::prelude::*;
 use triblespace_core::query::{Constraint, VariableContext, VariableSet};
+
+/// The sorted raw content handles of some texts, as a query over a
+/// `Handle<UTF8String>` attribute projects them.
+fn texts(values: &[&str]) -> Vec<[u8; 32]> {
+    let mut raw: Vec<[u8; 32]> = values
+        .iter()
+        .map(|value| {
+            let handle: Inline<Handle<UTF8String>> = (*value).to_inline();
+            handle.raw
+        })
+        .collect();
+    raw.sort_unstable();
+    raw
+}
 
 mod profile {
     use triblespace_core::prelude::*;
     attributes! {
-        "CC00000000000000DD00000000000001" unsafe as pub nickname: inlineencodings::ShortString;
-        "CC00000000000000DD00000000000002" unsafe as pub display_name: inlineencodings::ShortString;
-        "CC00000000000000DD00000000000003" unsafe as pub city: inlineencodings::ShortString;
+        "CC00000000000000DD00000000000001" as pub nickname: inlineencodings::Handle<blobencodings::UTF8String>;
+        "CC00000000000000DD00000000000002" as pub display_name: inlineencodings::Handle<blobencodings::UTF8String>;
+        "CC00000000000000DD00000000000003" as pub city: inlineencodings::Handle<blobencodings::UTF8String>;
         // Budget-test attributes (see
         // many_literals_do_not_consume_the_variable_budget).
-        "CC00000000000000DD00000000000010" unsafe as pub m0: inlineencodings::ShortString;
-        "CC00000000000000DD00000000000011" unsafe as pub m1: inlineencodings::ShortString;
-        "CC00000000000000DD00000000000012" unsafe as pub m2: inlineencodings::ShortString;
-        "CC00000000000000DD00000000000013" unsafe as pub m3: inlineencodings::ShortString;
-        "CC00000000000000DD00000000000014" unsafe as pub m4: inlineencodings::ShortString;
+        "CC00000000000000DD00000000000010" as pub m0: inlineencodings::Handle<blobencodings::UTF8String>;
+        "CC00000000000000DD00000000000011" as pub m1: inlineencodings::Handle<blobencodings::UTF8String>;
+        "CC00000000000000DD00000000000012" as pub m2: inlineencodings::Handle<blobencodings::UTF8String>;
+        "CC00000000000000DD00000000000013" as pub m3: inlineencodings::Handle<blobencodings::UTF8String>;
+        "CC00000000000000DD00000000000014" as pub m4: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }
 
@@ -68,7 +84,7 @@ fn book_nickname_display_name_example() {
     };
     dataset += entity! { &carol @ profile::city: "Caladan" };
 
-    let mut aliases: Vec<String> = find!(
+    let mut aliases: Vec<[u8; 32]> = find!(
         (alias: Inline<_>),
         temp!(
             (entity),
@@ -78,13 +94,13 @@ fn book_nickname_display_name_example() {
             )
         )
     )
-    .map(|(alias,)| alias.try_from_inline::<&str>().unwrap().to_string())
+    .map(|(alias,)| alias.raw)
     .collect();
     aliases.sort_unstable();
 
     // Bob has both attributes and yields two rows; Carol has neither
     // and yields none.
-    assert_eq!(aliases, ["Ali", "Bobby", "Robert"]);
+    assert_eq!(aliases, texts(&["Ali", "Bobby", "Robert"]));
 }
 
 /// Arms with the same attribute but different literal values.
@@ -127,18 +143,18 @@ fn or_arms_over_different_sets() {
     let mut set_b = TribleSet::new();
     set_b += entity! { &bob @ profile::nickname: "Bobby" };
 
-    let mut names: Vec<String> = find!(
+    let mut names: Vec<[u8; 32]> = find!(
         (person: Inline<GenId>, name: Inline<_>),
         or!(
             pattern!(&set_a, [{ ?person @ profile::nickname: ?name }]),
             pattern!(&set_b, [{ ?person @ profile::nickname: ?name }])
         )
     )
-    .map(|(_, name)| name.try_from_inline::<&str>().unwrap().to_string())
+    .map(|(_, name)| name.raw)
     .collect();
     names.sort_unstable();
 
-    assert_eq!(names, ["Ali", "Bobby"]);
+    assert_eq!(names, texts(&["Ali", "Bobby"]));
 }
 
 /// Mixed leaf/composite arms: a single pattern vs an `and!` of two
@@ -217,7 +233,7 @@ fn pattern_constants_allocate_no_helper_variables() {
             &mut ctx
         };
     }
-    let name = ctx.next_variable::<triblespace_core::prelude::inlineencodings::ShortString>();
+    let name = ctx.next_variable::<Handle<UTF8String>>();
     let constraint = pattern!(&dataset, [{ &alice @
         profile::nickname: ?name,
         profile::city: "Caladan",
@@ -256,7 +272,7 @@ fn constants_never_enter_binding() {
             &mut ctx
         };
     }
-    let name = ctx.next_variable::<triblespace_core::prelude::inlineencodings::ShortString>();
+    let name = ctx.next_variable::<Handle<UTF8String>>();
     let constraint = pattern!(&dataset, [{ &alice @
         profile::nickname: ?name,
         profile::city: "Caladan",

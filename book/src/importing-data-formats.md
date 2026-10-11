@@ -91,9 +91,8 @@ from `MemoryBlobStore::snapshot`) to `export_to_json` so `UTF8String` blobs can 
 blob is missing or unreadable the exporter returns an error with the handle hash
 instead of silently emitting a placeholder, keeping roundtrips lossless when
 blobs are present. The exporter uses the same fixed mapping in reverse:
-`ShortString` → JSON string, `Handle<UTF8String>` → JSON string (via
-blob lookup), `Boolean` → JSON bool, `F64` → JSON number, `GenId` → inlined
-object (unless already visited). Attributes that use other encodings are ignored
+`Handle<UTF8String>` → JSON string (via blob lookup), `Boolean` → JSON bool,
+`F64` → JSON number, `GenId` → inlined object (unless already visited). Attributes that use other encodings are ignored
 so JSON roundtrips stay predictable even when the dataset mixes in
 format-specific extensions.
 

@@ -31,7 +31,7 @@ fn entity_repeated_order_and_duplicates_are_ignored() {
 
 #[test]
 fn entity_repeated_empty_is_ignored() {
-    let json_kinds: Vec<&'static str> = Vec::new();
+    let names: Vec<&'static str> = Vec::new();
 
     let base = entity! { _ @
         metadata::tag: metadata::KIND_MULTI,
@@ -39,7 +39,7 @@ fn entity_repeated_empty_is_ignored() {
 
     let with_empty = entity! { _ @
         metadata::tag: metadata::KIND_MULTI,
-        metadata::json_kind*: json_kinds,
+        metadata::name*: names,
     };
 
     assert_eq!(base, with_empty);

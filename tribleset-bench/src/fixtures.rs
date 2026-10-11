@@ -671,11 +671,11 @@ mod r2_schema {
         // F12 — deep chain: the single functional hop edge.
         "7A7F3D3A4EBFB4FC617D063261FB592C" unsafe as hop: inlineencodings::GenId;
         // F13 — constant pressure: five string-valued slots per entity.
-        "FCE112E22C1592CC487EF5320D9E25D7" unsafe as c0: inlineencodings::ShortString;
-        "B57751A976F6908E53938CF80A615DCC" unsafe as c1: inlineencodings::ShortString;
-        "8C72F6255184F8FA9BDBD15574F540A8" unsafe as c2: inlineencodings::ShortString;
-        "ED5816955F19EFA0C6BBA2C2F7BA77ED" unsafe as c3: inlineencodings::ShortString;
-        "61C46CDF6E77A00A3B566C5157F57EFB" unsafe as c4: inlineencodings::ShortString;
+        "FCE112E22C1592CC487EF5320D9E25D7" as c0: inlineencodings::Handle<blobencodings::UTF8String>;
+        "B57751A976F6908E53938CF80A615DCC" as c1: inlineencodings::Handle<blobencodings::UTF8String>;
+        "8C72F6255184F8FA9BDBD15574F540A8" as c2: inlineencodings::Handle<blobencodings::UTF8String>;
+        "ED5816955F19EFA0C6BBA2C2F7BA77ED" as c3: inlineencodings::Handle<blobencodings::UTF8String>;
+        "61C46CDF6E77A00A3B566C5157F57EFB" as c4: inlineencodings::Handle<blobencodings::UTF8String>;
         // F14 — widening ramp: the wide root and the selective confirmer.
         "6389E8FE7CA25BE81A2BAFEF79C8EDBC" unsafe as w1: inlineencodings::GenId;
         "ED3F65982ED22D4008A510A19D4798A8" unsafe as w2: inlineencodings::GenId;

@@ -50,7 +50,7 @@ use triblespace::core::repo::BlobStoreGet;
 use triblespace::prelude::*;
 
 type Entity = Inline<inlineencodings::GenId>;
-type Title = Inline<inlineencodings::ShortString>;
+type Title = Inline<inlineencodings::Handle<blobencodings::UTF8String>>;
 type Row = (Entity, Entity, Title);
 
 /// The seed store holds the author and the registered projections; each arm

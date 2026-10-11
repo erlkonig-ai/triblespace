@@ -32,15 +32,23 @@
 use std::collections::HashSet;
 use triblespace_core::id::rngid;
 use triblespace_core::inline::encodings::genid::GenId;
+use triblespace_core::prelude::blobencodings::UTF8String;
+use triblespace_core::prelude::inlineencodings::Handle;
 use triblespace_core::prelude::*;
+
+/// A text value as stored: the raw content handle of its blob.
+fn text(value: &str) -> [u8; 32] {
+    let handle: Inline<Handle<UTF8String>> = value.to_inline();
+    handle.raw
+}
 
 mod profile {
     use triblespace_core::prelude::*;
     attributes! {
-        "F1A2B3C4D5E6F708192A3B4C5D6E7F01" unsafe as pub nickname: inlineencodings::ShortString;
-        "F1A2B3C4D5E6F708192A3B4C5D6E7F02" unsafe as pub display_name: inlineencodings::ShortString;
-        "F1A2B3C4D5E6F708192A3B4C5D6E7F03" unsafe as pub city: inlineencodings::ShortString;
-        "F1A2B3C4D5E6F708192A3B4C5D6E7F04" unsafe as pub alias: inlineencodings::ShortString;
+        "F1A2B3C4D5E6F708192A3B4C5D6E7F01" as pub nickname: inlineencodings::Handle<blobencodings::UTF8String>;
+        "F1A2B3C4D5E6F708192A3B4C5D6E7F02" as pub display_name: inlineencodings::Handle<blobencodings::UTF8String>;
+        "F1A2B3C4D5E6F708192A3B4C5D6E7F03" as pub city: inlineencodings::Handle<blobencodings::UTF8String>;
+        "F1A2B3C4D5E6F708192A3B4C5D6E7F04" as pub alias: inlineencodings::Handle<blobencodings::UTF8String>;
     }
 }
 
@@ -107,7 +115,7 @@ fn world() -> World {
     }
 }
 
-fn rows(dataset: &TribleSet) -> HashSet<([u8; 32], String)> {
+fn rows(dataset: &TribleSet) -> HashSet<([u8; 32], [u8; 32])> {
     find!(
         (p: Inline<GenId>, out: Inline<_>),
         or!(
@@ -117,7 +125,7 @@ fn rows(dataset: &TribleSet) -> HashSet<([u8; 32], String)> {
             pattern!(dataset, [{ ?p @ profile::nickname: "Bob", profile::display_name: ?out }])
         )
     )
-    .map(|(p, out)| (p.raw, out.try_from_inline::<&str>().unwrap().to_string()))
+    .map(|(p, out)| (p.raw, out.raw))
     .collect()
 }
 
@@ -132,9 +140,9 @@ fn dead_union_variant_must_not_propose_through_a_sibling_clause() {
         ..
     } = world();
 
-    let expected: HashSet<([u8; 32], String)> = [
-        (alice_val.raw, "Caladan".to_string()),
-        (bob_val.raw, "Robert".to_string()),
+    let expected: HashSet<([u8; 32], [u8; 32])> = [
+        (alice_val.raw, text("Caladan")),
+        (bob_val.raw, text("Robert")),
     ]
     .into_iter()
     .collect();
@@ -144,7 +152,7 @@ fn dead_union_variant_must_not_propose_through_a_sibling_clause() {
     // The leak, spelled out: bob's city reached through arm A, whose
     // `nickname: "Ali"` gate bob fails.
     assert!(
-        !got.contains(&(bob_val.raw, "Arrakis".to_string())),
+        !got.contains(&(bob_val.raw, text("Arrakis"))),
         "dead arm leaked (bob, \"Arrakis\"): arm A gates on nickname \"Ali\", \
          which bob does not have, but its `city` clause proposed anyway. \
          Got: {got:?}"
@@ -159,17 +167,17 @@ fn dead_union_variant_must_not_propose_through_a_sibling_clause() {
 fn or_of_gated_arms_equals_the_union_of_the_arms() {
     let dataset = world().dataset;
 
-    let arm_a: HashSet<([u8; 32], String)> = find!(
+    let arm_a: HashSet<([u8; 32], [u8; 32])> = find!(
         (p: Inline<GenId>, out: Inline<_>),
         pattern!(&dataset, [{ ?p @ profile::nickname: "Ali", profile::city: ?out }])
     )
-    .map(|(p, out)| (p.raw, out.try_from_inline::<&str>().unwrap().to_string()))
+    .map(|(p, out)| (p.raw, out.raw))
     .collect();
-    let arm_b: HashSet<([u8; 32], String)> = find!(
+    let arm_b: HashSet<([u8; 32], [u8; 32])> = find!(
         (p: Inline<GenId>, out: Inline<_>),
         pattern!(&dataset, [{ ?p @ profile::nickname: "Bob", profile::display_name: ?out }])
     )
-    .map(|(p, out)| (p.raw, out.try_from_inline::<&str>().unwrap().to_string()))
+    .map(|(p, out)| (p.raw, out.raw))
     .collect();
 
     let oracle: HashSet<_> = arm_a.union(&arm_b).cloned().collect();
@@ -195,7 +203,7 @@ fn dead_union_variant_must_not_vote_in_confirm() {
         bob: bob_val,
     } = world();
 
-    let got: HashSet<([u8; 32], String)> = find!(
+    let got: HashSet<([u8; 32], [u8; 32])> = find!(
         (p: Inline<GenId>, out: Inline<_>),
         and!(
             pattern!(&catalog, [{ ?p @ profile::alias: ?out }]),
@@ -205,18 +213,18 @@ fn dead_union_variant_must_not_vote_in_confirm() {
             )
         )
     )
-    .map(|(p, out)| (p.raw, out.try_from_inline::<&str>().unwrap().to_string()))
+    .map(|(p, out)| (p.raw, out.raw))
     .collect();
 
-    let expected: HashSet<([u8; 32], String)> = [
-        (alice_val.raw, "Caladan".to_string()),
-        (bob_val.raw, "Robert".to_string()),
+    let expected: HashSet<([u8; 32], [u8; 32])> = [
+        (alice_val.raw, text("Caladan")),
+        (bob_val.raw, text("Robert")),
     ]
     .into_iter()
     .collect();
 
     assert!(
-        !got.contains(&(bob_val.raw, "Arrakis".to_string())),
+        !got.contains(&(bob_val.raw, text("Arrakis"))),
         "dead arm voted in confirm and kept (bob, \"Arrakis\") alive. Got: {got:?}"
     );
     assert_eq!(got, expected);

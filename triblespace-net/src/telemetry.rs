@@ -24,10 +24,15 @@ use ed25519_dalek::VerifyingKey;
 use triblespace_core::attribute::Attribute;
 use triblespace_core::macros::{attributes, find, id_hex, pattern};
 use triblespace_core::metadata;
+use triblespace_core::prelude::blobencodings::UTF8String;
 use triblespace_core::prelude::*;
+use triblespace_core::repo::BlobStoreGet;
 
 use crate::dashboard::{CountMetric, Freshness};
 use crate::health_record;
+
+/// A label as stored: the content handle of its `UTF8String` blob.
+type TextHandle = Inline<inlineencodings::Handle<UTF8String>>;
 
 pub const KIND_SAMPLE: Id = id_hex!("61F510C330767E791E733239D432D861");
 
@@ -37,20 +42,20 @@ pub mod attrs {
         /// Sample -> worker scope. An opaque reference, not an ID to recompute.
         "2CC00BB2F43008D102DEB6A928C10A68" as subject: inlineencodings::GenId;
         /// Operator's stable process/worker label within this endpoint.
-        "5E3F4C5973047A386688FCFB5C29B03E" as worker: inlineencodings::ShortString;
+        "5E3F4C5973047A386688FCFB5C29B03E" as worker: inlineencodings::Handle<UTF8String>;
         /// E.g. custody, maintenance, link or process. Unknown roles coexist.
-        "6E88D61051CCB56FC7AECEF335CEEDB2" as role: inlineencodings::ShortString;
+        "6E88D61051CCB56FC7AECEF335CEEDB2" as role: inlineencodings::Handle<UTF8String>;
         "FE8D1A886EC649FE79F2D98AE106C00D" as elapsed_ns: inlineencodings::U256BE;
         /// Actual executing backend, not one merely compiled into the binary.
-        "258054295893A9C2B9677EA6611EB4B3" as backend: inlineencodings::ShortString;
+        "258054295893A9C2B9677EA6611EB4B3" as backend: inlineencodings::Handle<UTF8String>;
         /// Subject stage, e.g. selection, certification, mapping or joining.
         /// Separate stage subjects avoid attributing a whole pass to a kernel.
-        "EFF8F4225EE43DDCE38F01433166EC50" as stage: inlineencodings::ShortString;
+        "EFF8F4225EE43DDCE38F01433166EC50" as stage: inlineencodings::Handle<UTF8String>;
         /// Sum of completed operation wall durations for this scope/session,
         /// not process CPU time. Parallel operation durations may overlap.
         "8F269C3A72BA2A2BD3AF72C9033CED7A" as work_ns: inlineencodings::U256BE;
         /// Observed connection path (e.g. direct/relay); not routing candidates.
-        "3610AA8DE6C85D0816DB04E08B82E823" as path: inlineencodings::ShortString;
+        "3610AA8DE6C85D0816DB04E08B82E823" as path: inlineencodings::Handle<UTF8String>;
         /// Known queued work in this subject's scope; never an inventory guess.
         "6414ACDA4FF1CF3605A98A96E06E7207" as queued: inlineencodings::U256BE;
         /// Actual current in-flight work, not configured concurrency.
@@ -71,7 +76,7 @@ pub mod attrs {
         /// Neither pool size nor lazily-created thread count establishes this.
         "6DFCFD2ACDE2A3CF3821BABEA102C8B7" as parallel_compiled: inlineencodings::Boolean;
         /// Compiled-in backend capabilities, not runtime choice or GPU usage.
-        "C23227AD4E963B210884B38B298514E1" as compiled_backend: inlineencodings::ShortString;
+        "C23227AD4E963B210884B38B298514E1" as compiled_backend: inlineencodings::Handle<UTF8String>;
         /// Measured transport RTT, not an estimate from application completion.
         "CF8B3D8834B521AF09A16ABAD48305DD" as rtt_ns: inlineencodings::U256BE;
         "DF90FF3ACACCA2A75BEF4CF95E54A58A" as pending_merges: inlineencodings::U256BE;
@@ -217,8 +222,18 @@ struct Observation {
 /// Only two header witnesses per subject are retained; payload inventories and
 /// historical rows are never materialized into a secondary catalogue.
 /// Equal-time ties are a deterministic presentation choice, not causal order.
-/// Unfamiliar/undecodable facts simply do not match the typed query.
-pub fn observe(facts: &TribleSet, now_ns: i128, max_age: Duration) -> Vec<WorkerReport> {
+/// Unfamiliar/undecodable facts simply do not match the typed query, and a
+/// label whose text blob is not resident is skipped the same way.
+pub fn observe<B: BlobStoreGet>(
+    facts: &TribleSet,
+    blobs: &B,
+    now_ns: i128,
+    max_age: Duration,
+) -> Vec<WorkerReport> {
+    let text = |handle: TextHandle| -> Option<String> {
+        let text: anybytes::View<str> = blobs.get(handle).ok()?;
+        Some(text.as_ref().to_owned())
+    };
     let mut latest = BTreeMap::<Id, Vec<Observation>>::new();
     for (report, subject, created, session, elapsed_ns) in find!(
         (report: Id, subject: Id, created: (i128, i128), session: Id, elapsed_ns: u128),
@@ -299,20 +314,24 @@ pub fn observe(facts: &TribleSet, now_ns: i128, max_age: Duration) -> Vec<Worker
             });
         }
         let report = current.report;
-        let mut backends: Vec<String> = find!(backend: String,
+        let mut backends: Vec<String> = find!(backend: TextHandle,
             pattern!(facts, [{ report @ attrs::backend: ?backend }]))
+        .filter_map(&text)
         .collect();
         let mut parallel_compiled: Vec<bool> = find!(available: bool,
             pattern!(facts, [{ report @ attrs::parallel_compiled: ?available }]))
         .collect();
-        let mut compiled_backends: Vec<String> = find!(backend: String,
+        let mut compiled_backends: Vec<String> = find!(backend: TextHandle,
             pattern!(facts, [{ report @ attrs::compiled_backend: ?backend }]))
+        .filter_map(&text)
         .collect();
-        let mut paths: Vec<String> = find!(path: String,
+        let mut paths: Vec<String> = find!(path: TextHandle,
             pattern!(facts, [{ report @ attrs::path: ?path }]))
+        .filter_map(&text)
         .collect();
-        let mut stages: Vec<String> = find!(stage: String,
+        let mut stages: Vec<String> = find!(stage: TextHandle,
             pattern!(facts, [{ subject @ attrs::stage: ?stage }]))
+        .filter_map(&text)
         .collect();
         let mut peers: Vec<[u8; 32]> = find!(peer: VerifyingKey,
             pattern!(facts, [{ subject @ health_record::attrs::peer: ?peer }]))
@@ -340,14 +359,14 @@ pub fn observe(facts: &TribleSet, now_ns: i128, max_age: Duration) -> Vec<Worker
         // Reduce whole subject witnesses, never independent field bags. Extra
         // annotations and repeated labels do not invalidate admitted evidence.
         let mut subjects: Vec<_> = find!(
-            (node: VerifyingKey, worker: String, role: String),
+            (node: VerifyingKey, worker: TextHandle, role: TextHandle),
             pattern!(facts, [{ subject @
                 health_record::attrs::endpoint: ?node,
                 attrs::worker: ?worker,
                 attrs::role: ?role,
             }])
         )
-        .map(|(node, worker, role)| (node.to_bytes(), worker, role))
+        .filter_map(|(node, worker, role)| Some((node.to_bytes(), text(worker)?, text(role)?)))
         .collect();
         subjects.sort_unstable();
         subjects.dedup();

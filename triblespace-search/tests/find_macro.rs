@@ -286,10 +286,14 @@ fn matches_set_equals_score_threshold_set() {
 #[test]
 fn find_bm25_composed_with_pattern() {
     use triblespace_core::and;
+    use triblespace_core::blob::encodings::utf8string::UTF8String;
     use triblespace_core::examples::literature;
     use triblespace_core::id::ExclusiveId;
+    use triblespace_core::inline::encodings::hash::Handle;
+    use triblespace_core::inline::Inline;
     use triblespace_core::macros::{entity, pattern};
-    use triblespace_core::trible::TribleSet;
+    use triblespace_core::repo::{BlobStoreGet, SnapshotSource};
+    use triblespace_core::trible::Fragment;
 
     let target_author = id(10);
     let other_author = id(11);
@@ -298,7 +302,8 @@ fn find_bm25_composed_with_pattern() {
     let book_c = id(22);
     let book_d = id(23);
 
-    let mut kb = TribleSet::new();
+    // A fragment keeps the title blobs beside the facts that reference them.
+    let mut kb = Fragment::empty();
     kb += entity! { ExclusiveId::force_ref(&target_author) @
         literature::firstname: "Target",
         literature::lastname: "Author",
@@ -324,14 +329,17 @@ fn find_bm25_composed_with_pattern() {
         literature::author: &target_author,
     };
 
-    let titles: Vec<(Id, String)> = find!(
-        (b: Id, title: String),
-        pattern!(&kb, [{ ?b @ literature::title: ?title }])
+    let blobs = kb.blobs().clone().snapshot().unwrap();
+    let kb = kb.facts();
+    let titles: Vec<(Id, Inline<Handle<UTF8String>>)> = find!(
+        (b: Id, title: Inline<Handle<UTF8String>>),
+        pattern!(kb, [{ ?b @ literature::title: ?title }])
     )
     .collect();
     let mut bm25 = BM25Builder::new();
     for (b, title) in &titles {
-        bm25.insert(*b, hash_tokens(title));
+        let title: anybytes::View<str> = blobs.get(*title).unwrap();
+        bm25.insert(*b, hash_tokens(title.as_ref()));
     }
     let idx = bm25.build();
 
@@ -341,7 +349,7 @@ fn find_bm25_composed_with_pattern() {
         (book: Id),
         and!(
             idx.matches(book, &fox, 0.0),
-            pattern!(&kb, [{ ?book @ literature::author: &target_author }])
+            pattern!(kb, [{ ?book @ literature::author: &target_author }])
         )
     )
     .collect();

@@ -31,9 +31,7 @@ use triblespace_core::blob::{Blob, BlobEncoding, TryFromBlob};
 use triblespace_core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
 use triblespace_core::collection::{CollectionHandle, CollectionOperationError, DeriveMapping};
 use triblespace_core::id::{id_hex, ExclusiveId, Id};
-use triblespace_core::inline::encodings::{
-    genid::GenId, hash::Handle, iu256::U256BE, shortstring::ShortString,
-};
+use triblespace_core::inline::encodings::{genid::GenId, hash::Handle, iu256::U256BE};
 use triblespace_core::inline::{Inline, IntoInline, TryFromInline};
 use triblespace_core::macros::{attributes, entity, find};
 use triblespace_core::metadata::{self, MetaDescribe};
@@ -309,10 +307,9 @@ where
         if crate::nvfp4::mapping_dimension(target)? != DIMENSION {
             return Err(fatal("native WeMM descriptor requires dimension 4096"));
         }
-        let compute: String = Inline::<ShortString>::new(argument(facts, semantic_compute.id())?)
-            .try_from_inline()
-            .map_err(|e| fatal(format!("invalid compute class: {e:?}")))?;
-        if compute != COMPUTE_CLASS {
+        let compute =
+            crate::semantic_attributes::compute_class(argument(facts, semantic_compute.id())?);
+        if compute != Some(COMPUTE_CLASS) {
             return Err(fatal("native WeMM descriptor requires compute class gb10"));
         }
         let mapping = descriptor::mapping(facts)

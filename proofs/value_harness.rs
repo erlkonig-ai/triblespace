@@ -1,4 +1,6 @@
 #![cfg(kani)]
+// ShortString is deprecated; its proof stays until the type is removed.
+#![allow(deprecated)]
 
 use crate::inline::encodings::money::Amount;
 use crate::inline::encodings::money::Currency;

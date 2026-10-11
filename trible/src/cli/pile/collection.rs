@@ -686,7 +686,7 @@ fn parse_recipient_key(value: &str) -> Result<VerifyingKey> {
         .expect("iroh public keys are validated Ed25519 points"))
 }
 
-fn handle_hex(handle: CollectionHandle) -> String {
+pub(crate) fn handle_hex(handle: CollectionHandle) -> String {
     hex::encode(handle.raw)
 }
 
@@ -2511,7 +2511,7 @@ fn parse_attribute_id(flag: &str, value: Option<&str>) -> Result<Id> {
 }
 
 /// Resolve and open one collection of this pile by name or handle.
-fn open_resolved<E>(pile: &mut Pile, reference: &str) -> Result<Collection<E>>
+pub(crate) fn open_resolved<E>(pile: &mut Pile, reference: &str) -> Result<Collection<E>>
 where
     E: triblespace_core::collection::CollectionEncoding,
 {

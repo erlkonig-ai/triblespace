@@ -1,3 +1,7 @@
+// ShortString is deprecated; its own module and conversion impls still
+// have to name it until the type is removed.
+#![allow(deprecated)]
+
 use crate::id::ExclusiveId;
 use crate::id::Id;
 use crate::id_hex;
@@ -38,6 +42,15 @@ pub enum ValidationError {
 /// The string is null-terminated.
 /// If the string is shorter than 32 bytes, the remaining bytes are zero.
 /// If the string is exactly 32 bytes, then there is no zero terminator.
+///
+/// Deprecated: the 32-byte ceiling made `entity!` panic on longer input and
+/// pushed every caller into silent truncation or dropping. Declare text
+/// attributes as [`Handle<UTF8String>`](crate::inline::encodings::hash::Handle)
+/// instead. The type stays so that downstream crates keep compiling and old
+/// rows remain decodable; it will be removed once nothing writes it.
+#[deprecated(
+    note = "ShortString is being removed: declare text attributes as Handle<UTF8String> (blob text). Old rows stay readable under their old attribute ids."
+)]
 pub struct ShortString;
 
 impl MetaDescribe for ShortString {

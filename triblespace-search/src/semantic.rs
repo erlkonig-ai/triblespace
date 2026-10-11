@@ -86,7 +86,6 @@ use triblespace_core::collection::{
 use triblespace_core::id::{id_hex, ExclusiveId, Id};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::inline::encodings::shortstring::ShortString;
 use triblespace_core::inline::{Inline, IntoInline};
 use triblespace_core::macros::{attributes, entity, find};
 use triblespace_core::metadata::{self, MetaDescribe};
@@ -601,10 +600,9 @@ where
         )
         .map_err(|source| fatal(source.to_string()))?
         .ok_or_else(|| fatal("semantic index names no compute class"))?;
-        let compute_class: String = Inline::<ShortString>::new(compute_raw)
-            .try_from_inline()
-            .map_err(|source| {
-                fatal(format!("semantic index: invalid compute class: {source:?}"))
+        let compute_class =
+            crate::semantic_attributes::compute_class(compute_raw).ok_or_else(|| {
+                fatal("semantic index names a compute class this build does not know")
             })?;
         let model_collection = triblespace_core::collection::descriptor::mapping_argument(
             facts,

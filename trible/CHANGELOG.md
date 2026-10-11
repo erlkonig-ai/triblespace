@@ -15,6 +15,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   whole since the previous pass, and the telemetry `repair` subject reports
   no active count, since host health records the ends of pushes and
   receives rather than the ones in flight.
+
+- Telemetry worker labels have no 32-byte limit; the maintenance worker label
+  refuses control characters like the network one. The legacy branch-name
+  reader in `pile migrate branch-to-collection` decodes the retired 32-byte
+  layout from raw bytes instead of through `ShortString`.
+
 - Selected collection compaction consumes its exact preflight selection without
   repeating the filter or blob walk. Report scan, selection and copy phases,
   plus retained blob payload bytes (not total framed output size).
@@ -47,6 +53,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   held-set walker they configured.
 
 ### Added
+
+- `pile migrate <PILE> shortstring-to-utf8 <COLLECTION> [--pinned HEX]...
+  [--anchored HEX]... [--key KEY] [--dry-run]` appends the
+  `Handle<UTF8String>` twin of every old `ShortString` fact in a collection's
+  current view, in one commit its WRITE policy must admit. Old ids come from
+  the declaration hex (pinned: the hex itself; anchored: derived with the
+  ShortString encoding id, kept as a constant), new ids from the hex and
+  `Handle<UTF8String>`. Nothing is deleted or rewritten, a re-run writes
+  nothing, and undecodable values are counted and listed.
 
 - Expose `maintenance::Driver`, native target selection and operation-boundary
   events for caller-owned stores. The CLI uses the same driver; dropping a tick

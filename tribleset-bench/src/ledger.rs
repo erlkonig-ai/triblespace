@@ -28,7 +28,7 @@ use triblespace::core::collection::{
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::Pile;
 use triblespace::prelude::blobencodings::UTF8String;
-use triblespace::prelude::inlineencodings::{Handle, ShortString};
+use triblespace::prelude::inlineencodings::Handle;
 use triblespace::prelude::*;
 
 /// Canonical telemetry attributes — byte-for-byte the ids of
@@ -36,14 +36,14 @@ use triblespace::prelude::*;
 /// `june-on-tip/src/telemetry.rs`).
 pub mod tele {
     use triblespace::prelude::blobencodings::UTF8String;
-    use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString, U256BE};
+    use triblespace::prelude::inlineencodings::{GenId, Handle, U256BE};
     use triblespace::prelude::*;
 
     attributes! {
         "3E062AA7E3554C8F2DB94883CE639BFE" unsafe as pub session: GenId;
         "146E5AA2F7CB3D8B654BC7742A13CAB3" unsafe as pub parent: GenId;
         "CCB0147D20C4C6FCAC0E3D87FAFF71D1" unsafe as pub name: Handle<UTF8String>;
-        "8A4BE2C4D0E90D2B9EE0E1A07ECA2CFA" unsafe as pub category: ShortString;
+        "8A4BE2C4D0E90D2B9EE0E1A07ECA2CFA" as pub category: Handle<UTF8String>;
         "E11A84A30CC112650DC860B66B8BD8A9" unsafe as pub begin_ns: U256BE;
         "2786FA563372FB6EF469EC7710719A49" unsafe as pub end_ns: U256BE;
         "7593602383D0B0D21BBE382A67E5BD9F" unsafe as pub duration_ns: U256BE;
@@ -56,14 +56,14 @@ pub mod tele {
 /// outcome entities (of_run/workload/outcome/rows).
 pub mod bench {
     use triblespace::prelude::blobencodings::UTF8String;
-    use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString, U256BE};
+    use triblespace::prelude::inlineencodings::{GenId, Handle, U256BE};
     use triblespace::prelude::*;
 
     attributes! {
         /// Subject git rev (short=12) the session measured.
-        "2C96F6429B3E772B15A0AB630C2B394F" unsafe as pub commit: ShortString;
+        "2C96F6429B3E772B15A0AB630C2B394F" as pub commit: Handle<UTF8String>;
         /// Engine label (--label) naming the subject on the axis.
-        "2C899A2497B9565328A42A44996BD6A1" unsafe as pub engine: ShortString;
+        "2C899A2497B9565328A42A44996BD6A1" as pub engine: Handle<UTF8String>;
         /// Full run configuration: CLI + dataset + suite crate version.
         "8A3D02A290208D39DC18C69FAF38F1E1" unsafe as pub config: Handle<UTF8String>;
         /// Outcome entity -> its session.
@@ -71,7 +71,7 @@ pub mod bench {
         /// Outcome entity -> measure key (e.g. "harkonnen/F5/total").
         "81ADFDA915ABA850EE23FEE3B88FC02F" unsafe as pub workload: Handle<UTF8String>;
         /// signal | skip:<reason> | panic:<reason> | gate_fail:<reason>.
-        "5ACAF4FD8D71F0205694F646520707B5" unsafe as pub outcome: ShortString;
+        "5ACAF4FD8D71F0205694F646520707B5" as pub outcome: Handle<UTF8String>;
         /// Result cardinality of the measure, where meaningful.
         "B5A378BDC1A7F1C4576B2DC6902B5995" unsafe as pub rows: U256BE;
     }
@@ -118,17 +118,6 @@ fn results_collection() -> SimpleArchiveCollection {
         *RESULTS_COLLECTION_AUTHORITY,
         reach::private(),
     )
-}
-
-/// Clip a string to a ShortString-safe payload: first line, NULs
-/// stripped, at most 32 bytes on a char boundary.
-fn clip32(s: &str) -> String {
-    let line = s.lines().next().unwrap_or("").replace('\0', "");
-    let mut end = line.len().min(32);
-    while !line.is_char_boundary(end) {
-        end -= 1;
-    }
-    line[..end].to_owned()
 }
 
 /// Complete schema description stored beside every results element.
@@ -191,15 +180,13 @@ impl ResultsLedger {
         let mut pending = Fragment::empty();
         let name_handle = pending.put("tribleset-bench".to_string());
         let config_handle = pending.put(config.to_string());
-        let commit_short = clip32(commit);
-        let label_short = clip32(label);
         pending += entity! { &session_owner @
             metadata::tag: *KIND_SESSION,
             tele::category: "session",
             tele::name: name_handle,
             tele::begin_ns: 0u64,
-            bench::commit: commit_short.as_str(),
-            bench::engine: label_short.as_str(),
+            bench::commit: commit,
+            bench::engine: label,
             bench::config: config_handle,
         };
 
@@ -243,11 +230,10 @@ impl ResultsLedger {
     pub fn outcome(&mut self, workload: &str, outcome: &str, rows: Option<u64>) {
         let outcome_owner = genid();
         let workload_handle = self.pending.put(workload.to_string());
-        let outcome_short = clip32(outcome);
         self.pending += entity! { &outcome_owner @
             bench::of_run: self.session,
             bench::workload: workload_handle,
-            bench::outcome: outcome_short.as_str(),
+            bench::outcome: outcome,
         };
         if let Some(r) = rows {
             self.pending += entity! { &outcome_owner @ bench::rows: r };
@@ -381,18 +367,16 @@ pub fn verify(path: &Path) -> Result<()> {
     for (s, c, eng, cfg) in find!(
         (
             s: Id,
-            c: Inline<ShortString>,
-            eng: Inline<ShortString>,
+            c: Inline<Handle<UTF8String>>,
+            eng: Inline<Handle<UTF8String>>,
             cfg: Inline<Handle<UTF8String>>
         ),
         pattern!(&facts, [{ ?s @ bench::commit: ?c, bench::engine: ?eng, bench::config: ?cfg }])
     ) {
-        let commit: String = c
-            .try_from_inline()
-            .map_err(|e| anyhow!("commit decode: {e:?}"))?;
-        let engine: String = eng
-            .try_from_inline()
-            .map_err(|e| anyhow!("engine decode: {e:?}"))?;
+        let commit: anybytes::View<str> =
+            reader.get(c).map_err(|e| anyhow!("commit blob: {e:?}"))?;
+        let engine: anybytes::View<str> =
+            reader.get(eng).map_err(|e| anyhow!("engine blob: {e:?}"))?;
         let config: anybytes::View<str> =
             reader.get(cfg).map_err(|e| anyhow!("config blob: {e:?}"))?;
         let status = if ended_sessions.contains(&s) {
@@ -400,7 +384,11 @@ pub fn verify(path: &Path) -> Result<()> {
         } else {
             "incomplete"
         };
-        println!("  {s:X}  commit={commit} engine={engine} status={status}");
+        println!(
+            "  {s:X}  commit={} engine={} status={status}",
+            commit.as_ref(),
+            engine.as_ref()
+        );
         println!("    config: {}", config.as_ref());
     }
 
@@ -472,17 +460,16 @@ pub fn verify(path: &Path) -> Result<()> {
 
     let mut outcome_rows: Vec<(String, String, Option<u64>)> = Vec::new();
     for (o, w, v) in find!(
-        (o: Id, w: Inline<Handle<UTF8String>>, v: Inline<ShortString>),
+        (o: Id, w: Inline<Handle<UTF8String>>, v: Inline<Handle<UTF8String>>),
         pattern!(&facts, [{ ?o @ bench::workload: ?w, bench::outcome: ?v }])
     ) {
         let workload: anybytes::View<str> =
             reader.get(w).map_err(|e| anyhow!("workload blob: {e:?}"))?;
-        let outcome: String = v
-            .try_from_inline()
-            .map_err(|e| anyhow!("outcome decode: {e:?}"))?;
+        let outcome: anybytes::View<str> =
+            reader.get(v).map_err(|e| anyhow!("outcome blob: {e:?}"))?;
         outcome_rows.push((
             workload.as_ref().to_owned(),
-            outcome,
+            outcome.as_ref().to_owned(),
             rows_of.get(&o).copied(),
         ));
     }

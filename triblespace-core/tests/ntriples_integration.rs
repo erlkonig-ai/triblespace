@@ -12,7 +12,7 @@ use triblespace_core::blob::IntoBlob;
 use triblespace_core::id::Id;
 use triblespace_core::import::ntriples::{ingest_ntriples, uri_to_id_pure, IngestError};
 use triblespace_core::import::rdf_uri;
-use triblespace_core::inline::{Inline, TryToInline};
+use triblespace_core::inline::Inline;
 use triblespace_core::macros::{entity, find, pattern};
 use triblespace_core::metadata;
 use triblespace_core::prelude::inlineencodings::{self, Handle};
@@ -308,18 +308,16 @@ fn lang_tagged_literals_reify_into_entities() {
     );
 
     // The English label entity carries `rdf_lang = "en"` and one rdf_text trible.
-    let en_value = "en".try_to_inline().unwrap();
     let en_count = find!(
         (e: Id),
-        pattern!(&facts, [{ ?e @ rdf_lang: en_value }])
+        pattern!(&facts, [{ ?e @ rdf_lang: "en" }])
     )
     .count();
     assert_eq!(en_count, 1, "one shared English label entity");
 
-    let de_value = "de".try_to_inline().unwrap();
     let de_count = find!(
         (e: Id),
-        pattern!(&facts, [{ ?e @ rdf_lang: de_value }])
+        pattern!(&facts, [{ ?e @ rdf_lang: "de" }])
     )
     .count();
     assert_eq!(de_count, 1, "one German label entity");

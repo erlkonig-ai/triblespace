@@ -36,7 +36,6 @@ use triblespace_core::collection::{
 use triblespace_core::id::{id_hex, ExclusiveId, Id, RawId};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::inline::encodings::shortstring::ShortString;
 use triblespace_core::inline::{Encodes, Inline, IntoInline, RawInline};
 use triblespace_core::macros::{attributes, entity};
 use triblespace_core::metadata::{self, MetaDescribe};
@@ -57,7 +56,7 @@ attributes! {
     /// tokenizers over one attribute are two collections.
     ///
     /// Anchor minted with `trible genid` on 2026-09-10.
-    "CAD86B2DE38743BB054167A35A8E95FF" as bm25_tokenizer: ShortString;
+    "CAD86B2DE38743BB054167A35A8E95FF" as bm25_tokenizer: Handle<UTF8String>;
 }
 
 /// How a text is cut into terms. Each variant names one function of
@@ -88,6 +87,15 @@ impl Bm25Tokenizer {
             "code" => Some(Self::Code),
             _ => None,
         }
+    }
+
+    /// The tokenizer whose name has this content handle. A descriptor stores
+    /// the name as `UTF8String` text, and a loaded descriptor carries no
+    /// blobs, so the closed set of names is matched by handle.
+    pub fn from_name_handle(handle: Inline<Handle<UTF8String>>) -> Option<Self> {
+        [Self::Word, Self::Bigram, Self::Code]
+            .into_iter()
+            .find(|tokenizer| handle == tokenizer.name().to_inline())
     }
 
     /// The raw 32-byte terms of `text` under this tokenizer.
@@ -170,11 +178,8 @@ impl CollectionAttachment for PortableBM25Blob {
         )
         .map_err(|source| fatal(source.to_string()))?
         .ok_or_else(|| fatal("BM25 mapping is missing its tokenizer"))?;
-        let tokenizer: String = Inline::<ShortString>::new(tokenizer)
-            .try_from_inline()
-            .map_err(|source| fatal(format!("invalid BM25 tokenizer name: {source:?}")))?;
-        let tokenizer = Bm25Tokenizer::from_name(&tokenizer)
-            .ok_or_else(|| fatal(format!("unknown BM25 tokenizer {tokenizer:?}")))?;
+        let tokenizer = Bm25Tokenizer::from_name_handle(Inline::new(tokenizer))
+            .ok_or_else(|| fatal("unknown BM25 tokenizer"))?;
         Ok(TextAttributeToBm25 {
             attribute,
             tokenizer,

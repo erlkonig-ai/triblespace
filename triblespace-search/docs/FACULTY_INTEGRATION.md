@@ -53,7 +53,7 @@ use triblespace_search::succinct::{SuccinctBM25Blob, SuccinctBM25Index};
 use triblespace_search::tokens::hash_tokens;
 
 // Assume a `wiki` namespace is already in the pile, providing:
-//   wiki::title:   ShortString                   (fragment title)
+//   wiki::title:   Handle<UTF8String>    (fragment title)
 //   wiki::body:    Handle<UTF8String>    (typst body)
 //   wiki::index:   Handle<SuccinctBM25Blob>  (current-index handle)
 mod wiki { /* ... */ }
@@ -106,7 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The type annotation on the get line picks the
             // D=GenId, T=WordHash defaults; an index built with
             // different schemas would spell them here too (e.g.
-            // `SuccinctBM25Index<ShortString, WordHash>`).
+            // `SuccinctBM25Index<Handle<UTF8String>, WordHash>`).
             let idx: SuccinctBM25Index =
                 snapshot.get::<SuccinctBM25Index, SuccinctBM25Blob>(handle)?;
             // One engine pass: `matches_text` tokenises the query
@@ -152,7 +152,7 @@ shapes are explicit:
 | Use case | Type |
 |---|---|
 | Body-text search (the example) | `BM25Builder<GenId, WordHash>` |
-| Title-keyed search | `BM25Builder<ShortString, WordHash>` |
+| Title-keyed search | `BM25Builder<Handle<UTF8String>, WordHash>` |
 | Phrase search (bigram terms) | `BM25Builder<GenId, BigramHash>` |
 | Prefix / fuzzy (n-gram terms) | `BM25Builder<GenId, NgramHash>` |
 | Entity co-occurrence ("which docs cite X?") | `BM25Builder<GenId, GenId>` |
@@ -345,8 +345,8 @@ Migration recipe:
 4. Once no reader references the old attribute, `pile keep`
    sweeps the orphaned blobs at the next consolidation.
 
-Attributes whose value type is a plain `ShortString`,
-`UTF8String`, `GenId`, etc. (anything not parameterized on a
+Attributes whose value type is a plain `Handle<UTF8String>`,
+`GenId`, etc. (anything not parameterized on a
 crate-owned `BlobEncoding`) are unaffected by our schema
 rotations — only handles to *our* blob types transitively
 depend on our IDs.

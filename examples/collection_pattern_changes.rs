@@ -23,11 +23,12 @@ use triblespace::prelude::*;
 
 fn rebuild(
     full: &UnionArchive<OrderedUniverse>,
+    blobs: &impl BlobStoreGet,
     consume: &mut impl FnMut(&str) -> Result<(), Box<dyn Error>>,
 ) -> Result<Vec<String>, Box<dyn Error>> {
     let mut titles = Vec::new();
     for title in find!(
-        title: String,
+        title: Inline<_>,
         pattern!(full, [
             { _?author @ literature::firstname: "Frank" },
             { _?book @
@@ -36,8 +37,11 @@ fn rebuild(
             }
         ])
     ) {
-        consume(&title)?;
-        titles.push(title);
+        // A title is the content handle of its text; read the text through
+        // the same snapshot.
+        let title: View<str> = blobs.get(title)?;
+        consume(title.as_ref())?;
+        titles.push(title.as_ref().to_owned());
     }
     Ok(titles)
 }
@@ -45,11 +49,12 @@ fn rebuild(
 fn changes(
     full: &UnionArchive<OrderedUniverse>,
     changed: &TribleSet,
+    blobs: &impl BlobStoreGet,
     consume: &mut impl FnMut(&str) -> Result<(), Box<dyn Error>>,
 ) -> Result<Vec<String>, Box<dyn Error>> {
     let mut titles = Vec::new();
     for title in find!(
-        title: String,
+        title: Inline<_>,
         pattern_changes!(full, changed, [
             { _?author @ literature::firstname: "Frank" },
             { _?book @
@@ -58,8 +63,11 @@ fn changes(
             }
         ])
     ) {
-        consume(&title)?;
-        titles.push(title);
+        // A title is the content handle of its text; read the text through
+        // the same snapshot.
+        let title: View<str> = blobs.get(title)?;
+        consume(title.as_ref())?;
+        titles.push(title.as_ref().to_owned());
     }
     Ok(titles)
 }
@@ -112,8 +120,8 @@ fn observe(
     // token names.
     let full: UnionArchive<OrderedUniverse> = attached.view()?;
     let titles = match changed {
-        Some(changed) => changes(&full, &changed, &mut consume)?,
-        None => rebuild(&full, &mut consume)?,
+        Some(changed) => changes(&full, &changed, &snapshot, &mut consume)?,
+        None => rebuild(&full, &snapshot, &mut consume)?,
     };
 
     // Adopt only after the complete fold succeeds. A failed consumer retries

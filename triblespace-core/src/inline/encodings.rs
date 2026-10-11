@@ -24,7 +24,8 @@ pub mod r256;
 pub mod range;
 /// Order-preserving exact rational encoding (bytes sort numerically).
 pub mod rord256;
-/// Inline UTF-8 short string encoding (up to 32 bytes).
+/// Inline UTF-8 short string encoding (up to 32 bytes). Deprecated: declare
+/// text attributes as `Handle<UTF8String>`.
 pub mod shortstring;
 /// Socket address (IP address and port) encoding.
 pub mod socketaddr;

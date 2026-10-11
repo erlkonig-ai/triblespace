@@ -16,9 +16,9 @@ pub mod literature {
 
     attributes! {
         "8F180883F9FD5F787E9E0AF0DF5866B9" unsafe as author: inlineencodings::GenId;
-        "0DBB530B37B966D137C50B943700EDB2" unsafe as firstname: inlineencodings::ShortString;
-        "6BAA463FD4EAF45F6A103DB9433E4545" unsafe as lastname: inlineencodings::ShortString;
-        "A74AA63539354CDA47F387A4C3A8D54C" unsafe as title: inlineencodings::ShortString;
+        "0DBB530B37B966D137C50B943700EDB2" as firstname: inlineencodings::Handle<blobencodings::UTF8String>;
+        "6BAA463FD4EAF45F6A103DB9433E4545" as lastname: inlineencodings::Handle<blobencodings::UTF8String>;
+        "A74AA63539354CDA47F387A4C3A8D54C" as title: inlineencodings::Handle<blobencodings::UTF8String>;
         "FCCE870BECA333D059D5CD68C43B98F0" unsafe as page_count: inlineencodings::R256;
         "6A03BAF6CFB822F04DA164ADAAEB53F6" unsafe as quote: inlineencodings::Handle<blobencodings::UTF8String>;
     }
@@ -41,8 +41,8 @@ fn main() {
         };
     });
 
-    let author_names: HashSet<String, _> =
-        HashSet::from_iter(["Frank", "Bob"].iter().map(|s| s.to_string()));
+    let author_names: HashSet<Inline<inlineencodings::Handle<blobencodings::UTF8String>>, _> =
+        HashSet::from_iter(["Frank", "Bob"].into_iter().map(|s| s.to_inline()));
 
     let _result: Vec<_> = find!(
     (firstname: Inline<_>, title: Inline<_>, author: Inline<_>, quote: Inline<_>),

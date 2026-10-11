@@ -25,15 +25,15 @@ Omit the anchor only for local prototypes whose identity may follow their name.
 mod literature {
     use triblespace::prelude::*;
     use triblespace::prelude::blobencodings::UTF8String;
-    use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString};
+    use triblespace::prelude::inlineencodings::{GenId, Handle};
 
     attributes! {
-        "A74AA63539354CDA47F387A4C3A8D54C" as pub title: ShortString;
+        "A74AA63539354CDA47F387A4C3A8D54C" as pub title: Handle<UTF8String>;
         "6A03BAF6CFB822F04DA164ADAAEB53F6" as pub quote: Handle<UTF8String>;
         "8F180883F9FD5F787E9E0AF0DF5866B9" as pub author: GenId;
-        "0DBB530B37B966D137C50B943700EDB2" as pub firstname: ShortString;
-        "6BAA463FD4EAF45F6A103DB9433E4545" as pub lastname: ShortString;
-        "D2D1B857AC92CEAA45C0737147CA417E" as pub alias: ShortString;
+        "0DBB530B37B966D137C50B943700EDB2" as pub firstname: Handle<UTF8String>;
+        "6BAA463FD4EAF45F6A103DB9433E4545" as pub lastname: Handle<UTF8String>;
+        "D2D1B857AC92CEAA45C0737147CA417E" as pub alias: Handle<UTF8String>;
     }
 }
 ```
@@ -89,8 +89,9 @@ grants nothing.
 
 With no explicit subject prefix, `entity!` derives the entity ID from the
 canonical set of emitted fields. `Fragment::root()` returns that exported ID,
-which can be referenced by another entity. Long strings become blobs and remain
-attached to the fragment automatically.
+which can be referenced by another entity. Text becomes `UTF8String` blobs
+that remain attached to the fragment automatically; the fact holds the blob's
+content handle.
 
 ```rust,ignore
 let author = entity! {
@@ -146,7 +147,7 @@ let facts: TribleSet = library.read(&snapshot)?;
 let title = "Dune";
 
 for (first, last, quote) in find!(
-    (first: String, last: String, quote),
+    (first, last, quote),
     pattern!(&facts, [
         { _?author @
             literature::firstname: ?first,
@@ -159,8 +160,15 @@ for (first, last, quote) in find!(
         }
     ])
 ) {
+    let first: View<str> = snapshot.get(first)?;
+    let last: View<str> = snapshot.get(last)?;
     let quote: View<str> = snapshot.get(quote)?;
-    println!("'{}'\n - from {title} by {first} {last}.", quote.as_ref());
+    println!(
+        "'{}'\n - from {title} by {} {}.",
+        quote.as_ref(),
+        first.as_ref(),
+        last.as_ref()
+    );
 }
 ```
 

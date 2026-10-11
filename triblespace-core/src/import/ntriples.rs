@@ -88,10 +88,9 @@ use crate::inline::encodings::boolean::Boolean;
 use crate::inline::encodings::f64::F64;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::hash::Handle;
-use crate::inline::encodings::shortstring::ShortString;
 use crate::inline::encodings::time::{i128_to_ordered_be, NsDuration, NsTAIInterval};
 use crate::inline::encodings::UnknownInline;
-use crate::inline::{Inline, IntoInline, RawInline, TryToInline};
+use crate::inline::{Inline, IntoInline, RawInline};
 use crate::macros::entity;
 use crate::prelude::inlineencodings;
 use crate::trible::{build_intrinsic_entity, Fragment, IntrinsicEntityRow, Trible, TribleSet};
@@ -1341,10 +1340,8 @@ fn build_resolved_outgoing(
             // outgoing fact carries a GenId reference to it. Side
             // effects (the lang-entity tribles) land in `facts`
             // immediately since they don't depend on the parent id.
-            let Ok(lang_value): Result<Inline<ShortString>, _> = lang.as_ref().try_to_inline()
-            else {
-                return None;
-            };
+            let lang: &str = lang.as_ref();
+            let lang_value: Inline<Handle<UTF8String>> = facts.put(lang);
             let text_handle: Inline<Handle<UTF8String>> = facts.put(text);
             let label_fragment = entity! {
                 crate::import::rdf_lang: lang_value,
@@ -1540,9 +1537,7 @@ fn emit_lang_literal(
     // Reify `"text"@lang` into a small entity carrying `rdf_lang` and
     // `rdf_text`. The intrinsic id derived from those facts dedupes
     // `(lang, text)` pairs across the whole import.
-    let Ok(lang_value): Result<Inline<ShortString>, _> = lang.try_to_inline() else {
-        return; // tag too long; BCP-47 caps subtags at 8 chars
-    };
+    let lang_value: Inline<Handle<UTF8String>> = facts.put(lang);
     let text_handle: Inline<Handle<UTF8String>> = facts.put(text);
     let label_fragment = entity! {
         crate::import::rdf_lang: lang_value,

@@ -434,7 +434,6 @@ use crate::trible::{TribleSet, V_END, V_START};
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::utf8string::UTF8String;
-use crate::inline::encodings::shortstring::ShortString;
 use crate::prelude::*;
 
 attributes! {
@@ -444,8 +443,6 @@ attributes! {
     "317044B612C690000D798CA660ECFD2A" unsafe as pub parent: Handle<SimpleArchive>;
     /// A (potentially long) message describing the commit.
     "B59D147839100B6ED4B165DF76EDF3BB" unsafe as pub message: Handle<UTF8String>;
-    /// A short message describing the commit.
-    "12290C0BE0E9207E324F24DDE0D89300" unsafe as pub short_message: ShortString;
     /// The hash of the first commit in the commit chain of the branch.
     "272FBC56108F336C4D2E17289468C35F" unsafe as pub head: Handle<SimpleArchive>;
     /// An id used to track the branch.

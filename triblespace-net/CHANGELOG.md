@@ -212,6 +212,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a salt each draws once and never sends, instead of by the provider's public
   XOR distance from the key, which a provider could grind an identity for.
 
+- Telemetry labels (`worker`, `role`, `backend`, `stage`, `path`,
+  `compiled_backend`) are `Handle<UTF8String>` with ids derived anew from the
+  same anchors; old samples stay under the old ids. `telemetry::observe` takes
+  a blob reader and skips labels whose text is not resident.
+
 - Add explicit `shutdown_and_join` for `Peer`, `Leech` and the started host.
   Withdraw serving, close future host activation, revoke retained acquisition
   capabilities, stop the transport and join its runtime thread. The caller

@@ -48,8 +48,8 @@ cargo add triblespace ed25519-dalek rand
 
 The example below publishes one self-contained `Fragment`, freezes one coherent
 store snapshot, and queries an admitted collection cover. `entity!` derives the
-author and book identifiers from their contents and carries the quoted string
-blob with the facts that reference it.
+author and book identifiers from their contents and carries the text
+blobs with the facts that reference them.
 
 ```rust
 use ed25519_dalek::SigningKey;
@@ -60,19 +60,19 @@ use triblespace::prelude::*;
 mod literature {
     use triblespace::prelude::*;
     use triblespace::prelude::blobencodings::UTF8String;
-    use triblespace::prelude::inlineencodings::{GenId, Handle, ShortString};
+    use triblespace::prelude::inlineencodings::{GenId, Handle};
 
     attributes! {
         /// The title of a work.
-        "A74AA63539354CDA47F387A4C3A8D54C" as pub title: ShortString;
+        "A74AA63539354CDA47F387A4C3A8D54C" as pub title: Handle<UTF8String>;
         /// A quote from a work.
         "6A03BAF6CFB822F04DA164ADAAEB53F6" as pub quote: Handle<UTF8String>;
         /// The author of a work.
         "8F180883F9FD5F787E9E0AF0DF5866B9" as pub author: GenId;
         /// The first name of an author.
-        "0DBB530B37B966D137C50B943700EDB2" as pub firstname: ShortString;
+        "0DBB530B37B966D137C50B943700EDB2" as pub firstname: Handle<UTF8String>;
         /// The last name of an author.
-        "6BAA463FD4EAF45F6A103DB9433E4545" as pub lastname: ShortString;
+        "6BAA463FD4EAF45F6A103DB9433E4545" as pub lastname: Handle<UTF8String>;
     }
 }
 
@@ -108,7 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let facts: TribleSet = library.read(&snapshot)?;
     let title = "Dune";
     for (first, last, quote) in find!(
-        (first: String, last: String, quote),
+        (first, last, quote),
         pattern!(&facts, [
             { _?author @
                 literature::firstname: ?first,
@@ -121,8 +121,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         ])
     ) {
+        let first: View<str> = snapshot.get(first)?;
+        let last: View<str> = snapshot.get(last)?;
         let quote: View<str> = snapshot.get(quote)?;
-        println!("'{}'\n - from {title} by {first} {last}.", quote.as_ref());
+        println!(
+            "'{}'\n - from {title} by {} {}.",
+            quote.as_ref(),
+            first.as_ref(),
+            last.as_ref()
+        );
     }
 
     Ok(())

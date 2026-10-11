@@ -326,7 +326,7 @@ impl Reader {
                 )),
             }
         }
-        let workers = telemetry::observe(&facts, now_ns, self.max_age);
+        let workers = telemetry::observe(&facts, &snapshot, now_ns, self.max_age);
         let mut health_readable = true;
         let health = match self.health.as_mut() {
             Some(source) => match source.facts(&snapshot) {
@@ -2720,7 +2720,12 @@ mod tests {
             assert_eq!(reader.projection_runs, expected_queries, "at {seconds}");
             assert_eq!(
                 frame.workers,
-                telemetry::observe(facts.facts(), now_ns, options.max_age)
+                telemetry::observe(
+                    facts.facts(),
+                    &facts.blobs().clone().snapshot().unwrap(),
+                    now_ns,
+                    options.max_age
+                )
             );
             assert_eq!(
                 frame.health,

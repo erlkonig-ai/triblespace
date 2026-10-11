@@ -71,14 +71,14 @@ mod readme_example {
 
     mod literature {
         use crate::prelude::blobencodings::UTF8String;
-        use crate::prelude::inlineencodings::{GenId, Handle, ShortString, R256};
+        use crate::prelude::inlineencodings::{GenId, Handle, R256};
         use crate::prelude::*;
 
         attributes! {
             /// The title of a work.
             ///
             /// Small doc paragraph used in the book examples.
-            "A74AA63539354CDA47F387A4C3A8D54C" unsafe as pub title: ShortString;
+            "A74AA63539354CDA47F387A4C3A8D54C" as pub title: Handle<UTF8String>;
 
             /// A quote from a work.
             "6A03BAF6CFB822F04DA164ADAAEB53F6" unsafe as pub quote: Handle<UTF8String>;
@@ -87,10 +87,10 @@ mod readme_example {
             "8F180883F9FD5F787E9E0AF0DF5866B9" unsafe as pub author: GenId;
 
             /// The first name of an author.
-            "0DBB530B37B966D137C50B943700EDB2" unsafe as pub firstname: ShortString;
+            "0DBB530B37B966D137C50B943700EDB2" as pub firstname: Handle<UTF8String>;
 
             /// The last name of an author.
-            "6BAA463FD4EAF45F6A103DB9433E4545" unsafe as pub lastname: ShortString;
+            "6BAA463FD4EAF45F6A103DB9433E4545" as pub lastname: Handle<UTF8String>;
 
             /// The number of pages in the work.
             "FCCE870BECA333D059D5CD68C43B98F0" unsafe as pub page_count: R256;
@@ -129,8 +129,8 @@ mod readme_example {
         let catalog: TribleSet = library.read(&snapshot)?;
         let title = "Dune";
 
-        for (f, l, quote) in find!(
-            (first: String, last: String, quote),
+        for (first, last, quote) in find!(
+            (first, last, quote),
             pattern!(&catalog, [
                 { _?author @
                     literature::firstname: ?first,
@@ -143,9 +143,15 @@ mod readme_example {
                 }
             ])
         ) {
+            let first: View<str> = snapshot.get(first)?;
+            let last: View<str> = snapshot.get(last)?;
             let quote: View<str> = snapshot.get(quote)?;
-            let quote = quote.as_ref();
-            println!("'{quote}'\n - from {title} by {f} {l}.");
+            println!(
+                "'{}'\n - from {title} by {} {}.",
+                quote.as_ref(),
+                first.as_ref(),
+                last.as_ref()
+            );
         }
 
         // Independent commits coexist and materialize by set union. There is
@@ -169,11 +175,14 @@ mod readme_example {
 
         let snapshot = storage.snapshot()?;
         let catalog: TribleSet = library.read(&snapshot)?;
-        let mut names: Vec<String> = find!(
-            first: String,
+        let mut names = Vec::new();
+        for first in find!(
+            first,
             pattern!(&catalog, [{ _?author @ literature::firstname: ?first }])
-        )
-        .collect();
+        ) {
+            let first: View<str> = snapshot.get(first)?;
+            names.push(first.as_ref().to_owned());
+        }
         names.sort();
         assert_eq!(names, ["Francis", "Frank", "Franklin"]);
 
