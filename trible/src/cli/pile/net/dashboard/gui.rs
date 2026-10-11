@@ -158,7 +158,7 @@ fn compose<P, S>(
     // it publishes and the panel it draws are the same thing, not two.
     let observed = notebook.state(
         "colony-frame",
-        None as Observed,
+        || None as Observed,
         move |ctx, held: &mut Observed| {
             ctx.ctx().request_repaint_after(Duration::from_millis(250));
             let (observed, since) = pull();
@@ -199,7 +199,7 @@ fn compose<P, S>(
     // while reading another's.
     let selection = notebook.state(
         "colony-selection",
-        selected,
+        move || selected,
         move |ctx, selected: &mut Option<[u8; 32]>| {
             let held = observed.read(ctx);
             draw(ctx, &held, "Collection lattice", |ui, frame| {
