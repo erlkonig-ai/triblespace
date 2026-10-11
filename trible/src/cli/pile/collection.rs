@@ -61,6 +61,7 @@ use triblespace_core::trible::TribleSet;
 use super::{open_refreshed, open_refreshed_as};
 
 mod adopt;
+mod backfill_text;
 use trible::maintenance::{telemetry as maintenance_telemetry, SuccinctBackend};
 pub(crate) mod v3_mappings;
 
@@ -201,6 +202,20 @@ pub enum Command {
     /// Nothing is written without `--apply`; the dry run is the default, and
     /// its net-new figure is exactly what `--apply` appends.
     Adopt(adopt::AdoptArgs),
+    /// Append the Handle<UTF8String> twin of every old ShortString fact.
+    ///
+    /// Text attributes moved off the 32-byte ShortString encoding, and the
+    /// encoding is part of an attribute's id, so old facts sit under ids new
+    /// code no longer reads. Name each retired declaration by its hex:
+    /// `--pinned HEX` for `"HEX" unsafe as ..: ShortString` (old id = HEX),
+    /// `--anchored HEX` for `"HEX" as ..: ShortString` (old id derived from
+    /// HEX and ShortString). The new id is derived from HEX and
+    /// Handle<UTF8String>. Every old fact in the collection's current view
+    /// whose twin is absent gets one, text stored as a blob, in a single
+    /// commit the collection's WRITE must admit. Nothing is deleted or
+    /// rewritten, a second run writes nothing, and values that do not decode
+    /// are counted and listed rather than dropped.
+    BackfillText(backfill_text::BackfillTextArgs),
     /// Register one derived collection over a source and print its exact handle.
     ///
     /// Only a mapping not every reader can compute is derived: its leaves
@@ -499,6 +514,7 @@ pub fn run(cmd: Command) -> Result<()> {
             long,
         } => run_log(pile, collection, limit, long),
         Command::Adopt(args) => adopt::run_adopt(args),
+        Command::BackfillText(args) => backfill_text::run_backfill_text(args),
         Command::Derive {
             pile,
             source,

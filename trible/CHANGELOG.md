@@ -19,6 +19,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- `pile collection backfill-text <PILE> <COLLECTION> [--pinned HEX]...
+  [--anchored HEX]... [--key KEY] [--dry-run]` appends the
+  `Handle<UTF8String>` twin of every old `ShortString` fact in a collection's
+  current view, in one commit its WRITE policy must admit. Old ids come from
+  the declaration hex (pinned: the hex itself; anchored: derived with the
+  ShortString encoding id, kept as a constant), new ids from the hex and
+  `Handle<UTF8String>`. Nothing is deleted or rewritten, a re-run writes
+  nothing, and undecodable values are counted and listed.
+
 - Expose `maintenance::Driver`, native target selection and operation-boundary
   events for caller-owned stores. The CLI uses the same driver; dropping a tick
   cancels its work without leaving a detached worker. Process CPU observations
