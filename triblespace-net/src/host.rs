@@ -96,12 +96,38 @@ pub struct PeerConfig {
 #[derive(Clone)]
 pub struct HostStarted {
     endpoint: iroh::Endpoint,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    thread: Arc<Mutex<Option<thread::JoinHandle<anyhow::Result<()>>>>>,
 }
 
 impl HostStarted {
     /// The local sockets the endpoint is bound to now.
     pub fn bound(&self) -> Vec<SocketAddr> {
         self.endpoint.bound_sockets()
+    }
+
+    /// Explicit owner shutdown, called off UI/runtime threads. Stops the host,
+    /// closes its transport and joins its runtime thread, reporting panics and
+    /// transport-close timeout. Transport-specific errors retain that
+    /// implementation's reporting policy. Drop remains nonblocking for existing callers.
+    pub fn shutdown_and_join(&self) -> anyhow::Result<()> {
+        self.shutdown.send_replace(true);
+        let mut thread = self
+            .thread
+            .lock()
+            .map_err(|_| anyhow::anyhow!("network join state poisoned"))?;
+        if thread
+            .as_ref()
+            .is_some_and(|thread| thread.thread().id() == std::thread::current().id())
+        {
+            anyhow::bail!("network host cannot join itself");
+        }
+        if let Some(thread) = thread.take() {
+            thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("network host thread panicked"))??;
+        }
+        Ok(())
     }
 }
 
@@ -741,14 +767,15 @@ pub(crate) fn start(
 ) -> anyhow::Result<HostStarted> {
     let secret = iroh_secret(&key);
     let (startup_tx, startup_rx) = mpsc::sync_channel(1);
-    thread::Builder::new()
+    let (shutdown, mut stopping) = tokio::sync::watch::channel(false);
+    let thread = thread::Builder::new()
         .name("triblespace-net".to_owned())
         .spawn(move || {
             let runtime = match tokio::runtime::Runtime::new() {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     let _ = startup_tx.send(Err(anyhow::Error::new(error)));
-                    return;
+                    return Ok(());
                 }
             };
             runtime.block_on(async move {
@@ -756,7 +783,7 @@ pub(crate) fn start(
                     Ok(harness) => harness,
                     Err(error) => {
                         let _ = startup_tx.send(Err(error));
-                        return;
+                        return Ok(());
                     }
                 };
                 if let Some(key) = config.daemon.filter(|_| !daemon_addresses.is_empty()) {
@@ -767,17 +794,52 @@ pub(crate) fn start(
                         daemon_addresses.iter().copied().map(TransportAddr::Ip),
                     ));
                 }
-                let started = HostStarted {
-                    endpoint: harness.transport.endpoint().clone(),
-                };
+                let started = harness.transport.endpoint().clone();
+                let transport = harness.transport.clone();
+                let capability = wiring.cap_tx.clone();
                 if startup_tx.send(Ok(started)).is_ok() {
-                    run_host(harness, config, wiring).await;
+                    tokio::select! {
+                        _ = run_host(harness, config, wiring) => {}
+                        _ = async {
+                            while !*stopping.borrow() {
+                                // Dropping the optional join owner preserves the
+                                // existing sender-lifetime shutdown contract.
+                                if stopping.changed().await.is_err() {
+                                    std::future::pending::<()>().await;
+                                }
+                            }
+                        } => {}
+                    }
                 }
-            });
+                // A watch receiver retains its last value even after every
+                // sender closes. Revoke the capability before joining, or
+                // retained snapshots keep NetCap -> transport -> UDP alive.
+                capability.send_replace(None);
+                tokio::time::timeout(std::time::Duration::from_secs(5), transport.shutdown())
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("network transport shutdown exceeded 5 seconds")
+                    })?;
+                Ok(())
+            })
         })?;
-    startup_rx
-        .recv()
-        .map_err(|_| anyhow::anyhow!("network host stopped during startup"))?
+    match startup_rx.recv() {
+        Ok(Ok(endpoint)) => Ok(HostStarted {
+            endpoint,
+            shutdown,
+            thread: Arc::new(Mutex::new(Some(thread))),
+        }),
+        result => {
+            shutdown.send_replace(true);
+            thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("network host startup thread panicked"))??;
+            match result {
+                Ok(Err(error)) => Err(error),
+                _ => Err(anyhow::anyhow!("network host stopped during startup")),
+            }
+        }
+    }
 }
 
 const BACKGROUND_LOOKUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);

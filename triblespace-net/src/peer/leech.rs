@@ -70,6 +70,12 @@ where
         self.peer.store()
     }
 
+    /// Stop and join a started exact-acquisition host before closing storage.
+    /// A dormant leech stays dormant; retained readers cannot start it later.
+    pub fn shutdown_and_join(&mut self) -> anyhow::Result<()> {
+        self.peer.shutdown_and_join()
+    }
+
     /// Close live acquisition ownership and return the backend without flushing it.
     pub fn into_store(self) -> S {
         self.peer.into_store()

@@ -22,7 +22,7 @@ use triblespace_core::repo::{BlobStorePut, CapabilityProofStore};
 use triblespace_net::{health_record, telemetry};
 
 #[derive(Clone, Debug, Default, clap::Args)]
-pub(crate) struct Options {
+pub struct Options {
     /// Existing telemetry collection; the maintenance key identifies and signs this worker.
     /// Never creates a descriptor or grant.
     #[arg(long, requires = "telemetry_worker")]
@@ -35,14 +35,14 @@ pub(crate) struct Options {
     pub telemetry_interval_secs: Option<u64>,
 }
 
-pub(super) struct Config {
+pub struct Config {
     collection: CollectionHandle,
     worker: String,
     interval: Duration,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Failure {
+pub enum Failure {
     Parameters,
     Snapshot,
     Descriptor,
@@ -69,7 +69,7 @@ impl std::fmt::Display for Failure {
 impl std::error::Error for Failure {}
 
 impl Options {
-    pub(super) fn config(self) -> std::result::Result<Option<Config>, Failure> {
+    pub fn config(self) -> std::result::Result<Option<Config>, Failure> {
         let Some(handle) = self.telemetry_collection else {
             return if self.telemetry_worker.is_none() && self.telemetry_interval_secs.is_none() {
                 Ok(None)
@@ -95,7 +95,7 @@ impl Options {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct Publications {
+pub struct Publications {
     pub merges: u128,
     pub derives: u128,
     /// MAPs this worker published: the attached counterpart of a DERIVE, one
@@ -201,7 +201,7 @@ impl Work {
     }
 }
 
-pub(super) struct Telemetry {
+pub struct Telemetry {
     config: Config,
     collection: Collection<SimpleArchive>,
     signer: SigningKey,
@@ -221,7 +221,7 @@ pub(super) struct Telemetry {
 }
 
 impl Telemetry {
-    pub(super) fn open<S: Store>(
+    pub fn open<S: Store>(
         store: &mut S,
         config: Config,
         signer: &SigningKey,
@@ -334,7 +334,7 @@ impl Telemetry {
         }
     }
 
-    pub(super) fn finish<S: Store>(&mut self, store: &mut S) {
+    pub fn finish<S: Store>(&mut self, store: &mut S) {
         self.running = false;
         self.hops.active = false;
         self.passes.active = false;
@@ -365,7 +365,7 @@ impl Telemetry {
             metadata::created_at: created,
             telemetry::attrs::elapsed_ns: elapsed_ns,
             telemetry::attrs::active: u128::from(self.running),
-            telemetry::attrs::cpu_ns?: crate::cli::util::process_cpu_ns(),
+            telemetry::attrs::cpu_ns?: crate::process::process_cpu_ns(),
         };
         for (subject, stage, work) in [
             (&self.hop, "maintenance-hop", &self.hops),
@@ -412,4 +412,5 @@ impl Telemetry {
 }
 
 #[cfg(test)]
+#[path = "telemetry/tests.rs"]
 mod tests;

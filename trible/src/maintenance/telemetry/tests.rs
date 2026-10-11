@@ -1,5 +1,4 @@
 use super::*;
-use clap::Parser;
 use triblespace_core::collection::{CollectionCommit, CollectionDerive, CollectionMerge};
 use triblespace_core::prelude::*;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -251,33 +250,6 @@ fn options_are_opt_in_and_require_valid_explicit_scope() {
         valid.config().unwrap().unwrap().interval,
         Duration::from_secs(60)
     );
-}
-
-#[test]
-fn maintenance_cli_rejects_independent_telemetry_identities() {
-    let fixture = Fixture::new();
-    let handle = hex::encode(fixture.reports.handle().raw);
-    for command in ["maintain", "maintain-all"] {
-        let args = [
-            "collection",
-            command,
-            "test.pile",
-            "target",
-            "--telemetry-collection",
-            handle.as_str(),
-            "--telemetry-worker",
-            "test-maintainer",
-        ];
-        assert!(super::super::Command::try_parse_from(args).is_ok());
-        for option in ["--telemetry-key", "--telemetry-node"] {
-            let error = super::super::Command::try_parse_from(
-                args.into_iter().chain([option, "independent-identity"]),
-            )
-            .err()
-            .expect("independent telemetry identity must be rejected");
-            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-        }
-    }
 }
 
 #[test]
