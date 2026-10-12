@@ -264,10 +264,56 @@ impl Walks {
                 && requested.unwrap_or(self.algorithm) == crate::walk_stream::Algorithm::CachedRiblt
             {
                 Exchange::start_riblt(collection, kind, pinned)
+            } else if sends != receives {
+                Exchange::start_one_way(collection, kind, pinned, agreed, sends, receives)
             } else {
                 Exchange::start(collection, kind, pinned, agreed, sends, receives)
             },
         )
+    }
+
+    /// OPEN commits to the body protocol before driver registration. Ordinary
+    /// Prefix never infers eager acceptance from our local authorization view.
+    fn start_incoming(
+        &self,
+        peer: PeerId,
+        collection: CollectionHandle,
+        kind: WalkKind,
+        algorithm: crate::walk_stream::Algorithm,
+        offer: Option<crate::walk_stream::OfferRole>,
+    ) -> Option<Exchange> {
+        use crate::walk_stream::{Algorithm, OfferRole};
+        self.selected.get(&collection.raw)?;
+        let pinned = self.local(collection)?;
+        let sends = self.sends(peer, &pinned);
+        let receives = self.receives(peer, &pinned);
+        if !sends && !receives {
+            return None;
+        }
+        let agreed = self
+            .agreed
+            .get(&agreed_key(peer, collection.raw, kind))
+            .cloned();
+        match (algorithm, offer) {
+            (Algorithm::CachedRiblt, None) if sends && receives => {
+                Some(Exchange::start_riblt(collection, kind, pinned))
+            }
+            (Algorithm::Prefix, None) => Some(Exchange::start(
+                collection, kind, pinned, agreed, sends, receives,
+            )),
+            (Algorithm::Prefix, Some(role))
+                if kind != WalkKind::References
+                    && match role {
+                        OfferRole::Send => receives && !sends,
+                        OfferRole::Receive => sends && !receives,
+                    } =>
+            {
+                Some(Exchange::start_one_way(
+                    collection, kind, pinned, agreed, sends, receives,
+                ))
+            }
+            _ => None,
+        }
     }
 
     /// The exchange of C's `kind` tree with `peer` ended: health sees a push
@@ -718,6 +764,7 @@ impl WalksHandle {
         collection: CollectionHandle,
         kind: WalkKind,
         algorithm: crate::walk_stream::Algorithm,
+        offer: Option<crate::walk_stream::OfferRole>,
         send: Box<dyn SendStream>,
         recv: Box<dyn RecvStream>,
     ) {
@@ -726,6 +773,7 @@ impl WalksHandle {
             collection,
             kind,
             algorithm,
+            offer,
             send,
             recv,
         };
@@ -755,6 +803,7 @@ pub(crate) enum Command {
         collection: CollectionHandle,
         kind: WalkKind,
         algorithm: crate::walk_stream::Algorithm,
+        offer: Option<crate::walk_stream::OfferRole>,
         send: Box<dyn SendStream>,
         recv: Box<dyn RecvStream>,
     },
@@ -890,9 +939,10 @@ impl<T: Transport, S: Service> Task<T, S> {
                 collection,
                 kind,
                 algorithm,
+                offer,
                 send,
                 recv,
-            } => self.incoming(peer, collection, kind, algorithm, send, recv),
+            } => self.incoming(peer, collection, kind, algorithm, offer, send, recv),
             Command::Ended {
                 id,
                 peer,
@@ -947,21 +997,28 @@ impl<T: Transport, S: Service> Task<T, S> {
         };
         let (driver, acked, replaced) = self.register(key, true, &exchange);
         tokio::spawn(async move {
-            let (ended, duplicate) =
-                match open_walk(&connection, collection, kind, exchange.algorithm()).await {
-                    Ok((send, recv)) => {
-                        drive(
-                            &driver,
-                            exchange,
-                            Box::new(send),
-                            Box::new(recv),
-                            acked,
-                            replaced,
-                        )
-                        .await
-                    }
-                    Err(_) => (exchange.end(), false),
-                };
+            let (ended, duplicate) = match open_walk(
+                &connection,
+                collection,
+                kind,
+                exchange.algorithm(),
+                exchange.offer_role(),
+            )
+            .await
+            {
+                Ok((send, recv)) => {
+                    drive(
+                        &driver,
+                        exchange,
+                        Box::new(send),
+                        Box::new(recv),
+                        acked,
+                        replaced,
+                    )
+                    .await
+                }
+                Err(_) => (exchange.end(), false),
+            };
             driver.ended(ended, duplicate);
         });
     }
@@ -978,6 +1035,7 @@ impl<T: Transport, S: Service> Task<T, S> {
         collection: CollectionHandle,
         kind: WalkKind,
         algorithm: crate::walk_stream::Algorithm,
+        offer: Option<crate::walk_stream::OfferRole>,
         mut send: Box<dyn SendStream>,
         mut recv: Box<dyn RecvStream>,
     ) {
@@ -991,7 +1049,7 @@ impl<T: Transport, S: Service> Task<T, S> {
         }
         let Some(exchange) = self
             .walks
-            .start_selected(peer, collection, kind, Some(algorithm))
+            .start_incoming(peer, collection, kind, algorithm, offer)
         else {
             send.reset(RESET_WALK_REFUSED);
             recv.stop(RESET_WALK_REFUSED);
@@ -1229,6 +1287,12 @@ async fn drive<T: Transport, S: Service>(
         }
         // Answers first, then the delta, one frame ahead of the writer: the
         // stream's credit is the delta's only pace.
+        if pending
+            .as_ref()
+            .is_some_and(|frame| !exchange.keep_pending(frame))
+        {
+            pending = None;
+        }
         if exchange.discovery_stopped() {
             if matches!(pending, Some(Frame::RibltCell { .. })) {
                 pending = None;
@@ -1496,6 +1560,10 @@ mod riblt_runtime_tests;
 #[cfg(test)]
 #[path = "walk_default_tests.rs"]
 mod walk_default_tests;
+
+#[cfg(test)]
+#[path = "prefix_role_tests.rs"]
+mod prefix_role_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -2194,6 +2262,7 @@ pub(crate) mod tests {
                     collection,
                     WalkKind::Records,
                     crate::walk_stream::Algorithm::Prefix,
+                    None,
                     Box::new(Tx(send, reset.clone())),
                     Box::new(Rx(recv, reset.clone())),
                 );
@@ -2930,6 +2999,72 @@ pub(crate) mod tests {
         }
 
         #[tokio::test(start_paused = true)]
+        async fn prefix_offer_actual_open_both_roles_cross_three_windows_and_land() {
+            use crate::walk_stream::{FRAME_HAVE, FRAME_VALUE};
+            for opener_sends in [true, false] {
+                let net = SimNet::new(0x3A32, SimConfig::default());
+                let mut writer = Node::new(225);
+                let mut reader = Node::new(226);
+                let policy = CollectionPolicy::new(
+                    AdmissionPolicy::direct(reader.key.verifying_key()),
+                    AdmissionPolicy::direct(writer.key.verifying_key()),
+                );
+                let collection = writer.hold("one-way offer transport", policy.clone());
+                assert_eq!(reader.hold("one-way offer transport", policy), collection);
+                for n in 0..131 {
+                    writer.commit(collection, n);
+                }
+                writer.observe();
+                reader.observe();
+                let expected = summary(WalkKind::Records, writer.pinned(collection).repair());
+                let writer = Hosted::new(writer, &net);
+                let reader = Hosted::new(reader, &net);
+                // The walk opener must have an installed current connection;
+                // the acceptor may not have processed its incoming queue yet.
+                let _connection = if opener_sends {
+                    writer.table.connect(reader.peer).await.unwrap()
+                } else {
+                    reader.table.connect(writer.peer).await.unwrap()
+                };
+                let before_reader = reader.health(collection, writer.peer);
+                let before_writer = writer.health(collection, reader.peer);
+                if opener_sends {
+                    writer
+                        .walks
+                        .open(reader.peer, collection, WalkKind::Records);
+                } else {
+                    reader
+                        .walks
+                        .open(writer.peer, collection, WalkKind::Records);
+                }
+                let sent = writer.ended(reader.peer, collection, before_writer).await;
+                let received = reader.ended(writer.peer, collection, before_reader).await;
+                assert!(sent.pushes.last_ok && received.receives.last_ok);
+                assert_eq!(sent.confirmed.records, Some(expected));
+                assert_eq!(received.received.records, Some(expected));
+                assert_eq!(reader.records(collection).len(), 131);
+                let count = |tap: &Taps, kind| {
+                    tap.crossed()
+                        .iter()
+                        .filter(|f| f.sent && f.tag == TAG_WALK && f.kind == kind)
+                        .count()
+                };
+                assert_eq!(count(&writer.taps, FRAME_VALUE), 131);
+                assert_eq!(count(&reader.taps, FRAME_HAVE), 131);
+                assert_eq!(count(&reader.taps, FRAME_VALUE_REQUEST), 0);
+                assert_eq!(
+                    count(&writer.taps, FRAME_OPEN) + count(&reader.taps, FRAME_OPEN),
+                    1
+                );
+                assert_eq!(count(&writer.taps, FRAME_LANDED), 1);
+                assert_eq!(count(&reader.taps, FRAME_LANDED), 1);
+                eprintln!(
+                    "PREFIX_OFFER_RUNTIME opener_sends={opener_sends} values=131 have=131 value_requests=0 landed=2"
+                );
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
         async fn a_closed_connection_cannot_restore_agreement_from_an_old_end() {
             stale_completion_is_ignored(false).await;
         }
@@ -2988,6 +3123,7 @@ pub(crate) mod tests {
                 collection,
                 kind,
                 algorithm: crate::walk_stream::Algorithm::Prefix,
+                offer: None,
                 send: Box::new(Tx(send, reset.clone())),
                 recv: Box::new(Rx(recv, reset.clone())),
             });
@@ -2995,6 +3131,108 @@ pub(crate) mod tests {
             assert!(task.running.is_empty());
             assert_eq!(task.next_id, 0);
             assert!(received.try_recv().is_err(), "no admitted exchange events");
+        }
+
+        async fn offer_writer_stall(retire: bool) {
+            let net = SimNet::new(0x3A33, SimConfig::default());
+            let mut node = Node::new(227);
+            let collection = node.hold("offer writer retirement", open());
+            for n in 0..131 {
+                node.commit(collection, n);
+            }
+            node.observe();
+            let exchange = Exchange::start_one_way(
+                collection,
+                WalkKind::Records,
+                node.pinned(collection),
+                None,
+                true,
+                false,
+            );
+            let hosted = Hosted::new(node, &net);
+            let (landing, _landings) = mpsc::unbounded_channel();
+            let (commands, _commands) = mpsc::unbounded_channel();
+            let driver = Driver {
+                connections: hosted.table.clone(),
+                snapshots: hosted.lander.snapshots.subscribe(),
+                landing,
+                commands,
+                id: 1,
+                peer: Node::new(228).id(),
+                collection,
+                kind: WalkKind::Records,
+            };
+            let (script, driven) = tokio::io::duplex(128);
+            let (mut recv, mut send) = tokio::io::split(script);
+            let (driven_recv, driven_send) = tokio::io::split(driven);
+            let reset = Arc::new(Mutex::new(None));
+            let (_acks, acked) = mpsc::unbounded_channel();
+            let (replace, replaced) = oneshot::channel();
+            let task_reset = reset.clone();
+            let task = tokio::spawn(async move {
+                drive(
+                    &driver,
+                    exchange,
+                    Box::new(Tx(driven_send, task_reset.clone())),
+                    Box::new(Rx(driven_recv, task_reset)),
+                    acked,
+                    replaced,
+                )
+                .await
+            });
+            write(
+                &mut send,
+                Frame::Subtree {
+                    prefix: Vec::new(),
+                    summary: PatchSummary::new(None, 0).unwrap(),
+                },
+            )
+            .await;
+            write(&mut send, Frame::Done).await;
+            let mut values = 0;
+            loop {
+                match read(&mut recv)
+                    .await
+                    .expect("offered stream before credit stalls")
+                {
+                    Frame::Subtree { prefix, .. } if retire && prefix.len() == 32 => break,
+                    Frame::Value { .. } => {
+                        values += 1;
+                        if values == 64 {
+                            break;
+                        }
+                    }
+                    Frame::ValueRequest { .. } => panic!("no NEED in offer mode"),
+                    _ => {}
+                }
+            }
+            if retire {
+                // Leave the following body write blocked by the tiny pipe.
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                }
+                drop(replace);
+            } else {
+                assert_eq!(values, 64);
+                tokio::time::advance(WALK_DEADLINE + Duration::from_secs(1)).await;
+            }
+            let (ended, duplicate) = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("bounded failure/retirement")
+                .unwrap();
+            assert!(!duplicate && !ended.confirmed);
+            assert!(ended.agreed.is_none());
+            assert_eq!(*reset.lock().unwrap(), Some(RESET_WALK_FAILED));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn prefix_offer_driver_missing_receipts_fail_at_bounded_window() {
+            offer_writer_stall(false).await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn prefix_offer_retirement_cancels_blocked_speculative_body() {
+            offer_writer_stall(true).await;
         }
 
         async fn blocked_final_write_finishes(retire: bool) {

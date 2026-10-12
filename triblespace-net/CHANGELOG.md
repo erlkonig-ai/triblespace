@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Source-only ALPN32: explicit one-way Records/AUTH Prefix offer roles in OPEN,
+  exact offer-bound HAVE receipts and a 64-leaf speculative body window. Receipts
+  use explicit leaf possession or immutable shared G, never private-prefix
+  equality. New bodies return credit only after ordinary canonical landing;
+  final root proof, LANDED, actual writes/finish and Task retirement still gate
+  agreement. Two-way pull Prefix, CachedRiblt default/core and References are
+  unchanged. No live activation or generic cold-subtree containment claim.
+
 - Batch native collection-record PATCH updates at the serving-publication
   boundary. Validate removals and additions, including attached-value overlaps,
   before applying structural difference/union; no wire or admission change.

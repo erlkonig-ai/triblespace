@@ -790,7 +790,7 @@ pub struct Crossed {
     pub wire_bytes: usize,
     /// Prefix depth for a complete walk subtree announcement, if applicable.
     pub walk_depth: Option<u8>,
-    /// Component byte of a complete ALPN31 walk OPEN (records=0, AUTH=1,
+    /// Component byte of a complete ALPN32 walk OPEN (records=0, AUTH=1,
     /// references=2). Test-only classification; does not change counted bytes.
     pub walk_kind: Option<u8>,
 }

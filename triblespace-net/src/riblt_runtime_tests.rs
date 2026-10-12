@@ -443,6 +443,7 @@ fn riblt_runtime_codec_pins_lengths_and_rejects_unknown_algorithm() {
         collection,
         kind: WalkKind::Records,
         algorithm: Algorithm::CachedRiblt,
+        offer: None,
     }
     .encode();
     bytes[33] = 255;
@@ -815,6 +816,7 @@ async fn riblt_runtime_one_way_walks_use_prefix_and_refuse_incoming_riblt() {
         collection,
         WalkKind::Records,
         Algorithm::CachedRiblt,
+        None,
         Box::new(Tx(send, reset.clone())),
         Box::new(Rx(recv, reset.clone())),
     );
@@ -997,6 +999,7 @@ async fn riblt_runtime_simultaneous_open_tie_break_preserves_winners_explicit_al
                 collection,
                 WalkKind::Records,
                 incoming,
+                None,
                 Box::new(Tx(send, reset.clone())),
                 Box::new(Rx(recv, reset.clone())),
             );

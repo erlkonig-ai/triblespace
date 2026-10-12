@@ -12,7 +12,9 @@
 //! Its ordinary empty-prefix SUBTREE commits to Δ, not to the collection or
 //! to the union. Every visited subtree then announces only its prefix, hash
 //! and leaf count; children appear as separate later FIFO announcements.
-//! There are no full child arrays, level barriers, HELD frames or reply waits.
+//! Pull Prefix has no full child arrays, level barriers or reply waits. The
+//! explicitly selected one-way typed offer mode adds HAVE credit and a bounded
+//! eager body window without changing final delta proof or landing completion.
 //!
 //! A matching announcement is compared with our own Δ. We still announce
 //! that subtree once, but prune queued descendants and do not descend into
@@ -63,6 +65,14 @@ use crate::walk::{
 use crate::walk_stream::Algorithm;
 use crate::walk_stream::Frame;
 use riblt::Symbol;
+
+#[path = "prefix_offer.rs"]
+mod prefix_offer;
+use prefix_offer::Offers;
+
+#[cfg(test)]
+#[path = "prefix_offer_tests.rs"]
+mod prefix_offer_tests;
 
 /// Missing leaves awaiting a value beyond which the exchange fails.
 pub(crate) const FLOOD_WANTED: usize = 32 * 1024;
@@ -377,6 +387,7 @@ pub(crate) struct Ended {
 
 pub(crate) struct Exchange {
     riblt: Option<Riblt>,
+    offers: Option<Offers>,
     collection: CollectionHandle,
     kind: WalkKind,
     pinned: Arc<CollectionSnapshot>,
@@ -444,6 +455,7 @@ impl Exchange {
         };
         Self {
             riblt: None,
+            offers: None,
             collection,
             kind,
             pinned,
@@ -470,6 +482,24 @@ impl Exchange {
             landed_received: false,
             outcome: None,
         }
+    }
+
+    /// Offer receipts are confined to one-way immutable typed components.
+    /// References retain their separate exact-blob fetch/landing protocol.
+    pub(crate) fn start_one_way(
+        collection: CollectionHandle,
+        kind: WalkKind,
+        pinned: Arc<CollectionSnapshot>,
+        agreed: Option<Arc<Tree>>,
+        sends: bool,
+        receives: bool,
+    ) -> Self {
+        assert_ne!(sends, receives);
+        let mut exchange = Self::start(collection, kind, pinned, agreed, sends, receives);
+        if kind != WalkKind::References {
+            exchange.offers = Some(Offers::default());
+        }
+        exchange
     }
 
     pub(crate) fn start_riblt(
@@ -505,16 +535,40 @@ impl Exchange {
         }
     }
 
+    pub(crate) fn offer_role(&self) -> Option<crate::walk_stream::OfferRole> {
+        self.offers.as_ref().map(|_| {
+            if self.sends {
+                crate::walk_stream::OfferRole::Send
+            } else {
+                crate::walk_stream::OfferRole::Receive
+            }
+        })
+    }
+
     /// Encode at most one eager body, independently of prepared cell capacity.
     pub(crate) fn next_body(&mut self) -> Option<Frame> {
         if self.kind == WalkKind::References {
             return None;
         }
-        let r = self.riblt.as_mut()?;
-        let key = r.decoder.local().get(r.eager)?.symbol.0;
-        r.eager += 1;
+        let key = if let Some(offers) = &mut self.offers {
+            offers.next_body()?
+        } else {
+            let r = self.riblt.as_mut()?;
+            let key = r.decoder.local().get(r.eager)?.symbol.0;
+            r.eager += 1;
+            key
+        };
         let bytes = self.delta_value(key)?.bytes(self.collection)?;
         Some(Frame::Value { key, bytes })
+    }
+
+    /// Only an unqueued speculative body may be suppressed by HAVE. Frames
+    /// already handed to the writer remain ordered and may arrive as duplicates.
+    pub(crate) fn keep_pending(&self, frame: &Frame) -> bool {
+        match (&self.offers, frame) {
+            (Some(offers), Frame::Value { key, .. }) => offers.pending(key),
+            _ => true,
+        }
     }
 
     /// Writer receipts only follow complete frame writes, never queue admission.
@@ -593,6 +647,9 @@ impl Exchange {
                 }
             }
         }
+        if self.offers.as_ref().is_some_and(Offers::full) {
+            return None;
+        }
         let prefix = if !self.root_sent {
             self.root_sent = true;
             Vec::new()
@@ -623,6 +680,12 @@ impl Exchange {
                 }
             }
         }
+        if let Some(offers) = &mut self.offers
+            && let Err(failure) = offers.offer(&prefix, declared, self.sends)
+        {
+            self.fail(failure);
+            return None;
+        }
         Some(Frame::Subtree {
             prefix,
             summary: declared,
@@ -648,6 +711,30 @@ impl Exchange {
 
     pub(crate) fn on_landed_ack(&mut self, landed: u64, failed: u64) -> Vec<Out> {
         let mut outs = Vec::new();
+        if self.outcome.is_some() {
+            return outs;
+        }
+        if self.offers.is_some() {
+            let count = landed
+                .checked_add(failed)
+                .and_then(|n| usize::try_from(n).ok());
+            let Some(count) = count.filter(|n| *n <= self.offers.as_ref().unwrap().landings.len())
+            else {
+                self.fail(Failure::Protocol);
+                return outs;
+            };
+            // ACKs aggregate the next ordered per-walk events. Any failure
+            // makes their identities ambiguous: fail without releasing credit.
+            if failed != 0 {
+                self.fail(Failure::InsertFailed);
+                return outs;
+            }
+            for _ in 0..count {
+                if let Some(key) = self.offers.as_mut().unwrap().landings.pop_front().flatten() {
+                    self.have_leaf(key, &mut outs);
+                }
+            }
+        }
         self.unlanded = self
             .unlanded
             .saturating_sub(usize::try_from(landed + failed).unwrap_or(usize::MAX));
@@ -663,6 +750,9 @@ impl Exchange {
         blob: Option<Blob<UnknownBlob>>,
     ) -> Vec<Out> {
         let mut outs = Vec::new();
+        if self.outcome.is_some() {
+            return outs;
+        }
         self.fetching = self.fetching.saturating_sub(1);
         let admit = admit_fetched(self.collection, handle, proof, blob);
         self.admit(admit, &mut outs);
@@ -677,6 +767,7 @@ impl Exchange {
     pub(crate) fn awaits(&self) -> bool {
         !self.peer_done
             || !self.requests.is_empty()
+            || self.offers.as_ref().is_some_and(Offers::awaits)
             || self.riblt.as_ref().is_some_and(|r| {
                 !self.wanted.is_empty() || r.remote_queued < r.decoder.remote().len()
             })
@@ -870,7 +961,19 @@ impl Exchange {
                     {
                         return Err(Failure::BadNode);
                     }
+                    if self.offers.is_some() && self.remember(leaf)? {
+                        self.have_leaf(leaf, outs);
+                        return Ok(());
+                    }
                     return self.leaf(leaf);
+                }
+                // Only already shared immutable G certifies a coarse HAVE.
+                // The private-prefix graft below is proof-only and must never
+                // make a receipt depend on unrelated private siblings.
+                if self.offers.is_some()
+                    && self.agreed.as_ref().and_then(|tree| tree.at(&prefix)) == Some(declared)
+                {
+                    self.have(&prefix, declared, outs);
                 }
                 // An exact held subtree can close this portion without any
                 // descendants, but only into the peer's separate delta view.
@@ -889,7 +992,11 @@ impl Exchange {
                 Ok(())
             }
             Frame::Value { key, bytes } => {
-                if self.riblt.is_none() && self.requests.get(&key).is_none() {
+                let offered = self.offers.is_some() && self.receives;
+                if offered && self.commitments.get(&locator_key(&key)).is_none() {
+                    return Err(Failure::Protocol);
+                }
+                if !offered && self.riblt.is_none() && self.requests.get(&key).is_none() {
                     return Err(Failure::Protocol);
                 }
                 if let Some(r) = &mut self.riblt {
@@ -915,13 +1022,42 @@ impl Exchange {
                     live.repair().authorization_evidence(),
                 )
                 .map_err(|_| Failure::BadValue)?;
+                if offered {
+                    let offers = self.offers.as_mut().unwrap();
+                    if offers.values.get(&key).is_some() {
+                        if self
+                            .tree_value(&self.peer, key)
+                            .and_then(|v| v.bytes(self.collection))
+                            != Some(bytes)
+                        {
+                            return Err(Failure::BadValue);
+                        }
+                        return Ok(());
+                    }
+                    if offers.values.len() >= FLOOD_LOCATORS as u64 {
+                        return Err(Failure::ResourceLimit);
+                    }
+                    offers.values.insert(&Entry::new(&key));
+                    self.wanted.retain(|wanted| wanted != &key);
+                    // A HAVE may race a body already in the writer. Validate
+                    // its exact attached value, but do not land it twice.
+                    if let Some(held) = self.held_value(&live, key) {
+                        if held.bytes(self.collection) != Some(bytes) {
+                            return Err(Failure::BadValue);
+                        }
+                        self.peer.insert(key, held);
+                        self.proof_budget()?;
+                        self.have_leaf(key, outs);
+                        return Ok(());
+                    }
+                }
                 self.peer.insert(key, value);
                 self.proof_budget()?;
                 self.admit(admit, outs);
                 Ok(())
             }
             Frame::ValueRequest { key } => {
-                if !self.sends || self.riblt.is_some() {
+                if !self.sends || self.riblt.is_some() || self.offers.is_some() {
                     return Err(Failure::Protocol);
                 }
                 // Only the immutable advertised delta serves requests, never
@@ -931,6 +1067,17 @@ impl Exchange {
                     .and_then(|value| value.bytes(self.collection))
                     .ok_or(Failure::Protocol)?;
                 outs.push(Out::Send(Frame::Value { key, bytes }));
+                Ok(())
+            }
+            Frame::Have { prefix, summary } => {
+                if !self.sends || prefix.len() > KEY_BYTES {
+                    return Err(Failure::Protocol);
+                }
+                self.offers
+                    .as_mut()
+                    .ok_or(Failure::Protocol)?
+                    .have(&prefix, summary)?;
+                self.queue.retain(|queued| !queued.starts_with(&prefix));
                 Ok(())
             }
             Frame::Done => {
@@ -952,7 +1099,11 @@ impl Exchange {
     }
 
     fn delta_value(&self, key: [u8; KEY_BYTES]) -> Option<Value> {
-        match &self.delta {
+        self.tree_value(&self.delta, key)
+    }
+
+    fn tree_value(&self, tree: &Tree, key: [u8; KEY_BYTES]) -> Option<Value> {
+        match tree {
             Tree::Records(patch) => patch.get(&key).copied().map(Value::Record),
             Tree::Authorization(collection, patch) => {
                 let absolute: [u8; 64] = [collection.raw.as_slice(), key.as_slice()]
@@ -962,6 +1113,36 @@ impl Exchange {
                 patch.get(&absolute).cloned().map(Value::Proof)
             }
             Tree::References(_) => None,
+        }
+    }
+
+    /// One-way typed offers may rely on immutable, already shared G even
+    /// while the serving snapshot lags a completed landing. Never consult the
+    /// peer proof: it may contain a private-prefix graft or unlanded VALUE.
+    fn held_value(&self, live: &CollectionSnapshot, key: [u8; KEY_BYTES]) -> Option<Value> {
+        value(self.kind, live.repair(), key).or_else(|| {
+            self.offers.as_ref()?;
+            self.tree_value(self.agreed.as_deref()?, key)
+        })
+    }
+
+    fn have(&mut self, prefix: &[u8], summary: PatchSummary, outs: &mut Vec<Out>) {
+        let Some(offers) = &mut self.offers else {
+            return;
+        };
+        let locator = locator_key(prefix);
+        if offers.sent.get(&locator).is_none() {
+            offers.sent.insert(&Entry::new(&locator));
+            outs.push(Out::Send(Frame::Have {
+                prefix: prefix.to_vec(),
+                summary,
+            }));
+        }
+    }
+
+    fn have_leaf(&mut self, key: [u8; KEY_BYTES], outs: &mut Vec<Out>) {
+        if let Some(summary) = self.commitments.get(&locator_key(&key)).copied() {
+            self.have(&key, summary, outs);
         }
     }
 
@@ -1017,7 +1198,7 @@ impl Exchange {
             return Ok(true);
         }
         let live = self.live()?;
-        let Some(value) = value(self.kind, live.repair(), key) else {
+        let Some(value) = self.held_value(&live, key) else {
             return Ok(false);
         };
         self.peer.insert(key, value);
@@ -1055,6 +1236,15 @@ impl Exchange {
     fn admit(&mut self, admit: Admit, outs: &mut Vec<Out>) {
         match admit {
             Admit::Land(events) => {
+                if let Some(offers) = &mut self.offers {
+                    for event in &events {
+                        offers.landings.push_back(match event {
+                            NetEvent::CollectionRecord(record) => Some(record.fingerprint().raw()),
+                            NetEvent::CapabilityProof(proof) => Some(proof.id().raw),
+                            _ => None,
+                        });
+                    }
+                }
                 self.unlanded += events.len();
                 outs.push(Out::Land(events));
             }
@@ -1062,8 +1252,18 @@ impl Exchange {
                 self.fetching += 1;
                 outs.push(Out::Fetch { handle, proof });
             }
-            Admit::Defer => self.deferred = true,
-            Admit::Fail => self.failed += 1,
+            Admit::Defer => {
+                self.deferred = true;
+                if self.offers.is_some() {
+                    self.fail(Failure::DeferredProof);
+                }
+            }
+            Admit::Fail => {
+                self.failed += 1;
+                if self.offers.is_some() {
+                    self.fail(Failure::InsertFailed);
+                }
+            }
         }
     }
 
@@ -1106,7 +1306,7 @@ impl Exchange {
                 }
                 None => {
                     self.requests.insert(&Entry::new(&key));
-                    if self.riblt.is_none() {
+                    if self.riblt.is_none() && self.offers.is_none() {
                         outs.push(Out::Send(Frame::ValueRequest { key }));
                     }
                 }
@@ -1148,7 +1348,10 @@ impl Exchange {
             self.landed_sent = true;
             outs.push(Out::Send(Frame::Landed));
         }
-        if self.landed_sent && self.landed_received {
+        if self.landed_sent
+            && self.landed_received
+            && self.offers.as_ref().is_none_or(|offers| !offers.awaits())
+        {
             self.outcome = Some(Outcome::Confirmed);
         }
     }
@@ -2082,6 +2285,7 @@ pub(crate) mod tests {
                 collection,
                 kind: WalkKind::Records,
                 algorithm: Algorithm::Prefix,
+                offer: None,
             },
             Frame::ValueRequest { key: [9; 32] },
             Frame::Done,
@@ -2166,6 +2370,15 @@ pub(crate) mod tests {
 
     #[test]
     fn a_deferred_proof_fails_the_exchange_until_its_descriptor_arrives() {
+        deferred_proof(false);
+    }
+
+    #[test]
+    fn prefix_offer_auth_receipt_waits_for_descriptor_and_canonical_landing() {
+        deferred_proof(true);
+    }
+
+    fn deferred_proof(offers: bool) {
         use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
         use triblespace_core::capability::policy::{resource_collection, resource_policy};
         use triblespace_core::capability::{CapabilityProof, CapabilityResource};
@@ -2216,7 +2429,39 @@ pub(crate) mod tests {
 
         for attempt in 0..2 {
             let mut side = Side::both(receiver, collection, kind);
-            stream(&mut side, &sender, collection, kind, &BTreeSet::new());
+            if offers {
+                side.exchange = Exchange::start_one_way(
+                    collection,
+                    kind,
+                    side.node.pinned(collection),
+                    None,
+                    false,
+                    true,
+                );
+                side.hold = true;
+                for frame in tree(&sender, collection, kind, &BTreeSet::new()) {
+                    let key = match &frame {
+                        Frame::Subtree { prefix, .. } if prefix.len() == KEY_BYTES => {
+                            Some(prefix.as_slice().try_into().unwrap())
+                        }
+                        _ => None,
+                    };
+                    side.feed(frame);
+                    if let Some(key) = key {
+                        side.feed(Frame::Value {
+                            key,
+                            bytes: value_of(&sender, collection, kind, key),
+                        });
+                    }
+                }
+                while side.next().is_some() {}
+                assert!(!side.sent.iter().any(|frame| matches!(
+                    frame,
+                    Frame::Have { .. } | Frame::ValueRequest { .. } | Frame::Landed
+                )));
+            } else {
+                stream(&mut side, &sender, collection, kind, &BTreeSet::new());
+            }
             assert_eq!(side.outcome(), None, "a fetch is owed");
             let (descriptor, fetched) = side.fetches.pop().unwrap();
             assert_eq!((fetched, descriptor), (Some(proof.clone()), resource.raw));
@@ -2232,6 +2477,30 @@ pub(crate) mod tests {
                 .exchange
                 .on_fetched(resource.raw, Some(proof.clone()), blob);
             side.outputs(outs);
+            if offers {
+                assert!(
+                    !side
+                        .sent
+                        .iter()
+                        .chain(&side.outbox)
+                        .any(|frame| matches!(frame, Frame::Have { .. } | Frame::Landed))
+                );
+                if attempt == 1 {
+                    assert_eq!(
+                        side.held.iter().map(Vec::len).sum::<usize>(),
+                        2,
+                        "descriptor plus proof await ordered landing"
+                    );
+                    side.release();
+                    assert_eq!(
+                        side.outbox
+                            .iter()
+                            .filter(|frame| matches!(frame, Frame::Have { .. }))
+                            .count(),
+                        1
+                    );
+                }
+            }
             if attempt == 0 {
                 assert_eq!(
                     side.outcome(),

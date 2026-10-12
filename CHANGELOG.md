@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Source-only ALPN32: explicitly negotiated one-way Records/AUTH Prefix offers
+  add possession-safe HAVE feedback and bounded speculative bodies. Preserve
+  final delta proof, admission, landing/finish and retirement guards; leave
+  CachedRiblt default/core, two-way pull Prefix and References unchanged. No
+  main/cohort activation or broad cold-pruning/performance claim.
+
 - Apply validated collection-record changes through one typed PATCH difference
   and union per publication batch, avoiding repeated large-root rehashing while
   preserving exact attached-value collision checks and old snapshot sharing.

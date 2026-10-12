@@ -39,7 +39,11 @@ use crate::transport::PeerId;
 /// collection trees on `walk/1` streams of its own, and `recon/1` carries
 /// peerings and the grant exchange only. A generation-29 peer announces on
 /// `recon/1` and opens no `walk/1` stream, so it is refused at the handshake.
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/31";
+/// Generation 31 added the explicit walk algorithm and cached RIBLT profile.
+/// Generation 32 adds offer-bound HAVE receipts and bounded eager values for
+/// one-way Prefix. Older receivers reject those unsolicited values, so these
+/// semantics require a handshake boundary even when a walk selects Prefix.
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/32";
 
 // Stream type tags — first byte on each stream, read before any admission
 // permit is taken. An unknown tag resets only its own stream.

@@ -10,6 +10,7 @@
 //! | 0x08 | LANDED        | empty                           |
 //! | 0x09 | RIBLT_ROOT    | profile-key16, hash32, u64       |
 //! | 0x0a | RIBLT_CELL    | index:u32, symbol32, hash:u64, count:i64 |
+//! | 0x0b | HAVE          | offered depth:u8, prefix32, hash32, u64 |
 //!
 //! SUBTREE has exactly73 payload bytes, or78 bytes with the ordinary five-byte
 //! frame header. Integers are big-endian. Prefix bytes outside depth are zero;
@@ -21,7 +22,9 @@
 //! A kind or OPEN walk kind not understood is skipped. A known payload must
 //! decode completely and canonically; malformed frames end only the exchange.
 //! Unknown OPEN algorithms are refused. Prefix=0 and CachedRiblt=1 are separate
-//! explicit ALPN31 algorithms, not an old-wire compatibility negotiation.
+//! explicit ALPN32 algorithms. Prefix offer profiles 2/3 additionally bind the
+//! opener's send/receive-only role; profile 0 always remains pull Prefix.
+//! This is not an old-wire compatibility negotiation.
 
 use triblespace_core::collection::CollectionHandle;
 
@@ -39,8 +42,9 @@ pub const FRAME_LANDED: u8 = 0x08;
 pub const SUBTREE_BYTES: usize = 1 + 32 + 32 + 8;
 pub const FRAME_RIBLT_ROOT: u8 = 0x09;
 pub const FRAME_RIBLT_CELL: u8 = 0x0a;
+pub const FRAME_HAVE: u8 = 0x0b;
 
-/// Explicit ALPN31 discovery profile. CachedRiblt is the default for mutually
+/// Explicit ALPN32 discovery profile. CachedRiblt is the default for mutually
 /// authorized peers. Prefix remains selectable and is required
 /// when either direction lacks collection READ authority. Unknown profiles are
 /// refused, never interpreted as Prefix or as successful cache exhaustion.
@@ -53,20 +57,32 @@ pub enum Algorithm {
 }
 
 impl Algorithm {
-    fn wire(self) -> u8 {
-        match self {
-            Self::Prefix => 0,
-            Self::CachedRiblt => 1,
+    fn wire(self, offer: Option<OfferRole>) -> u8 {
+        match (self, offer) {
+            (Self::Prefix, None) => 0,
+            (Self::CachedRiblt, None) => 1,
+            (Self::Prefix, Some(OfferRole::Send)) => 2,
+            (Self::Prefix, Some(OfferRole::Receive)) => 3,
+            (Self::CachedRiblt, Some(_)) => unreachable!("cached mode has no Prefix offer role"),
         }
     }
 
-    fn read(byte: u8) -> Result<Self, Malformed> {
+    fn read(byte: u8) -> Result<(Self, Option<OfferRole>), Malformed> {
         match byte {
-            0 => Ok(Self::Prefix),
-            1 => Ok(Self::CachedRiblt),
+            0 => Ok((Self::Prefix, None)),
+            1 => Ok((Self::CachedRiblt, None)),
+            2 => Ok((Self::Prefix, Some(OfferRole::Send))),
+            3 => Ok((Self::Prefix, Some(OfferRole::Receive))),
             _ => Err(Malformed("unknown walk discovery algorithm")),
         }
     }
+}
+
+/// Explicit opener role for one-way typed offers; not a user-facing algorithm.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OfferRole {
+    Send,
+    Receive,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,8 +91,14 @@ pub(crate) enum Frame {
         collection: CollectionHandle,
         kind: WalkKind,
         algorithm: Algorithm,
+        offer: Option<OfferRole>,
     },
     Subtree {
+        prefix: Vec<u8>,
+        summary: PatchSummary,
+    },
+    /// Possession of exactly one previously offered subtree, not a private root.
+    Have {
         prefix: Vec<u8>,
         summary: PatchSummary,
     },
@@ -109,20 +131,25 @@ impl Frame {
                 collection,
                 kind,
                 algorithm,
+                offer,
             } => {
                 payload.extend_from_slice(&collection.raw);
                 payload.push(kind.wire());
-                payload.push(algorithm.wire());
+                payload.push(algorithm.wire(*offer));
                 FRAME_OPEN
             }
-            Self::Subtree { prefix, summary } => {
+            Self::Subtree { prefix, summary } | Self::Have { prefix, summary } => {
                 assert!(prefix.len() <= 32, "a local subtree prefix fits its key");
                 payload.push(prefix.len() as u8);
                 let mut padded = [0; 32];
                 padded[..prefix.len()].copy_from_slice(prefix);
                 payload.extend_from_slice(&padded);
                 push_summary(&mut payload, *summary);
-                FRAME_SUBTREE
+                if matches!(self, Self::Have { .. }) {
+                    FRAME_HAVE
+                } else {
+                    FRAME_SUBTREE
+                }
             }
             Self::ValueRequest { key } => {
                 payload.extend_from_slice(key);
@@ -164,14 +191,18 @@ impl Frame {
                 let Some(kind) = WalkKind::from_wire(rest.byte()?) else {
                     return Ok(None);
                 };
-                let algorithm = Algorithm::read(rest.byte()?)?;
+                let (algorithm, offer) = Algorithm::read(rest.byte()?)?;
+                if offer.is_some() && kind == WalkKind::References {
+                    return Err(Malformed("References do not use typed offers"));
+                }
                 Self::Open {
                     collection,
                     kind,
                     algorithm,
+                    offer,
                 }
             }
-            FRAME_SUBTREE => {
+            FRAME_SUBTREE | FRAME_HAVE => {
                 if payload.len() != SUBTREE_BYTES {
                     return Err(Malformed("subtree payload is not73 bytes"));
                 }
@@ -187,9 +218,19 @@ impl Frame {
                 if depth != 0 && summary.root().is_none() {
                     return Err(Malformed("only the empty prefix may name an empty delta"));
                 }
-                Self::Subtree {
-                    prefix: prefix[..depth].to_vec(),
-                    summary,
+                if kind == FRAME_HAVE {
+                    if summary.root().is_none() {
+                        return Err(Malformed("HAVE requires a nonempty offer"));
+                    }
+                    Self::Have {
+                        prefix: prefix[..depth].to_vec(),
+                        summary,
+                    }
+                } else {
+                    Self::Subtree {
+                        prefix: prefix[..depth].to_vec(),
+                        summary,
+                    }
                 }
             }
             FRAME_VALUE_REQUEST => Self::ValueRequest { key: rest.hash()? },
@@ -235,11 +276,19 @@ mod tests {
     #[test]
     fn default_is_cached_riblt_without_changing_explicit_wire_selection() {
         assert_eq!(Algorithm::default(), Algorithm::CachedRiblt);
-        assert_eq!(Algorithm::Prefix.wire(), 0);
-        assert_eq!(Algorithm::CachedRiblt.wire(), 1);
-        assert_eq!(Algorithm::read(0), Ok(Algorithm::Prefix));
-        assert_eq!(Algorithm::read(1), Ok(Algorithm::CachedRiblt));
-        assert!(Algorithm::read(2).is_err());
+        assert_eq!(Algorithm::Prefix.wire(None), 0);
+        assert_eq!(Algorithm::CachedRiblt.wire(None), 1);
+        assert_eq!(Algorithm::read(0), Ok((Algorithm::Prefix, None)));
+        assert_eq!(Algorithm::read(1), Ok((Algorithm::CachedRiblt, None)));
+        assert_eq!(
+            Algorithm::read(2),
+            Ok((Algorithm::Prefix, Some(OfferRole::Send)))
+        );
+        assert_eq!(
+            Algorithm::read(3),
+            Ok((Algorithm::Prefix, Some(OfferRole::Receive)))
+        );
+        assert!(Algorithm::read(4).is_err());
     }
 
     fn roundtrip(frame: Frame) -> Vec<u8> {
@@ -261,6 +310,7 @@ mod tests {
                     collection: CollectionHandle::new([7; 32]),
                     kind,
                     algorithm: Algorithm::Prefix,
+                    offer: None,
                 })
                 .len(),
                 34
@@ -339,6 +389,7 @@ mod tests {
             collection: CollectionHandle::new([7; 32]),
             kind: WalkKind::Records,
             algorithm: Algorithm::Prefix,
+            offer: None,
         }
         .encode();
         let (_, subtree) = Frame::Subtree {
@@ -499,6 +550,7 @@ mod sim_tests {
             collection,
             WalkKind::Records,
             Algorithm::Prefix,
+            None,
         )
         .await
         .unwrap();
@@ -517,9 +569,10 @@ mod sim_tests {
         .enumerate()
         {
             let collection = CollectionHandle::new([index as u8; 32]);
-            let (mut send, _recv) = open_walk(&connection, collection, kind, Algorithm::Prefix)
-                .await
-                .unwrap();
+            let (mut send, _recv) =
+                open_walk(&connection, collection, kind, Algorithm::Prefix, None)
+                    .await
+                    .unwrap();
             let root = Frame::Subtree {
                 prefix: Vec::new(),
                 summary: PatchSummary::new(Some([5; 32]), 600).unwrap(),
@@ -554,6 +607,7 @@ mod sim_tests {
                     collection,
                     WalkKind::Records,
                     Algorithm::Prefix,
+                    None,
                 ),
             )
             .await

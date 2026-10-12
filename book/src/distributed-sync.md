@@ -468,8 +468,13 @@ receipt added here.
 ## Walk streams
 
 The opener writes the stream tag and OPEN naming collection, kind (records
-`0`, authorization `1`, references `2`) and algorithm (`0` prefix, `1` cached
-RIBLT profile 1). Unknown algorithms are refused. The accept loop hands both halves to
+`0`, authorization `1`, references `2`) and profile (`0` pull Prefix, `1` cached
+RIBLT, `2` offer Prefix with opener sending, `3` offer Prefix with opener receiving).
+OPEN remains 34 bytes. Profiles 2/3 require Records or AUTH and the opposite
+locally authorized one-way role before driver registration. Profile 0 always
+uses pull semantics, even under a one-way local authorization view. Unknown
+profiles and inconsistent offer roles are refused, not guessed from data frames.
+The accept loop hands both halves to
 the walks task. Missing OPEN within ten seconds, or no task, resets the stream.
 Frames have a one-byte kind, big-endian u32 payload length, then at most 64 KiB.
 Keys are 32 bytes relative to the kind's base; authorization hashes bind the full
@@ -485,6 +490,7 @@ collection32 || proof-id32 key. Integers are big-endian.
 | `0x08` | LANDED | empty |
 | `0x09` | RIBLT_ROOT | profile-key16, hash32, leaf-count:u64 |
 | `0x0a` | RIBLT_CELL | index:u32, symbol32, checksum:u64, count:i64 |
+| `0x0b` | HAVE | exact offered depth:u8, prefix32, hash32, leaf-count:u64 |
 
 Every SUBTREE payload is 73 bytes, 78 including the frame header, regardless of
 fanout. Depth is 0..32; all prefix bytes outside depth must be zero. Depth0 is the
@@ -499,7 +505,8 @@ putting children at the back in ascending edge order. Children are separate late
 announcements, never embedded metadata. A nonempty compressed root prefix is
 announced after [], including a singleton's full-depth key. FIFO concerns logical
 trie levels; compressed byte-prefix lengths need not be monotonic. There is no
-level barrier or wait for a transport round trip. DONE follows this traversal.
+level barrier in pull mode. Offer mode additionally obeys its bounded receipt
+window below. DONE follows this traversal.
 
 A peer announcement matching our own delta at that prefix prunes its queued
 proper descendants. If we have not announced the prefix yet, our own matching
@@ -529,8 +536,52 @@ proof remains deferred and fails completion. References have no VALUE payload:
 resident blobs are noted held, absent ones fetched by hash and landed with their
 held note. All actual landing/fetch/deferred outcomes precede LANDED. A value
 request is served only from the immutable advertised delta. A receive-only side
-announces empty and cannot reveal its private pinned tree or cached G, nor serve
-ordinary values.
+announces empty and cannot advertise its private pinned tree or serve ordinary
+values. Offer-mode receipts only repeat commitments the sender already offered.
+
+### One-way typed offers
+
+Locally opened one-way Records and AUTH exchanges select offer profile 2/3.
+References retain their existing exact-fetch/landing path; two-way Prefix and
+CachedRiblt are unchanged. Each generated SUBTREE commitment is registered under
+its exact prefix/hash/count on this stream, before writer completion. A nonempty
+HAVE must match such a registered commitment; not-yet-generated or mismatched
+receipts fail the exchange. Registration is neither a completed-write receipt
+nor cryptographic proof that the peer observed the offer. Duplicate receipts are
+idempotent. HAVE prunes queued descendants and suppresses unqueued eager bodies,
+but cannot recall already queued/written frames.
+
+The receiver acknowledges an explicit offered leaf if its immutable typed value
+is already held, or after its validated VALUE has actually landed. A routed AUTH
+proof returns no credit while its descriptor is missing, fetched or unlanded;
+the descriptor and proof must both land successfully. Retained sound G may
+certify an exact offered subtree, including a leaf whose physical publication
+lags. An already queued descendant after such a coarse HAVE creates no new body
+debt. Private-prefix equality grafts and unlanded VALUEs remain proof-only: they
+never establish HAVE eligibility. Adding unrelated private siblings with the
+same offered-key possession and G leaves logical receipt decisions unchanged.
+
+An opaque cold root hash does not prove offered-set containment in a larger
+private set. Thus this first implementation gives leaf possession feedback and
+G-certified coarse pruning, not general early cold-subtree pruning. Positive
+leaf feedback deliberately reveals possession of already-offered identities;
+it does not claim timing or traffic-analysis secrecy.
+
+At most 64 offered leaves await possession receipts. Their bodies are sent
+speculatively without VALUE_REQUEST, before waiting for those receipts; an
+all-missing transfer can progress beyond the window through ordinary landing
+ACKs. Authenticated offered keys alone admit eager VALUEs, with the existing
+signature, collection, fingerprint and proof checks. Racing duplicate bodies
+are validated but land at most once. A missing receipt eventually fails under
+the existing progress deadline; there is no silent pull fallback. Offer/receipt
+indexes and admitted-body identities share the explicit 1,048,576 entry ceiling.
+This window bounds instantaneous speculation, not cumulative duplicate bytes
+over an entire cold high-overlap stream, and makes no universal speedup claim.
+
+HAVE releases speculative credit only. Exact peer delta reconstruction, all
+fetch/landing obligations, final LANDED and successful actual writes/finish
+remain necessary for G. The driver drains queued receipts before finishing;
+failed/retired streams cannot be revived by late landing callbacks.
 
 After both LANDEDs, propose G' = G union Δlocal union Δpeer. The driver retains
 it only after actual queued writes and successful finish; an enqueue is not a
@@ -559,7 +610,7 @@ liveness or throughput.
 
 ### Cached full-component discovery
 
-This source-only ALPN31 candidate defaults to cached RIBLT for mutually
+This source-only ALPN32 candidate defaults to cached RIBLT for mutually
 authorized locally opened streams, through both the CLI and
 `Algorithm::default()`. Explicit `trible pile net sync --walk-algorithm prefix`
 or `PeerConfig::walk_algorithm = Algorithm::Prefix` retains the Prefix option;
@@ -1343,9 +1394,10 @@ guarantee.
 
 ## Wire surface
 
-The ALPN is `/triblespace/pile-sync/31`. Generation 31 adds the explicit OPEN
-algorithm discriminator and cached whole-component RIBLT profile; generation 30
-and earlier are refused at the handshake. Generation 27 replaced the bearer
+The ALPN is `/triblespace/pile-sync/32`. Generation 32 adds explicit one-way
+Prefix offer roles and HAVE/eager typed bodies; generation 31 and earlier are
+refused at the handshake. Generation 31 added the explicit OPEN algorithm
+discriminator and cached whole-component RIBLT profile. Generation 27 replaced the bearer
 locator, directory token and exact-GET proofs with one-block constructions, so
 a generation-26 peer cannot connect at all; generation 28 exports foundations
 only, so collection sync never carries a MERGE; generation 29 replaced the

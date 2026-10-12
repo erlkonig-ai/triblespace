@@ -1142,6 +1142,7 @@ async fn stream<T: Transport, S: Service>(
                         collection,
                         kind,
                         algorithm,
+                        offer,
                     })),
                     Some(walks),
                 ) => {
@@ -1150,6 +1151,7 @@ async fn stream<T: Transport, S: Service>(
                         collection,
                         kind,
                         algorithm,
+                        offer,
                         Box::new(send),
                         Box::new(recv),
                     );
@@ -1209,6 +1211,7 @@ pub(crate) async fn open_walk<C: Conn>(
     collection: CollectionHandle,
     kind: WalkKind,
     algorithm: walk_stream::Algorithm,
+    offer: Option<walk_stream::OfferRole>,
 ) -> anyhow::Result<(Tracked<C::SendHalf>, Tracked<C::RecvHalf>)> {
     let state = connection.state();
     let (send, recv) = connection.conn.open_bi().await?;
@@ -1219,6 +1222,7 @@ pub(crate) async fn open_walk<C: Conn>(
         collection,
         kind,
         algorithm,
+        offer,
     }
     .encode();
     write_frame(&mut send, frame, &payload).await?;
