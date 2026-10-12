@@ -681,7 +681,11 @@ turn decoding into success.
 One landing task per host lands the values of every push in arrival order. It
 takes up to 4,096 waiting values at a time, inserts them in one pass, publishes
 one serving snapshot, and then tells each push how many of its values landed
-and how many inserts failed. A group whose snapshot cannot be published counts
+and how many inserts failed. Record publication builds operation-local typed
+PATCH deltas and applies one native difference and union per batch, rather than
+rehashing the retained large tree after each record. Structural/collection and
+exact attached-value checks still precede the key-only set operations; old
+snapshots retain their unchanged native subtrees. A group whose snapshot cannot be published counts
 as failed and withdraws serving. Later leaves of every push are therefore
 checked against what already landed. The task also reobserves the store every
 two seconds, so appends by other processes reach the serving snapshot, and

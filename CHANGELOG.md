@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Apply validated collection-record changes through one typed PATCH difference
+  and union per publication batch, avoiding repeated large-root rehashing while
+  preserving exact attached-value collision checks and old snapshot sharing.
+
 - Default mutually authorized local walks to cached RIBLT in the source API and
   CLI. Explicit Prefix selection and one-way Prefix authorization remain;
   ALPN31 and running daemon configurations are unchanged. No live rollout.

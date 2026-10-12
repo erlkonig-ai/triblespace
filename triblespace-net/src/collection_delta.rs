@@ -176,24 +176,44 @@ where
     let (added, removed) = current
         .select_record_changes(previous, &selectors)
         .map_err(CollectionRecordPatchError::Store)?;
-    let mut next = prior.clone();
+    // Operation-local deltas: edit the retained Merkle trie once per batch,
+    // rather than rehashing its wide ancestors after every changed record.
+    // PATCH equality only observes keys, so validate attached values before
+    // either structural operation can short-circuit an equal subtree.
+    let mut removals = PATCH::new();
     for record in removed {
         validate_record(expected, record).map_err(CollectionRecordPatchError::Evidence)?;
         let fingerprint = record.fingerprint();
         let key = fingerprint.raw();
-        if let Some(existing) = next.records.get(&key) {
+        if let Some(existing) = prior.records.get(&key) {
             if existing != &record {
                 return Err(CollectionRecordPatchError::Evidence(
                     CollectionDeltaError::FingerprintCollision(fingerprint),
                 ));
             }
-            next.records.remove(&key);
+            removals.insert(&PatchEntry::with_value(&key, record));
         }
     }
+    let mut next = prior.clone();
+    next.records = next.records.difference(&removals);
+    let mut additions = PATCH::new();
     for record in added {
-        insert_record(expected, &mut next.records, record)
+        validate_record(expected, record).map_err(CollectionRecordPatchError::Evidence)?;
+        let fingerprint = record.fingerprint();
+        if next
+            .get(fingerprint)
+            .is_some_and(|existing| existing != record)
+        {
+            return Err(CollectionRecordPatchError::Evidence(
+                CollectionDeltaError::FingerprintCollision(fingerprint),
+            ));
+        }
+        // Checks duplicates/collisions within this batch independently of the
+        // retained tree. Actual values, not placeholders, enter the delta.
+        insert_record(expected, &mut additions, record)
             .map_err(CollectionRecordPatchError::Evidence)?;
     }
+    next.records.union(additions);
     Ok(next)
 }
 
@@ -269,6 +289,10 @@ fn insert_record(
     canonical.insert(&PatchEntry::with_value(&key, record));
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "collection_delta_batch_tests.rs"]
+mod batch_tests;
 
 #[cfg(test)]
 mod tests {

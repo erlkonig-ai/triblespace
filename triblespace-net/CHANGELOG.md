@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Batch native collection-record PATCH updates at the serving-publication
+  boundary. Validate removals and additions, including attached-value overlaps,
+  before applying structural difference/union; no wire or admission change.
+
 - Make `Algorithm::default()` and the walk scheduler prefer CachedRiblt for
   mutually authorized peers. Explicit Prefix opening and incoming selection
   remain supported; one-way authorization still uses Prefix. Source default
