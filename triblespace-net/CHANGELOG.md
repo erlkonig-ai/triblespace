@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Make `Algorithm::default()` and the walk scheduler prefer CachedRiblt for
+  mutually authorized peers. Explicit Prefix opening and incoming selection
+  remain supported; one-way authorization still uses Prefix. Source default
+  only, with no ALPN change or live deployment.
+
 - Add explicit Prefix/CachedRiblt ALPN31 OPEN selection. Cached mode requires
   mutual collection authorization and shares independently scoped flat
   Records/AUTH/References source generations, using actual PATCH updates and

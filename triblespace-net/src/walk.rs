@@ -213,7 +213,7 @@ impl Walks {
     pub(crate) fn new(health: Health) -> Self {
         Self {
             health,
-            algorithm: crate::walk_stream::Algorithm::Prefix,
+            algorithm: crate::walk_stream::Algorithm::default(),
             snapshot: None,
             selected: PATCH::new(),
             agreed: PATCH::new(),
@@ -1494,6 +1494,10 @@ async fn write_stream_progress(
 mod riblt_runtime_tests;
 
 #[cfg(test)]
+#[path = "walk_default_tests.rs"]
+mod walk_default_tests;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 
@@ -1552,7 +1556,9 @@ pub(crate) mod tests {
                     .collection(CONFIG_COLLECTION_NAME, private_policy(key.verifying_key()))
                     .unwrap();
                 Self {
-                    walks: Walks::new(health.clone()),
+                    // This shared fixture exercises the Prefix exchange.
+                    walks: Walks::new(health.clone())
+                        .with_algorithm(crate::walk_stream::Algorithm::Prefix),
                     health,
                     key,
                     store,
@@ -2149,7 +2155,8 @@ pub(crate) mod tests {
                         accepting.accept(incoming.conn);
                     }
                 });
-                let walks = Walks::new(node.health.clone());
+                let walks = Walks::new(node.health.clone())
+                    .with_algorithm(crate::walk_stream::Algorithm::Prefix);
                 let lander = Arc::new(Lander {
                     node: Mutex::new(node),
                     snapshots,
@@ -2862,7 +2869,8 @@ pub(crate) mod tests {
             let mut task = Task {
                 connections: hosted.table.clone(),
                 snapshots: hosted.lander.snapshots.subscribe(),
-                walks: Walks::new(hosted.lander.node.lock().unwrap().health.clone()),
+                walks: Walks::new(hosted.lander.node.lock().unwrap().health.clone())
+                    .with_algorithm(crate::walk_stream::Algorithm::Prefix),
                 commands: hosted.walks.clone(),
                 landing,
                 events,

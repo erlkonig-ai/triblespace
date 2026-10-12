@@ -221,7 +221,7 @@ pub enum Command {
         /// Opening preference for mutually authorized peers; inbound streams may
         /// choose either supported algorithm. One-way authorization uses prefix;
         /// cache exhaustion is an exchange failure.
-        #[arg(long, value_enum, default_value = "prefix")]
+        #[arg(long, value_enum, default_value = "cached-riblt")]
         walk_algorithm: WalkAlgorithmArg,
         /// Publish local, timestamped swarm-health observations using the node key.
         /// The health collection is not automatically activated for sync.
@@ -1269,11 +1269,11 @@ mod tests {
     }
 
     #[test]
-    fn walk_algorithm_is_explicit_prefix_default_or_cached_riblt() {
+    fn walk_algorithm_defaults_to_cached_riblt_and_preserves_explicit_selection() {
         for (args, expected) in [
             (
                 vec!["net", "sync", "test.pile"],
-                triblespace_net::walk_stream::Algorithm::Prefix,
+                triblespace_net::walk_stream::Algorithm::CachedRiblt,
             ),
             (
                 vec!["net", "sync", "test.pile", "--walk-algorithm", "prefix"],

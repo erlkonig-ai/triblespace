@@ -9,7 +9,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ### Changed
 
 - Source-only ALPN31 candidate offers `pile net sync --walk-algorithm
-  prefix|cached-riblt` (default `prefix`). Cached symmetric discovery is refused
+  prefix|cached-riblt` (default `cached-riblt`, with explicit `prefix` retained).
+  Cached symmetric discovery is refused
   for one-way-authorized incoming streams; outgoing one-way exchanges explicitly
   use prefix. No running daemon or saved selection is changed by this option.
 

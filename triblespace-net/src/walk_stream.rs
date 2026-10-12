@@ -40,14 +40,15 @@ pub const SUBTREE_BYTES: usize = 1 + 32 + 32 + 8;
 pub const FRAME_RIBLT_ROOT: u8 = 0x09;
 pub const FRAME_RIBLT_CELL: u8 = 0x0a;
 
-/// Explicit ALPN31 discovery profile. Prefix remains selectable and is required
+/// Explicit ALPN31 discovery profile. CachedRiblt is the default for mutually
+/// authorized peers. Prefix remains selectable and is required
 /// when either direction lacks collection READ authority. Unknown profiles are
 /// refused, never interpreted as Prefix or as successful cache exhaustion.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Algorithm {
-    #[default]
     Prefix,
     /// Exact raw32 SipHash24/mapping recipe documented in riblt_cache.
+    #[default]
     CachedRiblt,
 }
 
@@ -230,6 +231,16 @@ impl Frame {
 mod tests {
     use super::*;
     use crate::recon::MAX_RECON_FRAME_BYTES;
+
+    #[test]
+    fn default_is_cached_riblt_without_changing_explicit_wire_selection() {
+        assert_eq!(Algorithm::default(), Algorithm::CachedRiblt);
+        assert_eq!(Algorithm::Prefix.wire(), 0);
+        assert_eq!(Algorithm::CachedRiblt.wire(), 1);
+        assert_eq!(Algorithm::read(0), Ok(Algorithm::Prefix));
+        assert_eq!(Algorithm::read(1), Ok(Algorithm::CachedRiblt));
+        assert!(Algorithm::read(2).is_err());
+    }
 
     fn roundtrip(frame: Frame) -> Vec<u8> {
         let (kind, payload) = frame.encode();

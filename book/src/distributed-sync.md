@@ -559,11 +559,13 @@ liveness or throughput.
 
 ### Cached full-component discovery
 
-This source-only ALPN31 candidate can be selected with
-`trible pile net sync --walk-algorithm cached-riblt` or
-`PeerConfig::walk_algorithm`. The CLI and `Algorithm::default()` retain explicit
-`prefix` selection for locally opened streams; nothing changes a live daemon or
-its configuration. Incoming streams explicitly choose either supported algorithm
+This source-only ALPN31 candidate defaults to cached RIBLT for mutually
+authorized locally opened streams, through both the CLI and
+`Algorithm::default()`. Explicit `trible pile net sync --walk-algorithm prefix`
+or `PeerConfig::walk_algorithm = Algorithm::Prefix` retains the Prefix option;
+`--walk-algorithm cached-riblt` remains accepted too. This changes the source
+default only, not a live daemon or its configuration. Incoming streams
+explicitly choose either supported algorithm
 regardless of the local opening preference. With simultaneous opens, the existing
 lower-peer-id survivor determines which explicit algorithm runs. Cached symmetric RIBLT is
 refused unless both send and receive are authorized for this collection. Local

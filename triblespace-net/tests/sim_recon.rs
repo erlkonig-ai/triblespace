@@ -42,7 +42,7 @@ use triblespace_net::transport::sim::{
     Crossed, SimConfig, SimConn, SimNet, SimRecvStream, SimSendStream, Taps,
 };
 use triblespace_net::transport::{Conn, Harness, PeerId, RecvStream, SendStream, Transport};
-use triblespace_net::walk_stream::{FRAME_OPEN as FRAME_WALK_OPEN, FRAME_VALUE_REQUEST};
+use triblespace_net::walk_stream::{Algorithm, FRAME_OPEN as FRAME_WALK_OPEN, FRAME_VALUE_REQUEST};
 
 // Test-only leaf classification from the uniform SUBTREE depth, not a wire kind.
 const FRAME_LEAF: u8 = 254;
@@ -90,11 +90,20 @@ fn bring_up<T: Transport>(
     key: &SigningKey,
     store: MemoryRepo,
 ) -> Peer<MemoryRepo> {
+    bring_up_with_algorithm(harness, key, store, Algorithm::default())
+}
+
+fn bring_up_with_algorithm<T: Transport>(
+    harness: Harness<T>,
+    key: &SigningKey,
+    store: MemoryRepo,
+    algorithm: Algorithm,
+) -> Peer<MemoryRepo> {
     let (sender, receiver, wiring) = host::wire(EndpointId::from_bytes(&id(key)).unwrap());
     tokio::task::spawn_local(host::run_host(
         harness,
         PeerConfig {
-            walk_algorithm: Default::default(),
+            walk_algorithm: algorithm,
             daemon: None,
             provider_publication_budget: Some(0),
             bind: None,
@@ -444,8 +453,15 @@ fn a_partition_ends_the_peering_and_the_push_after_the_heal_asks_only_for_what_w
         select(&mut owner_store, &owner_key, collection);
         select(&mut reader_store, &reader_key, collection);
         let (harness, taps) = net.tap(&owner_key);
-        let mut owner = bring_up(harness, &owner_key, owner_store);
-        let mut reader = bring_up(net.join(&reader_key), &reader_key, reader_store);
+        // This fixture counts Prefix requests and subtree leaves.
+        let mut owner =
+            bring_up_with_algorithm(harness, &owner_key, owner_store, Algorithm::Prefix);
+        let mut reader = bring_up_with_algorithm(
+            net.join(&reader_key),
+            &reader_key,
+            reader_store,
+            Algorithm::Prefix,
+        );
         owner.activate_collection(collection);
         reader.activate_collection(collection);
         until(
@@ -546,9 +562,10 @@ fn a_receiver_holding_a_subtree_from_a_third_peer_prunes_it() {
         net.partition(x_id, z_id);
         net.partition(x_id, y_id);
         let (harness, taps) = net.tap(&x_key);
-        let mut x = bring_up(harness, &x_key, x_store);
-        let mut y = bring_up(net.join(&y_key), &y_key, y_store);
-        let mut z = bring_up(net.join(&z_key), &z_key, z_store);
+        // Pruned subtree/request counts are the explicit Prefix contract.
+        let mut x = bring_up_with_algorithm(harness, &x_key, x_store, Algorithm::Prefix);
+        let mut y = bring_up_with_algorithm(net.join(&y_key), &y_key, y_store, Algorithm::Prefix);
+        let mut z = bring_up_with_algorithm(net.join(&z_key), &z_key, z_store, Algorithm::Prefix);
         for host in [&mut x, &mut y, &mut z] {
             host.activate_collection(collection);
         }

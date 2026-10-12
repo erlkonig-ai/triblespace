@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Default mutually authorized local walks to cached RIBLT in the source API and
+  CLI. Explicit Prefix selection and one-way Prefix authorization remain;
+  ALPN31 and running daemon configurations are unchanged. No live rollout.
+
 - Source-only ALPN31 candidate: explicitly selectable cached whole-component
   RIBLT discovery alongside prefix exchange. Share one flat source-bound cache
   per Records/AUTH/References component, maintain it through native PATCH
