@@ -69,6 +69,11 @@ pub(crate) type ActiveCollections = PATCH<32, IdentitySchema>;
 /// seed.
 #[derive(Clone)]
 pub struct PeerConfig {
+    /// Opening preference for mutually authorized exchanges. Incoming streams
+    /// may explicitly select either supported algorithm. One-way
+    /// authorization always uses Prefix; cached symmetric cells would reveal
+    /// the receive-only side's private holdings.
+    pub walk_algorithm: crate::walk_stream::Algorithm,
     /// The key of this pile's sync daemon: the key its configuration is
     /// written under, which the daemon runs as. A process whose pile names
     /// no peer reaches the DHT through it. Its first lookup dials the
@@ -202,6 +207,7 @@ impl BlobStoreGet for ResidentBlobReader {
 /// One collection's immutable server overlay.
 pub(crate) struct CollectionSnapshot {
     repair: Arc<CollectionRepairOverlay>,
+    caches: [Arc<crate::riblt_cache::Generation>; 3],
 }
 
 impl CollectionSnapshot {
@@ -223,10 +229,40 @@ impl CollectionSnapshot {
     /// Bind the collection's held set, fixed by the same store observation
     /// as the repair evidence. The store's held-blob index computed it: no
     /// blob is scanned while publishing.
-    fn with_held(repair: CollectionRepairOverlay, held: HeldBlobs) -> Self {
-        Self {
-            repair: Arc::new(repair.with_blob_inventory(Arc::new(held))),
-        }
+    fn with_held(
+        repair: CollectionRepairOverlay,
+        held: HeldBlobs,
+        previous: Option<&Self>,
+    ) -> anyhow::Result<Self> {
+        use crate::exchange::Tree;
+        use crate::riblt_cache::Generation;
+        use crate::walk::WalkKind;
+        let repair = Arc::new(repair.with_blob_inventory(Arc::new(held)));
+        let advance = |index, kind| {
+            Generation::advance(
+                repair.collection(),
+                kind,
+                Tree::pinned(kind, &repair),
+                previous.map(|old| &old.caches[index]),
+            )
+            .map_err(|error| anyhow::anyhow!("RIBLT cache publication: {error:?}"))
+        };
+        let caches = [
+            advance(0, WalkKind::Records)?,
+            advance(1, WalkKind::Authorization)?,
+            advance(2, WalkKind::References)?,
+        ];
+        Ok(Self { repair, caches })
+    }
+
+    pub(crate) fn cache(&self, kind: crate::walk::WalkKind) -> Arc<crate::riblt_cache::Generation> {
+        use crate::walk::WalkKind;
+        self.caches[match kind {
+            WalkKind::Records => 0,
+            WalkKind::Authorization => 1,
+            WalkKind::References => 2,
+        }]
+        .clone()
     }
 }
 
@@ -309,12 +345,18 @@ impl StoreSnapshot {
                 _ => StoreChanges::ALL,
             };
             if let Some(prior) = prior.filter(|_| relevant.is_empty()) {
-                let value = prior.value.as_ref().map(|prior| {
-                    Arc::new(CollectionSnapshot::with_held(
-                        prior.repair.as_ref().clone().with_reader(reader.clone()),
-                        held.clone(),
-                    ))
-                });
+                let value = prior
+                    .value
+                    .as_ref()
+                    .map(|prior| {
+                        CollectionSnapshot::with_held(
+                            prior.repair.as_ref().clone().with_reader(reader.clone()),
+                            held.clone(),
+                            Some(prior),
+                        )
+                        .map(Arc::new)
+                    })
+                    .transpose()?;
                 collections.insert(&PatchEntry::with_value(
                     raw,
                     Arc::new(CollectionObservation {
@@ -383,7 +425,8 @@ impl StoreSnapshot {
             let value = Arc::new(CollectionSnapshot::with_held(
                 repair.with_reader(reader.clone()),
                 held,
-            ));
+                prior_value.map(Arc::as_ref),
+            )?);
             collections.insert(&PatchEntry::with_value(
                 raw,
                 Arc::new(CollectionObservation {
@@ -1099,7 +1142,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
     let (walks, received) = crate::walk::spawn(
         connections.clone(),
         wiring.snapshot.clone(),
-        crate::walk::Walks::new(wiring.health.clone()),
+        crate::walk::Walks::new(wiring.health.clone()).with_algorithm(config.walk_algorithm),
         wiring.lander.clone(),
     );
     let provider_client = ProviderClient {

@@ -80,6 +80,7 @@ fn bring_up(net: &SimNet, key: &SigningKey, store: MemoryRepo) -> Peer<MemoryRep
     tokio::task::spawn_local(host::run_host(
         harness,
         PeerConfig {
+            walk_algorithm: Default::default(),
             daemon: None,
             provider_publication_budget: Some(0),
             bind: None,
@@ -200,7 +201,11 @@ fn a_stranger_cannot_make_the_subject_store_a_large_definition() {
         stranger.activate_collection(collection);
         subject.refresh();
         advance(&clock, &mut [&mut stranger, &mut subject], 10).await;
-        assert_eq!(subject.health().available, [collection], "the grant arrived");
+        assert_eq!(
+            subject.health().available,
+            [collection],
+            "the grant arrived"
+        );
         assert!(
             !holds_blob(&mut subject, junk_handle),
             "the subject stored the stranger's 4 MiB definition"

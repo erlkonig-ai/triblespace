@@ -2,12 +2,14 @@
 //!
 //! | kind | frame         | payload                         |
 //! |------|---------------|---------------------------------|
-//! | 0x01 | OPEN          | collection32, walk kind:u8      |
+//! | 0x01 | OPEN          | collection32, kind:u8, algorithm:u8 |
 //! | 0x03 | SUBTREE       | depth:u8, prefix32, hash32, u64  |
 //! | 0x05 | VALUE_REQUEST | key32                           |
 //! | 0x06 | VALUE         | key32, nonempty bytes           |
 //! | 0x07 | DONE          | empty                           |
 //! | 0x08 | LANDED        | empty                           |
+//! | 0x09 | RIBLT_ROOT    | profile-key16, hash32, u64       |
+//! | 0x0a | RIBLT_CELL    | index:u32, symbol32, hash:u64, count:i64 |
 //!
 //! SUBTREE has exactly73 payload bytes, or78 bytes with the ordinary five-byte
 //! frame header. Integers are big-endian. Prefix bytes outside depth are zero;
@@ -18,6 +20,8 @@
 //!
 //! A kind or OPEN walk kind not understood is skipped. A known payload must
 //! decode completely and canonically; malformed frames end only the exchange.
+//! Unknown OPEN algorithms are refused. Prefix=0 and CachedRiblt=1 are separate
+//! explicit ALPN31 algorithms, not an old-wire compatibility negotiation.
 
 use triblespace_core::collection::CollectionHandle;
 
@@ -33,12 +37,43 @@ pub const FRAME_VALUE: u8 = 0x06;
 pub const FRAME_DONE: u8 = 0x07;
 pub const FRAME_LANDED: u8 = 0x08;
 pub const SUBTREE_BYTES: usize = 1 + 32 + 32 + 8;
+pub const FRAME_RIBLT_ROOT: u8 = 0x09;
+pub const FRAME_RIBLT_CELL: u8 = 0x0a;
+
+/// Explicit ALPN31 discovery profile. Prefix remains selectable and is required
+/// when either direction lacks collection READ authority. Unknown profiles are
+/// refused, never interpreted as Prefix or as successful cache exhaustion.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Algorithm {
+    #[default]
+    Prefix,
+    /// Exact raw32 SipHash24/mapping recipe documented in riblt_cache.
+    CachedRiblt,
+}
+
+impl Algorithm {
+    fn wire(self) -> u8 {
+        match self {
+            Self::Prefix => 0,
+            Self::CachedRiblt => 1,
+        }
+    }
+
+    fn read(byte: u8) -> Result<Self, Malformed> {
+        match byte {
+            0 => Ok(Self::Prefix),
+            1 => Ok(Self::CachedRiblt),
+            _ => Err(Malformed("unknown walk discovery algorithm")),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Frame {
     Open {
         collection: CollectionHandle,
         kind: WalkKind,
+        algorithm: Algorithm,
     },
     Subtree {
         prefix: Vec<u8>,
@@ -53,15 +88,30 @@ pub(crate) enum Frame {
     },
     Done,
     Landed,
+    RibltRoot {
+        key: [u8; 16],
+        summary: PatchSummary,
+    },
+    RibltCell {
+        index: u32,
+        symbol: [u8; 32],
+        hash: u64,
+        count: i64,
+    },
 }
 
 impl Frame {
     pub(crate) fn encode(&self) -> (u8, Vec<u8>) {
         let mut payload = Vec::new();
         let kind = match self {
-            Self::Open { collection, kind } => {
+            Self::Open {
+                collection,
+                kind,
+                algorithm,
+            } => {
                 payload.extend_from_slice(&collection.raw);
                 payload.push(kind.wire());
+                payload.push(algorithm.wire());
                 FRAME_OPEN
             }
             Self::Subtree { prefix, summary } => {
@@ -84,6 +134,23 @@ impl Frame {
             }
             Self::Done => FRAME_DONE,
             Self::Landed => FRAME_LANDED,
+            Self::RibltRoot { key, summary } => {
+                payload.extend_from_slice(key);
+                push_summary(&mut payload, *summary);
+                FRAME_RIBLT_ROOT
+            }
+            Self::RibltCell {
+                index,
+                symbol,
+                hash,
+                count,
+            } => {
+                payload.extend_from_slice(&index.to_be_bytes());
+                payload.extend_from_slice(symbol);
+                payload.extend_from_slice(&hash.to_be_bytes());
+                payload.extend_from_slice(&count.to_be_bytes());
+                FRAME_RIBLT_CELL
+            }
         };
         (kind, payload)
     }
@@ -96,7 +163,12 @@ impl Frame {
                 let Some(kind) = WalkKind::from_wire(rest.byte()?) else {
                     return Ok(None);
                 };
-                Self::Open { collection, kind }
+                let algorithm = Algorithm::read(rest.byte()?)?;
+                Self::Open {
+                    collection,
+                    kind,
+                    algorithm,
+                }
             }
             FRAME_SUBTREE => {
                 if payload.len() != SUBTREE_BYTES {
@@ -135,6 +207,16 @@ impl Frame {
             }
             FRAME_DONE => Self::Done,
             FRAME_LANDED => Self::Landed,
+            FRAME_RIBLT_ROOT => Self::RibltRoot {
+                key: rest.take(16)?.try_into().unwrap(),
+                summary: rest.summary()?,
+            },
+            FRAME_RIBLT_CELL => Self::RibltCell {
+                index: u32::from_be_bytes(rest.take(4)?.try_into().unwrap()),
+                symbol: rest.hash()?,
+                hash: u64::from_be_bytes(rest.take(8)?.try_into().unwrap()),
+                count: i64::from_be_bytes(rest.take(8)?.try_into().unwrap()),
+            },
             _ => return Ok(None),
         };
         if !rest.0.is_empty() {
@@ -166,10 +248,11 @@ mod tests {
             assert_eq!(
                 roundtrip(Frame::Open {
                     collection: CollectionHandle::new([7; 32]),
-                    kind
+                    kind,
+                    algorithm: Algorithm::Prefix,
                 })
                 .len(),
-                33
+                34
             );
         }
         for depth in 0..=32 {
@@ -236,7 +319,7 @@ mod tests {
         );
         assert_eq!(Frame::decode(0x02, &[]), Ok(None));
         assert_eq!(Frame::decode(0x04, &[]), Ok(None));
-        assert_eq!(Frame::decode(0x09, &[]), Ok(None));
+        assert!(Frame::decode(0x09, &[]).is_err());
     }
 
     #[test]
@@ -244,6 +327,7 @@ mod tests {
         let (_, open) = Frame::Open {
             collection: CollectionHandle::new([7; 32]),
             kind: WalkKind::Records,
+            algorithm: Algorithm::Prefix,
         }
         .encode();
         let (_, subtree) = Frame::Subtree {
@@ -399,9 +483,14 @@ mod sim_tests {
 
         // Before a walk task runs, a walk stream is reset; the connection
         // stays.
-        let (_send, mut recv) = open_walk(&connection, collection, WalkKind::Records)
-            .await
-            .unwrap();
+        let (_send, mut recv) = open_walk(
+            &connection,
+            collection,
+            WalkKind::Records,
+            Algorithm::Prefix,
+        )
+        .await
+        .unwrap();
         assert!(reads_reset(&mut recv, RESET_WALK_FAILED).await);
         assert_eq!(opener.table.len(), 1);
         assert_eq!(acceptor.table.len(), 1);
@@ -417,7 +506,9 @@ mod sim_tests {
         .enumerate()
         {
             let collection = CollectionHandle::new([index as u8; 32]);
-            let (mut send, _recv) = open_walk(&connection, collection, kind).await.unwrap();
+            let (mut send, _recv) = open_walk(&connection, collection, kind, Algorithm::Prefix)
+                .await
+                .unwrap();
             let root = Frame::Subtree {
                 prefix: Vec::new(),
                 summary: PatchSummary::new(Some([5; 32]), 600).unwrap(),
@@ -447,7 +538,12 @@ mod sim_tests {
         for _ in 0..MAX_REQUESTS_PER_CONNECTION + 1 {
             let halves = tokio::time::timeout(
                 Duration::from_secs(1),
-                open_walk(&connection, collection, WalkKind::Records),
+                open_walk(
+                    &connection,
+                    collection,
+                    WalkKind::Records,
+                    Algorithm::Prefix,
+                ),
             )
             .await
             .expect("opening a walk stream waits for no request permit")

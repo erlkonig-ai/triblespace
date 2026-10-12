@@ -790,6 +790,9 @@ pub struct Crossed {
     pub wire_bytes: usize,
     /// Prefix depth for a complete walk subtree announcement, if applicable.
     pub walk_depth: Option<u8>,
+    /// Component byte of a complete ALPN31 walk OPEN (records=0, AUTH=1,
+    /// references=2). Test-only classification; does not change counted bytes.
+    pub walk_kind: Option<u8>,
 }
 
 /// Every frame that crossed a `recon/1` or `walk/1` stream of a [`Tapped`]
@@ -993,6 +996,9 @@ impl Tap {
                 && kind == crate::walk_stream::FRAME_SUBTREE
                 && length == 5 + crate::walk_stream::SUBTREE_BYTES)
                 .then(|| self.buffer[5]);
+            let walk_kind =
+                (tag == TAG_WALK && kind == crate::walk_stream::FRAME_OPEN && length == 5 + 34)
+                    .then(|| self.buffer[5 + 32]);
             self.buffer.drain(..length);
             self.taps.0.lock().unwrap().push(Crossed {
                 peer: self.peer,
@@ -1002,6 +1008,7 @@ impl Tap {
                 kind,
                 wire_bytes: length,
                 walk_depth,
+                walk_kind,
             });
         }
     }

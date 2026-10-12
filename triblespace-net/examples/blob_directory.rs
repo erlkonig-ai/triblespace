@@ -96,6 +96,7 @@ async fn main() -> Result<()> {
 
     // Reuse production Iroh reachability, but never start the store host loop.
     let config = PeerConfig {
+        walk_algorithm: Default::default(),
         daemon: None,
         provider_publication_budget: Some(0),
         bind: None,

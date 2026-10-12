@@ -1137,8 +1137,22 @@ async fn stream<T: Transport, S: Service>(
                 .upgrade()
                 .and_then(|table| table.walks.get().cloned());
             match (open, walks) {
-                (Ok(Some(walk_stream::Frame::Open { collection, kind })), Some(walks)) => {
-                    walks.incoming(state.peer, collection, kind, Box::new(send), Box::new(recv));
+                (
+                    Ok(Some(walk_stream::Frame::Open {
+                        collection,
+                        kind,
+                        algorithm,
+                    })),
+                    Some(walks),
+                ) => {
+                    walks.incoming(
+                        state.peer,
+                        collection,
+                        kind,
+                        algorithm,
+                        Box::new(send),
+                        Box::new(recv),
+                    );
                 }
                 (open, walks) => {
                     debug!(
@@ -1194,13 +1208,19 @@ pub(crate) async fn open_walk<C: Conn>(
     connection: &Connection<C>,
     collection: CollectionHandle,
     kind: WalkKind,
+    algorithm: walk_stream::Algorithm,
 ) -> anyhow::Result<(Tracked<C::SendHalf>, Tracked<C::RecvHalf>)> {
     let state = connection.state();
     let (send, recv) = connection.conn.open_bi().await?;
     let walk = Arc::new(InFlight::new(state, None, None));
     let mut send = Tracked::new(send, state, Some(walk.clone()));
     send_u8(&mut send, TAG_WALK).await?;
-    let (frame, payload) = walk_stream::Frame::Open { collection, kind }.encode();
+    let (frame, payload) = walk_stream::Frame::Open {
+        collection,
+        kind,
+        algorithm,
+    }
+    .encode();
     write_frame(&mut send, frame, &payload).await?;
     Ok((send, Tracked::new(recv, state, Some(walk))))
 }

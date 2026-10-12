@@ -122,6 +122,7 @@ async fn bring_up_owned(
 ) -> (Peer<MemoryRepo>, tokio::task::JoinHandle<()>) {
     let id = endpoint.id();
     let config = PeerConfig {
+        walk_algorithm: Default::default(),
         daemon: daemon.map(|daemon| VerifyingKey::from_bytes(daemon.as_bytes()).unwrap()),
         provider_publication_budget: None,
         bind: None,

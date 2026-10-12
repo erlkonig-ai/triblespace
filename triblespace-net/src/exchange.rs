@@ -1,4 +1,9 @@
-//! Symmetric, continuous FIFO exchange of prefix/hash/count delta subtrees.
+//! Explicit prefix-delta or cached whole-component reconciliation.
+//!
+//! Cached mode binds a shared source/cache generation, peels full-source cell
+//! differences with eager bodies, and proves the native peer root before stopping
+//! at a completed-write frontier. It never subtracts connection agreement G.
+//! Prefix mode retains the continuous FIFO delta protocol described below.
 //!
 //! Each connection retains sound common-held agreement G. Asymmetric final
 //! failures can leave unequal local bases; both still contain only jointly
@@ -49,11 +54,15 @@ use crate::collection_activation::CollectionRepairOverlay;
 use crate::host::{CollectionSnapshot, StoreSnapshot};
 use crate::patch_repair::PatchSummary;
 use crate::protocol::RawHash;
+use crate::riblt_cache::{CacheError, Cell, Generation, KeySymbol, MAX_CELLS};
+use crate::riblt_decode::{DecodeError, ResidualDecoder};
 use crate::walk::{
     Admit, KEY_BYTES, MAX_WALK_REQUESTS, MAX_WALK_UNLANDED, Value, WalkKind, admit_fetched,
     admit_missing, admit_value, node_summary, summary, value,
 };
+use crate::walk_stream::Algorithm;
 use crate::walk_stream::Frame;
+use riblt::Symbol;
 
 /// Missing leaves awaiting a value beyond which the exchange fails.
 pub(crate) const FLOOD_WANTED: usize = 32 * 1024;
@@ -107,6 +116,27 @@ impl Tree {
         self.at(&[]).unwrap_or_else(empty)
     }
 
+    /// Exact native summary after sparse inserts, without unknown typed bodies.
+    pub(crate) fn summary_with_keys(
+        &self,
+        keys: &PATCH<32, IdentitySchema, (), Blake3Merkle>,
+    ) -> PatchSummary {
+        match self {
+            Self::Records(patch) => crate::riblt_proof::union_summary(patch, keys),
+            Self::References(patch) => crate::riblt_proof::union_summary(patch, keys),
+            Self::Authorization(collection, patch) => {
+                let mut absolute = PATCH::<64, IdentitySchema, (), Blake3Merkle>::new();
+                for key in keys.iter() {
+                    let mut full = [0; 64];
+                    full[..32].copy_from_slice(&collection.raw);
+                    full[32..].copy_from_slice(key);
+                    absolute.insert(&Entry::new(&full));
+                }
+                crate::riblt_proof::union_summary(patch, &absolute)
+            }
+        }
+    }
+
     /// A newer serving observation needs another exchange only for keys
     /// outside the agreed union. Publication may still lag landings; a
     /// strict subset is not new work and must not trigger an empty repush.
@@ -152,8 +182,8 @@ impl Tree {
         }
     }
 
-    /// Exactly the immutable set difference against the shared agreement.
-    fn difference(&self, agreed: &Self) -> Self {
+    /// Exact native key difference, for agreement omission or cache maintenance.
+    pub(crate) fn difference(&self, agreed: &Self) -> Self {
         match (self, agreed) {
             (Self::Records(patch), Self::Records(agreed)) => {
                 Self::Records(patch.difference(agreed))
@@ -165,6 +195,17 @@ impl Tree {
                 Self::References(patch.difference(agreed))
             }
             _ => unreachable!("one agreement contains one kind"),
+        }
+    }
+
+    /// Visit wire-relative keys without retaining a second symbol inventory.
+    pub(crate) fn for_each_key(&self, mut visit: impl FnMut([u8; KEY_BYTES])) {
+        match self {
+            Self::Records(patch) => patch.iter_ordered().for_each(|key| visit(*key)),
+            Self::Authorization(_, patch) => patch.iter_ordered().for_each(|key| {
+                visit(key[KEY_BYTES..].try_into().expect("authorization suffix"));
+            }),
+            Self::References(patch) => patch.iter_ordered().for_each(|key| visit(*key)),
         }
     }
 
@@ -205,6 +246,23 @@ impl Tree {
             }
             (Self::References(patch), Value::Handle) => patch.insert(&Entry::new(&key)),
             _ => unreachable!("a value of another kind"),
+        }
+    }
+
+    fn remove(&mut self, key: [u8; KEY_BYTES]) {
+        match self {
+            Self::Records(patch) => {
+                patch.remove(&key);
+            }
+            Self::Authorization(collection, patch) => {
+                let mut absolute = [0; 64];
+                absolute[..32].copy_from_slice(&collection.raw);
+                absolute[32..].copy_from_slice(&key);
+                patch.remove(&absolute);
+            }
+            Self::References(patch) => {
+                patch.remove(&key);
+            }
         }
     }
 
@@ -277,6 +335,28 @@ pub(crate) enum Failure {
     CountMismatch,
     InsertFailed,
     DeferredProof,
+    /// A local configured cell/proof limit, not malformed peer data or success.
+    ResourceLimit,
+    /// A poisoned cache or local count invariant failure.
+    CacheUnavailable,
+}
+
+impl From<CacheError> for Failure {
+    fn from(error: CacheError) -> Self {
+        match error {
+            CacheError::Exhausted => Self::ResourceLimit,
+            CacheError::Poisoned | CacheError::CountOverflow => Self::CacheUnavailable,
+        }
+    }
+}
+
+impl From<DecodeError> for Failure {
+    fn from(error: DecodeError) -> Self {
+        match error {
+            DecodeError::Limit => Self::ResourceLimit,
+            DecodeError::Invalid | DecodeError::CountOverflow => Self::Protocol,
+        }
+    }
 }
 
 pub(crate) struct Ended {
@@ -289,17 +369,22 @@ pub(crate) struct Ended {
     pub(crate) root: PatchSummary,
     /// Logical peer held view G ∪ Δpeer, not a physical publication frontier.
     pub(crate) peer_root: Option<PatchSummary>,
+    /// Prefix reuses G; whole-source cached exchanges use the union only while
+    /// retiring this task and never keep a second per-neighbour source pin.
+    pub(crate) retain_agreement: bool,
     pub(crate) agreed: Option<Arc<Tree>>,
 }
 
 pub(crate) struct Exchange {
+    riblt: Option<Riblt>,
     collection: CollectionHandle,
     kind: WalkKind,
     pinned: Arc<CollectionSnapshot>,
     sends: bool,
     receives: bool,
     agreed: Option<Arc<Tree>>,
-    /// Immutable native PATCH difference pinned \ G, empty if not sending.
+    /// Advertised source: prefix mode's pinned \ G, cached mode's whole source,
+    /// or empty when directionality forbids sending.
     delta: Tree,
     /// Essential protocol membership proof of ONLY the peer's delta. This
     /// shares known immutable trees; it is not a catalogue of the local store.
@@ -324,6 +409,22 @@ pub(crate) struct Exchange {
     outcome: Option<Outcome>,
 }
 
+/// Per-exchange residual decoder only: no full encoder or copied cell prefix.
+/// The peer membership proof is the existing native `Exchange::peer` PATCH.
+struct Riblt {
+    cache: Arc<Generation>,
+    decoder: ResidualDecoder,
+    generated: usize,
+    written: usize,
+    received: usize,
+    local: usize,
+    remote_queued: usize,
+    decoded_at: Option<usize>,
+    proven: bool,
+    values: PATCH<32, IdentitySchema, ()>,
+    eager: usize,
+}
+
 impl Exchange {
     pub(crate) fn start(
         collection: CollectionHandle,
@@ -342,6 +443,7 @@ impl Exchange {
             Tree::empty(kind, collection)
         };
         Self {
+            riblt: None,
             collection,
             kind,
             pinned,
@@ -370,6 +472,74 @@ impl Exchange {
         }
     }
 
+    pub(crate) fn start_riblt(
+        collection: CollectionHandle,
+        kind: WalkKind,
+        pinned: Arc<CollectionSnapshot>,
+    ) -> Self {
+        let cache = pinned.cache(kind);
+        let mut exchange = Self::start(collection, kind, pinned, None, true, true);
+        // Full component, never the per-neighbour agreement difference G.
+        exchange.peer = exchange.delta.clone();
+        exchange.riblt = Some(Riblt {
+            decoder: ResidualDecoder::with_key(cache.key()),
+            cache,
+            generated: 0,
+            written: 0,
+            received: 0,
+            local: 0,
+            remote_queued: 0,
+            decoded_at: None,
+            proven: false,
+            values: PATCH::new(),
+            eager: 0,
+        });
+        exchange
+    }
+
+    pub(crate) fn algorithm(&self) -> Algorithm {
+        if self.riblt.is_some() {
+            Algorithm::CachedRiblt
+        } else {
+            Algorithm::Prefix
+        }
+    }
+
+    /// Encode at most one eager body, independently of prepared cell capacity.
+    pub(crate) fn next_body(&mut self) -> Option<Frame> {
+        if self.kind == WalkKind::References {
+            return None;
+        }
+        let r = self.riblt.as_mut()?;
+        let key = r.decoder.local().get(r.eager)?.symbol.0;
+        r.eager += 1;
+        let bytes = self.delta_value(key)?.bytes(self.collection)?;
+        Some(Frame::Value { key, bytes })
+    }
+
+    /// Writer receipts only follow complete frame writes, never queue admission.
+    pub(crate) fn on_written(&mut self, prefix: usize) -> Vec<Out> {
+        if let Some(riblt) = &mut self.riblt {
+            if prefix < riblt.written || prefix > riblt.generated {
+                self.fail(Failure::Protocol);
+            } else {
+                riblt.written = prefix;
+            }
+        }
+        let mut outs = Vec::new();
+        self.settle(&mut outs);
+        outs
+    }
+
+    /// Matching residual systems peel symmetrically only through the prefix
+    /// actually written locally. Exact native root/count additionally discharges
+    /// the probabilistic checksum, including upstream's zero-cell shortcut.
+    pub(crate) fn discovery_stopped(&self) -> bool {
+        self.riblt
+            .as_ref()
+            .is_some_and(|r| r.decoded_at.is_some_and(|prefix| r.written >= prefix) && r.proven)
+    }
+
     pub(crate) fn receives(&self) -> bool {
         self.receives
     }
@@ -377,11 +547,51 @@ impl Exchange {
         self.outcome
     }
 
-    /// Root is an ordinary empty-prefix announcement. A singleton additionally
-    /// needs its full-depth key announcement. No read or reply gates this FIFO.
+    /// Prefix roots are ordinary empty-prefix announcements with no reply gate.
+    /// Cached mode first exchanges explicit profile/root frames, then streams
+    /// indexed cells until exact proof and the complete-written frontier meet.
     pub(crate) fn next_delta(&mut self) -> Option<Frame> {
         if self.outcome.is_some() || self.done_sent {
             return None;
+        }
+        if self.riblt.is_some() {
+            if !self.root_sent {
+                if self.delta.summary().leaf_count() > i64::MAX as u64 {
+                    self.fail(Failure::ResourceLimit);
+                    return None;
+                }
+                self.root_sent = true;
+                let r = self.riblt.as_ref().unwrap();
+                return Some(Frame::RibltRoot {
+                    key: r.cache.key(),
+                    summary: self.delta.summary(),
+                });
+            }
+            if self.discovery_stopped() {
+                self.done_sent = true;
+                return Some(Frame::Done);
+            }
+            // A root is required before spending CPU or disclosing cell data.
+            if self.peer_root.is_none() {
+                return None;
+            }
+            let r = self.riblt.as_mut().unwrap();
+            match r.cache.cell(r.generated) {
+                Ok(cell) => {
+                    let index = r.generated as u32;
+                    r.generated += 1;
+                    return Some(Frame::RibltCell {
+                        index,
+                        symbol: cell.symbol.0,
+                        hash: cell.hash,
+                        count: cell.count,
+                    });
+                }
+                Err(error) => {
+                    self.fail(error.into());
+                    return None;
+                }
+            }
         }
         let prefix = if !self.root_sent {
             self.root_sent = true;
@@ -465,7 +675,11 @@ impl Exchange {
     }
 
     pub(crate) fn awaits(&self) -> bool {
-        !self.peer_done || !self.requests.is_empty()
+        !self.peer_done
+            || !self.requests.is_empty()
+            || self.riblt.as_ref().is_some_and(|r| {
+                !self.wanted.is_empty() || r.remote_queued < r.decoder.remote().len()
+            })
     }
 
     pub(crate) fn end(self) -> Ended {
@@ -487,6 +701,7 @@ impl Exchange {
             landed: self.landed_sent,
             root: summary(self.kind, self.pinned.repair()),
             peer_root,
+            retain_agreement: self.riblt.is_none(),
             agreed: next.map(Arc::new),
         }
     }
@@ -505,10 +720,105 @@ impl Exchange {
     fn frame(&mut self, frame: Frame, outs: &mut Vec<Out>) -> Result<(), Failure> {
         match frame {
             Frame::Open { .. } => Err(Failure::Protocol),
+            Frame::RibltRoot { key, summary } => {
+                let r = self.riblt.as_mut().ok_or(Failure::Protocol)?;
+                if self.peer_root.is_some() || key != r.cache.key() {
+                    return Err(Failure::Protocol);
+                }
+                if summary.leaf_count() > i64::MAX as u64 {
+                    return Err(Failure::ResourceLimit);
+                }
+                self.peer_root = Some(summary);
+                if summary == self.delta.summary() {
+                    r.decoded_at = Some(0);
+                    r.proven = true;
+                }
+                Ok(())
+            }
+            Frame::RibltCell {
+                index,
+                symbol,
+                hash,
+                count,
+            } => {
+                self.arriving()?;
+                let r = self.riblt.as_mut().ok_or(Failure::Protocol)?;
+                if index as usize != r.received
+                    || count < 0
+                    || count as u64 > self.peer_root.unwrap().leaf_count()
+                {
+                    return Err(Failure::Protocol);
+                }
+                if r.received >= MAX_CELLS {
+                    return Err(Failure::ResourceLimit);
+                }
+                r.received += 1;
+                // Once fully peeled, extra in-flight cells are harmless but are
+                // still ordered/bounded. Bodies never enter decoder windows.
+                if r.decoded_at.is_some() {
+                    return Ok(());
+                }
+                let local = r.cache.cell(index as usize).map_err(Failure::from)?;
+                let count = count.checked_sub(local.count).ok_or(Failure::Protocol)?;
+                r.decoder
+                    .add(Cell {
+                        symbol: KeySymbol(symbol).xor(&local.symbol),
+                        hash: hash ^ local.hash,
+                        count,
+                    })
+                    .map_err(Failure::from)?;
+                if r.decoder.local().len() > FLOOD_LOCATORS
+                    || r.decoder.remote().len() > FLOOD_LOCATORS
+                {
+                    return Err(Failure::ResourceLimit);
+                }
+                let local: Vec<_> = r.decoder.local()[r.local..]
+                    .iter()
+                    .map(|s| s.symbol.0)
+                    .collect();
+                r.local = r.decoder.local().len();
+                if r.decoder.decoded() {
+                    r.decoded_at = Some(r.received);
+                }
+                if r.decoded_at.is_some() {
+                    let mut retained = self.delta.clone();
+                    let mut removed = PATCH::<32, IdentitySchema>::new();
+                    for item in r.decoder.local() {
+                        let key = item.symbol.0;
+                        if self.delta.at(&key).is_none() || removed.get(&key).is_some() {
+                            return Err(Failure::BadNode);
+                        }
+                        removed.insert(&Entry::new(&key));
+                        retained.remove(key);
+                    }
+                    let mut additions = PATCH::<32, IdentitySchema, (), Blake3Merkle>::new();
+                    for item in r.decoder.remote() {
+                        let key = item.symbol.0;
+                        if self.delta.at(&key).is_some() || additions.get(&key).is_some() {
+                            return Err(Failure::BadNode);
+                        }
+                        additions.insert(&Entry::new(&key));
+                    }
+                    if Some(retained.summary_with_keys(&additions)) != self.peer_root {
+                        return Err(Failure::CountMismatch);
+                    }
+                    r.proven = true;
+                }
+                for key in local {
+                    if self.delta.at(&key).is_none() {
+                        return Err(Failure::BadNode);
+                    }
+                    self.peer.remove(key);
+                }
+                Ok(())
+            }
             Frame::Subtree {
                 prefix,
                 summary: declared,
             } => {
+                if self.riblt.is_some() {
+                    return Err(Failure::Protocol);
+                }
                 if prefix.len() > KEY_BYTES {
                     return Err(Failure::BadNode);
                 }
@@ -579,8 +889,21 @@ impl Exchange {
                 Ok(())
             }
             Frame::Value { key, bytes } => {
-                if self.requests.get(&key).is_none() {
+                if self.riblt.is_none() && self.requests.get(&key).is_none() {
                     return Err(Failure::Protocol);
+                }
+                if let Some(r) = &mut self.riblt {
+                    if self.peer_root.is_none() || self.kind == WalkKind::References {
+                        return Err(Failure::Protocol);
+                    }
+                    if r.values.get(&key).is_some() {
+                        return Ok(());
+                    }
+                    if r.values.len() >= FLOOD_LOCATORS as u64 {
+                        return Err(Failure::ResourceLimit);
+                    }
+                    r.values.insert(&Entry::new(&key));
+                    self.wanted.retain(|wanted| wanted != &key);
                 }
                 self.requests.remove(&key);
                 let live = self.live()?;
@@ -598,7 +921,7 @@ impl Exchange {
                 Ok(())
             }
             Frame::ValueRequest { key } => {
-                if !self.sends {
+                if !self.sends || self.riblt.is_some() {
                     return Err(Failure::Protocol);
                 }
                 // Only the immutable advertised delta serves requests, never
@@ -612,6 +935,9 @@ impl Exchange {
             }
             Frame::Done => {
                 self.arriving()?;
+                if self.riblt.as_ref().is_some_and(|r| !r.proven) {
+                    return Err(Failure::Protocol);
+                }
                 self.peer_done = true;
                 Ok(())
             }
@@ -654,7 +980,15 @@ impl Exchange {
     }
 
     fn proof_budget(&self) -> Result<(), Failure> {
-        if self.peer.summary().leaf_count() > FLOOD_LOCATORS as u64 {
+        self.proof_budget_with_limit(FLOOD_LOCATORS as u64)
+    }
+
+    /// Prefix owns a materialized delta proof. Cached mode shares the native
+    /// full source and bounds newly recovered supports/bodies instead; its
+    /// transient typed frontier may exceed either final source's cardinality.
+    /// The explicit limit also permits tiny structural regression fixtures.
+    pub(crate) fn proof_budget_with_limit(&self, prefix_limit: u64) -> Result<(), Failure> {
+        if self.riblt.is_none() && self.peer.summary().leaf_count() > prefix_limit {
             Err(Failure::Protocol)
         } else {
             Ok(())
@@ -675,6 +1009,13 @@ impl Exchange {
     /// Live held typed values avoid refetch even when publication moved since
     /// our pin; only the declared leaf enters the independent peer proof.
     fn remember(&mut self, key: [u8; KEY_BYTES]) -> Result<bool, Failure> {
+        if self
+            .riblt
+            .as_ref()
+            .is_some_and(|r| r.values.get(&key).is_some())
+        {
+            return Ok(true);
+        }
         let live = self.live()?;
         let Some(value) = value(self.kind, live.repair(), key) else {
             return Ok(false);
@@ -734,6 +1075,24 @@ impl Exchange {
         if self.outcome.is_some() {
             return;
         }
+        // The decoder already retains its sparse difference. Drain it by cursor
+        // through bounded body scheduling, not another lifetime key queue.
+        while self.wanted.len() < FLOOD_WANTED {
+            let Some(r) = &mut self.riblt else {
+                break;
+            };
+            let Some(item) = r.decoder.remote().get(r.remote_queued) else {
+                break;
+            };
+            let key = item.symbol.0;
+            r.remote_queued += 1;
+            if self.delta.at(&key).is_some() {
+                return self.fail(Failure::BadNode);
+            }
+            if let Err(failure) = self.leaf(key) {
+                return self.fail(failure);
+            }
+        }
         while self.requests.len() as usize + self.fetching < MAX_WALK_REQUESTS
             && let Some(key) = self.wanted.pop_front()
         {
@@ -747,12 +1106,29 @@ impl Exchange {
                 }
                 None => {
                     self.requests.insert(&Entry::new(&key));
-                    outs.push(Out::Send(Frame::ValueRequest { key }));
+                    if self.riblt.is_none() {
+                        outs.push(Out::Send(Frame::ValueRequest { key }));
+                    }
                 }
             }
         }
+        if self
+            .riblt
+            .as_ref()
+            .is_some_and(|r| r.decoded_at.is_some() && r.remote_queued == r.decoder.remote().len())
+            && self.wanted.is_empty()
+            && self.requests.is_empty()
+            && self.peer_root != Some(self.peer.summary())
+        {
+            return self.fail(Failure::CountMismatch);
+        }
         if !self.landed_sent
             && self.peer_done
+            && (self.riblt.is_none() || (self.done_sent && self.discovery_stopped()))
+            && self
+                .riblt
+                .as_ref()
+                .is_none_or(|r| r.remote_queued == r.decoder.remote().len())
             && self.wanted.is_empty()
             && self.requests.is_empty()
             && self.fetching == 0
@@ -1705,6 +2081,7 @@ pub(crate) mod tests {
             Frame::Open {
                 collection,
                 kind: WalkKind::Records,
+                algorithm: Algorithm::Prefix,
             },
             Frame::ValueRequest { key: [9; 32] },
             Frame::Done,

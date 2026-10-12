@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add explicit Prefix/CachedRiblt ALPN31 OPEN selection. Cached mode requires
+  mutual collection authorization and shares independently scoped flat
+  Records/AUTH/References source generations, using actual PATCH updates and
+  exact grow-only prefixes. Pin unchanged upstream RIBLT d0737aee with an explicit
+  raw32 SipHash/mapping profile. Eager bodies, sparse pre-body native root proof,
+  complete-write stop frontier and original landing/finish/retirement guards are
+  independent. A local residual decoder bounds work inside cascades and validates
+  arithmetic, mapping incidence and unique support; full COW source cardinality
+  does not consume its difference budget. Prepared generations cap at 1,048,576
+  cells; failures never mean success or a silent algorithm fallback. Candidate
+  only; no deployment.
+
 - Replace W8 child-array NODE exchange with uniform 73-byte SUBTREE payloads
   (depth, zero-padded prefix32, hash32, leaf-count:u64). Roots/leaves use that
   same format. Native PATCH differences omit prior agreed keys; independently

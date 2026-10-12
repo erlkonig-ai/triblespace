@@ -41,6 +41,13 @@ pub mod protocol;
 pub mod provider;
 pub mod recon;
 pub mod reconcile;
+pub(crate) mod riblt_cache;
+#[cfg(test)]
+mod riblt_cache_tests;
+pub(crate) mod riblt_decode;
+#[cfg(test)]
+mod riblt_decode_tests;
+pub(crate) mod riblt_proof;
 pub(crate) mod routing;
 pub(crate) mod schedule;
 pub mod telemetry;

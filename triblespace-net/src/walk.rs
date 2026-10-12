@@ -198,6 +198,7 @@ pub(crate) enum Event {
 /// collection and kind, and whether each neighbour is sent or received
 /// from.
 pub(crate) struct Walks {
+    algorithm: crate::walk_stream::Algorithm,
     health: Health,
     snapshot: Option<Arc<StoreSnapshot>>,
     /// The collections the last snapshot selected: one that leaves the
@@ -212,10 +213,16 @@ impl Walks {
     pub(crate) fn new(health: Health) -> Self {
         Self {
             health,
+            algorithm: crate::walk_stream::Algorithm::Prefix,
             snapshot: None,
             selected: PATCH::new(),
             agreed: PATCH::new(),
         }
+    }
+
+    pub(crate) fn with_algorithm(mut self, algorithm: crate::walk_stream::Algorithm) -> Self {
+        self.algorithm = algorithm;
+        self
     }
 
     /// Start an exchange of C's `kind` tree with `peer`, against what they
@@ -227,6 +234,16 @@ impl Walks {
         collection: CollectionHandle,
         kind: WalkKind,
     ) -> Option<Exchange> {
+        self.start_selected(peer, collection, kind, None)
+    }
+
+    pub(crate) fn start_selected(
+        &self,
+        peer: PeerId,
+        collection: CollectionHandle,
+        kind: WalkKind,
+        requested: Option<crate::walk_stream::Algorithm>,
+    ) -> Option<Exchange> {
         self.selected.get(&collection.raw)?;
         let pinned = self.local(collection)?;
         let sends = self.sends(peer, &pinned);
@@ -234,13 +251,23 @@ impl Walks {
         if !sends && !receives {
             return None;
         }
+        if requested == Some(crate::walk_stream::Algorithm::CachedRiblt) && !(sends && receives) {
+            return None;
+        }
         let agreed = self
             .agreed
             .get(&agreed_key(peer, collection.raw, kind))
             .cloned();
-        Some(Exchange::start(
-            collection, kind, pinned, agreed, sends, receives,
-        ))
+        Some(
+            if sends
+                && receives
+                && requested.unwrap_or(self.algorithm) == crate::walk_stream::Algorithm::CachedRiblt
+            {
+                Exchange::start_riblt(collection, kind, pinned)
+            } else {
+                Exchange::start(collection, kind, pinned, agreed, sends, receives)
+            },
+        )
     }
 
     /// The exchange of C's `kind` tree with `peer` ended: health sees a push
@@ -290,7 +317,13 @@ impl Walks {
                 .is_some_and(|current| agreed.has_new_keys(&Tree::pinned(kind, current.repair())));
         // The key stays constant across exchanges; replace must publish the
         // new attached tree even though PATCH set equality observes keys only.
-        self.agreed.replace(&Entry::with_value(&key, agreed));
+        if ended.retain_agreement {
+            self.agreed.replace(&Entry::with_value(&key, agreed));
+        } else {
+            // Cached mode never subtracts G. A prior Prefix agreement is also
+            // released once this explicitly selected whole-source walk ends.
+            self.agreed.remove(&key);
+        }
         moved
     }
 
@@ -684,6 +717,7 @@ impl WalksHandle {
         peer: PeerId,
         collection: CollectionHandle,
         kind: WalkKind,
+        algorithm: crate::walk_stream::Algorithm,
         send: Box<dyn SendStream>,
         recv: Box<dyn RecvStream>,
     ) {
@@ -691,6 +725,7 @@ impl WalksHandle {
             peer,
             collection,
             kind,
+            algorithm,
             send,
             recv,
         };
@@ -719,6 +754,7 @@ pub(crate) enum Command {
         peer: PeerId,
         collection: CollectionHandle,
         kind: WalkKind,
+        algorithm: crate::walk_stream::Algorithm,
         send: Box<dyn SendStream>,
         recv: Box<dyn RecvStream>,
     },
@@ -853,9 +889,10 @@ impl<T: Transport, S: Service> Task<T, S> {
                 peer,
                 collection,
                 kind,
+                algorithm,
                 send,
                 recv,
-            } => self.incoming(peer, collection, kind, send, recv),
+            } => self.incoming(peer, collection, kind, algorithm, send, recv),
             Command::Ended {
                 id,
                 peer,
@@ -910,20 +947,21 @@ impl<T: Transport, S: Service> Task<T, S> {
         };
         let (driver, acked, replaced) = self.register(key, true, &exchange);
         tokio::spawn(async move {
-            let (ended, duplicate) = match open_walk(&connection, collection, kind).await {
-                Ok((send, recv)) => {
-                    drive(
-                        &driver,
-                        exchange,
-                        Box::new(send),
-                        Box::new(recv),
-                        acked,
-                        replaced,
-                    )
-                    .await
-                }
-                Err(_) => (exchange.end(), false),
-            };
+            let (ended, duplicate) =
+                match open_walk(&connection, collection, kind, exchange.algorithm()).await {
+                    Ok((send, recv)) => {
+                        drive(
+                            &driver,
+                            exchange,
+                            Box::new(send),
+                            Box::new(recv),
+                            acked,
+                            replaced,
+                        )
+                        .await
+                    }
+                    Err(_) => (exchange.end(), false),
+                };
             driver.ended(ended, duplicate);
         });
     }
@@ -939,6 +977,7 @@ impl<T: Transport, S: Service> Task<T, S> {
         peer: PeerId,
         collection: CollectionHandle,
         kind: WalkKind,
+        algorithm: crate::walk_stream::Algorithm,
         mut send: Box<dyn SendStream>,
         mut recv: Box<dyn RecvStream>,
     ) {
@@ -950,7 +989,10 @@ impl<T: Transport, S: Service> Task<T, S> {
             recv.stop(RESET_WALK_DUPLICATE);
             return;
         }
-        let Some(exchange) = self.walks.start(peer, collection, kind) else {
+        let Some(exchange) = self
+            .walks
+            .start_selected(peer, collection, kind, Some(algorithm))
+        else {
             send.reset(RESET_WALK_REFUSED);
             recv.stop(RESET_WALK_REFUSED);
             return;
@@ -1161,11 +1203,19 @@ async fn drive<T: Transport, S: Service>(
     let (outgoing, written) = mpsc::channel(1);
     let (reset, resetting) = oneshot::channel();
     let (write_failed, mut writer_failed) = oneshot::channel();
-    let mut writer = tokio::spawn(write_stream(send, written, resetting, write_failed));
+    let (progress, mut progressed) = watch::channel(0usize);
+    let mut writer = tokio::spawn(write_stream_progress(
+        send,
+        written,
+        resetting,
+        write_failed,
+        Some(progress),
+    ));
     let (fetches, mut fetched) = mpsc::unbounded_channel::<Fetched>();
     let mut outbox = VecDeque::new();
     // ROOT first, whatever arrives meanwhile.
     let mut pending = exchange.next_delta();
+    let mut deferred_delta = None;
     let mut heard_at = tokio::time::Instant::now();
     let mut duplicate = false;
     let failed = 'drive: loop {
@@ -1179,8 +1229,25 @@ async fn drive<T: Transport, S: Service>(
         }
         // Answers first, then the delta, one frame ahead of the writer: the
         // stream's credit is the delta's only pace.
+        if exchange.discovery_stopped() {
+            if matches!(pending, Some(Frame::RibltCell { .. })) {
+                pending = None;
+            }
+            deferred_delta = None;
+        }
+        // An eager body supersedes a not-yet-queued cell; prepared capacity is
+        // irrelevant to this one-frame lookahead. Never split an in-flight write.
+        if matches!(pending, Some(Frame::RibltCell { .. })) {
+            if let Some(body) = outbox.pop_front().or_else(|| exchange.next_body()) {
+                deferred_delta = pending.replace(body);
+            }
+        }
         if pending.is_none() {
-            pending = outbox.pop_front().or_else(|| exchange.next_delta());
+            pending = outbox
+                .pop_front()
+                .or_else(|| exchange.next_body())
+                .or_else(|| deferred_delta.take())
+                .or_else(|| exchange.next_delta());
         }
         if exchange.outcome().is_some() {
             continue;
@@ -1207,6 +1274,11 @@ async fn drive<T: Transport, S: Service>(
             },
             Some((landed, failed)) = acked.recv() => exchange.on_landed_ack(landed, failed),
             Some((handle, proof, blob)) = fetched.recv() => exchange.on_fetched(handle, proof, blob),
+            changed = progressed.changed() => {
+                if changed.is_err() { break 'drive true; }
+                let prefix = *progressed.borrow_and_update();
+                exchange.on_written(prefix)
+            },
             _ = &mut writer_failed => break 'drive true,
             _ = &mut replaced => break 'drive true,
         };
@@ -1237,6 +1309,9 @@ async fn drive<T: Transport, S: Service>(
         let drain = async {
             for frame in pending.into_iter().chain(outbox) {
                 outgoing.send(frame).await.map_err(|_| ())?;
+            }
+            while let Some(body) = exchange.next_body() {
+                outgoing.send(body).await.map_err(|_| ())?;
             }
             Ok::<(), ()>(())
         };
@@ -1331,16 +1406,19 @@ async fn read_stream(
 /// the driver immediately. Writes have a byte-progress deadline, and final
 /// shutdown is bounded and cancellable. Returns actual LANDED write and
 /// successful stream-finish receipts separately.
-async fn write_stream(
+async fn write_stream_progress(
     mut send: Box<dyn SendStream>,
     mut frames: mpsc::Receiver<Frame>,
     reset: oneshot::Receiver<u32>,
     write_failed: oneshot::Sender<()>,
+    progress: Option<watch::Sender<usize>>,
 ) -> (bool, bool) {
     let mut reset = std::pin::pin!(futures::FutureExt::fuse(reset));
     let mut broken = false;
     let mut write_failed = Some(write_failed);
     let mut landed_written = false;
+    let mut cell_prefix = 0;
+    let mut riblt = false;
     loop {
         tokio::select! {
             biased;
@@ -1391,12 +1469,29 @@ async fn write_stream(
                         } else if matches!(frame, Frame::Landed) {
                             landed_written = true;
                         }
+                        if !broken {
+                            riblt |= matches!(frame, Frame::RibltRoot { .. });
+                            let notify = matches!(frame, Frame::RibltCell { .. })
+                                || (riblt && matches!(frame, Frame::Done));
+                            if let Frame::RibltCell { index, .. } = frame {
+                                cell_prefix = index as usize + 1;
+                            }
+                            // DONE also wakes settlement for equal-root,
+                            // zero-cell exchanges whose peer DONE arrived first.
+                            if notify && let Some(progress) = &progress {
+                                let _ = progress.send(cell_prefix);
+                            }
+                        }
                     }
                 }
             }
         }
     }
 }
+
+#[cfg(all(test, feature = "sim"))]
+#[path = "riblt_runtime_tests.rs"]
+mod riblt_runtime_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -1646,6 +1741,7 @@ pub(crate) mod tests {
             for (peer, collection) in pairs {
                 let pinned = node.pinned(collection);
                 let ended = Ended {
+                    retain_agreement: true,
                     sends: true,
                     receives: true,
                     confirmed: true,
@@ -1751,6 +1847,7 @@ pub(crate) mod tests {
             collection,
             kind,
             Ended {
+                retain_agreement: true,
                 sends: true,
                 receives: true,
                 confirmed: true,
@@ -2089,6 +2186,7 @@ pub(crate) mod tests {
                     peer,
                     collection,
                     WalkKind::Records,
+                    crate::walk_stream::Algorithm::Prefix,
                     Box::new(Tx(send, reset.clone())),
                     Box::new(Rx(recv, reset.clone())),
                 );
@@ -2800,6 +2898,7 @@ pub(crate) mod tests {
                 kind,
                 duplicate: false,
                 ended: Ended {
+                    retain_agreement: true,
                     sends: true,
                     receives: true,
                     confirmed: true,
@@ -2880,6 +2979,7 @@ pub(crate) mod tests {
                 peer: other.peer,
                 collection,
                 kind,
+                algorithm: crate::walk_stream::Algorithm::Prefix,
                 send: Box::new(Tx(send, reset.clone())),
                 recv: Box::new(Rx(recv, reset.clone())),
             });

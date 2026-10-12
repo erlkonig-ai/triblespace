@@ -115,6 +115,7 @@ fn bring_up_with_publication_budget(
     tokio::task::spawn_local(host::run_host(
         harness,
         PeerConfig {
+            walk_algorithm: Default::default(),
             daemon: daemon.map(|daemon| VerifyingKey::from_bytes(&daemon).unwrap()),
             provider_publication_budget,
             bind: None,
@@ -1150,7 +1151,7 @@ fn a_previous_generation_peer_is_refused() {
         let server_id = server_key.verifying_key().to_bytes();
         assert_eq!(
             triblespace_net::protocol::PILE_SYNC_ALPN,
-            b"/triblespace/pile-sync/30"
+            b"/triblespace/pile-sync/31"
         );
         let current = client
             .transport

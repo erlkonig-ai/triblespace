@@ -29,6 +29,8 @@ ed25519-dalek = "2.2.0"
 getrandom = "0.4"
 hex = "0.4"
 rand = "0.8.5"
+riblt = { git = "https://github.com/ngerakines/riblt-rs", rev = "d0737aeeac0f705ea0f26ebf7421a8b9f307b7d0", default-features = false }
+siphasher = "=1.0.4"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 tracing = "0.1"

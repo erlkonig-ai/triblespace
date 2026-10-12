@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Source-only ALPN31 candidate: explicitly selectable cached whole-component
+  RIBLT discovery alongside prefix exchange. Share one flat source-bound cache
+  per Records/AUTH/References component, maintain it through native PATCH
+  differences on normal publication, and pin old generations for in-flight work.
+  Sparse native root proof and actual written-prefix receipts stop cells before
+  body completion; ordinary authority, admission, landing and finish guards stay.
+  No live rollout, dependency publication or deployed performance claim.
+
 - Stream collection-kind PATCH differences against connection-scoped agreement
   as fixed 73-byte prefix/hash/leaf-count announcements, without full child
   lists or special root/leaf frames. Reconstruct and close the peer delta before

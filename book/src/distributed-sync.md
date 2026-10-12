@@ -467,8 +467,9 @@ receipt added here.
 
 ## Walk streams
 
-The opener writes the stream tag and OPEN naming collection and kind (records
-`0`, authorization `1`, references `2`). The accept loop hands both halves to
+The opener writes the stream tag and OPEN naming collection, kind (records
+`0`, authorization `1`, references `2`) and algorithm (`0` prefix, `1` cached
+RIBLT profile 1). Unknown algorithms are refused. The accept loop hands both halves to
 the walks task. Missing OPEN within ten seconds, or no task, resets the stream.
 Frames have a one-byte kind, big-endian u32 payload length, then at most 64 KiB.
 Keys are 32 bytes relative to the kind's base; authorization hashes bind the full
@@ -476,12 +477,14 @@ collection32 || proof-id32 key. Integers are big-endian.
 
 | Kind | Frame | Payload |
 |---:|---|---|
-| `0x01` | OPEN | collection32, kind:u8 |
+| `0x01` | OPEN | collection32, kind:u8, algorithm:u8 |
 | `0x03` | SUBTREE | depth:u8, prefix32, hash32, leaf-count:u64 |
 | `0x05` | VALUE_REQUEST | key32 |
 | `0x06` | VALUE | key32, nonempty encoded bytes |
 | `0x07` | DONE | empty |
 | `0x08` | LANDED | empty |
+| `0x09` | RIBLT_ROOT | profile-key16, hash32, leaf-count:u64 |
+| `0x0a` | RIBLT_CELL | index:u32, symbol32, checksum:u64, count:i64 |
 
 Every SUBTREE payload is 73 bytes, 78 including the frame header, regardless of
 fanout. Depth is 0..32; all prefix bytes outside depth must be zero. Depth0 is the
@@ -490,7 +493,7 @@ count. There is no ROOT, LEAF, NODE child array, HELD or reply bitmap.
 Unknown kinds are skipped; known malformed payloads fail only the exchange.
 The retired `0x02` and `0x04` kinds are not compatibility paths.
 
-Freeze native PATCH difference Δ = pinned minus G, or empty if not sending.
+For the prefix algorithm, freeze native PATCH difference Δ = pinned minus G, or empty if not sending.
 Announce [] and then visit its actual compressed trie nodes continuously FIFO,
 putting children at the back in ascending edge order. Children are separate later
 announcements, never embedded metadata. A nonempty compressed root prefix is
@@ -553,6 +556,123 @@ progress-bounded/cancellable, including when a driver is retired. A walk takes n
 request permit but uses transport stream credit and counts as connection use.
 Small and scratch/sim gates do not establish many-collection live stream-credit
 liveness or throughput.
+
+### Cached full-component discovery
+
+This source-only ALPN31 candidate can be selected with
+`trible pile net sync --walk-algorithm cached-riblt` or
+`PeerConfig::walk_algorithm`. The CLI and `Algorithm::default()` retain explicit
+`prefix` selection for locally opened streams; nothing changes a live daemon or
+its configuration. Incoming streams explicitly choose either supported algorithm
+regardless of the local opening preference. With simultaneous opens, the existing
+lower-peer-id survivor determines which explicit algorithm runs. Cached symmetric RIBLT is
+refused unless both send and receive are authorized for this collection. Local
+opens with one-way authority choose prefix, so receive-only holdings never enter
+symmetric equations. Collection/component admission and reference eligibility
+are otherwise unchanged.
+
+Each published collection observation owns three separate latest cache Arcs:
+Records, scoped AUTH, and positive resident References. A generation binds the
+immutable native source, collection, component and profile to one flat grow-only
+`Vec<CodedSymbol<KeySymbol>>`. Running exchanges retain that generation; they
+have residual decoders, not full per-peer encoders or cell caches. Normal local
+publication and incoming landing use the same owner update. An unchanged key set
+reuses its cache Arc, while the exchange still pins the current typed observation
+for body serving and authorization. Actual native PATCH differences `new \\ old`
+and `old \\ new` update the already-prepared prefix by checksum/symbol XOR and
+signed membership count. Publication copies the entire prepared vector first:
+update cost includes O(prepared cells) copy, PATCH differences and sparse scatter,
+not merely the small edit. Old leased buffers remain separately resident.
+Completed cached exchanges use the agreed native union only transiently for
+health, receipts and moved-source checks, then release it instead of retaining
+per-peer G. They also discard any older Prefix G for that component. Prefix
+exchanges continue retaining their reusable agreement as before.
+
+Preparation is lazy, initially 1,024 cells, doubling up to 1,048,576 cells. Growth
+and an update's prepared-prefix snapshot are serialized; the new generation is
+then updated privately. Growth scatters the entire frozen source only into a
+private new tail; existing cells never change. This avoids adding symbols
+to an already-advanced upstream encoder. Old leases can grow their own generation
+without becoming the latest owner. There is no retained reverse-membership index;
+the public mapping reconstructs each changed symbol's memberships. Cell storage
+is 48 logical bytes (and measured Rust layout on the tested target), at most
+48 MiB per prepared generation, plus Vec capacity, native PATCH sharing and
+decoder state. Exhaustion, poisoning or count overflow fails the exchange or
+publication; none is a success or silent prefix fallback. Each decoded local-only
+or remote-only set and the eager-body deduplication set have a 1,048,576-key
+ceiling. Unlike Prefix's materialized delta proof, the cached COW proof does not
+cap absolute source cardinality at that value: source counts must fit i64, while
+newly retained difference state is bounded independently. A transient typed
+frontier may exceed either final source's cardinality while eager bodies arrive.
+Cursors into those difference vectors drain at most 32,768 queued body keys
+and 64 active owed bodies/fetches; the queue bound is not a lifetime delta bound.
+The decoded-support ceiling and prepared-cell ceiling are separate limits:
+fitting the former does not guarantee decoding within the latter. This
+candidate does not support unbounded cold synchronization. Local exhaustion is
+reported as a resource limit, separately from malformed peer frames; cache
+poisoning/count-invariant failures are separately unavailable, never success.
+
+Profile 1 uses exact 32-byte symbols, including trailing zeros. SipHash-2-4 hashes
+precisely those raw bytes, with no Rust `Hash` length prefix. Its public 16-byte
+key is the first 16 bytes of BLAKE3(domain || collection32 || component-byte),
+where domain `2D1743DA8080C9DBDAEB886FEE34089C` was minted with `trible genid`.
+The checksum u64 is also the mapping seed. Mapping is pinned upstream
+`ngerakines/riblt-rs` commit `d0737aeeac0f705ea0f26ebf7421a8b9f307b7d0`:
+every symbol contributes to cell 0; advance the u64 PRNG by wrapping multiply
+by `0xda942042e4dd58b5`, then compute
+`gap = max(1, ceil((f64(index) + 1.5) * (4294967296 / sqrt(f64(prng) + 1) - 1)))`
+and saturating-add that integer gap to the index. Operations use IEEE754 binary64
+in the stated order, matching `RandomMapping`; cross-platform profile parity is a requirement, not a
+Rust-layout assumption. This is a public deterministic map, not authentication
+or adversarial-workload protection. Roots reject a different profile key.
+
+Cells describe the **whole component**, never `source \\ G`. The sender emits its
+root immediately but deliberately waits for the peer's root
+before preparing or sending any cells. This initial feedback barrier validates
+the profile and avoids both cold preparation and coded oversend for equal roots;
+it does add startup latency and is not a feedback-free root-plus-cells stream.
+After that exchange, cells proceed without cell-by-cell request rounds. A bounded
+residual-only decoder receives peer cells minus cached local cells: XOR symbol
+and checksum, subtract signed count. Indices are contiguous and bounded. Before
+admission, the residual count must fit the signed decoded-support bound,
+independently of source size. Count arithmetic is checked throughout peeling.
+Upstream's unbounded `try_decode` is not used on network input: the local boundary
+adapter reuses its public mapping and keeps its Encoder as an oracle. The
+adapter charges mapping, cell updates and queue work inside every cascade loop,
+with a total budget of 64 times the maximum cell count. This is an explicit work
+budget, not a latency guarantee. Queue membership is deduplicated and bounded by
+the received prefix; purity is rechecked at dequeue, the recovered key must map
+to the triggering cell, and repeated or cross-sign recovery is rejected. Exact
+zero includes all symbol bytes, not merely count/checksum. Incremental mapping
+heaps retain only recovered difference keys, never a full-source inventory.
+Peeling
+reveals local-only bodies, which are pushed eagerly from the pinned typed source;
+remote-only bodies are owed pushes, not an additional VALUE_REQUEST round trip.
+References continue through the ordinary exact-blob fetch/held-note path. Bodies
+never enter decoder windows. Duplicate bodies are admitted at most once.
+
+After complete peeling, local-only keys must exist in the original source,
+remote-only keys must not, and both recovered sets must be unique. A sparse
+native Merkle union summary combines the COW source minus local-only keys with
+the remote-only key PATCH, sharing all unchanged native subtree summaries. It
+checks the exact peer root/count without waiting for unknown typed bodies and
+without a copied full-source key inventory. AUTH hashes still bind physical
+collection32 || proof32 keys. Typed peer reconstruction and canonical signature
+admission independently guard final landing.
+
+Once this exact proof holds, stop coded output only when the **complete locally
+written** cell prefix reaches the decoded incoming prefix. Opposite residual
+counts and identical XOR equations then give the peer the same solvable prefix.
+Equal root/count with the same profile/domain can stop at zero cells; the
+upstream decoder's initially true `decoded()` alone cannot. DONE before this
+proof fails. Eager bodies take priority over unqueued cells; one active write,
+one queued frame and a single deferred cell bound coded lookahead independently
+of prepared megabytes. Each cell is locked/copied/encoded individually: 52 payload
+bytes, 57 framed bytes, not zero-copy wire. Root, OPEN, control frames and bodies
+are additional traffic. Body/fetch/landing obligations, both LANDEDs, actual
+LANDED write, successful finish and current Task generation all remain required.
+Premature EOF, reset, malformed data, failed landing or retired drivers cannot
+turn decoding into success.
 
 ### Landing
 
@@ -1217,7 +1337,9 @@ guarantee.
 
 ## Wire surface
 
-The ALPN is `/triblespace/pile-sync/30`. Generation 27 replaced the bearer
+The ALPN is `/triblespace/pile-sync/31`. Generation 31 adds the explicit OPEN
+algorithm discriminator and cached whole-component RIBLT profile; generation 30
+and earlier are refused at the handshake. Generation 27 replaced the bearer
 locator, directory token and exact-GET proofs with one-block constructions, so
 a generation-26 peer cannot connect at all; generation 28 exports foundations
 only, so collection sync never carries a MERGE; generation 29 replaced the

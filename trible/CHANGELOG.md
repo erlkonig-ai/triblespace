@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- Source-only ALPN31 candidate offers `pile net sync --walk-algorithm
+  prefix|cached-riblt` (default `prefix`). Cached symmetric discovery is refused
+  for one-way-authorized incoming streams; outgoing one-way exchanges explicitly
+  use prefix. No running daemon or saved selection is changed by this option.
+
 - `pile net sync` speaks transport generation `/triblespace/pile-sync/30`
   and cannot sync with a 0.47 daemon, which speaks generation 28; upgrade
   every daemon of a cohort together. Its `reconciled with peer` line counts

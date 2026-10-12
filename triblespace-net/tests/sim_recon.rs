@@ -94,6 +94,7 @@ fn bring_up<T: Transport>(
     tokio::task::spawn_local(host::run_host(
         harness,
         PeerConfig {
+            walk_algorithm: Default::default(),
             daemon: None,
             provider_publication_budget: Some(0),
             bind: None,
