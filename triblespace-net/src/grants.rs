@@ -16,8 +16,15 @@
 //! collection's held descriptor and is dropped when it is not. A proof naming
 //! this node whose descriptor is not held stays in memory if its signatures
 //! hold, lists its collection as available, and lands once the descriptor
-//! arrives. It waits for every sender that delivered it, and leaves when the
-//! last connection of the last of them closes. At most
+//! arrives. The descriptor is fetched over `blob/1` from each sender that
+//! delivers the proof: a sender holds the collection it granted, so the
+//! descriptor comes over the connection that brought the grant, before the
+//! collection is selected here and without a lookup. Once it is held, the
+//! name it carries is fetched the same way, so the collection can be
+//! presented; its other definitions wait for its selection, like the rest
+//! of its metadata. The proof waits for every sender that
+//! delivered it, and leaves when the last connection of the last of them
+//! closes. At most
 //! [`MAX_PENDING_PER_SENDER`] of these wait for one sender, and
 //! [`MAX_PENDING`] for all; the rest are dropped. A proof counts against each
 //! sender it waits for, not only its first: a sender then keeps no more
@@ -43,7 +50,9 @@ use triblespace_core::blob::TryFromBlob as _;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::capability::CapabilityProof;
 use triblespace_core::collection::{AdmissionPolicy, CollectionHandle};
-use triblespace_core::collection::descriptor::{capability_policies, validate_proof_for_policies};
+use triblespace_core::collection::descriptor::{
+    capability_policies, name, validate_proof_for_policies,
+};
 use triblespace_core::inline::Inline;
 use triblespace_core::patch::Entry as PatchEntry;
 use triblespace_core::trible::TribleSet;
@@ -251,7 +260,8 @@ impl Grants {
     /// Keep the proofs naming this node or `sender`: land those that are
     /// evidence under their held descriptor, keep in memory those naming this
     /// node whose descriptor is not held, drop the rest, and fetch the
-    /// definitions the kept ones name.
+    /// definitions the kept ones name and the descriptors the waiting ones
+    /// wait for.
     fn receive(&mut self, sender: PeerId, proofs: Vec<CapabilityProof>) -> Effects {
         let mut effects = Effects::default();
         for proof in proofs {
@@ -300,18 +310,26 @@ impl Grants {
                     }
                 }
             }
-            let definitions = proof
-                .capabilities()
-                .map(|definition| definition.raw)
-                .filter(|definition| {
-                    self.snapshot
-                        .as_ref()
-                        .is_none_or(|snapshot| snapshot.get_blob(definition).is_none())
-                })
-                .collect::<BTreeSet<_>>();
-            if !definitions.is_empty() {
+            let resident = |handle: &RawHash| {
+                self.snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.get_blob(handle).is_some())
+            };
+            let mut blobs = Vec::new();
+            let descriptor = proof.resource().into_bytes();
+            if self.pending.contains_key(&proof.id().raw) && !resident(&descriptor) {
+                blobs.push(descriptor);
+            }
+            blobs.extend(
+                proof
+                    .capabilities()
+                    .map(|definition| definition.raw)
+                    .filter(|definition| !resident(definition))
+                    .collect::<BTreeSet<_>>(),
+            );
+            if !blobs.is_empty() {
                 effects.fetch.push(Fetch {
-                    blobs: definitions.into_iter().collect(),
+                    blobs,
                     sources: sources(sender, std::slice::from_ref(&proof)),
                 });
             }
@@ -412,8 +430,9 @@ impl Grants {
     }
 
     /// Take a new store observation: land or drop the proofs waiting for a
-    /// descriptor that arrived, send each connection's changed digest, and
-    /// dial the subjects of grants this key newly signed.
+    /// descriptor that arrived, fetching a landed one's collection name from
+    /// the senders that kept it waiting, send each connection's changed
+    /// digest, and dial the subjects of grants this key newly signed.
     pub(crate) fn observe(&mut self, snapshot: Arc<StoreSnapshot>) -> Effects {
         let mut held = SubjectProofPatch::new();
         for collection in snapshot.active() {
@@ -439,7 +458,27 @@ impl Grants {
                 None => {
                     self.pending.insert(id, (senders, proof));
                 }
-                Some(true) => effects.land.push(proof),
+                Some(true) => {
+                    let snapshot = self.snapshot.as_ref().expect("validated under a snapshot");
+                    let wanted = snapshot
+                        .get_blob(&proof.resource().into_bytes())
+                        .filter(|bytes| bytes.len() as u64 <= METADATA_BLOB_BYTES)
+                        .and_then(|bytes| {
+                            Blob::<SimpleArchive>::new(bytes)
+                                .try_from_blob::<TribleSet>()
+                                .ok()
+                        })
+                        .and_then(|facts| name(&facts).ok().flatten())
+                        .map(|name| name.raw)
+                        .filter(|name| snapshot.get_blob(name).is_none());
+                    if let Some(name) = wanted {
+                        effects.fetch.push(Fetch {
+                            blobs: vec![name],
+                            sources: senders.into_iter().collect(),
+                        });
+                    }
+                    effects.land.push(proof);
+                }
                 Some(false) => {
                     for (subject, prefix) in subject_prefixes(&proof) {
                         self.received
@@ -958,8 +997,8 @@ mod tests {
 
     /// Without its descriptor, a proof naming this node waits in memory: it
     /// lists its collection as available, counts in this node's digest and
-    /// fetches its definition from the sender. It lands once the descriptor
-    /// is held.
+    /// fetches its descriptor and definition from the sender. It lands once
+    /// the descriptor is held.
     #[test]
     fn a_proof_without_its_descriptor_waits_in_memory_until_the_descriptor_arrives() {
         let mut owner = Node::new(20);
@@ -976,7 +1015,7 @@ mod tests {
         assert_eq!(
             received.fetch,
             [Fetch {
-                blobs: vec![read_capability().raw],
+                blobs: vec![collection.raw, read_capability().raw],
                 sources: vec![owner.id(), subject.id()],
             }]
         );
@@ -1030,7 +1069,7 @@ mod tests {
             .expect("the owner holds the descriptor of the collection it granted");
         subject
             .store
-            .put::<UnknownBlob, _>(Blob::<UnknownBlob>::new(descriptor))
+            .put::<UnknownBlob, _>(Blob::<UnknownBlob>::new(descriptor.clone()))
             .unwrap();
         let effects = subject.observe();
         assert_eq!(effects.land, [read]);
@@ -1038,6 +1077,19 @@ mod tests {
         assert!(
             subject.active.get(&collection.raw).is_none(),
             "the descriptor landed without the collection being active"
+        );
+        // The collection's name comes from the same sender, so it can be
+        // presented by name; its other definitions wait for its selection.
+        let facts = Blob::<SimpleArchive>::new(descriptor)
+            .try_from_blob::<TribleSet>()
+            .unwrap();
+        let name = name(&facts).unwrap().expect("a named collection");
+        assert_eq!(
+            effects.fetch,
+            [Fetch {
+                blobs: vec![name.raw],
+                sources: vec![owner.id()],
+            }]
         );
     }
 
