@@ -241,7 +241,7 @@ fn wanted(
         .map(|handle| handle.raw)
         .collect::<BTreeSet<_>>();
     (!definitions.is_empty()).then(|| Fetch {
-        definitions: definitions.into_iter().collect(),
+        blobs: definitions.into_iter().collect(),
         sources: sources(peer, presented),
     })
 }
@@ -1646,7 +1646,7 @@ mod tests {
         assert_eq!(
             owner.peerings.take_wanted(),
             [Fetch {
-                definitions: vec![custom.raw],
+                blobs: vec![custom.raw],
                 sources: vec![asker.id(), owner.id()],
             }]
         );

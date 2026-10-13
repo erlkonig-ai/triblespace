@@ -93,11 +93,12 @@ pub(crate) struct Effects {
     pub(crate) dial: Vec<PeerId>,
 }
 
-/// Definitions to fetch, and the keys to ask, in order. Only keys this node
-/// is connected to are asked.
+/// Metadata blobs to fetch, and the keys to ask, in order: the definitions
+/// a proof names and, for a proof waiting for it, its collection's
+/// descriptor. Only keys this node is connected to are asked.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Fetch {
-    pub(crate) definitions: Vec<RawHash>,
+    pub(crate) blobs: Vec<RawHash>,
     pub(crate) sources: Vec<PeerId>,
 }
 
@@ -310,7 +311,7 @@ impl Grants {
                 .collect::<BTreeSet<_>>();
             if !definitions.is_empty() {
                 effects.fetch.push(Fetch {
-                    definitions: definitions.into_iter().collect(),
+                    blobs: definitions.into_iter().collect(),
                     sources: sources(sender, std::slice::from_ref(&proof)),
                 });
             }
@@ -572,22 +573,22 @@ impl<T: Transport, S: Service> Sink<T, S> {
             });
         }
         for fetch in effects.fetch {
-            let definitions = {
+            let blobs = {
                 let mut fetching = self.fetching.lock().unwrap();
                 fetch
-                    .definitions
+                    .blobs
                     .into_iter()
-                    .filter(|definition| fetching.insert(*definition))
+                    .filter(|blob| fetching.insert(*blob))
                     .collect::<Vec<_>>()
             };
-            if definitions.is_empty() {
+            if blobs.is_empty() {
                 continue;
             }
-            tokio::spawn(fetch_definitions(
+            tokio::spawn(fetch_blobs(
                 self.connections.clone(),
                 self.admissions.clone(),
                 self.fetching.clone(),
-                definitions,
+                blobs,
                 fetch.sources,
             ));
         }
@@ -614,30 +615,29 @@ async fn land(
     }
 }
 
-/// Fetch each definition from the first connected source that has it. A
-/// definition is policy metadata, bounded like a descriptor.
-async fn fetch_definitions<T: Transport, S: Service>(
+/// Fetch each blob from the first connected source that has it. Definitions
+/// and descriptors are metadata, bounded alike.
+async fn fetch_blobs<T: Transport, S: Service>(
     connections: ConnectionTable<T, S>,
     admissions: tokio::sync::mpsc::Sender<NetEventBatch>,
     fetching: Arc<Mutex<HashSet<RawHash>>>,
-    definitions: Vec<RawHash>,
+    blobs: Vec<RawHash>,
     sources: Vec<PeerId>,
 ) {
     let local = connections.transport().local_id();
-    for definition in definitions {
+    for handle in blobs {
         for source in &sources {
             let Some(connection) = connections.current(*source) else {
                 continue;
             };
-            let fetch =
-                op_get_blob_with_limit(&connection, local, &definition, METADATA_BLOB_BYTES);
+            let fetch = op_get_blob_with_limit(&connection, local, &handle, METADATA_BLOB_BYTES);
             let fetched = tokio::time::timeout(FETCH_DEADLINE, fetch).await;
             if let Ok(Ok(Some(blob))) = fetched {
                 land(&admissions, std::iter::once(NetEvent::Blob(blob))).await;
                 break;
             }
         }
-        fetching.lock().unwrap().remove(&definition);
+        fetching.lock().unwrap().remove(&handle);
     }
 }
 
@@ -653,6 +653,9 @@ mod tests {
     };
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::repo::{CapabilityProofStore, SnapshotSource, StoreChanges};
+
+    use triblespace_core::blob::encodings::UnknownBlob;
+    use triblespace_core::repo::BlobStorePut as _;
 
     use crate::host::ActiveCollections;
     use crate::recon::{FRAME_PROOF_DIGEST, FRAME_PROOF_REQUEST, FRAME_PROOFS, FRAME_PROOFS_END};
@@ -721,17 +724,23 @@ mod tests {
             self.observe()
         }
 
-        fn observe(&mut self) -> Effects {
-            let snapshot = StoreSnapshot::from_store_changes(
-                self.store.snapshot().unwrap(),
-                &self.active,
-                self.key.verifying_key(),
-                None,
-                None,
-                StoreChanges::ALL,
+        fn snapshot(&mut self) -> Arc<StoreSnapshot> {
+            Arc::new(
+                StoreSnapshot::from_store_changes(
+                    self.store.snapshot().unwrap(),
+                    &self.active,
+                    self.key.verifying_key(),
+                    None,
+                    None,
+                    StoreChanges::ALL,
+                )
+                .unwrap(),
             )
-            .unwrap();
-            self.grants.observe(Arc::new(snapshot))
+        }
+
+        fn observe(&mut self) -> Effects {
+            let snapshot = self.snapshot();
+            self.grants.observe(snapshot)
         }
     }
 
@@ -967,7 +976,7 @@ mod tests {
         assert_eq!(
             received.fetch,
             [Fetch {
-                definitions: vec![read_capability().raw],
+                blobs: vec![read_capability().raw],
                 sources: vec![owner.id(), subject.id()],
             }]
         );
@@ -984,6 +993,52 @@ mod tests {
         let effects = subject.observe();
         assert_eq!(effects.land, [read]);
         assert!(subject.grants.available().is_empty());
+    }
+
+    /// A proof naming this node over a collection it does not hold asks its
+    /// sender for the collection's descriptor: the sender holds the
+    /// collection it granted, so nothing need be selected or looked up. Once
+    /// the descriptor is resident the proof lands, though the collection is
+    /// still not active here.
+    #[test]
+    fn a_proof_without_its_descriptor_fetches_the_descriptor_from_its_sender() {
+        let mut owner = Node::new(40);
+        let mut subject = Node::new(41);
+        let collection = owner.hold(policy(&owner.key));
+        let read = grant(&owner.key, &subject.key, read_capability(), collection);
+        owner.learn(read.clone());
+        subject.observe();
+
+        let mut wire = connect(&mut owner, &mut subject, 1);
+        let (_, _, received) = carry(&mut owner, &mut subject, &mut wire);
+        assert!(received.land.is_empty());
+        assert_eq!(
+            received.fetch,
+            [Fetch {
+                blobs: vec![collection.raw, read_capability().raw],
+                sources: vec![owner.id(), subject.id()],
+            }],
+            "the descriptor is asked for first, from the sender first"
+        );
+        assert_eq!(subject.grants.available(), [collection]);
+
+        // The sink fetches the descriptor over `blob/1` from the owner, who
+        // holds it, and lands it through admission.
+        let descriptor = owner
+            .snapshot()
+            .get_blob(&collection.raw)
+            .expect("the owner holds the descriptor of the collection it granted");
+        subject
+            .store
+            .put::<UnknownBlob, _>(Blob::<UnknownBlob>::new(descriptor))
+            .unwrap();
+        let effects = subject.observe();
+        assert_eq!(effects.land, [read]);
+        assert!(subject.grants.available().is_empty());
+        assert!(
+            subject.active.get(&collection.raw).is_none(),
+            "the descriptor landed without the collection being active"
+        );
     }
 
     /// A proof whose descriptor is not held waits in memory only if its
