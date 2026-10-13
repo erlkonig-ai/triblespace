@@ -1,7 +1,7 @@
 //! The grant exchange through whole hosts over the deterministic transport:
-//! a grant reaches its subject, a peering waits for the definitions a
-//! credential names, and a definition is fetched no larger than policy
-//! metadata.
+//! a grant reaches its subject with its collection's descriptor, a peering
+//! waits for the definitions a credential names, and a definition is fetched
+//! no larger than policy metadata.
 #![cfg(feature = "sim")]
 
 use std::sync::{Arc, Mutex, OnceLock};
@@ -10,6 +10,7 @@ use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
 use iroh_base::EndpointId;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::capability::policy::resource_policy;
 use triblespace_core::capability::{
@@ -125,9 +126,11 @@ fn proofs(peer: &mut Peer<MemoryRepo>) -> Vec<CapabilityProof> {
 
 /// A grant written while its subject is unknown to the owner's host reaches
 /// the subject: the host dials it, and the subject asks for the proof. The
-/// subject holds no descriptor, so the proof waits in memory and lists the
-/// collection as available, and its definition is fetched from the owner.
-/// It lands once the descriptor does.
+/// subject holds no descriptor, has not selected the collection, and can
+/// look nothing up (no host publishes to the DHT), so the descriptor comes
+/// from the owner over the connection that brought the grant, with the
+/// definition the proof names and the collection's name; the proof lands.
+/// The subject dialled nobody, and the collection is not active on it.
 #[test]
 fn a_signed_grant_dials_its_subject() {
     run(async || {
@@ -161,23 +164,33 @@ fn a_signed_grant_dials_its_subject() {
         advance(&clock, &mut [&mut owner, &mut subject], 5).await;
         assert_eq!(net.dial_count(owner_id, subject_id), 1);
         assert_eq!(net.dial_count(subject_id, owner_id), 0);
-        assert_eq!(subject.health().available, [collection]);
-        assert!(proofs(&mut subject).is_empty());
+        assert!(
+            holds_blob(&mut subject, collection),
+            "the descriptor came from the owner"
+        );
         assert!(holds_blob(&mut subject, read_capability()));
-
-        // The descriptor arrives by any path; the waiting proof lands.
-        subject.store().collection("granted", policy).unwrap();
-        subject.refresh();
-        advance(&clock, &mut [&mut owner, &mut subject], 2).await;
         assert_eq!(proofs(&mut subject), [read]);
         assert!(subject.health().available.is_empty());
+        let name = IntoBlob::<UTF8String>::to_blob("granted").get_handle();
+        assert!(
+            subject.snapshot().unwrap().contains_blob(name).unwrap(),
+            "the collection's name came with the descriptor"
+        );
+        assert!(
+            subject.health().peerings.is_empty(),
+            "the collection is not active on the subject"
+        );
     });
 }
 
 /// A stranger grants the subject a capability whose definition handle names
 /// a 4 MiB blob of its choosing. The grant reaches the subject, which fetches
-/// the definitions a proof naming it names, but no more than policy metadata
-/// can take: the blob is not stored.
+/// the descriptor and the definitions a proof naming it names, but no more
+/// than policy metadata can take: the descriptor is stored, the blob is not.
+/// The grant is evidence under the stranger's own descriptor, so it lands,
+/// as any proof naming this node does once its descriptor is held; what a
+/// stranger can make the subject store per grant is bounded to that proof
+/// and two metadata blobs.
 #[test]
 fn a_stranger_cannot_make_the_subject_store_a_large_definition() {
     run(async || {
@@ -195,21 +208,22 @@ fn a_stranger_cannot_make_the_subject_store_a_large_definition() {
         let junk_handle = junk.get_handle();
         stranger_store.put::<SimpleArchive, _>(junk).unwrap();
         let bait = grant(&stranger_key, &subject_key, junk_handle, collection);
-        stranger_store.insert_proof(bait).unwrap();
+        stranger_store.insert_proof(bait.clone()).unwrap();
         let mut stranger = bring_up(&net, &stranger_key, stranger_store);
         let mut subject = bring_up(&net, &subject_key, MemoryRepo::default());
         stranger.activate_collection(collection);
         subject.refresh();
         advance(&clock, &mut [&mut stranger, &mut subject], 10).await;
-        assert_eq!(
-            subject.health().available,
-            [collection],
-            "the grant arrived"
+        assert!(
+            holds_blob(&mut subject, collection),
+            "the grant arrived, and its descriptor with it"
         );
         assert!(
             !holds_blob(&mut subject, junk_handle),
             "the subject stored the stranger's 4 MiB definition"
         );
+        assert_eq!(proofs(&mut subject), [bait]);
+        assert!(subject.health().available.is_empty());
     });
 }
 
