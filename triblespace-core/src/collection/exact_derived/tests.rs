@@ -3038,8 +3038,10 @@ mod lattice_v2 {
         for entity in 0..7 {
             own_commit(&mut store, root, 41, entity);
         }
-        block_on(store.maintain(root, &owner)).unwrap();
-        assert!(merges_in(&mut store, root.handle()).is_empty());
+        for _ in 0..3 {
+            block_on(store.maintain(root, &owner)).unwrap();
+            assert!(merges_in(&mut store, root.handle()).is_empty());
+        }
         assert_eq!(frontier(&mut store, root.handle()).len(), 7);
 
         own_commit(&mut store, root, 41, 7);
@@ -3047,6 +3049,11 @@ mod lattice_v2 {
         let merges = merges_in(&mut store, root.handle());
         assert_eq!(merges.len(), 1);
         assert_eq!(merges[0].inputs().len(), MERGE_FAN_IN);
+        merges[0].verify_strict().unwrap();
+        assert!(merges[0]
+            .inputs()
+            .windows(2)
+            .all(|pair| pair[0].raw < pair[1].raw));
         let payloads: Vec<_> = (0..8).map(|entity| payload(41, entity)).collect();
         assert_eq!(inputs(&merges[0]), payloads.iter().map(data).collect());
         let union = simplearchive_union::join_all(&payloads).unwrap();
@@ -3124,7 +3131,7 @@ mod lattice_v2 {
     }
 
     #[test]
-    fn a_held_node_inside_another_is_absorbed_and_a_foreign_merge_is_no_node() {
+    fn dominated_underfull_nodes_stay_readable_without_new_absorption() {
         let (mut store, root, _, _) = collections();
         let owner = key(41);
         let commits: Vec<_> = (0..8)
@@ -3160,19 +3167,120 @@ mod lattice_v2 {
             BTreeSet::from([wide, narrow])
         );
 
-        block_on(store.maintain(root, &owner)).unwrap();
+        let before = records(&mut store).len();
+        for _ in 0..3 {
+            block_on(store.maintain(root, &owner)).unwrap();
+            assert_eq!(records(&mut store).len(), before);
+        }
         let merges = merges_in(&mut store, root.handle());
         let absorbed: Vec<_> = merges
             .iter()
             .filter(|merge| merge.public_key() == public(41) && merge.result() == wide)
             .filter(|merge| merge.inputs().len() == 2)
             .collect();
-        assert_eq!(absorbed.len(), 1);
-        assert_eq!(inputs(absorbed[0]), BTreeSet::from([narrow, wide]));
+        assert!(absorbed.is_empty());
         assert!(merges
             .iter()
             .all(|merge| merge.public_key() != public(41) || !merge.inputs().contains(&foreign)));
-        assert_eq!(frontier(&mut store, root.handle()), BTreeSet::from([wide]));
+        assert_eq!(
+            frontier(&mut store, root.handle()),
+            BTreeSet::from([wide, narrow])
+        );
+        let snapshot = store.snapshot().unwrap();
+        let attached = snapshot.collection(root).unwrap();
+        assert_eq!(attached.cover().len(), 1);
+        assert_eq!(attached.view::<TribleSet>().unwrap().len(), MERGE_FAN_IN);
+    }
+
+    #[test]
+    fn self_result_eight_way_carry_consumes_seven_inputs_and_is_not_repeated() {
+        for preexisting in [false, true] {
+            reset_mapping_calls();
+            let (mut store, root, first, _) = collections();
+            let host = key(41);
+            let payloads: Vec<_> = (0..7).map(|entity| payload(41, entity)).collect();
+            let wide = simplearchive_union::join_all(&payloads).unwrap();
+            let mut members: Vec<_> = payloads
+                .iter()
+                .chain([&wide])
+                .map(|blob| publish_root(&mut store, root, blob, 41).data())
+                .collect();
+            members.sort_by_key(|member| member.raw);
+            assert_eq!(
+                members.iter().copied().collect::<BTreeSet<_>>().len(),
+                MERGE_FAN_IN
+            );
+            if preexisting {
+                store
+                    .insert(CollectionRecord::Merge(
+                        CollectionMerge::sign(
+                            &host,
+                            root.handle(),
+                            members.iter().copied(),
+                            data(&wide),
+                        )
+                        .unwrap(),
+                    ))
+                    .unwrap();
+            }
+            block_on(store.maintain(root, &host)).unwrap();
+            let merges = merges_in(&mut store, root.handle());
+            assert_eq!(merges.len(), 1);
+            merges[0].verify_strict().unwrap();
+            assert_eq!(merges[0].inputs(), members.as_slice());
+            assert_eq!(merges[0].result(), data(&wide));
+            assert!(merges[0].inputs().contains(&merges[0].result()));
+            assert_eq!(
+                frontier(&mut store, root.handle()),
+                BTreeSet::from([data(&wide)])
+            );
+            let snapshot = store.snapshot().unwrap();
+            let attached = snapshot.collection(root).unwrap();
+            assert_eq!(attached.support().unwrap().len(), MERGE_FAN_IN);
+            assert_eq!(attached.view::<TribleSet>().unwrap().len(), 7);
+            drop(attached);
+            drop(snapshot);
+
+            // The same self-result law holds for the derived producer path.
+            block_on(store.ensure(first, &host)).unwrap();
+            let mut images: Vec<_> = derives_in(&mut store, first.handle())
+                .iter()
+                .map(|leaf| leaf.output())
+                .collect();
+            images.sort_by_key(|image| image.raw);
+            if preexisting {
+                store
+                    .insert(CollectionRecord::Merge(
+                        CollectionMerge::sign(
+                            &host,
+                            first.handle(),
+                            images.iter().copied(),
+                            first_image(&wide),
+                        )
+                        .unwrap(),
+                    ))
+                    .unwrap();
+            }
+            block_on(store.maintain(first, &host)).unwrap();
+            let carried = merges_in(&mut store, first.handle());
+            assert_eq!(carried.len(), 1);
+            carried[0].verify_strict().unwrap();
+            assert_eq!(carried[0].inputs(), images.as_slice());
+            assert_eq!(carried[0].result(), first_image(&wide));
+            assert!(carried[0].inputs().contains(&carried[0].result()));
+            assert_eq!(
+                frontier(&mut store, first.handle()),
+                BTreeSet::from([first_image(&wide)])
+            );
+            reset_mapping_calls();
+            let before = records(&mut store).len();
+            for _ in 0..3 {
+                block_on(store.maintain(root, &host)).unwrap();
+                block_on(store.maintain(first, &host)).unwrap();
+                assert_eq!(records(&mut store).len(), before);
+                assert_eq!(FIRST_JOIN_CALLS.get(), 0);
+            }
+        }
     }
 
     #[test]
@@ -4214,10 +4322,10 @@ mod lattice_v2 {
     /// A host merge result whose bytes are gone -- here, bytes this store
     /// never held -- is never joined and never fetched. Its inputs are
     /// consumed, so it stays on the frontier, and a reader descends it to
-    /// those inputs. A held node with the same support absorbs it without
-    /// reading its bytes, and the frontier narrows to the held node.
+    /// those inputs. A held node with the same support later serves the read,
+    /// but an underfull frontier stays without binary absorption.
     #[test]
-    fn a_host_merge_result_whose_bytes_are_gone_is_descended_until_a_held_node_absorbs_it() {
+    fn an_absent_merge_is_descended_and_a_held_cover_does_not_emit_absorption() {
         let host = key(41);
         let (mut inner, root, _, _) = collections();
         let commits: Vec<CollectionData> = (0..8)
@@ -4266,18 +4374,21 @@ mod lattice_v2 {
             BTreeSet::from([gone, held])
         );
 
-        drop(block_on(store.maintain(root, &host)).unwrap());
-        assert!(store.acquired.is_empty(), "{:?}", store.acquired);
-        let absorptions: Vec<_> = merges_in(&mut store.inner, root.handle())
-            .into_iter()
-            .filter(|merge| merge.result() == held && merge.inputs().len() == 2)
-            .collect();
-        assert_eq!(absorptions.len(), 1);
-        assert_eq!(inputs(&absorptions[0]), BTreeSet::from([gone, held]));
+        let before = records(&mut store.inner).len();
+        for _ in 0..3 {
+            drop(block_on(store.maintain(root, &host)).unwrap());
+            assert_eq!(records(&mut store.inner).len(), before);
+            assert!(store.acquired.is_empty(), "{:?}", store.acquired);
+            assert!(store.events.is_empty());
+        }
         assert_eq!(
             frontier(&mut store.inner, root.handle()),
-            BTreeSet::from([held])
+            BTreeSet::from([gone, held])
         );
+        let snapshot = store.inner.snapshot().unwrap();
+        let attached = snapshot.collection(root).unwrap();
+        assert_eq!(attached.cover().len(), 1);
+        assert_eq!(attached.view::<TribleSet>().unwrap().len(), MERGE_FAN_IN);
     }
 
     /// The first view's mapping, pinned to a class of host: elsewhere it

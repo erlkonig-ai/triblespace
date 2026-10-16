@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Maintenance emits only eight-input MERGEs, with distinct canonically ordered
+  inputs, for both root and derived collections. Binary absorption is no longer
+  produced; underfull and dominated frontier nodes may remain. A union equal to
+  an input is valid, while an unfolded published witness still reports a stall.
+  Historical variable-arity record decoding and signatures are unchanged.
+
 - Add the endpoint register to `collection::selection`: where the sync
   daemon that runs as a key listens, one register per endpoint in the pile's
   own configuration collection. `write_sync_addresses` records the addresses

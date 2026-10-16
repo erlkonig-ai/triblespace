@@ -12,12 +12,11 @@
 //! - A collection carries every frontier node whose bytes are here: a root
 //!   its commits, a derived collection its leaf images, each joined in its
 //!   own lattice by its own join -- a root's encoding's, a derived
-//!   collection's mapping's ([`DeriveMapping::join_images`]). A frontier
-//!   node whose support lies inside a held node's is absorbed by it,
-//!   `MERGE(node, wider) -> wider`, whether or not its own bytes are here:
-//!   an absorption reads none. Whenever one tier -- `floor(log_8
-//!   |support|)` -- holds [`MERGE_FAN_IN`] held nodes, the eight lowest
-//!   handles are joined by one n-ary MERGE, until no tier holds eight. A
+//!   collection's mapping's ([`DeriveMapping::join_images`]). Whenever one
+//!   tier -- `floor(log_8 |support|)` -- holds [`MERGE_FAN_IN`] held nodes,
+//!   eight distinct handles in canonical order are joined by one MERGE.
+//!   Underfull tiers, including nodes covered by another node, may remain;
+//!   no binary absorption is emitted. The union may equal an input. A
 //!   frontier node whose bytes are not here is never joined: nothing is
 //!   fetched for it, so an absent payload never stalls or restarts the
 //!   carry. A derived collection's carry never reads its source: its
@@ -391,14 +390,20 @@ fn publish<S: Store>(
     Ok(())
 }
 
-/// Sign one MERGE the planner chose. Its inputs are distinct nodes, two to
-/// sixteen of them, so an arity refusal is a planning bug, reported as such.
+/// Sign exactly eight distinct, canonically ordered nodes. The historical
+/// variable-arity codec and signature remain unchanged; this is a producer
+/// restriction, not a record-format migration.
 fn sign_merge(
     signing_key: &SigningKey,
     collection: CollectionHandle,
-    inputs: impl IntoIterator<Item = CollectionData>,
+    inputs: [CollectionData; MERGE_FAN_IN],
     result: CollectionData,
 ) -> Result<CollectionMerge, CollectionRealizationError> {
+    if !inputs.windows(2).all(|pair| pair[0].raw < pair[1].raw) {
+        return Err(CollectionRealizationError::Resolution(
+            "plan a MERGE without eight distinct canonically ordered inputs".into(),
+        ));
+    }
     CollectionMerge::sign(signing_key, collection, inputs, result).map_err(|error| {
         CollectionRealizationError::Resolution(format!("plan an invalid MERGE: {error}"))
     })
@@ -484,34 +489,31 @@ impl Lineage {
     }
 }
 
-/// Every frontier node of one collection, and those of them whose bytes are
-/// here and read, each widest first.
+/// Frontier nodes of one collection whose bytes are here and read, widest first.
 ///
 /// The frontier is every believed foundation, whoever signed it, and the
-/// host's own merge results. Only a held node is ever joined or absorbs
-/// another. A node whose bytes are not here is not asked for, so a host
+/// host's own merge results. Only a held node is ever joined.
+/// A node whose bytes are not here is not asked for, so a host
 /// holding another key's commit or leaf records without their payloads
-/// neither fetches them nor restarts the carry once per payload; it can
-/// still be absorbed by a held node that covers it, which reads no bytes,
-/// and it rejoins the carry proper when its bytes arrive. A node whose bytes
+/// neither fetches them nor restarts the carry once per payload. A node
+/// rejoins the carry when its bytes arrive. A node whose bytes
 /// are here but do not read -- a store's index may say a blob is present
 /// without reading it, as a pile's does -- sits out the same way, instead of
 /// failing every carry that would join it.
-fn frontier_nodes<R>(
+fn held_frontier_nodes<R>(
     snapshot: &R,
     coverage: &Coverage,
     collection: CollectionHandle,
-) -> Result<(Vec<Node>, Vec<Node>), CollectionRealizationError>
+) -> Result<Vec<Node>, CollectionRealizationError>
 where
     R: StoreRead,
 {
     let Some(frontier) = coverage.frontier_set(collection) else {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(Vec::new());
     };
     let resident = snapshot.resident(frontier).map_err(|error| {
         CollectionRealizationError::storage("intersect frontier with residency", error)
     })?;
-    let mut every = Vec::new();
     let mut held = Vec::new();
     for raw in frontier.iter_ordered() {
         let node: CollectionData = Inline::new(*raw);
@@ -519,19 +521,16 @@ where
             if resident.get(raw).is_some() && reads(snapshot, node)? {
                 held.push((node, support.clone()));
             }
-            every.push((node, support.clone()));
         }
     }
-    for nodes in [&mut every, &mut held] {
-        nodes.sort_by(|left, right| {
-            right
-                .1
-                .len()
-                .cmp(&left.1.len())
-                .then_with(|| left.0.raw.cmp(&right.0.raw))
-        });
-    }
-    Ok((every, held))
+    held.sort_by(|left, right| {
+        right
+            .1
+            .len()
+            .cmp(&left.1.len())
+            .then_with(|| left.0.raw.cmp(&right.0.raw))
+    });
+    Ok(held)
 }
 
 /// Whether a blob's bytes can be read here, which on a store whose index
@@ -564,6 +563,27 @@ fn require_host(
         Ok(())
     } else {
         Err(CollectionRealizationError::HostMismatch { host, signer })
+    }
+}
+
+/// A successful publication must become this exact driven witness. Support
+/// growth or a different producer for the same output is not evidence of that.
+fn require_driven(
+    coverage: &Coverage,
+    collection: CollectionHandle,
+    inputs: &[CollectionData; MERGE_FAN_IN],
+    result: CollectionData,
+) -> Result<(), CollectionRealizationError> {
+    if coverage
+        .producers(collection, result)
+        .iter()
+        .any(|producer| producer.as_slice() == inputs.as_slice())
+    {
+        Ok(())
+    } else {
+        Err(CollectionRealizationError::Stalled {
+            cover: coverage.frontier(collection).collect(),
+        })
     }
 }
 
@@ -601,11 +621,8 @@ where
 /// point, joining with `join`.
 ///
 /// Each round reads the frontier from the index, whoever signed the
-/// foundations beneath it. A frontier node whose support lies inside a held
-/// node's -- one whose bytes are here -- is consumed first, by `MERGE(node,
-/// wider) -> wider`: no bytes move, so the absorbed node's own bytes need
-/// not be here. Then every tier holding [`MERGE_FAN_IN`] held nodes is
-/// carried, the lowest such tier first, eight lowest handles per MERGE,
+/// foundations beneath it. Every tier holding [`MERGE_FAN_IN`] held nodes is
+/// carried, the lowest such tier first, eight distinct lowest handles per MERGE,
 /// joined by `join`, before the frontier is read again. Each result is
 /// stored and published at once, so a later failure keeps the complete
 /// successful prefix. A join that answers `Capacity` or `MissingDependency`
@@ -613,10 +630,13 @@ where
 /// merge needs no WRITE authority, only the store's host key: publishing
 /// with any other key is an error
 /// ([`CollectionRealizationError::HostMismatch`]). A frontier node whose
-/// bytes are not here is never joined and nothing is fetched for it; a host
-/// merge result whose bytes are gone and that no held node covers therefore
-/// stays on the frontier, and a reader descends it to its inputs. Nothing
-/// outside the collection's own lattice is read.
+/// bytes are not here is never joined and nothing is fetched for it. Underfull
+/// tiers and dominated nodes may remain on the frontier; readers still select
+/// a sufficient cover or descend to finer inputs. A result may equal an input,
+/// and unchanged support is not a failure. Each exact group is attempted at
+/// most once per invocation, but a published witness must be driven by the
+/// next coverage fold. No eventual consumption of all nodes is promised.
+/// Nothing outside the collection's own lattice is read.
 fn carry<S, E, J>(
     store: &mut S,
     target: Collection<E>,
@@ -633,85 +653,34 @@ where
     ) -> Result<Blob<E>, CollectionOperationError>,
 {
     let scope = BTreeSet::from([target.handle()]);
-    let mut seen = BTreeSet::new();
-    let mut declined = BTreeSet::<Vec<CollectionData>>::new();
-    let mut progressed = true;
+    // Scratch for this invocation only, never retained across observations.
+    let mut attempted = BTreeSet::<[CollectionData; MERGE_FAN_IN]>::new();
+    let mut published = Vec::<([CollectionData; MERGE_FAN_IN], CollectionData)>::new();
     loop {
         let snapshot = open(store, frontier, "open root-carry snapshot")?;
         let index = index_of(&snapshot, &scope)?;
-        let (every, nodes) = frontier_nodes(&snapshot, index.published(), target.handle())?;
-        let identity: Vec<CollectionData> = every.iter().map(|(node, _)| *node).collect();
-        if progressed && !seen.insert(identity.clone()) {
-            return Err(CollectionRealizationError::Stalled { cover: identity });
+        for (inputs, result) in published.drain(..) {
+            require_driven(index.published(), target.handle(), &inputs, result)?;
         }
-        if every.len() < 2 || nodes.is_empty() {
+        let nodes = held_frontier_nodes(&snapshot, index.published(), target.handle())?;
+        if nodes.len() < MERGE_FAN_IN {
             return Ok(());
         }
-        // A frontier node inside a held node's support is consumed by its
-        // widest such node. Two nodes with one support keep the lower held
-        // handle, which is also the one a reader keeps. Only a strictly
-        // wider node can hold a node properly, and `nodes` is widest first,
-        // so each node tests inclusion against the held nodes before its
-        // own width alone; an equal support is found by its Merkle root.
-        // Fresh commits -- pairwise disjoint singletons, all of one width --
-        // then cost no inclusion test at all, however many of them a root
-        // holds.
-        let mut keepers = BTreeMap::<[u8; 32], CollectionData>::new();
-        for (node, support) in &nodes {
-            if let Some(root) = support.merkle_root() {
-                // Within one width `nodes` ascends by handle: the first seen
-                // is the lowest.
-                keepers.entry(root).or_insert(*node);
-            }
-        }
-        let absorbed: Vec<(CollectionData, CollectionData)> = every
-            .iter()
-            .filter_map(|(node, support)| {
-                let wider = nodes
-                    .iter()
-                    .take_while(|(_, wider)| wider.len() > support.len())
-                    .find(|(_, wider)| support <= wider)
-                    .map(|(wider, _)| *wider)
-                    .or_else(|| {
-                        let keeper = *keepers.get(&support.merkle_root()?)?;
-                        (keeper != *node).then_some(keeper)
-                    })?;
-                Some((*node, wider))
-            })
-            .collect();
-        if !absorbed.is_empty() {
-            require_host(&index, signing_key)?;
-            drop(snapshot);
-            for (node, wider) in absorbed {
-                publish(
-                    store,
-                    frontier,
-                    CollectionRecord::Merge(sign_merge(
-                        signing_key,
-                        target.handle(),
-                        [node, wider],
-                        wider,
-                    )?),
-                    "publish root absorption MERGE",
-                )?;
-            }
-            progressed = true;
-            continue;
-        }
+        // Per-round scratch: grouping does not become a retained catalogue.
         let mut tiers = BTreeMap::<u32, BTreeSet<CollectionData>>::new();
         for (node, support) in &nodes {
             tiers.entry(tier(support.len())).or_default().insert(*node);
         }
         // The lowest tier with a full group; within it, consecutive groups of
         // the lowest handles, each group pairwise disjoint from the others.
-        let round: Vec<Vec<CollectionData>> = tiers
+        let round: Vec<[CollectionData; MERGE_FAN_IN]> = tiers
             .into_values()
             .map(|members| {
                 let members: Vec<CollectionData> = members.into_iter().collect();
                 members
                     .chunks_exact(MERGE_FAN_IN)
-                    .map(<[CollectionData]>::to_vec)
-                    .filter(|group| !declined.contains(group))
+                    .map(|group| group.try_into().expect("an exact eight-node chunk"))
+                    .filter(|group| !attempted.contains(group))
                     .collect::<Vec<_>>()
             })
             .find(|groups| !groups.is_empty())
@@ -721,8 +690,8 @@ where
         }
         require_host(&index, signing_key)?;
         drop(snapshot);
-        progressed = false;
         for group in round {
+            attempted.insert(group);
             let snapshot = open(store, frontier, "open root-carry join snapshot")?;
             let blobs = group
                 .iter()
@@ -745,23 +714,22 @@ where
                         CollectionRecord::Merge(sign_merge(
                             signing_key,
                             target.handle(),
-                            group.iter().copied(),
+                            group,
                             result,
                         )?),
                         "publish root carry MERGE",
                     )?;
-                    progressed = true;
+                    published.push((group, result));
                 }
                 Err(CollectionOperationError::Fatal(reason)) => {
                     return Err(CollectionRealizationError::Merge {
-                        inputs: group,
+                        inputs: group.to_vec(),
                         reason,
                     });
                 }
                 Err(CollectionOperationError::Capacity(_))
                 | Err(CollectionOperationError::MissingDependency(_)) => {
                     // The finer cover stays the valid result for this group.
-                    declined.insert(group);
                 }
             }
         }
@@ -1717,7 +1685,77 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::tier;
+    use super::*;
+    use crate::collection::coverage::AdmitEveryRecord;
+    use crate::collection::{empty_metadata_handle, CollectionCommit};
+
+    #[test]
+    fn a_published_witness_requires_its_exact_driven_inputs_and_result() {
+        let host = SigningKey::from_bytes(&[41; 32]);
+        let collection = Inline::new([20; 32]);
+        let inputs: [CollectionData; MERGE_FAN_IN] =
+            std::array::from_fn(|i| Inline::new([i as u8 + 1; 32]));
+        let result = inputs[7];
+        let mut index = CoverageIndex::for_host(Inline::new(host.verifying_key().to_bytes()));
+        for input in inputs {
+            index.apply(
+                &CollectionRecord::Commit(CollectionCommit::sign(
+                    &host,
+                    collection,
+                    input,
+                    empty_metadata_handle(),
+                )),
+                &AdmitEveryRecord,
+            );
+        }
+        assert!(matches!(
+            require_driven(index.published(), collection, &inputs, result),
+            Err(CollectionRealizationError::Stalled { .. })
+        ));
+        // A different driven producer for this output cannot satisfy the check.
+        index.apply(
+            &CollectionRecord::Merge(
+                CollectionMerge::sign(&host, collection, [inputs[0], result], result).unwrap(),
+            ),
+            &AdmitEveryRecord,
+        );
+        assert!(matches!(
+            require_driven(index.published(), collection, &inputs, result),
+            Err(CollectionRealizationError::Stalled { .. })
+        ));
+        index.apply(
+            &CollectionRecord::Merge(sign_merge(&host, collection, inputs, result).unwrap()),
+            &AdmitEveryRecord,
+        );
+        require_driven(index.published(), collection, &inputs, result).unwrap();
+        assert!(matches!(
+            require_driven(index.published(), collection, &inputs, inputs[0]),
+            Err(CollectionRealizationError::Stalled { .. })
+        ));
+    }
+
+    #[test]
+    fn the_producer_refuses_duplicate_or_noncanonical_inputs() {
+        let host = SigningKey::from_bytes(&[41; 32]);
+        let collection = Inline::new([20; 32]);
+        let mut inputs: [CollectionData; MERGE_FAN_IN] =
+            std::array::from_fn(|i| Inline::new([i as u8 + 1; 32]));
+        let result = inputs[7];
+        sign_merge(&host, collection, inputs, result)
+            .unwrap()
+            .verify_strict()
+            .unwrap();
+        inputs.swap(0, 1);
+        assert!(matches!(
+            sign_merge(&host, collection, inputs, result),
+            Err(CollectionRealizationError::Resolution(_))
+        ));
+        inputs[0] = inputs[1];
+        assert!(matches!(
+            sign_merge(&host, collection, inputs, result),
+            Err(CollectionRealizationError::Resolution(_))
+        ));
+    }
 
     #[test]
     fn tiers_are_powers_of_the_fan_in() {
