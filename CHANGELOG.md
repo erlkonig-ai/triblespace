@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add `blob::Bundle<S>`, a typed blob root with explicitly carried attachments.
+  Existing `entity!` spreading emits its root handle and unions the carried
+  bytes without merging an archived inner graph into the outer facts.
+
 - Source-only ALPN32: explicitly negotiated one-way Records/AUTH Prefix offers
   add possession-safe HAVE feedback and bounded speculative bodies. Preserve
   final delta proof, admission, landing/finish and retirement guards; leave

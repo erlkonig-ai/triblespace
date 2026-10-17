@@ -59,3 +59,26 @@ fn entity_repeated_affects_id_and_insertions() {
     assert_ne!(entity_id(&base), entity_id(&with_tags));
     assert_eq!(base.len() + 1, with_tags.len());
 }
+
+#[test]
+fn entity_repeated_bundle_works_through_the_facade_prelude() {
+    use blobencodings::RawBytes;
+    use inlineencodings::Handle;
+    use triblespace::core::blob::Bytes;
+
+    let body = Attribute::<Handle<RawBytes>>::named("facade_bundle_body");
+    let root: Blob<RawBytes> = b"facade payload".as_slice().to_blob();
+    let bundle = Bundle::new(root, MemoryBlobStore::new());
+    let handle = bundle.root();
+
+    let fragment = entity! { body*: bundle };
+
+    assert_eq!(fragment.facts().len(), 1);
+    assert_eq!(
+        fragment.iter().next().unwrap().v::<Handle<RawBytes>>(),
+        &handle
+    );
+    let mut blobs = fragment.blobs().clone();
+    let bytes: Bytes = blobs.snapshot().unwrap().get(handle).unwrap();
+    assert_eq!(&*bytes, b"facade payload");
+}
