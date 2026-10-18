@@ -19,9 +19,9 @@ memory map never exposes half-written records.
 
 ## Record model: one frame, 256-byte-aligned records
 
-Every record the pile writes begins with the same **64-byte common prefix** and
-occupies a **256-byte multiple**. COMMIT and WANT fit in one block; signed
-MERGE and DERIVE use two. Blobs and variable capability proofs may continue
+Every record the pile writes has a **32-byte recovery prefix**, followed by
+its 32-byte kind, and occupies a **256-byte multiple**. COMMIT, DERIVE, MAP and
+WANT fit in one block; exact-eight MERGE uses two. Blobs and capability proofs may continue
 after the first block and are zero-padded to their declared span:
 
 | Offset | Width | Field |
@@ -448,20 +448,86 @@ explains how to query these fields through the `PileSnapshot` API.
 
 ## Native Collection Records
 
-`CollectionStore` is a grow-only set of signed typed collection-calculus
-records: `COMMIT` assertions and witness-bound `MERGE` and `DERIVE`
-endorsements. The pile stores them directly as fixed enveloped records:
-COMMIT occupies 256 bytes; MERGE and DERIVE each occupy 512. COMMIT's signed
-bytes and kind are unchanged. The current equation kinds are distinct from
-both their unsigned and their signed payload-only predecessors. They are
-**not blob records**, have no following payload, and carry no insertion
-timestamp. They are also distinct from operational wants and historical pins:
-collection records have no head, tombstone, or
-last-writer-wins update. Their exact canonical value is the semantic record; a
-collection record is not a trible entity. The pile indexes a record by the
-collection and member it names and the frame it sits in; a full-width BLAKE3
-fingerprint exists for anything that needs a fixed-width identity, such as the
-network delta.
+### Canonical literal-prefix candidate (2026-10-17)
+
+This source candidate uses one representation for current COMMIT, DERIVE, MAP
+and MERGE assertions: `kind32 | fields | signature(kind32 | fields)`.
+The kind is the content-addressed handle of the precise grammar description,
+not a separate carrier tag. There is no ASCII signature domain, semantic
+kind16, numeric transcript version, or dense u8 wrapper. Ed25519 authenticates
+the author public key as well as every field. The signature is always last.
+
+Offsets in this table are relative to the canonical record, not the pile frame:
+
+| Offset | COMMIT | DERIVE | MAP |
+| --- | --- | --- | --- |
+| 0..32 | kind | kind | kind |
+| 32..64 | collection | target collection | attached collection |
+| 64..96 | data | output | attachment |
+| 96..128 | metadata | source locator | parent node |
+| 128..160 | author | author | author |
+| 160..192 | signature R | signature R | signature R |
+| 192..224 | signature S | signature S | signature S |
+
+MERGE is exactly 448 bytes: kind at 0..32, collection at 32..64, result at
+64..96, author at 96..128, eight distinct input digests in ascending byte order
+at 128..384, and signature R/S at 384..448. Its signed prefix is 384 bytes;
+the other three kinds sign their first 160 bytes. No count or dummy input is
+encoded. The result may equal one input, but a binary equation cannot be
+converted by padding it to eight. The SimpleArchive validator binds all eight
+real input archives by hash and checks their streaming deduplicated union
+against the result.
+
+The following description anchors were minted with installed `trible genid`
+on 2026-10-17. Each handle is recomputed from its exact description in
+`repo/pile/record_kind.rs` by a regression test:
+
+| Kind | Anchor | Description handle |
+| --- | --- | --- |
+| COMMIT | `FDB671F61026890184000D275E0AB0F7` | `630454328DD62B0254179781E3413DC58397255ACC22152778ABFC9679211A3D` |
+| DERIVE | `5D09D99A2B549A60BEA9942E7E5752FD` | `B71A1803BA4905C1ACBD3E8C8A544EA0A918233409A66EA42E2FA245AC6B77DC` |
+| MAP | `3D52F26EC0A2852BF2ED998A3A8A56F5` | `4C8850C0D6E70FB67AA6DB87122824E068D8F1526F663870463ABD5290DFF3D9` |
+| MERGE | `75B76CA9E028127AC06C550A156B469D` | `9F13367C022BD21D2EE7554A2635EF4F8F431E1D96362729EC0369EE1E647ADC` |
+
+The pile prepends only its 32-byte recovery prefix (magic and span). Canonical
+bytes start at frame byte 32, so the kind occurs exactly once. Fixed assertions
+fill one 256-byte frame. MERGE fills 480 bytes including the recovery prefix,
+then has 32 zero carrier-padding bytes to complete two blocks. Recovery bytes,
+timestamps, and carrier padding are never signed or fingerprinted.
+
+ObjectStore values and network record bodies are those exact canonical bytes,
+without framing or another tag. A record fingerprint is BLAKE3 of the complete
+canonical assertion, signature included. It names an assertion, not a member
+blob or an invented entity. Different authors or signatures remain distinct.
+Only COMMIT and DERIVE replicate; MERGE and MAP remain host-local claims.
+AUTH's existing complete prefix-signed proof grammar is unchanged. ALPN33
+remains this unreleased candidate's boundary from deployed32.
+
+The in-memory fixed-record index stores ordinary typed `View` values in PATCH
+leaves, keyed by `collection32 | produced-member32 | BLAKE3(canonical-body)32`.
+Each value retains its actual immutable mapping, not a whole record-root owner.
+Replay's checked lazy insertion keeps the first value/owner for an exact
+duplicate without constructing another view. Equal complete keys with unequal
+bodies report an error without repairing or truncating the source. This check
+does not turn key-only cross-root set algebra into a collision detector: the
+index still assumes fingerprint identity there.
+
+Full fixed-record enumeration streams one leaf at a time. This implementation
+groups COMMIT, DERIVE, MAP and orders each kind by its stable key; consumers
+rely on deterministic backend order, not a particular index layout. It does
+not sort canonical bodies or promise their former byte order. Prefix-local
+selectors deduplicate overlapping routes and return the corresponding filtered
+enumeration order. A record decoded to the existing owned return type needs no
+temporary `View` clone; an escaping body view retains its own mapping. The
+already-computed fingerprint accompanies native body views for peer indexing.
+MERGE's occurrence path and all persisted/signed bytes remain unchanged.
+
+This is not migration or deployment. Old native kinds remain opaque (or
+explicit retired evidence); they never become current assertions around old
+signatures. In particular old COMMIT frames lose active typed visibility while
+their bytes remain preserved. Old dense wrappers are rejected even by trusted
+ObjectStore decoding. A coordinated cutover still needs an explicit own-key
+re-attestation tool, policy, rehearsal, and adoption preflight.
 
 The collection itself is identified by a canonical `SimpleArchive` descriptor.
 Its 32-byte blob handle is the sole `CollectionHandle`. Records carry this
@@ -515,48 +581,6 @@ than only naming them. A bare id is legible only to someone who already holds
 the code that minted it, which is exactly the reader — a peer receiving a
 collection it has never seen — that most needs the answer.
 
-The magic markers below identify the compact pile representation. They are
-storage-envelope markers, distinct both from the stable semantic kind IDs used
-in fingerprints/signature domains and from the one-byte versioned tags used by
-generic dense record stores. There is no equivalent `SimpleArchive` form for
-these algebra records.
-
-| Kind | Record kind (rooted at) | Kind-specific byte layout after the common prefix |
-|---|---|---|
-| Commit | `A1322BB3F5214287C314D42AFCC1A97CB264FACD9A22B4938838BE78DB31AA59` (`CBF2CF97D52A3486E16C12D70D397C66`) | `64..96` descriptor handle, `96..128` data digest, `128..160` metadata handle, `160..192` Ed25519 public key, `192..224` signature R, `224..256` signature S — no reserved bytes |
-| Merge | `4D2087B6C4944A404E1D0BCF4898819267E00FCAE49B146F5955522CBE935909` (`3AB7D3C2BAB53C85CCA6108A30BB8930`) | `64..96` descriptor handle, `96..128` low input digest, `128..160` high input digest, `160..192` result digest, `192..224` low input-record fingerprint, `224..256` high input-record fingerprint, `256..288` Ed25519 public key, `288..320` signature R, `320..352` signature S, `352..512` reserved zeros |
-| Derive | `DBF641F31E772F6CE715087D954375AA44860BF411C0DE849C207B542ABDC583` (`D933002B5656620792BFD250AB5061AD`) | `64..96` target descriptor handle, `96..128` input digest, `128..160` output digest, `160..192` input-record fingerprint, `192..224` Ed25519 public key, `224..256` signature R, `256..288` signature S, `288..512` reserved zeros |
-| Map | `32E0D7333FD2AD1F567AE9A030814F95CA8F7F4A87C0DEAA275FB9DD8FC5F408` (`ED7B98CD20AD9A4D172F037A08CC47F1`) | `64..96` attached collection descriptor handle, `96..128` node digest, `128..160` attachment digest, `160..192` Ed25519 public key, `192..224` signature R, `224..256` signature S — one block, no reserved bytes |
-
-The new MERGE and DERIVE description anchors above were minted with installed
-`trible genid` on 2026-09-14. Their signed semantic kind IDs, independently
-minted in the same session, are `96AB9DE7389DD621D44C55E593898A69` and
-`529D8F57A20FCA0BC921121313DC619B`, respectively. The descriptions are named
-`pile-collection-merge-v6` and `pile-collection-derive-v7`; their handles above
-are pinned by the description-recomputation test. COMMIT retains semantic kind
-`B34817308188C4515A3C51967A91A603` and its historical version-2 transcript.
-
-Generic stores and collection repair use a one-byte dense tag followed by the
-same ordered 32-byte body fields, without native framing or reserved padding:
-
-| Record | Dense tag | Payload bytes | Total dense bytes |
-|---|---:|---:|---:|
-| COMMIT | 1 | 192 | 193 |
-| witness-bound MERGE | 6 | 288 | 289 |
-| witness-bound DERIVE | 7 | 224 | 225 |
-| MAP | 10 | 192 | 193 |
-
-Tags 2/3 are retired unsigned layouts; tags 4/5 are retired signed payload-only
-layouts. None is an alias for a witness-bound endorsement. The combined
-equation/AUTH-v5 wire epoch uses ALPN `/triblespace/pile-sync/26`.
-An equation signs its domain bytes (`triblespace.collection.merge.endorsement`
-or `triblespace.collection.derive.endorsement`), the corresponding new semantic
-kind ID, author public key, and its ordered collection/operand/result/witness
-fields.
-The newly minted kind versions this grammar; there is no extra equation version
-integer. COMMIT's historical domain, kind, version integer, field order, and
-signature bytes are unchanged.
-
 Public dense `from_bytes` constructors perform strict signature verification,
 including canonical non-weak author keys. Network ingress uses that checked
 boundary once. Locally signed constructors build their typed values directly;
@@ -584,73 +608,27 @@ evicted. This is producer trust, not proof of mathematical correctness: an
 authorized dishonest producer, or a bug in the host's own merge, can still
 endorse a wrong result.
 
-`MAP(attached; node -> attachment)` is the fourth native record: a host's
-own index of one node of a parent collection's lattice, its attachment
-mapped from the node's own bytes. The MAP kind was minted with `trible
-genid` on 2026-09-28: semantic kind `329669AA662709605053C123671DF1D2`,
-pile description anchor `ED7B98CD20AD9A4D172F037A08CC47F1` (description
-`pile-collection-map-v1`, handle above pinned by the description-recomputation
-test), signed over the domain `4A5191C36898D0B453FEFF99ED0E3852` ||
-`4AADD87ED8EB8620BD39623B5221B5BE`. It carries no witness and adds no
-foundation, and it means nothing to another store: a store believes a MAP only
-when its own host key signed it, keeps it as the attachment of its node, and a reader uses it only
-for a node it reaches in the parent's lattice. A Rank9-accelerated member is
-an ordinary blob root plus its portable raw child, attached to the same node
-as that child's Succinct attachment; neither attached collection has
-`MERGE` records of its own. The accelerated root's first 32 bytes name the
-raw child, so generic blob traversal can follow the dependency without a
-special pile index. An attached read treats an attachment as usable only when
-its root and required representation closure are resident; otherwise it
-descends to the attachments of the nodes beneath. Typed
-materialization then defensively validates the selected raw/index pair.
-The unpublished mapping-evidence record kind was clean-cutover removed after a
-scan found no live records requiring migration.
+MAP is the host's own index of an attachment built from a parent node. It adds
+no foundation and is believed only when the store's host signed it. An attached
+read uses it only for a node reached in the parent's lattice, and only while its
+root and required representation closure are resident; otherwise it descends
+to attachments below that node. Typed materialization still validates the
+selected raw/index pair.
 
-Every reserved byte must be zero; a nonzero reserved byte makes replay fail as
-corrupt rather than silently assigning meaning to a format extension. Merge
-inputs are sorted by payload digest, so swapping operands cannot create a
-second representation of the same endorsement.
+Pile fixed-record roots retain the whole 224-byte canonical assertion in PATCH,
+with direct segments `[32, 32, 32, 128]`: kind, collection, produced member,
+and the full remaining signed tail. The constant per-kind prefix participates
+in selectors. Borrowed typed views retain their complete root/archive owner;
+heap leaves are never extended backwards to pretend an absent kind exists.
+MERGE retains its occurrence-based index route. The final index architecture
+can change without changing canonical bytes.
 
-There is no synthetic trible entity or separately stored ID for the record.
-On replay, the decoder reconstructs its exact dense typed payload: 192 bytes
-for a commit, 224 bytes for a merge, and 192 bytes for a derive. Every current
-payload includes the public key and both signature components. A
-`CollectionRecordFingerprint`, the BLAKE3 digest of the stable semantic kind ID
-followed by every canonical payload byte, names the actual persisted record
-wherever a fixed-width identity is needed, such as the network delta PATCH; it
-names a record, not a blob, invented entity, or member of `Support`. The pile
-computes none at replay.
-
-Pile replay indexes every collection frame, by the collection it names, the
-member it produces, and the frame's offset. Inserting a record the file already
-holds appends nothing: the producers of the same member are the only records it
-could be, and they are compared as records. Replay does not make that
-comparison. Done per frame it is quadratic in a member's producers, and on a
-68&nbsp;GB pile it cost 294 million record decodes per open while collapsing
-nothing, because that pile's 1,367,796 collection frames were all distinct.
-Since `insert` never writes a repeat, a record can only occupy two frames when
-piles are concatenated, and then each frame gets its own index entry until a
-compaction rewrites the pile through `insert`. Reads hide the repeat: every copy
-of a record sits under the same `collection | member` prefix, so a walk in key
-order meets them together and hands the record out once, and the coverage fold
-is idempotent. Concatenating piles therefore gives set-union semantics for
-collection records: append order and duplicate copies do not change the
-discovered collection calculus. Current operational
-WANTs are likewise a grow-only set. Historical pins remain ordered evidence;
-retired WANT logs are only explicit migration input and do not participate in
-ordinary replay.
-
-The immutable record read surface also provides raw relationship selectors.
-`Collection(C)` selects every record naming `C`; `ProducedMember(C, H)`
-selects every COMMIT data, MERGE result, or DERIVE output matching the exact
-collection and payload; `CommitMember`, `MergeCollection` and `DeriveTarget`
-narrow those by kind. One snapshot-shared PATCH keyed
-`C | member | frame offset` (72 bytes) answers all of them by prefix, and the
-record itself is read from its frame. Mixed selectors return each record once,
-in index order; unindexed backends retain the same scan-based contract. The
-index only projects stored record fields: refresh performs no capability
-admission, signature recheck, or blob read for it, and changes no record bytes
-or encoding identities.
+`Collection(C)` and `ProducedMember(C, H)`, plus kind-specific selectors,
+return every distinct full assertion once. Repeated physical frames do not
+change set semantics; physical diagnostics still expose every occurrence.
+Indexing does not perform capability admission, signature rechecks, or blob
+loads. Public structural views require checked conversion before foreign
+claims become trusted records.
 
 ### Retired payload-only equations and reader cutover
 
@@ -682,8 +660,8 @@ as the same unsigned evidence rather than current equations.
 equations for explicit migration, separate from `CollectionRead` and ordinary
 repair. GC and semantic reframe preserve their raw source frames, and retained
 rewrites preserve all resident descriptor/input/output reference closures.
-Object-store listing omits these equations from current semantics while leaving
-their immutable objects untouched and checking their historical content keys.
+Current ObjectStore decoding rejects these old tagged objects without modifying
+their immutable bytes; an offline converter must select their grammar explicitly.
 An endorsement migration must append a new signature by a writer authorized
 for that exact collection (the target for DERIVE). It must not use every
 receiver's key or delete unsigned evidence that cannot yet be endorsed.

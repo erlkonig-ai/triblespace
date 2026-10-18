@@ -488,8 +488,8 @@ fn assert_same_record_leaves(
     records: &[CollectionRecord],
 ) {
     assert_eq!(
-        before.repair.records().summary(),
-        after.repair.records().summary()
+        before.repair.records().summaries(),
+        after.repair.records().summaries()
     );
     assert_shared_record_leaves(before, after, records);
 }
@@ -501,11 +501,16 @@ fn assert_shared_record_leaves(
 ) {
     for record in records {
         let key = record.fingerprint().raw();
-        assert!(
-            std::ptr::eq(
-                before.repair.records().patch().get(&key).unwrap(),
-                after.repair.records().patch().get(&key).unwrap(),
-            ),
+        let shared = match record {
+            CollectionRecord::Commit(_) => std::ptr::eq(
+                before.repair.records().commits().get(&key).unwrap(),
+                after.repair.records().commits().get(&key).unwrap()),
+            CollectionRecord::Derive(_) => std::ptr::eq(
+                before.repair.records().derives().get(&key).unwrap(),
+                after.repair.records().derives().get(&key).unwrap()),
+            _ => panic!("local-only kind in serving overlay"),
+        };
+        assert!(shared,
             "unchanged record leaves must be retained, not reconstructed"
         );
     }
@@ -630,7 +635,7 @@ fn new_commit_updates_the_record_summary_without_reenumeration() {
     let old = serving_before
         .collection(fixture.collection.handle())
         .unwrap();
-    assert_eq!(old.repair.records().summary().leaf_count(), 2);
+    assert_eq!(old.repair.records().len(), 2);
     assert_eq!(fixture.enumerations.swap(0, Ordering::Relaxed), 1);
 
     fixture.store.insert(fixture.pending).unwrap();
@@ -650,10 +655,10 @@ fn new_commit_updates_the_record_summary_without_reenumeration() {
         .collection(fixture.collection.handle())
         .unwrap();
     assert_eq!(fixture.enumerations.load(Ordering::Relaxed), 0);
-    assert_eq!(new.repair.records().summary().leaf_count(), 3);
+    assert_eq!(new.repair.records().len(), 3);
     assert_ne!(
-        old.repair.records().summary(),
-        new.repair.records().summary()
+        old.repair.records().summaries(),
+        new.repair.records().summaries()
     );
     assert_eq!(
         new.repair.records().get(fixture.pending.fingerprint()),
@@ -676,8 +681,8 @@ fn new_commit_updates_the_record_summary_without_reenumeration() {
     let restored = restored.collection(fixture.collection.handle()).unwrap();
     assert_eq!(fixture.enumerations.load(Ordering::Relaxed), 0);
     assert_eq!(
-        restored.repair.records().summary(),
-        old.repair.records().summary()
+        restored.repair.records().summaries(),
+        old.repair.records().summaries()
     );
     assert!(
         restored
@@ -749,7 +754,7 @@ fn cold_collection_activation_enumerates_even_with_a_blob_only_change_mask() {
     .unwrap();
     assert_eq!(fixture.enumerations.load(Ordering::Relaxed), 1);
     let cold = serving_after.collection(second.handle()).unwrap();
-    assert_eq!(cold.repair.records().summary().leaf_count(), 1);
+    assert_eq!(cold.repair.records().len(), 1);
     assert_eq!(
         cold.repair.records().get(record.fingerprint()),
         Some(record)
@@ -844,8 +849,8 @@ fn arriving_read_definition_refreshes_admission_with_same_wake_root_and_record_l
     assert_eq!(enumerations.load(Ordering::Relaxed), 0);
     assert_same_record_leaves(&old, &new, &[record]);
     assert_eq!(
-        old.repair.records().summary(),
-        new.repair.records().summary()
+        old.repair.records().summaries(),
+        new.repair.records().summaries()
     );
     assert_eq!(
         old.repair.authorization_evidence().summary(),
@@ -1240,8 +1245,8 @@ fn scoped_missing_definition_landing_changes_admission_without_rebuilding_record
     assert!(reads <= 1024 + 64);
     let new = arrived.1.collection(collection).unwrap();
     assert_eq!(
-        old.repair.records().summary(),
-        new.repair.records().summary()
+        old.repair.records().summaries(),
+        new.repair.records().summaries()
     );
     assert_eq!(
         old.repair.authorization_evidence().summary(),

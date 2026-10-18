@@ -339,6 +339,19 @@ where
         self.records.select_records(selectors)
     }
 
+    fn select_record_views(
+        &self, selectors: &std::collections::BTreeSet<crate::collection::CollectionRecordSelector>,
+    ) -> Result<Vec<crate::collection::CollectionRecordView>, Self::RecordsError> {
+        self.records.select_record_views(selectors)
+    }
+
+    fn select_record_view_changes(
+        &self, previous: &Self,
+        selectors: &std::collections::BTreeSet<crate::collection::CollectionRecordSelector>,
+    ) -> Result<(Vec<crate::collection::CollectionRecordView>, Vec<crate::collection::CollectionRecordView>), Self::RecordsError> {
+        self.records.select_record_view_changes(&previous.records, selectors)
+    }
+
     fn select_record_changes(
         &self,
         previous: &Self,
@@ -482,8 +495,8 @@ mod tests {
             CollectionMerge::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 collection,
-                [Inline::new([4; 32]), Inline::new([5; 32])],
-                Inline::new([6; 32]),
+                (4..12).map(|input| Inline::new([input; 32])),
+                Inline::new([12; 32]),
             )
             .unwrap(),
         );

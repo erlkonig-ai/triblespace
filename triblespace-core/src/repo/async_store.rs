@@ -812,11 +812,8 @@ mod tests {
             CollectionMerge::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 identity_for_tests(&descriptor),
-                [
-                    Inline::new([tag.wrapping_add(3); 32]),
-                    Inline::new([tag.wrapping_add(4); 32]),
-                ],
-                Inline::new([tag.wrapping_add(5); 32]),
+                (3..11).map(|offset| Inline::new([tag.wrapping_add(offset); 32])),
+                Inline::new([tag.wrapping_add(11); 32]),
             )
             .unwrap(),
         )

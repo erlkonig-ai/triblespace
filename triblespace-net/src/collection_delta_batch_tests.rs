@@ -69,19 +69,19 @@ fn batch_matches_native_oracle_for_add_remove_overlap_duplicates_and_old_pin() {
     let next = update_collection_record_patch(&after, &before, &prior).unwrap();
     let expected =
         canonical_records(collection, all[64..].iter().copied().chain([all[0]])).unwrap();
-    assert_eq!(next.summary(), expected.summary());
+    assert_eq!(next.summaries(), expected.summaries());
     assert_eq!(
         next.records().collect::<Vec<_>>(),
         expected.records().collect::<Vec<_>>()
     );
-    assert_eq!(pinned.summary(), prior.summary());
+    assert_eq!(pinned.summaries(), prior.summaries());
     assert!(
         all[..256]
             .iter()
             .all(|r| pinned.get(r.fingerprint()) == Some(*r))
     );
     let same = update_collection_record_patch(&before, &before, &prior).unwrap();
-    assert_eq!(same.summary(), prior.summary());
+    assert_eq!(same.summaries(), prior.summaries());
     let clear = Delta {
         collection,
         added: vec![],
@@ -102,7 +102,7 @@ fn batch_keeps_wrong_collection_and_nonfoundation_rejections() {
         added: vec![],
         removed: vec![],
     };
-    let prior = canonical_records(collection, []).unwrap();
+    let prior = canonical_records(collection, [] as [CollectionRecord; 0]).unwrap();
     let wrong = Delta {
         collection,
         added: vec![record(CollectionHandle::new([50; 32]), 1)],
@@ -118,7 +118,7 @@ fn batch_keeps_wrong_collection_and_nonfoundation_rejections() {
         CollectionMerge::sign(
             &SigningKey::from_bytes(&[47; 32]),
             collection,
-            [CollectionData::new([1; 32]), CollectionData::new([2; 32])],
+            (1..=8).map(|byte| CollectionData::new([byte; 32])),
             CollectionData::new([3; 32]),
         )
         .unwrap(),
@@ -150,10 +150,10 @@ fn batch_does_not_let_key_equality_hide_conflicting_attached_values() {
     };
     // Deliberately invalid valued index models a fingerprint collision without
     // requiring a cryptographic collision or changing record fingerprints.
-    let mut prior = canonical_records(collection, []).unwrap();
+    let mut prior = canonical_records(collection, [] as [CollectionRecord; 0]).unwrap();
     prior
-        .records
-        .insert(&PatchEntry::with_value(&a.fingerprint().raw(), b));
+        .commits
+        .insert(&PatchEntry::with_value(&a.fingerprint().raw(), CollectionRecordView::from(b).as_commit().unwrap().clone()));
     for adding in [false, true] {
         let delta = Delta {
             collection,
@@ -166,6 +166,6 @@ fn batch_does_not_let_key_equality_hide_conflicting_attached_values() {
     }
     // The same insertion helper guards a batch-local map, before native union.
     assert!(
-        matches!(insert_record(collection, &mut prior.records, a), Err(CollectionDeltaError::FingerprintCollision(key)) if key == a.fingerprint())
+        matches!(insert_record(collection, &mut prior, a), Err(CollectionDeltaError::FingerprintCollision(key)) if key == a.fingerprint())
     );
 }

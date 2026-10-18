@@ -309,6 +309,24 @@ impl<R: CollectionRead> CollectionRead for ObservedStore<R> {
         self.inner.select_records(selectors)
     }
 
+    fn select_record_views(
+        &self, selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<Vec<crate::collection::CollectionRecordView>, Self::RecordsError> {
+        self.tracker.lock().expect("store dependency tracker is not poisoned")
+            .records.extend(selectors.iter().copied());
+        self.inner.select_record_views(selectors)
+    }
+
+    fn select_record_view_changes(
+        &self, previous: &Self, selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<(Vec<crate::collection::CollectionRecordView>, Vec<crate::collection::CollectionRecordView>), Self::RecordsError> {
+        for tracker in [&self.tracker, &previous.tracker] {
+            tracker.lock().expect("store dependency tracker is not poisoned")
+                .records.extend(selectors.iter().copied());
+        }
+        self.inner.select_record_view_changes(&previous.inner, selectors)
+    }
+
     fn select_record_changes(
         &self,
         previous: &Self,

@@ -33,6 +33,11 @@
 //! and a blob fetch ends after [`WALK_DEADLINE`] without progress, never for
 //! its size. Walk streams count as in use on their connection, so a
 //! draining connection waits for them.
+//!
+//! Cached whole-component walks instead use gated FINs: local readiness does
+//! not require peer FIN; all owed outgoing frames finish first, then the receive
+//! direction and local insertion/fetch work remain live. Only clean EOF is a
+//! peer completion promise. Prefix's DONE/LANDED and late requests are unchanged.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -42,6 +47,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::bail;
+use anybytes::View;
 use ed25519_dalek::VerifyingKey;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -50,8 +56,10 @@ use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::{Blob, MemoryBlobStore};
 use triblespace_core::capability::{CapabilityProof, CapabilityProofId, QuorumOutcome};
 use triblespace_core::collection::{
-    CollectionHandle, CollectionRecord, CollectionRecordFingerprint, descriptor,
+    CollectionHandle, CollectionRecordView, EncodedCommit, EncodedDerive, descriptor,
 };
+#[cfg(test)]
+use triblespace_core::collection::CollectionRecord;
 use triblespace_core::patch::{Blake3Merkle, Entry, IdentitySchema, PATCH};
 use triblespace_core::repo::SnapshotSource;
 use triblespace_core::trible::TribleSet;
@@ -62,7 +70,9 @@ use crate::collection_activation::{
     CollectionAuthorizationEvidenceError, CollectionAuthorizationEvidencePatch,
     CollectionRepairOverlay,
 };
-use crate::collection_delta::{decode_record, encode_record};
+use crate::collection_delta::decode_record;
+#[cfg(test)]
+use crate::collection_delta::encode_record;
 use crate::connection::{
     ConnectionTable, FrameError, RESET_WALK_DUPLICATE, RESET_WALK_FAILED, RESET_WALK_REFUSED,
     Service, open_walk, read_frame, write_frame,
@@ -87,8 +97,10 @@ pub(crate) const KEY_BYTES: usize = 32;
 /// What a walk enumerates.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) enum WalkKind {
-    /// The collection's records: its COMMITs and DERIVEs.
-    Records,
+    /// The collection's signed COMMIT foundations.
+    Commit,
+    /// The collection's signed DERIVE foundations.
+    Derive,
     /// Its authorization evidence, keyed by proof id under the collection.
     Authorization,
     /// The blobs it holds, as handles without values.
@@ -98,17 +110,19 @@ pub(crate) enum WalkKind {
 impl WalkKind {
     pub(crate) const fn wire(self) -> u8 {
         match self {
-            Self::Records => 0,
+            Self::Commit => 0,
             Self::Authorization => 1,
             Self::References => 2,
+            Self::Derive => 3,
         }
     }
 
     pub(crate) const fn from_wire(byte: u8) -> Option<Self> {
         match byte {
-            0 => Some(Self::Records),
+            0 => Some(Self::Commit),
             1 => Some(Self::Authorization),
             2 => Some(Self::References),
+            3 => Some(Self::Derive),
             _ => None,
         }
     }
@@ -317,8 +331,8 @@ impl Walks {
     }
 
     /// The exchange of C's `kind` tree with `peer` ended: health sees a push
-    /// where this side sent, confirmed if the peer's LANDED arrived, and a
-    /// receive where it received, landed if LANDED went back; the agreed
+    /// where this side sent, confirmed by peer LANDED/FIN, and a receive where
+    /// it received, landed after actual LANDED write/gated FIN; the agreed
     /// tree is set when the exchange confirmed and forgotten otherwise.
     /// Returns whether to exchange again at once: a confirmed exchange of a
     /// tree that moved from the agreed one since. A failed exchange is left
@@ -344,11 +358,12 @@ impl Walks {
             if ended.receives {
                 health.received(now, kind, ended.peer_root, ended.landed)
             }
-            // Directional end counters are LANDED receipts. This diagnostic
+            // Directional end counters are LANDED/gated-FIN receipts. This diagnostic
             // root, unlike those counters, exists only with shared agreement.
             let agreed_root = ended.agreed.as_ref().map(|tree| tree.summary());
             match kind {
-                WalkKind::Records => health.confirmed.records = agreed_root,
+                WalkKind::Commit => health.confirmed.commits = agreed_root,
+                WalkKind::Derive => health.confirmed.derives = agreed_root,
                 WalkKind::Authorization => health.confirmed.authorization_evidence = agreed_root,
                 WalkKind::References => {}
             }
@@ -379,6 +394,13 @@ impl Walks {
     /// costs the next exchange the delta against nothing, which the peer's
     /// announcements prune.
     pub(crate) fn closed(&mut self, peer: PeerId) {
+        self.health.update(|health| {
+            for collection in &mut health.collections {
+                for pair in collection.peers.iter_mut().filter(|pair| pair.peer == peer) {
+                    pair.disconnected();
+                }
+            }
+        });
         let dropped = self
             .agreed
             .iter()
@@ -502,17 +524,28 @@ pub(crate) enum Admit {
 /// The value under a key of one kind's tree.
 #[derive(Clone)]
 pub(crate) enum Value {
-    Record(CollectionRecord),
+    Commit(View<EncodedCommit>),
+    Derive(View<EncodedDerive>),
     Proof(CapabilityProof),
     /// A held reference carries no value.
     Handle,
 }
 
 impl Value {
+    /// Dispatch only a sealed trusted carrier; public structural views alone
+    /// never enter foreign admission through this helper.
+    pub(crate) fn from_record_view(record: &CollectionRecordView) -> Option<Self> {
+        if let Some(view) = record.as_commit() { return Some(Self::Commit(view.clone())); }
+        record.as_derive().map(|view| Self::Derive(view.clone()))
+    }
+
     /// The value as it travels in a VALUE frame; a held reference does not.
     pub(crate) fn bytes(&self, collection: CollectionHandle) -> Option<Vec<u8>> {
         match self {
-            Self::Record(record) => encode_record(collection, *record).ok(),
+            Self::Commit(record) => (record.collection() == collection)
+                .then(|| record.body_bytes().to_vec()),
+            Self::Derive(record) => (record.collection() == collection)
+                .then(|| record.body_bytes().to_vec()),
             Self::Proof(proof) => Some(proof.as_bytes().to_vec()),
             Self::Handle => None,
         }
@@ -532,13 +565,18 @@ pub(crate) fn admit_value(
     evidence: &CollectionAuthorizationEvidencePatch,
 ) -> anyhow::Result<(Value, Admit)> {
     match kind {
-        WalkKind::Records => {
+        WalkKind::Commit | WalkKind::Derive => {
             let record = decode_record(collection, bytes)?;
+            if !matches!((kind, record),
+                (WalkKind::Commit, triblespace_core::collection::CollectionRecord::Commit(_)) |
+                (WalkKind::Derive, triblespace_core::collection::CollectionRecord::Derive(_))) {
+                bail!("record body belongs to another walk kind");
+            }
             if record.fingerprint().raw() != key {
                 bail!("a record under another record's key");
             }
             Ok((
-                Value::Record(record),
+                Value::from_record_view(&record.into()).expect("checked foundation kind"),
                 Admit::Land(vec![NetEvent::CollectionRecord(record)]),
             ))
         }
@@ -628,13 +666,14 @@ pub(crate) fn admit_fetched(
 pub(crate) fn base(kind: WalkKind, collection: CollectionHandle) -> Vec<u8> {
     match kind {
         WalkKind::Authorization => collection.raw.to_vec(),
-        WalkKind::Records | WalkKind::References => Vec::new(),
+        WalkKind::Commit | WalkKind::Derive | WalkKind::References => Vec::new(),
     }
 }
 
 pub(crate) fn summary(kind: WalkKind, overlay: &CollectionRepairOverlay) -> PatchSummary {
     match kind {
-        WalkKind::Records => overlay.records().summary(),
+        WalkKind::Commit => PatchSummary::from_patch(overlay.records().commits()),
+        WalkKind::Derive => PatchSummary::from_patch(overlay.records().derives()),
         WalkKind::Authorization => overlay.authorization_evidence().summary(),
         WalkKind::References => PatchSummary::from_patch(overlay.blob_inventory()),
     }
@@ -649,7 +688,8 @@ pub(crate) fn local_summary(
     prefix: &[u8],
 ) -> Option<PatchSummary> {
     match kind {
-        WalkKind::Records => node_summary(overlay.records().patch(), prefix),
+        WalkKind::Commit => node_summary(overlay.records().commits(), prefix),
+        WalkKind::Derive => node_summary(overlay.records().derives(), prefix),
         WalkKind::Authorization => overlay.authorization_evidence().prefix_summary(prefix),
         WalkKind::References => node_summary(overlay.blob_inventory(), prefix),
     }
@@ -673,8 +713,11 @@ pub(crate) fn node(
     prefix: &[u8],
 ) -> Option<PatchNode<()>> {
     let found = match kind {
-        WalkKind::Records => {
-            patch_node_response(overlay.records().patch(), &[], prefix, |_, _| Ok(()))
+        WalkKind::Commit => {
+            patch_node_response(overlay.records().commits(), &[], prefix, |_, _| Ok(()))
+        }
+        WalkKind::Derive => {
+            patch_node_response(overlay.records().derives(), &[], prefix, |_, _| Ok(()))
         }
         WalkKind::Authorization => patch_node_response(
             overlay.authorization_evidence().patch(),
@@ -699,10 +742,8 @@ pub(crate) fn value(
     key: [u8; KEY_BYTES],
 ) -> Option<Value> {
     match kind {
-        WalkKind::Records => overlay
-            .records()
-            .get(CollectionRecordFingerprint::from_raw(key))
-            .map(Value::Record),
+        WalkKind::Commit => overlay.records().commits().get(&key).cloned().map(Value::Commit),
+        WalkKind::Derive => overlay.records().derives().get(&key).cloned().map(Value::Derive),
         WalkKind::Authorization => overlay
             .authorization_evidence()
             .get(CapabilityProofId::new(key))
@@ -1256,12 +1297,15 @@ async fn drive<T: Transport, S: Service>(
     mut acked: mpsc::UnboundedReceiver<(u64, u64)>,
     mut replaced: oneshot::Receiver<()>,
 ) -> (Ended, bool) {
+    if exchange.algorithm() == crate::walk_stream::Algorithm::CachedRiblt {
+        return cached::drive(driver, exchange, send, recv, acked, replaced).await;
+    }
     let (frames, mut framed) = mpsc::channel(1);
     let reader = tokio::spawn(read_stream(recv, frames));
     let (outgoing, written) = mpsc::channel(1);
     let (reset, resetting) = oneshot::channel();
     let (write_failed, mut writer_failed) = oneshot::channel();
-    let (progress, mut progressed) = watch::channel(0usize);
+    let (progress, mut progressed) = watch::channel(Written::default());
     let mut writer = tokio::spawn(write_stream_progress(
         send,
         written,
@@ -1340,8 +1384,10 @@ async fn drive<T: Transport, S: Service>(
             Some((handle, proof, blob)) = fetched.recv() => exchange.on_fetched(handle, proof, blob),
             changed = progressed.changed() => {
                 if changed.is_err() { break 'drive true; }
-                let prefix = *progressed.borrow_and_update();
-                exchange.on_written(prefix)
+                let written = *progressed.borrow_and_update();
+                let mut outs = exchange.on_written(written.cells);
+                if written.root { outs.extend(exchange.on_root_written()); }
+                outs
             },
             _ = &mut writer_failed => break 'drive true,
             _ = &mut replaced => break 'drive true,
@@ -1470,23 +1516,42 @@ async fn read_stream(
 /// the driver immediately. Writes have a byte-progress deadline, and final
 /// shutdown is bounded and cancellable. Returns actual LANDED write and
 /// successful stream-finish receipts separately.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Written {
+    root: bool,
+    cells: usize,
+}
+
+type Reset = futures::future::Fuse<oneshot::Receiver<u32>>;
+
 async fn write_stream_progress(
     mut send: Box<dyn SendStream>,
-    mut frames: mpsc::Receiver<Frame>,
+    frames: mpsc::Receiver<Frame>,
     reset: oneshot::Receiver<u32>,
     write_failed: oneshot::Sender<()>,
-    progress: Option<watch::Sender<usize>>,
+    progress: Option<watch::Sender<Written>>,
 ) -> (bool, bool) {
-    let mut reset = std::pin::pin!(futures::FutureExt::fuse(reset));
+    let mut reset = futures::FutureExt::fuse(reset);
+    write_stream_inner(&mut send, frames, &mut reset, write_failed, progress).await
+}
+
+/// The cached driver retains the send handle after half-close so replacement
+/// and failure can still reset it while the peer's direction remains open.
+async fn write_stream_inner(
+    mut send: &mut Box<dyn SendStream>,
+    mut frames: mpsc::Receiver<Frame>,
+    reset: &mut Reset,
+    write_failed: oneshot::Sender<()>,
+    progress: Option<watch::Sender<Written>>,
+) -> (bool, bool) {
     let mut broken = false;
     let mut write_failed = Some(write_failed);
     let mut landed_written = false;
-    let mut cell_prefix = 0;
-    let mut riblt = false;
+    let mut receipt = Written::default();
     loop {
         tokio::select! {
             biased;
-            Ok(code) = &mut reset => {
+            Ok(code) = &mut *reset => {
                 send.reset(code);
                 return (landed_written, false);
             }
@@ -1495,7 +1560,7 @@ async fn write_stream_progress(
                     if !broken {
                         let finished = tokio::select! {
                             biased;
-                            Ok(code) = &mut reset => {
+                            Ok(code) = &mut *reset => {
                                 send.reset(code);
                                 false
                             }
@@ -1518,7 +1583,7 @@ async fn write_stream_progress(
                 let (kind, payload) = frame.encode();
                 tokio::select! {
                     biased;
-                    Ok(code) = &mut reset => {
+                    Ok(code) = &mut *reset => {
                         send.reset(code);
                         return (landed_written, false);
                     }
@@ -1534,16 +1599,14 @@ async fn write_stream_progress(
                             landed_written = true;
                         }
                         if !broken {
-                            riblt |= matches!(frame, Frame::RibltRoot { .. });
-                            let notify = matches!(frame, Frame::RibltCell { .. })
-                                || (riblt && matches!(frame, Frame::Done));
+                            receipt.root |= matches!(frame, Frame::RibltRoot { .. });
+                            let notify = matches!(frame, Frame::RibltCell { .. } | Frame::RibltRoot { .. });
                             if let Frame::RibltCell { index, .. } = frame {
-                                cell_prefix = index as usize + 1;
+                                receipt.cells = index as usize + 1;
                             }
-                            // DONE also wakes settlement for equal-root,
-                            // zero-cell exchanges whose peer DONE arrived first.
+                            // ROOT itself wakes zero-cell/equal-root completion.
                             if notify && let Some(progress) = &progress {
-                                let _ = progress.send(cell_prefix);
+                                let _ = progress.send(receipt);
                             }
                         }
                     }
@@ -1552,6 +1615,9 @@ async fn write_stream_progress(
         }
     }
 }
+
+#[path = "walk_cached.rs"]
+mod cached;
 
 #[cfg(all(test, feature = "sim"))]
 #[path = "riblt_runtime_tests.rs"]
@@ -1760,8 +1826,8 @@ pub(crate) mod tests {
     use walking::{Node, open};
 
     /// Every branch locator of a records tree, by the PATCH's own view.
-    pub(crate) fn branches(
-        patch: &PATCH<32, IdentitySchema, CollectionRecord, Blake3Merkle>,
+    pub(crate) fn branches<V>(
+        patch: &PATCH<32, IdentitySchema, V, Blake3Merkle>,
         prefix: Vec<u8>,
         out: &mut Vec<Vec<u8>>,
     ) {
@@ -1781,14 +1847,14 @@ pub(crate) mod tests {
     }
 
     /// The branch locators of a records tree on the paths to `keys`.
-    pub(crate) fn paths(
-        patch: &PATCH<32, IdentitySchema, CollectionRecord, Blake3Merkle>,
+    pub(crate) fn paths<V: Clone>(
+        patch: &PATCH<32, IdentitySchema, V, Blake3Merkle>,
         keys: &[[u8; 32]],
     ) -> std::collections::BTreeSet<Vec<u8>> {
         // Only the native delta keys, not paths through unchanged collection siblings.
         let mut delta = PATCH::new();
         for key in keys {
-            delta.insert(&Entry::with_value(key, *patch.get(key).unwrap()));
+            delta.insert(&Entry::with_value(key, patch.get(key).unwrap().clone()));
         }
         let mut all = Vec::new();
         branches(&delta, Vec::new(), &mut all);
@@ -1808,7 +1874,7 @@ pub(crate) mod tests {
         node.commit(dropped, 1);
         node.observe();
         let (a, b) = (Node::new(64).id(), Node::new(65).id());
-        let kind = WalkKind::Records;
+        let kind = WalkKind::Commit;
         let now = crate::clock::mono_now();
         let pairs = [(a, kept), (a, dropped), (b, kept), (b, dropped)];
         let remember = |node: &mut Node| {
@@ -1872,7 +1938,7 @@ pub(crate) mod tests {
         assert_eq!((pair.pushes.ok, pair.pushes.failed), (2, 0));
         assert_eq!((pair.receives.ok, pair.receives.failed), (2, 0));
         assert_eq!(
-            pair.confirmed.records,
+            pair.confirmed.commits,
             Some(summary(kind, node.pinned(kept).repair()))
         );
     }
@@ -1913,7 +1979,7 @@ pub(crate) mod tests {
         node.commit(collection, 1);
         node.observe();
         let peer = Node::new(99).id();
-        let kind = WalkKind::Records;
+        let kind = WalkKind::Commit;
         let pinned = node.pinned(collection);
         let root = summary(kind, pinned.repair());
         node.walks.ended(
@@ -1962,7 +2028,7 @@ pub(crate) mod tests {
             .iter()
             .find(|pair| pair.peer == peer)
             .unwrap();
-        assert!(pair.confirmed.records.is_none());
+        assert!(pair.confirmed.commits.is_none());
         let mut retry = node.walks.start(peer, collection, kind).unwrap();
         assert!(matches!(retry.next_delta(), Some(Frame::Subtree { .. })));
         assert!(
@@ -2260,7 +2326,7 @@ pub(crate) mod tests {
                 self.walks.incoming(
                     peer,
                     collection,
-                    WalkKind::Records,
+                    WalkKind::Commit,
                     crate::walk_stream::Algorithm::Prefix,
                     None,
                     Box::new(Tx(send, reset.clone())),
@@ -2551,7 +2617,7 @@ pub(crate) mod tests {
             cut: usize,
             omit: Option<[u8; 32]>,
         ) -> (bool, usize) {
-            let kind = WalkKind::Records;
+            let kind = WalkKind::Commit;
             let overlay = sender.serving().collection(collection).unwrap();
             let overlay = overlay.repair();
             let mut answered = 0;
@@ -2645,24 +2711,24 @@ pub(crate) mod tests {
             assert!(health.receives.last_ok && health.receives.ok == 1);
             assert!(health.pushes.last_ok && health.pushes.ok == 1);
             let root = summary(
-                WalkKind::Records,
+                WalkKind::Commit,
                 sender.serving().collection(collection).unwrap().repair(),
             );
-            assert_eq!(health.received.records, Some(root));
+            assert_eq!(health.received.commits, Some(root));
             // The agreed tree is the union, which is the sender's tree.
-            assert_eq!(health.confirmed.records, Some(root));
+            assert_eq!(health.confirmed.commits, Some(root));
             assert_eq!(
                 receiving.events.try_recv(),
                 Ok(Event::Receiving {
                     collection,
-                    kind: WalkKind::Records
+                    kind: WalkKind::Commit
                 })
             );
             assert_eq!(
                 receiving.events.try_recv(),
                 Ok(Event::Received {
                     collection,
-                    kind: WalkKind::Records,
+                    kind: WalkKind::Commit,
                     landed: true
                 })
             );
@@ -2696,7 +2762,7 @@ pub(crate) mod tests {
             receiver.observe();
             let receiving = Hosted::new(receiver, &SimNet::new(2, SimConfig::default()));
             let overlay = sender.serving().collection(collection).unwrap();
-            let root = summary(WalkKind::Records, overlay.repair());
+            let root = summary(WalkKind::Commit, overlay.repair());
 
             let (mut first, _first_recv, first_reset) = receiving.open(sender.id(), collection);
             write(
@@ -2824,7 +2890,7 @@ pub(crate) mod tests {
         #[tokio::test(start_paused = true)]
         async fn first_sync_to_an_empty_peer_streams_without_waiting() {
             let (_net, full, empty, collection, records) = pair(0x3A1E, (55, 56), 300);
-            let kind = WalkKind::Records;
+            let kind = WalkKind::Commit;
             let _connection = full.table.connect(empty.peer).await.unwrap();
             let health = full.exchange(empty.peer, collection, kind).await;
             assert!(health.pushes.last_ok, "{health:?}");
@@ -2841,7 +2907,7 @@ pub(crate) mod tests {
             assert_eq!(count(&heard, FRAME_NODE) + count(&heard, FRAME_LEAF), 0);
             let mut expected = Vec::new();
             let pinned = full.lander.node.lock().unwrap().pinned(collection);
-            branches(pinned.repair().records().patch(), Vec::new(), &mut expected);
+            branches(pinned.repair().records().commits(), Vec::new(), &mut expected);
             assert!(expected.len() > 1);
             assert_eq!(
                 count(&sent, FRAME_ROOT) + count(&sent, FRAME_NODE),
@@ -2948,7 +3014,7 @@ pub(crate) mod tests {
             };
             task.observe(snapshot);
             let peer = Node::new(106).id();
-            let kind = WalkKind::Records;
+            let kind = WalkKind::Commit;
             let exchange = task.walks.start(peer, collection, kind).unwrap();
             let (driver, _acks, mut replaced) =
                 task.register((peer, collection.raw, kind), false, &exchange);
@@ -3016,7 +3082,7 @@ pub(crate) mod tests {
                 }
                 writer.observe();
                 reader.observe();
-                let expected = summary(WalkKind::Records, writer.pinned(collection).repair());
+                let expected = summary(WalkKind::Commit, writer.pinned(collection).repair());
                 let writer = Hosted::new(writer, &net);
                 let reader = Hosted::new(reader, &net);
                 // The walk opener must have an installed current connection;
@@ -3031,17 +3097,17 @@ pub(crate) mod tests {
                 if opener_sends {
                     writer
                         .walks
-                        .open(reader.peer, collection, WalkKind::Records);
+                        .open(reader.peer, collection, WalkKind::Commit);
                 } else {
                     reader
                         .walks
-                        .open(writer.peer, collection, WalkKind::Records);
+                        .open(writer.peer, collection, WalkKind::Commit);
                 }
                 let sent = writer.ended(reader.peer, collection, before_writer).await;
                 let received = reader.ended(writer.peer, collection, before_reader).await;
                 assert!(sent.pushes.last_ok && received.receives.last_ok);
-                assert_eq!(sent.confirmed.records, Some(expected));
-                assert_eq!(received.received.records, Some(expected));
+                assert_eq!(sent.confirmed.commits, Some(expected));
+                assert_eq!(received.received.commits, Some(expected));
                 assert_eq!(reader.records(collection).len(), 131);
                 let count = |tap: &Taps, kind| {
                     tap.crossed()
@@ -3106,7 +3172,7 @@ pub(crate) mod tests {
                 next_id: 0,
             };
             task.observe(snapshot);
-            let kind = WalkKind::Records;
+            let kind = WalkKind::Commit;
             assert!(task.walks.start(other.peer, collection, kind).is_none());
             task.command(Command::Open {
                 peer: other.peer,
@@ -3143,7 +3209,7 @@ pub(crate) mod tests {
             node.observe();
             let exchange = Exchange::start_one_way(
                 collection,
-                WalkKind::Records,
+                WalkKind::Commit,
                 node.pinned(collection),
                 None,
                 true,
@@ -3160,7 +3226,7 @@ pub(crate) mod tests {
                 id: 1,
                 peer: Node::new(228).id(),
                 collection,
-                kind: WalkKind::Records,
+                kind: WalkKind::Commit,
             };
             let (script, driven) = tokio::io::duplex(128);
             let (mut recv, mut send) = tokio::io::split(script);
@@ -3239,7 +3305,7 @@ pub(crate) mod tests {
             let net = SimNet::new(0x3A2A, SimConfig::default());
             let mut node = Node::new(107);
             let collection = node.hold("blocked final LANDED", open());
-            let kind = WalkKind::Records;
+            let kind = WalkKind::Commit;
             let exchange =
                 Exchange::start(collection, kind, node.pinned(collection), None, true, true);
             let hosted = Hosted::new(node, &net);
@@ -3336,7 +3402,7 @@ pub(crate) mod tests {
             let collection = node.hold("LANDED write failure", open());
             node.commit(collection, 1);
             node.observe();
-            let kind = WalkKind::Records;
+            let kind = WalkKind::Commit;
             let exchange =
                 Exchange::start(collection, kind, node.pinned(collection), None, true, true);
             let hosted = Hosted::new(node, &net);
@@ -3433,7 +3499,7 @@ pub(crate) mod tests {
             let collection = node.hold("LANDED write failure", open());
             node.commit(collection, 1);
             node.observe();
-            let kind = WalkKind::Records;
+            let kind = WalkKind::Commit;
             let exchange =
                 Exchange::start(collection, kind, node.pinned(collection), None, true, true);
             let hosted = Hosted::new(node, &net);
@@ -3536,7 +3602,7 @@ pub(crate) mod tests {
         #[tokio::test(start_paused = true)]
         async fn an_exchange_over_a_connection_lands_confirms_and_prunes() {
             let (net, sender, mut empty, collection, records) = pair(0x3A1F, (57, 58), 50);
-            let kind = WalkKind::Records;
+            let kind = WalkKind::Commit;
             let root = summary(
                 kind,
                 sender
@@ -3555,7 +3621,7 @@ pub(crate) mod tests {
             let health = sender.exchange(empty.peer, collection, kind).await;
             assert!(health.pushes.last_ok, "{health:?}");
             assert_eq!((health.pushes.ok, health.pushes.failed), (1, 0));
-            assert_eq!(health.confirmed.records, Some(root));
+            assert_eq!(health.confirmed.commits, Some(root));
             let (sent, heard) = crossed(&sender.taps, from, empty.peer);
             assert_eq!(heard.last(), Some(&FRAME_LANDED));
             assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 50);
@@ -3563,8 +3629,8 @@ pub(crate) mod tests {
             assert_eq!(empty.records(collection), all);
             let other = empty.health(collection, sender.peer).unwrap();
             assert!(other.receives.last_ok && other.pushes.last_ok, "{other:?}");
-            assert_eq!(other.confirmed.records, Some(root));
-            assert_eq!(other.received.records, Some(root));
+            assert_eq!(other.confirmed.commits, Some(root));
+            assert_eq!(other.received.commits, Some(root));
             assert_eq!(
                 empty.events.try_recv(),
                 Ok(Event::Receiving { collection, kind })
@@ -3642,7 +3708,7 @@ pub(crate) mod tests {
         #[tokio::test(start_paused = true)]
         async fn a_shared_subtree_costs_one_frame_per_direction() {
             let (_net, a, b, collection, records) = pair(0x3A22, (62, 63), 300);
-            let kind = WalkKind::Records;
+            let kind = WalkKind::Commit;
             {
                 let mut node = b.lander.node.lock().unwrap();
                 for record in &records {
@@ -3659,9 +3725,9 @@ pub(crate) mod tests {
                 kind,
                 a.lander.node.lock().unwrap().pinned(collection).repair(),
             );
-            assert_eq!(health.confirmed.records, Some(shared));
+            assert_eq!(health.confirmed.commits, Some(shared));
             assert_eq!(
-                b.health(collection, a.peer).unwrap().confirmed.records,
+                b.health(collection, a.peer).unwrap().confirmed.commits,
                 Some(shared)
             );
 
@@ -3686,7 +3752,7 @@ pub(crate) mod tests {
             );
             assert_eq!((health_a.pushes.ok, health_a.pushes.failed), (2, 0));
             assert_eq!((health_b.pushes.ok, health_b.pushes.failed), (2, 0));
-            assert_eq!(health_a.confirmed.records, health_b.confirmed.records);
+            assert_eq!(health_a.confirmed.commits, health_b.confirmed.commits);
             assert_eq!(a.records(collection).len(), 320);
             assert_eq!(b.records(collection), a.records(collection));
 
@@ -3697,7 +3763,7 @@ pub(crate) mod tests {
                 assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 10);
                 assert_eq!(count(&sent, FRAME_VALUE_REQUEST), 10);
                 let pinned = side.lander.node.lock().unwrap().pinned(collection);
-                let expected = paths(pinned.repair().records().patch(), own);
+                let expected = paths(pinned.repair().records().commits(), own);
                 assert!(expected.contains(&Vec::new()));
                 assert_eq!(
                     count(&sent, FRAME_ROOT) + count(&sent, FRAME_NODE),
@@ -3719,13 +3785,13 @@ pub(crate) mod tests {
         #[tokio::test(start_paused = true)]
         async fn an_incremental_exchange_skips_what_was_agreed_and_lands_only_the_new() {
             let (_net, a, b, collection, _) = pair(0x3A23, (64, 65), 300);
-            let kind = WalkKind::Records;
+            let kind = WalkKind::Commit;
             let _connection = a.table.connect(b.peer).await.unwrap();
             let health = a.exchange(b.peer, collection, kind).await;
             assert!(health.pushes.last_ok, "{health:?}");
-            let agreed = health.confirmed.records;
+            let agreed = health.confirmed.commits;
             assert_eq!(
-                b.health(collection, a.peer).unwrap().confirmed.records,
+                b.health(collection, a.peer).unwrap().confirmed.commits,
                 agreed
             );
             assert_eq!(b.records(collection).len(), 300);
@@ -3744,8 +3810,8 @@ pub(crate) mod tests {
                 health_b.pushes.last_ok && health_b.receives.last_ok,
                 "{health_b:?}"
             );
-            assert_eq!(health.confirmed.records, health_b.confirmed.records);
-            assert_ne!(health.confirmed.records, agreed);
+            assert_eq!(health.confirmed.commits, health_b.confirmed.commits);
+            assert_ne!(health.confirmed.commits, agreed);
             assert_eq!(a.records(collection).len(), 310);
             assert_eq!(b.records(collection), a.records(collection));
             for (side, from, own, other, asked) in [
@@ -3756,7 +3822,7 @@ pub(crate) mod tests {
                 assert_eq!(count(&heard, FRAME_VALUE_REQUEST), own.len());
                 assert_eq!(count(&sent, FRAME_VALUE_REQUEST), asked);
                 let pinned = side.lander.node.lock().unwrap().pinned(collection);
-                let expected = paths(pinned.repair().records().patch(), own);
+                let expected = paths(pinned.repair().records().commits(), own);
                 assert_eq!(
                     count(&sent, FRAME_ROOT) + count(&sent, FRAME_NODE),
                     expected.len(),
@@ -3778,7 +3844,7 @@ pub(crate) mod tests {
         #[tokio::test(start_paused = true)]
         async fn simultaneous_opens_keep_the_smaller_peer_s_stream() {
             let (_net, a, b, collection, _) = pair(0x3A24, (66, 67), 100);
-            let kind = WalkKind::Records;
+            let kind = WalkKind::Commit;
             let _connection = a.table.connect(b.peer).await.unwrap();
             // The accepted connection is current at B once its opening
             // frame is read.
@@ -3796,7 +3862,7 @@ pub(crate) mod tests {
                 assert_eq!((health.pushes.ok, health.pushes.failed), (1, 0));
                 assert_eq!((health.receives.ok, health.receives.failed), (1, 0));
             }
-            assert_eq!(health_a.confirmed.records, health_b.confirmed.records);
+            assert_eq!(health_a.confirmed.commits, health_b.confirmed.commits);
             assert_eq!(b.records(collection).len(), 100);
 
             // Each side opened one stream and heard the other's Open.
@@ -3859,7 +3925,7 @@ pub(crate) mod tests {
                     latency: Duration::from_millis(10)..Duration::from_millis(10),
                 },
             );
-            let kind = WalkKind::Records;
+            let kind = WalkKind::Commit;
             let mut sender = Node::new(68);
             let collection = sender.hold("cut", open());
             let records = (0..300)
@@ -3875,6 +3941,25 @@ pub(crate) mod tests {
             // The first, scripted, answers fifty values and drops the
             // stream.
             let (send, recv, reset) = receiving_cut(&receiver, &sender, collection).await;
+            // Writes into the duplex buffer are not insertion receipts. Make
+            // this test's "cut after landing" premise explicit before closing
+            // either half; a write error may otherwise retire the reader before
+            // it consumes any of those buffered bodies.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while receiver.records(collection).len() != 50 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the fifty answered bodies actually landed before the cut");
+            let before_cut = receiver.records(collection).len();
+            assert_eq!(before_cut, 50);
+            assert!(before_cut < records.len(), "the transfer is still incomplete");
+            assert!(receiver.health(collection, sender.id()).is_none_or(|health| {
+                health.receives.ok == 0
+                    && health.received.commits.is_none()
+                    && health.confirmed.commits.is_none()
+            }), "no full receive or shared root before the cut");
             drop((send, recv));
             assert_eq!(reset.await, Some(RESET_WALK_FAILED));
             for _ in 0..100 {
@@ -3889,10 +3974,10 @@ pub(crate) mod tests {
             let landed = receiver.records(collection).len();
             assert!(landed > 0 && landed < 300, "{landed} landed");
             let health = receiver.health(collection, sender.id()).unwrap();
-            assert!(!health.receives.last_ok && health.received.records.is_none());
+            assert!(!health.receives.last_ok && health.received.commits.is_none());
             // The scripted peer LANDED our empty delta before cutting its
             // own. That directional push succeeded, but no union was agreed.
-            assert!(health.pushes.last_ok && health.confirmed.records.is_none());
+            assert!(health.pushes.last_ok && health.confirmed.commits.is_none());
 
             // The sender agreed on nothing, and the next exchange asks only
             // for the rest.
@@ -3902,7 +3987,7 @@ pub(crate) mod tests {
             let from = sender.taps.len();
             let health = sender.exchange(receiver.peer, collection, kind).await;
             assert!(health.pushes.last_ok, "{health:?}");
-            assert_eq!(health.confirmed.records, Some(root));
+            assert_eq!(health.confirmed.commits, Some(root));
             let (sent, heard) = crossed(&sender.taps, from, receiver.peer);
             assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 300 - landed);
             assert!((300 - landed..=300).contains(&count(&sent, FRAME_LEAF)));

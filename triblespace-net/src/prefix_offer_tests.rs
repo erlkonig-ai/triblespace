@@ -22,7 +22,7 @@ impl Side {
     ) -> Self {
         let exchange = Exchange::start_one_way(
             collection,
-            WalkKind::Records,
+            WalkKind::Commit,
             node.pinned(collection),
             agreed,
             sends,
@@ -194,12 +194,12 @@ fn prefix_offer_private_extras_do_not_change_cold_receipts() {
 fn prefix_offer_shared_g_prunes_root_even_with_private_extras() {
     let (mut a, mut b, collection, _) = fixture(20, 20, true);
     let shared = Arc::new(Tree::pinned(
-        WalkKind::Records,
+        WalkKind::Commit,
         a.node.pinned(collection).repair(),
     ));
     b.exchange = Exchange::start_one_way(
         collection,
-        WalkKind::Records,
+        WalkKind::Commit,
         b.node.pinned(collection),
         Some(shared),
         false,
@@ -304,7 +304,7 @@ fn prefix_offer_no_receipts_bounds_speculation_without_false_completion() {
 fn prefix_offer_unoffered_value_receipt_and_failed_landing_refused() {
     let (mut a, mut b, _, records) = fixture(1, 0, false);
     let key = records[0].fingerprint().raw();
-    let bytes = Value::Record(records[0])
+    let bytes = Value::from_record_view(&records[0].into()).unwrap()
         .bytes(a.exchange.collection)
         .unwrap();
     b.hear(Frame::Value { key, bytes });
@@ -364,12 +364,12 @@ fn prefix_offer_codec_requires_exact_nonempty_canonical_commitment() {
 fn prefix_offer_coarse_have_racing_child_uses_shared_g_when_live_lags() {
     let (mut a, mut b, collection, _) = fixture(1, 0, false);
     let shared = Arc::new(Tree::pinned(
-        WalkKind::Records,
+        WalkKind::Commit,
         a.node.pinned(collection).repair(),
     ));
     b.exchange = Exchange::start_one_way(
         collection,
-        WalkKind::Records,
+        WalkKind::Commit,
         b.node.pinned(collection),
         Some(shared),
         false,

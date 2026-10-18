@@ -1613,6 +1613,7 @@ mod tests {
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::metadata;
     use triblespace_core::prelude::*;
+    use triblespace_core::repo::{BlobStoreMeta, BlobStorePut};
     use triblespace_net::telemetry::MetricValue;
 
     /// A root collection with one commit, plus an index attached to it that
@@ -1685,31 +1686,18 @@ mod tests {
         // is nothing any peer will send. The resident ratio is over the
         // foundations, which do replicate, and a store holding every one of
         // them reads as complete however many merges it also stores.
-        use triblespace_core::collection::CollectionStore;
-        let (mut store, source, _target) = lattice_fixture();
-        let stranger = ed25519_dalek::SigningKey::from_bytes(&[29; 32]);
-        store
-            .insert(CollectionRecord::Merge(
-                CollectionMerge::sign(
-                    &stranger,
-                    CollectionHandle::new(source.raw),
-                    [Inline::new([0x61; 32]), Inline::new([0x62; 32])],
-                    Inline::new([0x63; 32]),
-                )
-                .unwrap(),
-            ))
-            .unwrap();
+        let (mut store, source, _, _) = member_fixture_in(MemoryRepo::default());
         let snapshot = store.snapshot().unwrap();
         let lattice = observe_lattice(&snapshot, []).unwrap();
         let root = lattice
             .iter()
-            .find(|collection| collection.handle == source.raw)
+            .find(|collection| collection.handle == source)
             .expect("the source collection is projected");
         assert_eq!(root.merges, 1, "the stored MERGE is still counted");
-        assert_eq!(root.foundations(), 1);
+        assert_eq!(root.foundations(), 8);
         assert_eq!(
-            root.foundations_resident, 1,
-            "the one commit is here, so nothing replicable is missing"
+            root.foundations_resident, 8,
+            "all eight commits are here, so nothing replicable is missing"
         );
     }
 
@@ -1763,34 +1751,38 @@ mod tests {
         ed25519_dalek::SigningKey::from_bytes(&[13; 32])
     }
 
-    /// Two commits joined by one merge whose result bytes are not here, in a
+    /// Eight commits joined by one merge whose result bytes are not here, in a
     /// store opened as the merge's signer, so the fold believes the merge.
-    fn member_fixture() -> (MemoryRepo, [u8; 32], [u8; 32], [u8; 32], [u8; 32]) {
+    fn member_fixture() -> (MemoryRepo, [u8; 32], [[u8; 32]; 8], [u8; 32]) {
         member_fixture_in(MemoryRepo::for_host(member_host().verifying_key()))
     }
 
     /// The same records in `store`, whatever key it was opened as.
     fn member_fixture_in(
         mut store: MemoryRepo,
-    ) -> (MemoryRepo, [u8; 32], [u8; 32], [u8; 32], [u8; 32]) {
+    ) -> (MemoryRepo, [u8; 32], [[u8; 32]; 8], [u8; 32]) {
         use triblespace_core::collection::CollectionStore;
         let signer = member_host();
         let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
         let collection: Collection<SimpleArchive> = store.collection("members", policy).unwrap();
-        let first = store
-            .commit(collection, &signer, entity! { metadata::name: "a" })
-            .unwrap();
-        let second = store
-            .commit(collection, &signer, entity! { metadata::name: "b" })
-            .unwrap();
+        let commits = ["a", "b", "c", "d", "e", "f", "g", "h"].map(|name| {
+            store.commit(collection, &signer, entity! { metadata::name: name }).unwrap()
+        });
         // A real join equation. Its result blob is deliberately not stored:
         // an endorsed merge whose bytes were collected is ordinary, and it is
         // exactly the case the drawing must not show as complete.
-        let result = Inline::new([0x77; 32]);
+        let snapshot = store.snapshot().unwrap();
+        let blobs: Vec<Blob<SimpleArchive>> = commits.iter().map(|commit| {
+            snapshot.get(Handle::<SimpleArchive>::from_hash(commit.data())).unwrap()
+        }).collect();
+        let joined = triblespace_core::collection::simplearchive_union::join_all(&blobs).unwrap();
+        let result = Handle::<SimpleArchive>::to_hash(joined.get_handle());
+        assert!(!snapshot.contains_blob(joined.get_handle()).unwrap());
+        drop(snapshot);
         let merge = CollectionMerge::sign(
             &signer,
             collection.handle(),
-            [first.data(), second.data()],
+            commits.iter().map(|commit| commit.data()),
             result,
         )
         .unwrap();
@@ -1798,17 +1790,16 @@ mod tests {
         (
             store,
             collection.handle().raw,
-            first.data().raw,
-            second.data().raw,
+            commits.each_ref().map(|commit| commit.data().raw),
             result.raw,
         )
     }
 
     #[test]
-    fn a_merge_puts_both_of_its_inputs_under_its_result() {
-        // The join equation is the lattice. If the two inputs do not both land
-        // below the result, the picture is not of `low join high = result`.
-        let (mut store, collection, first, second, result) = member_fixture();
+    fn a_merge_puts_all_eight_inputs_under_its_result() {
+        // Every input must land below the result for the picture to be the
+        // eight-input join equation, not just a subset of its edges.
+        let (mut store, collection, inputs, result) = member_fixture();
         let snapshot = store.snapshot().unwrap();
         let members = observe_members(&snapshot, collection, MEMBER_LIMIT).unwrap();
         let at = |handle: [u8; 32]| {
@@ -1818,18 +1809,20 @@ mod tests {
                 .position(|member| member.handle == handle)
                 .expect("member projected")
         };
-        assert_eq!(members.members.len(), 3);
+        assert_eq!(members.members.len(), 9);
         assert_eq!(
             members.joins,
             {
-                let mut expected = vec![(at(first), at(result)), (at(second), at(result))];
+                let mut expected: Vec<_> = inputs.iter().map(|input| (at(*input), at(result))).collect();
                 expected.sort_unstable();
                 expected
             },
-            "both inputs feed the one result"
+            "all eight inputs feed the one result"
         );
-        assert!(members.members[at(first)].committed);
-        assert!(members.members[at(first)].resident);
+        for input in inputs {
+            assert!(members.members[at(input)].committed);
+            assert!(members.members[at(input)].resident);
+        }
         assert!(
             !members.members[at(result)].committed,
             "a join result is computed, never authored"
@@ -1838,7 +1831,7 @@ mod tests {
             !members.members[at(result)].resident,
             "its bytes were never stored, and must draw as the hole they are"
         );
-        assert_eq!(members.unproduced, 0, "both inputs are commits here");
+        assert_eq!(members.unproduced, 0, "all inputs are commits here");
     }
 
     #[test]
@@ -1900,7 +1893,7 @@ mod tests {
         let (mut store, collection, ..) = member_fixture();
         let snapshot = store.snapshot().unwrap();
         let members = observe_members(&snapshot, collection, 2).unwrap();
-        assert_eq!(members.too_large, Some(3));
+        assert_eq!(members.too_large, Some(9));
         assert!(members.members.is_empty());
         assert!(members.joins.is_empty());
     }
@@ -1966,7 +1959,7 @@ mod tests {
         // waiting on a grant -- nobody can issue one, because there is no
         // record here to admit -- and drawing it as such would send a reader
         // to ask the wrong person for the wrong thing.
-        let (mut store, collection, first, _second, result) = member_fixture();
+        let (mut store, collection, inputs, result) = member_fixture();
         let snapshot = store.snapshot().unwrap();
         let members = observe_members(&snapshot, collection, MEMBER_LIMIT).unwrap();
         let at = |handle: [u8; 32]| {
@@ -1978,7 +1971,9 @@ mod tests {
         };
         // The fixture is an open collection, so everything it records is
         // admitted; nothing here is ever Unadmitted.
-        assert_eq!(at(first).admission, Admission::Admitted);
+        for input in inputs {
+            assert_eq!(at(input).admission, Admission::Admitted);
+        }
         assert_eq!(at(result).admission, Admission::Admitted);
         assert!(members
             .members
@@ -1989,23 +1984,36 @@ mod tests {
     #[test]
     fn a_member_known_only_as_a_join_input_is_counted_not_hidden() {
         use triblespace_core::collection::CollectionStore;
-        let (mut store, collection, first, second, result) = member_fixture();
+        let (mut store, collection, inputs, result) = member_fixture();
         // The host's own join, so it is part of this lattice; it waits on the
         // orphan, which has no support, so no reader descends it and it is
         // drawn apart from the driven join below it.
         let signer = member_host();
-        // Join the earlier result with a member nothing here produces.
+        // Join the earlier result, six supported constituents and a member
+        // nothing here produces: exactly one input still lacks support.
         // Deliberately NOT committed anywhere: `unproduced` counts handles
         // that are neither committed nor produced, so a commit for the orphan
         // would make the assertion below false. One was built here and never
         // inserted, which is the only reason the test passed -- it contradicts
         // the premise rather than establishing it.
-        let orphan = Inline::new([0x44; 32]);
+        let orphan_blob: Blob<SimpleArchive> = entity! { metadata::name: "orphan" }
+            .facts().clone().to_blob();
+        let orphan = Handle::<SimpleArchive>::to_hash(orphan_blob.get_handle());
+        let snapshot = store.snapshot().unwrap();
+        let mut blobs: Vec<Blob<SimpleArchive>> = inputs.iter().map(|input| {
+            snapshot.get(Handle::<SimpleArchive>::from_hash(Inline::new(*input))).unwrap()
+        }).collect();
+        drop(snapshot);
+        blobs.push(orphan_blob);
+        let waiting_blob = triblespace_core::collection::simplearchive_union::join_all(&blobs).unwrap();
+        let waiting_result = Handle::<SimpleArchive>::to_hash(waiting_blob.get_handle());
+        let waiting_inputs: Vec<_> = inputs[..6].iter().copied().map(Inline::new)
+            .chain([Inline::new(result), orphan]).collect();
         let merge = CollectionMerge::sign(
             &signer,
             CollectionHandle::new(collection),
-            [Inline::new(result), orphan],
-            Inline::new([0x55; 32]),
+            waiting_inputs.iter().copied(),
+            waiting_result,
         )
         .unwrap();
         store.insert(CollectionRecord::Merge(merge)).unwrap();
@@ -2019,7 +2027,7 @@ mod tests {
             members.members.iter().any(|m| m.handle == orphan.raw),
             "and it is still drawn"
         );
-        assert!(members.members.iter().any(|m| m.handle == first));
+        assert!(inputs.iter().all(|input| members.members.iter().any(|m| m.handle == *input)));
 
         let at = |handle: [u8; 32]| {
             members
@@ -2028,14 +2036,12 @@ mod tests {
                 .position(|member| member.handle == handle)
                 .expect("member projected")
         };
-        let waiting_result = [0x55; 32];
-        let mut driven = vec![(at(first), at(result)), (at(second), at(result))];
+        let waiting_result = waiting_result.raw;
+        let mut driven: Vec<_> = inputs.iter().map(|input| (at(*input), at(result))).collect();
         driven.sort_unstable();
         assert_eq!(members.joins, driven, "the driven join is solid");
-        let mut waiting = vec![
-            (at(result), at(waiting_result)),
-            (at(orphan.raw), at(waiting_result)),
-        ];
+        let mut waiting: Vec<_> = waiting_inputs.iter()
+            .map(|input| (at(input.raw), at(waiting_result))).collect();
         waiting.sort_unstable();
         assert_eq!(
             members.waiting, waiting,
@@ -2057,15 +2063,32 @@ mod tests {
         // result are therefore not part of the lattice a reader here attaches,
         // and drawing them would show merges nothing reads.
         use triblespace_core::collection::CollectionStore;
-        let (mut store, collection, first, second, result) = member_fixture();
+        let (mut store, collection, inputs, result) = member_fixture();
         let stranger = ed25519_dalek::SigningKey::from_bytes(&[23; 32]);
-        let foreign = Inline::new([0x66; 32]);
+        // Give the foreign join a genuinely different, fully supported input
+        // set and its actual union. It is ignored for its signer, not because
+        // an input is absent or the claimed result was invented.
+        let extra_blob: Blob<SimpleArchive> = entity! { metadata::name: "extra" }
+            .facts().clone().to_blob();
+        let extra = Handle::<SimpleArchive>::to_hash(store.put(extra_blob).unwrap());
+        store.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &stranger, CollectionHandle::new(collection), extra, empty_metadata_handle(),
+        ))).unwrap();
+        let foreign_inputs: Vec<_> = inputs[..7].iter().copied().map(Inline::new)
+            .chain([extra]).collect();
+        let snapshot = store.snapshot().unwrap();
+        let blobs: Vec<Blob<SimpleArchive>> = foreign_inputs.iter().map(|input| {
+            snapshot.get(Handle::<SimpleArchive>::from_hash(*input)).unwrap()
+        }).collect();
+        let joined = triblespace_core::collection::simplearchive_union::join_all(&blobs).unwrap();
+        let foreign = Handle::<SimpleArchive>::to_hash(joined.get_handle());
+        drop(snapshot);
         store
             .insert(CollectionRecord::Merge(
                 CollectionMerge::sign(
                     &stranger,
                     CollectionHandle::new(collection),
-                    [Inline::new(first), Inline::new(second)],
+                    foreign_inputs,
                     foreign,
                 )
                 .unwrap(),
@@ -2078,8 +2101,8 @@ mod tests {
             "another key's join result is not a member here"
         );
         let handles: BTreeSet<[u8; 32]> = members.members.iter().map(|m| m.handle).collect();
-        assert_eq!(handles, BTreeSet::from([first, second, result]));
-        assert_eq!(members.joins.len(), 2, "only the host's join is drawn");
+        assert_eq!(handles, inputs.into_iter().chain([extra.raw, result]).collect::<BTreeSet<_>>());
+        assert_eq!(members.joins.len(), 8, "only the host's join is drawn");
         assert!(
             members.waiting.is_empty(),
             "another key's join is not drawn as waiting either"
@@ -2088,12 +2111,12 @@ mod tests {
 
         // Opened as no key, the same records believe no MERGE at all: the
         // commits are the whole lattice and nothing joins them.
-        let (mut keyless, collection, first, second, result) =
+        let (mut keyless, collection, inputs, result) =
             member_fixture_in(MemoryRepo::default());
         let snapshot = keyless.snapshot().unwrap();
         let members = observe_members(&snapshot, collection, MEMBER_LIMIT).unwrap();
         let handles: BTreeSet<[u8; 32]> = members.members.iter().map(|m| m.handle).collect();
-        assert_eq!(handles, BTreeSet::from([first, second]));
+        assert_eq!(handles, BTreeSet::from(inputs));
         assert!(!handles.contains(&result));
         assert!(members.joins.is_empty());
         assert!(members.waiting.is_empty());

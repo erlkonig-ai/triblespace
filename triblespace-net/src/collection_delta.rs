@@ -12,20 +12,22 @@
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
+use anybytes::View;
 
 use triblespace_core::collection::{
-    CollectionHandle, CollectionRead, CollectionRecord, CollectionRecordFingerprint,
-    CollectionRecordSelector, RecordDecodeError,
+    CollectionHandle, CollectionRead, CollectionRecord, CollectionRecordView, CollectionRecordFingerprint,
+    CollectionRecordSelector, RecordDecodeError, EncodedCommit, EncodedDerive,
 };
 use triblespace_core::patch::{Blake3Merkle, Entry as PatchEntry, IdentitySchema, PATCH};
 
 use crate::patch_repair::PatchSummary;
 
-/// Canonical valued PATCH of the records naming one exact collection.
+/// Two canonical per-kind PATCH roots naming one exact collection.
 #[derive(Clone, Debug)]
 pub struct CollectionRecordPatch {
     collection: CollectionHandle,
-    records: PATCH<32, IdentitySchema, CollectionRecord, Blake3Merkle>,
+    commits: PATCH<32, IdentitySchema, View<EncodedCommit>, Blake3Merkle>,
+    derives: PATCH<32, IdentitySchema, View<EncodedDerive>, Blake3Merkle>,
 }
 
 impl CollectionRecordPatch {
@@ -34,38 +36,65 @@ impl CollectionRecordPatch {
         self.collection
     }
 
-    /// Root and count of this immutable per-collection PATCH.
-    pub fn summary(&self) -> PatchSummary {
-        PatchSummary::from_patch(&self.records)
+    /// Independent COMMIT and DERIVE summaries, never a synthetic union root.
+    pub fn summaries(&self) -> [PatchSummary; 2] {
+        [PatchSummary::from_patch(&self.commits), PatchSummary::from_patch(&self.derives)]
     }
 
     /// Number of canonical records in this collection overlay.
     pub fn len(&self) -> u64 {
-        self.records.len()
+        self.commits.len() + self.derives.len()
     }
 
     /// Whether this collection overlay has no known records.
     pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
+        self.commits.is_empty() && self.derives.is_empty()
     }
 
-    /// Look up one record by its full-width physical fingerprint.
+    /// Test oracle only: production readers use kind-directed typed access.
+    #[cfg(test)]
     pub fn get(&self, fingerprint: CollectionRecordFingerprint) -> Option<CollectionRecord> {
-        self.records.get(&fingerprint.raw()).copied()
+        self.commits.get(&fingerprint.raw()).map(|v| CollectionRecord::Commit(v.to_record().unwrap()))
+            .or_else(|| self.derives.get(&fingerprint.raw()).map(|v| CollectionRecord::Derive(v.to_record().unwrap())))
     }
 
-    /// Enumerate canonical records in fingerprint order.
+    /// The immutable COMMIT fingerprint-to-body relation.
+    pub fn commits(&self) -> &PATCH<32, IdentitySchema, View<EncodedCommit>, Blake3Merkle> {
+        &self.commits
+    }
+
+    /// The immutable DERIVE fingerprint-to-body relation.
+    pub fn derives(&self) -> &PATCH<32, IdentitySchema, View<EncodedDerive>, Blake3Merkle> {
+        &self.derives
+    }
+
+    /// Test oracle; semantic decoding is deliberately absent from serving.
+    #[cfg(test)]
     pub fn records(&self) -> impl Iterator<Item = CollectionRecord> + '_ {
-        self.records.iter_ordered().map(|id| {
-            *self
-                .records
-                .get(id)
-                .expect("an ordered per-collection PATCH key retains its record value")
+        let mut commits = self.commits.iter_ordered().peekable();
+        let mut derives = self.derives.iter_ordered().peekable();
+        std::iter::from_fn(move || {
+            let key = match (commits.peek(), derives.peek()) {
+                (Some(c), Some(d)) if c <= d => commits.next(),
+                (Some(_), Some(_)) | (None, Some(_)) => derives.next(),
+                (Some(_), None) => commits.next(),
+                (None, None) => None,
+            }?;
+            self.get(CollectionRecordFingerprint::from_raw(*key))
         })
     }
 
-    pub(crate) const fn patch(&self) -> &PATCH<32, IdentitySchema, CollectionRecord, Blake3Merkle> {
-        &self.records
+    fn empty(collection: CollectionHandle) -> Self {
+        Self { collection, commits: PATCH::new(), derives: PATCH::new() }
+    }
+
+    /// Exact bytes are checked before PATCH's key-only equality can shortcut.
+    fn matches(&self, fingerprint: CollectionRecordFingerprint, record: &CollectionRecordView) -> Option<bool> {
+        let key = fingerprint.raw();
+        if let Some(existing) = self.commits.get(&key) {
+            return Some(record.as_commit().is_some_and(|v| v.body_bytes() == existing.body_bytes()));
+        }
+        self.derives.get(&key).map(|existing| record.as_derive().is_some_and(|v| v.body_bytes() == existing.body_bytes()))
     }
 }
 
@@ -154,7 +183,7 @@ where
 {
     let selectors = BTreeSet::from([CollectionRecordSelector::Foundations(collection)]);
     let records = snapshot
-        .select_records(&selectors)
+        .select_record_views(&selectors)
         .map_err(CollectionRecordPatchError::Store)?;
     canonical_records(collection, records).map_err(CollectionRecordPatchError::Evidence)
 }
@@ -174,36 +203,34 @@ where
     let expected = prior.collection;
     let selectors = BTreeSet::from([CollectionRecordSelector::Foundations(expected)]);
     let (added, removed) = current
-        .select_record_changes(previous, &selectors)
+        .select_record_view_changes(previous, &selectors)
         .map_err(CollectionRecordPatchError::Store)?;
     // Operation-local deltas: edit the retained Merkle trie once per batch,
     // rather than rehashing its wide ancestors after every changed record.
     // PATCH equality only observes keys, so validate attached values before
     // either structural operation can short-circuit an equal subtree.
-    let mut removals = PATCH::new();
+    let mut removals = CollectionRecordPatch::empty(expected);
     for record in removed {
-        validate_record(expected, record).map_err(CollectionRecordPatchError::Evidence)?;
+        validate_view(expected, &record).map_err(CollectionRecordPatchError::Evidence)?;
         let fingerprint = record.fingerprint();
-        let key = fingerprint.raw();
-        if let Some(existing) = prior.records.get(&key) {
-            if existing != &record {
+        if let Some(matches) = prior.matches(fingerprint, &record) {
+            if !matches {
                 return Err(CollectionRecordPatchError::Evidence(
                     CollectionDeltaError::FingerprintCollision(fingerprint),
                 ));
             }
-            removals.insert(&PatchEntry::with_value(&key, record));
+            insert_record(expected, &mut removals, record)
+                .map_err(CollectionRecordPatchError::Evidence)?;
         }
     }
     let mut next = prior.clone();
-    next.records = next.records.difference(&removals);
-    let mut additions = PATCH::new();
+    next.commits = next.commits.difference(&removals.commits);
+    next.derives = next.derives.difference(&removals.derives);
+    let mut additions = CollectionRecordPatch::empty(expected);
     for record in added {
-        validate_record(expected, record).map_err(CollectionRecordPatchError::Evidence)?;
+        validate_view(expected, &record).map_err(CollectionRecordPatchError::Evidence)?;
         let fingerprint = record.fingerprint();
-        if next
-            .get(fingerprint)
-            .is_some_and(|existing| existing != record)
-        {
+        if next.matches(fingerprint, &record) == Some(false) {
             return Err(CollectionRecordPatchError::Evidence(
                 CollectionDeltaError::FingerprintCollision(fingerprint),
             ));
@@ -213,7 +240,8 @@ where
         insert_record(expected, &mut additions, record)
             .map_err(CollectionRecordPatchError::Evidence)?;
     }
-    next.records.union(additions);
+    next.commits.union(additions.commits);
+    next.derives.union(additions.derives);
     Ok(next)
 }
 
@@ -258,35 +286,45 @@ fn validate_record(
     Ok(())
 }
 
-fn canonical_records(
+fn validate_view(expected: CollectionHandle, record: &CollectionRecordView) -> Result<(), CollectionDeltaError> {
+    if record.collection() != expected { return Err(CollectionDeltaError::WrongCollection); }
+    if !record.is_foundation() { return Err(CollectionDeltaError::NotReplicated); }
+    Ok(())
+}
+
+fn canonical_records<R: Into<CollectionRecordView>>(
     expected: CollectionHandle,
-    records: impl IntoIterator<Item = CollectionRecord>,
+    records: impl IntoIterator<Item = R>,
 ) -> Result<CollectionRecordPatch, CollectionDeltaError> {
-    let mut canonical = PATCH::new();
+    let mut canonical = CollectionRecordPatch::empty(expected);
     for record in records {
         insert_record(expected, &mut canonical, record)?;
     }
-    Ok(CollectionRecordPatch {
-        collection: expected,
-        records: canonical,
-    })
+    Ok(canonical)
 }
 
 fn insert_record(
     expected: CollectionHandle,
-    canonical: &mut PATCH<32, IdentitySchema, CollectionRecord, Blake3Merkle>,
-    record: CollectionRecord,
+    canonical: &mut CollectionRecordPatch,
+    record: impl Into<CollectionRecordView>,
 ) -> Result<(), CollectionDeltaError> {
-    validate_record(expected, record)?;
+    let record = record.into();
+    validate_view(expected, &record)?;
     let fingerprint = record.fingerprint();
     let key = fingerprint.raw();
-    if let Some(existing) = canonical.get(&key) {
-        if existing != &record {
+    if let Some(matches) = canonical.matches(fingerprint, &record) {
+        if !matches {
             return Err(CollectionDeltaError::FingerprintCollision(fingerprint));
         }
         return Ok(());
     }
-    canonical.insert(&PatchEntry::with_value(&key, record));
+    if let Some(value) = record.as_commit() {
+        canonical.commits.insert(&PatchEntry::with_value(&key, value.clone()));
+    } else if let Some(value) = record.as_derive() {
+        canonical.derives.insert(&PatchEntry::with_value(&key, value.clone()));
+    } else {
+        unreachable!("validate_view admits only foundations");
+    }
     Ok(())
 }
 
@@ -295,13 +333,17 @@ fn insert_record(
 mod batch_tests;
 
 #[cfg(test)]
+#[path = "collection_body_view_tests.rs"]
+mod body_view_tests;
+
+#[cfg(test)]
 mod tests {
     use std::cell::Cell;
     use std::convert::Infallible;
 
     use ed25519_dalek::SigningKey;
     use triblespace_core::collection::{
-        COLLECTION_RECORD_KIND_MERGE_V4, CollectionCommit, CollectionData, CollectionDerive,
+        CollectionCommit, CollectionData, CollectionDerive,
         CollectionMerge, empty_metadata_handle,
     };
     use triblespace_core::inline::Inline;
@@ -328,7 +370,7 @@ mod tests {
                 CollectionMerge::sign(
                     &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                     expected,
-                    [data(2), data(3)],
+                    [2, 3, 5, 6, 7, 8, 9, 10].map(data),
                     data(4),
                 )
                 .unwrap(),
@@ -451,7 +493,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut bytes = std::fs::read(file.path()).unwrap();
-        bytes[physical.offset + 64 + record.to_bytes().len() - 2] ^= 1;
+        bytes[physical.offset + 32 + record.to_bytes().len() - 2] ^= 1;
         std::fs::write(file.path(), bytes).unwrap();
         let physical = PileRecords::open(file.path())
             .unwrap()
@@ -463,7 +505,9 @@ mod tests {
         };
         assert!(evidence.verify_strict().is_err());
         let patch = canonical_records(expected, [evidence]).unwrap();
-        assert_eq!(patch.get(evidence.fingerprint()), Some(evidence));
+        let view = patch.derives().get(&evidence.fingerprint().raw()).unwrap();
+        assert_eq!(view.body_bytes(), &evidence.to_bytes());
+        assert_eq!(crate::walk::Value::Derive(view.clone()).bytes(expected).unwrap(), evidence.to_bytes());
         let outbound = encode_record(expected, evidence).unwrap();
         assert!(decode_record(expected, &outbound).is_err());
     }
@@ -491,7 +535,7 @@ mod tests {
         let mut tampered = bytes;
         // Every field is in the signature transcript, not an unauthenticated
         // retrieval hint: flipping one bit of the output breaks the record.
-        tampered[1 + 2 * 32] ^= 1;
+        tampered[2 * 32] ^= 1;
         assert!(decode_record(target, &tampered).is_err());
     }
 
@@ -501,19 +545,16 @@ mod tests {
         let merge = CollectionMerge::sign(
             &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
             expected,
-            [data(2), data(3)],
+            [2, 3, 5, 6, 7, 8, 9, 10].map(data),
             data(4),
         )
         .unwrap();
         let mut bytes = merge.to_bytes();
-        // The inputs follow the six fixed 32-byte slots.
-        bytes[192..224].fill(9);
-        bytes[224..256].fill(1);
-        let mut tagged = Vec::with_capacity(1 + bytes.len());
-        tagged.push(COLLECTION_RECORD_KIND_MERGE_V4);
-        tagged.extend_from_slice(&bytes);
+        // The inputs follow kind, collection, result and author.
+        bytes[128..160].fill(9);
+        bytes[160..192].fill(1);
         assert!(matches!(
-            decode_record(expected, &tagged),
+            decode_record(expected, &bytes),
             Err(CollectionDeltaError::Decode(
                 RecordDecodeError::NonCanonicalMergeInputs
             ))

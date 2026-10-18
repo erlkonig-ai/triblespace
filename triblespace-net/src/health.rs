@@ -31,7 +31,8 @@ pub const MAX_HEALTH_PEERS_PER_COLLECTION: usize = 128;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RepairFrontier {
     pub wake_root: [u8; 32],
-    pub records: PatchSummary,
+    pub commits: PatchSummary,
+    pub derives: PatchSummary,
     pub authorization_evidence: PatchSummary,
 }
 
@@ -39,7 +40,8 @@ impl RepairFrontier {
     /// Equality of the collection's repair evidence, independent of caching.
     /// Demand and shallow peers may intentionally retain different bodies.
     pub fn same_evidence(&self, other: &Self) -> bool {
-        self.records == other.records && self.authorization_evidence == other.authorization_evidence
+        self.commits == other.commits && self.derives == other.derives
+            && self.authorization_evidence == other.authorization_evidence
     }
 }
 
@@ -47,7 +49,8 @@ impl From<CollectionRepairManifest> for RepairFrontier {
     fn from(manifest: CollectionRepairManifest) -> Self {
         Self {
             wake_root: manifest.wake_root,
-            records: manifest.records,
+            commits: manifest.commits,
+            derives: manifest.derives,
             authorization_evidence: manifest.authorization_evidence,
         }
     }
@@ -87,22 +90,25 @@ impl Ends {
 /// health.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Roots {
-    pub records: Option<PatchSummary>,
+    pub commits: Option<PatchSummary>,
+    pub derives: Option<PatchSummary>,
     pub authorization_evidence: Option<PatchSummary>,
 }
 
 impl Roots {
     fn set(&mut self, kind: WalkKind, root: PatchSummary) {
         match kind {
-            WalkKind::Records => self.records = Some(root),
+            WalkKind::Commit => self.commits = Some(root),
+            WalkKind::Derive => self.derives = Some(root),
             WalkKind::Authorization => self.authorization_evidence = Some(root),
             WalkKind::References => {}
         }
     }
 
-    /// Whether both roots are those of `frontier`.
+    /// Whether all three semantic roots are those of `frontier`.
     pub fn hold(&self, frontier: &RepairFrontier) -> bool {
-        self.records == Some(frontier.records)
+        self.commits == Some(frontier.commits)
+            && self.derives == Some(frontier.derives)
             && self.authorization_evidence == Some(frontier.authorization_evidence)
     }
 }
@@ -126,6 +132,10 @@ pub struct PeerHealth {
     pub receives: Ends,
     /// What the peer pushed that landed whole here.
     pub received: Roots,
+    /// Latest successful completion of each semantic receive component
+    /// (COMMIT, DERIVE, AUTH), cleared on its failure or disconnection. Roots
+    /// above remain last-landed diagnostics, not fresh-completion evidence.
+    received_complete_at: [Option<Mono>; 3],
 }
 
 impl PeerHealth {
@@ -137,6 +147,7 @@ impl PeerHealth {
             confirmed: Roots::default(),
             receives: Ends::default(),
             received: Roots::default(),
+            received_complete_at: [None; 3],
         }
     }
 
@@ -167,6 +178,20 @@ impl PeerHealth {
         if let Some(root) = root.filter(|_| landed) {
             self.received.set(kind, root);
         }
+        let component = match kind {
+            WalkKind::Commit => 0,
+            WalkKind::Derive => 1,
+            WalkKind::Authorization => 2,
+            // Held-blob availability is not semantic record/AUTH health.
+            WalkKind::References => return,
+        };
+        self.received_complete_at[component] = (landed && root.is_some()).then_some(at);
+    }
+
+    pub(crate) fn disconnected(&mut self) {
+        // Keep last-confirmed/landed roots as diagnostics, as before. Only
+        // receive completion needs fresh evidence on the next connection.
+        self.received_complete_at = [None; 3];
     }
 }
 
@@ -334,8 +359,12 @@ impl HealthSnapshot {
 
     /// Pairwise, time-bounded evidence only: `Current` once the peer
     /// confirmed the records and evidence this side serves now, where this
-    /// side sends, and the last push from the peer landed whole, where it
-    /// receives. A local record/AUTH advance, an unavailable or stale store
+    /// side sends, and each COMMIT/DERIVE/AUTH receive component completed
+    /// successfully within `max_age`, where it receives. Empty components
+    /// must complete too; a different kind's success cannot mask failure.
+    /// References never establish or invalidate receive-component completion;
+    /// the existing sending-direction last-end policy is unchanged.
+    /// A local record/AUTH advance, an unavailable or stale store
     /// observation, an ended peering or no push or receive within `max_age`
     /// leaves the pair `Unknown`. Catching-up/stalled policy belongs to the
     /// observer: use the ends and their times, not successful RPC counts.
@@ -376,7 +405,8 @@ impl HealthSnapshot {
                 && entry
                     .local_frontier
                     .is_some_and(|local| pair.confirmed.hold(&local)));
-        let receives = peering.receives && !pair.receives.last_ok;
+        let receives = peering.receives
+            && !pair.received_complete_at.iter().all(|at| fresh(*at, now, max_age));
         if pushes || receives {
             PairState::Behind { pushes, receives }
         } else {
@@ -527,7 +557,8 @@ mod tests {
     fn frontier(byte: u8, count: u64) -> RepairFrontier {
         RepairFrontier {
             wake_root: [byte; 32],
-            records: PatchSummary::new(Some([byte; 32]), count).unwrap(),
+            derives: PatchSummary::new(None, 0).unwrap(),
+            commits: PatchSummary::new(Some([byte; 32]), count).unwrap(),
             authorization_evidence: PatchSummary::new(None, 0).unwrap(),
         }
     }
@@ -572,18 +603,77 @@ mod tests {
     fn settle(health: &Health, collection: CollectionHandle, peer: PeerId, now: Mono) {
         health.with_peer(collection, peer, |pair| {
             let frontier = frontier(5, 1);
-            pair.pushed(now, WalkKind::Records, frontier.records, true);
+            pair.pushed(now, WalkKind::Commit, frontier.commits, true);
+            pair.pushed(now, WalkKind::Derive, frontier.derives, true);
             pair.pushed(
                 now,
                 WalkKind::Authorization,
                 frontier.authorization_evidence,
                 true,
             );
-            pair.received(now, WalkKind::Records, Some(frontier.records), true);
+            pair.received(now, WalkKind::Commit, Some(frontier.commits), true);
+            pair.received(now, WalkKind::Derive, Some(frontier.derives), true);
+            pair.received(now, WalkKind::Authorization, Some(frontier.authorization_evidence), true);
         });
     }
 
     const AGE: Duration = Duration::from_secs(180);
+
+    #[test]
+    fn receive_only_completion_isolated_by_foundation_kind() {
+        let (health, collection, peer, now) = fixture();
+        health.update(|sample| sample.peerings[0].sends = false);
+        let f = frontier(5, 1);
+        health.with_peer(collection, peer, |pair| {
+            pair.received(now, WalkKind::Derive, None, false);
+            pair.received(now, WalkKind::Authorization, Some(f.authorization_evidence), true);
+            pair.received(now, WalkKind::Commit, Some(f.commits), true);
+        });
+        assert_eq!(health.snapshot().pair(collection, peer, now, AGE),
+            PairState::Behind { pushes: false, receives: true });
+        health.with_peer(collection, peer, |pair| {
+            pair.received(now, WalkKind::Derive, Some(f.derives), true);
+        });
+        assert_eq!(health.snapshot().pair(collection, peer, now, AGE), PairState::Current);
+        health.with_peer(collection, peer, |pair| {
+            pair.received(now, WalkKind::Derive, Some(f.derives), false);
+            pair.received(now, WalkKind::Commit, Some(frontier(6, 2).commits), true);
+            pair.received(now, WalkKind::References, Some(f.derives), true);
+        });
+        assert_eq!(health.snapshot().pair(collection, peer, now, AGE),
+            PairState::Behind { pushes: false, receives: true });
+    }
+
+    #[test]
+    fn receive_completion_freshness_and_disconnect_do_not_reuse_old_roots() {
+        let (health, collection, peer, now) = fixture();
+        health.update(|sample| sample.peerings[0].sends = false);
+        settle(&health, collection, peer, now);
+        let later = now + AGE + Duration::from_secs(1);
+        health.update(|sample| {
+            sample.observed_at = Some(later);
+            sample.store.last_snapshot_observed_at = Some(later);
+        });
+        health.with_peer(collection, peer, |pair| {
+            pair.received(later, WalkKind::Commit, Some(frontier(6, 2).commits), true);
+        });
+        assert_eq!(health.snapshot().pair(collection, peer, later, AGE),
+            PairState::Behind { pushes: false, receives: true });
+        health.with_peer(collection, peer, |pair| {
+            pair.received(later, WalkKind::Derive, Some(frontier(6, 2).derives), true);
+            pair.received(later, WalkKind::Authorization, Some(frontier(6, 2).authorization_evidence), true);
+        });
+        assert_eq!(health.snapshot().pair(collection, peer, later, AGE), PairState::Current);
+        let confirmed = health.snapshot().collections[0].peers[0].confirmed;
+        health.with_peer(collection, peer, |pair| pair.disconnected());
+        assert_eq!(health.snapshot().collections[0].peers[0].confirmed, confirmed);
+        assert!(health.snapshot().collections[0].peers[0].received.derives.is_some(), "last-landed diagnostic root survives");
+        health.update(|sample| sample.peerings[0].peered = false);
+        assert_eq!(health.snapshot().pair(collection, peer, later, AGE), PairState::Unknown);
+        health.update(|sample| sample.peerings[0].peered = true);
+        assert_eq!(health.snapshot().pair(collection, peer, later, AGE),
+            PairState::Behind { pushes: false, receives: true });
+    }
 
     #[test]
     fn unknown_until_an_end_then_a_fresh_settled_pair_expires() {
@@ -632,14 +722,14 @@ mod tests {
             }
         );
         health.with_peer(collection, peer, |pair| {
-            pair.pushed(now, WalkKind::Records, frontier(6, 2).records, true);
+            pair.pushed(now, WalkKind::Commit, frontier(6, 2).commits, true);
         });
         assert_eq!(
             health.snapshot().pair(collection, peer, now, AGE),
             PairState::Current
         );
         health.with_peer(collection, peer, |pair| {
-            pair.pushed(now, WalkKind::Records, frontier(6, 2).records, false);
+            pair.pushed(now, WalkKind::Commit, frontier(6, 2).commits, false);
             pair.received(now, WalkKind::Authorization, None, false);
         });
         let pinned = health.snapshot();
@@ -651,10 +741,10 @@ mod tests {
             }
         );
         let pair = &pinned.collections[0].peers[0];
-        assert_eq!((pair.pushes.ok, pair.pushes.failed), (3, 1));
-        assert_eq!((pair.receives.ok, pair.receives.failed), (1, 1));
-        assert_eq!(pair.confirmed.records, Some(frontier(6, 2).records));
-        assert_eq!(pair.received.records, Some(frontier(5, 1).records));
+        assert_eq!((pair.pushes.ok, pair.pushes.failed), (4, 1));
+        assert_eq!((pair.receives.ok, pair.receives.failed), (3, 1));
+        assert_eq!(pair.confirmed.commits, Some(frontier(6, 2).commits));
+        assert_eq!(pair.received.commits, Some(frontier(5, 1).commits));
         assert_eq!(pair.first_at, Some(now));
 
         // A direction the peering does not have is never behind.
@@ -717,7 +807,7 @@ mod tests {
             let mut peer = [0; 32];
             peer[..8].copy_from_slice(&(index as u64).to_be_bytes());
             health.with_peer(collection, peer, |health| {
-                health.pushed(now, WalkKind::Records, frontier(1, 1).records, false)
+                health.pushed(now, WalkKind::Commit, frontier(1, 1).commits, false)
             });
         }
         assert_eq!(

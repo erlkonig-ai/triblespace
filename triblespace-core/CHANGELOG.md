@@ -7,11 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- Maintenance emits only eight-input MERGEs, with distinct canonically ordered
-  inputs, for both root and derived collections. Binary absorption is no longer
-  produced; underfull and dominated frontier nodes may remain. A union equal to
-  an input is valid, while an unfolded published witness still reports a stall.
-  Historical variable-arity record decoding and signatures are unchanged.
+- Add a synthetic native-Pile rewrite rehearsal, using actual deployed /32
+  writer fixtures and a test-only old-kind adapter. It copies validated BLOB
+  and AUTH frames unchanged, reseals owned foundations/MAP/exact-eight MERGE,
+  requires exact-author/field foreign refreshes, and withholds test-local
+  completion for unresolved evidence. Controlled interrupted attempts retry
+  into fresh files. This is not a migration CLI, admission/closure proof,
+  arbitrary crash-recovery guarantee, or live cutover.
+
+- Add a synthetic test-support prototype for offline /32 assertion conversion:
+  verify old bytes before same-author COMMIT/DERIVE re-attestation, preserve
+  original bytes and identity mappings, and explicitly leave foreign signers,
+  unsupported history and host-cache disposition unresolved. AUTH bytes remain
+  unchanged after existing verification. No runtime compatibility or rewrite CLI.
+- Unreleased canonical collection assertion candidate: one
+  `kind32 | fields | signature(kind32 | fields)` representation across native
+  Pile, ObjectStore, typed views and network bodies. Fingerprints hash those
+  exact complete bytes. COMMIT/DERIVE/MAP are 224 bytes with a common
+  collection/produced-member body prefix; MERGE is 448 bytes with exactly eight
+  distinct ordered inputs, no count, and signature last. AUTH is unchanged.
+  No deployment or automatic historical re-attestation is included.
+- Canonical description anchors minted with installed `trible genid` on
+  2026-10-17: COMMIT `FDB671F61026890184000D275E0AB0F7`,
+  DERIVE `5D09D99A2B549A60BEA9942E7E5752FD`,
+  MAP `3D52F26EC0A2852BF2ED998A3A8A56F5`,
+  MERGE `75B76CA9E028127AC06C550A156B469D`.
+- Full 224-byte archive-backed PATCH keys retain every signed field and the
+  kind, with direct kind/collection/member/tail segmentation. Sealed store
+  views keep complete root/archive ownership; public structural views require
+  strict conversion. Fixed duplicate occurrences collapse while diagnostics
+  retain physical occurrences. MERGE keeps its occurrence index; final index
+  selection remains independent of the canonical format.
+- Old native signatures are never wrapped in current kinds: old frames remain
+  opaque or explicitly retired evidence, and old dense wrappers are rejected.
+  Current eight-input MERGEs cannot supersede historical binary equations.
+- Align the SimpleArchive MERGE validator with eight-input production: bind
+  eight actual archive hashes and validate their streaming deduplicated union.
+  Maintenance produces no binary absorption or dummy inputs; an exact-eight
+  union may equal one input, and underfull/dominated frontier nodes may remain.
 
 - Add the endpoint register to `collection::selection`: where the sync
   daemon that runs as a key listens, one register per endpoint in the pile's

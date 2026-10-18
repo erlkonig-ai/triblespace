@@ -393,6 +393,18 @@ where
     ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
         self.frozen.select_records(selectors)
     }
+
+    fn select_record_views(
+        &self, selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<Vec<triblespace_core::collection::CollectionRecordView>, Self::RecordsError> {
+        self.frozen.select_record_views(selectors)
+    }
+
+    fn select_record_view_changes(
+        &self, previous: &Self, selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<(Vec<triblespace_core::collection::CollectionRecordView>, Vec<triblespace_core::collection::CollectionRecordView>), Self::RecordsError> {
+        self.frozen.select_record_view_changes(&previous.frozen, selectors)
+    }
 }
 
 impl<S: SnapshotSource> CapabilityProofRead for PeerSnapshot<S>

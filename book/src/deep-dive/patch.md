@@ -40,6 +40,23 @@ children, and update the owning pointer in place. Because every branch uses the
 same structure we avoid the tag soup and pointer chasing that ARTs rely on while
 still adapting to sparse and dense fan-out.
 
+`try_insert_with` adds a checked, lazy value insertion without changing
+`insert`'s first-value-wins or `replace`'s replacement behavior. Occupancy is
+decided by complete key bytes, not subtree fingerprints. One routing descent
+either validates the existing value or constructs the missing value. Unique
+branches update in place; shared branches copy only after an actual insertion.
+Callback errors or panics leave the prior root intact (apart from any interior
+mutation the callback itself performs). Values still do not participate in
+PATCH equality or set algebra.
+
+`iter_entries_ordered` streams borrowed key/value pairs in schema tree order;
+the returned keys retain their shared physical layout. A consuming ordered
+cursor's `next_with` instead visits one pair while it holds that leaf alive.
+Its callback can decode an owned result or clone a value that must escape, but
+cannot return a reference into the cursor. Neither traversal looks keys up a
+second time or materializes the complete output. Ordered traversal sorts each
+visited branch's at-most-256 child handles, not the full collection.
+
 ## Resizing strategy
 
 PATCH relies on two hash functions: an identity map and a pseudo-random

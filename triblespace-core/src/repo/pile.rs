@@ -55,14 +55,14 @@ use crate::collection::store::{selectors_match_record, CollectionRead};
 pub use crate::collection::LegacyUnsignedCollectionEquation;
 pub use crate::collection::RetiredCollectionEquation;
 use crate::collection::{
-    collection_merge_bytes_len, CollectionCommit, CollectionData, CollectionDerive,
+    CollectionCommit, CollectionData, CollectionDerive,
     CollectionHandle, CollectionMap, CollectionMerge, CollectionRecord, CollectionRecordSelector,
-    CollectionStore, SourceLocator, COLLECTION_MERGE_FIXED_BYTES_LEN, MAX_MERGE_INPUTS,
-    MIN_MERGE_INPUTS,
+    CollectionStore, COLLECTION_MERGE_BYTES_LEN,
 };
+#[cfg(test)]
+use crate::collection::SourceLocator;
 use crate::id::Id;
 use crate::id::RawId;
-use crate::inline::encodings::ed25519::{ED25519PublicKey, ED25519RComponent, ED25519SComponent};
 use crate::inline::encodings::hash::Blake3;
 use crate::inline::encodings::hash::Hash;
 use crate::inline::Inline;
@@ -81,6 +81,8 @@ use crate::repo::{
 #[cfg(test)]
 mod append_visibility_tests;
 mod record_kind;
+mod record_index;
+use record_index::CollectionRecordIndex;
 pub use record_kind::{described_kinds, description_blobs, RecordKind, KIND_PILE_RECORD};
 
 /// Self-description handle of the physical pile frame used for `record`.
@@ -493,7 +495,7 @@ mod collection_record_key {
 }
 
 type PileBlobIndex = PATCH<40, blob_occurrence_key::Schema, CachedValidation, XorSip128>;
-type CollectionRecordIndex = PATCH<72, collection_record_key::Schema, (), XorSip128>;
+type CollectionOccurrenceIndex = PATCH<72, collection_record_key::Schema, (), XorSip128>;
 type CapabilityProofIndex = PATCH<32, IdentitySchema, CapabilityProof, XorSip128>;
 type LegacyCollectionHeaderIndex = PATCH<V3_HEADER_LEN, IdentitySchema>;
 
@@ -596,8 +598,11 @@ fn collection_record_indexed(
     applied_length: usize,
     record: &CollectionRecord,
 ) -> bool {
+    if !matches!(record, CollectionRecord::Merge(_)) {
+        return index.contains_fixed(record);
+    }
     let mut present = false;
-    index.infixes(
+    index.occurrences.infixes(
         &collection_record_member_prefix(record),
         |offset: &[u8; 8]| {
             if !present {
@@ -650,7 +655,7 @@ fn retired_equation_at(
 
 /// Whether some frame under the same member already decodes to `equation`.
 fn retired_equation_indexed(
-    index: &CollectionRecordIndex,
+    index: &CollectionOccurrenceIndex,
     mmap: &MmapRaw,
     applied_length: usize,
     equation: &RetiredCollectionEquation,
@@ -1314,22 +1319,14 @@ struct RetiredCollectionMergeV8RecordHeader {
     reserved: [u8; 224],
 }
 
-/// One n-ary merge frame (pile kind v10): the frame, the dense record, and
-/// zero padding to `ceil((64 + 192 + 32k) / 256)` blocks.
+/// Generic recovery prefix, complete canonical MERGE, then 32 zero padding bytes.
 fn collection_merge_frame(record: &CollectionMerge) -> Vec<u8> {
     let dense = record.to_bytes();
-    let blocks = envelope_blocks_for_prefixed_payload(FRAME_BODY_OFFSET, dense.len())
-        .expect("a merge of at most sixteen inputs spans at most three blocks");
+    let blocks = 2u32;
     let frame_len = blocks as usize * ENVELOPE_BLOCK_LEN;
     let mut frame = Vec::with_capacity(frame_len);
-    frame.extend_from_slice(
-        RecordFrame {
-            magic: FRAME_MAGIC,
-            span_blocks: blocks.to_le_bytes(),
-            record_kind: record_kind::KIND_COLLECTION_MERGE,
-        }
-        .as_bytes(),
-    );
+    frame.extend_from_slice(&FRAME_MAGIC);
+    frame.extend_from_slice(&blocks.to_le_bytes());
     frame.extend_from_slice(&dense);
     frame.resize(frame_len, 0);
     frame
@@ -1370,7 +1367,7 @@ fn retired_equation_frame(equation: &RetiredCollectionEquation) -> Vec<u8> {
             public_key,
             signature_r,
             signature_s,
-        } => CollectionDeriveRecordHeader {
+        } => RetiredCollectionDeriveV9RecordHeader {
             magic: FRAME_MAGIC,
             span_blocks: 1u32.to_le_bytes(),
             record_kind: record_kind::KIND_COLLECTION_DERIVE_V9,
@@ -1399,10 +1396,22 @@ struct LegacyCollectionDeriveRecordHeader {
     reserved: [u8; 96],
 }
 
-/// Signed derive equation. Its six fields fill one block exactly. The
-/// locator DERIVE (pile kind v11) and the retired handle DERIVE (pile kind
-/// v9) share this layout; `input` is a locator in the first and a handle in
-/// the second.
+/// Retired handle DERIVE v9. Keep its original input-before-output offsets.
+#[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
+#[repr(C)]
+struct RetiredCollectionDeriveV9RecordHeader {
+    magic: [u8; FRAME_MAGIC_LEN],
+    span_blocks: [u8; 4],
+    record_kind: RawInline,
+    target: RawInline,
+    input: RawInline,
+    output: RawInline,
+    public_key: RawInline,
+    signature_r: RawInline,
+    signature_s: RawInline,
+}
+
+/// Current locator DERIVE, with the collection and produced blob first.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
 struct CollectionDeriveRecordHeader {
@@ -1410,8 +1419,8 @@ struct CollectionDeriveRecordHeader {
     span_blocks: [u8; 4],
     record_kind: RawInline,
     target: RawInline,
-    input: RawInline,
     output: RawInline,
+    input: RawInline,
     public_key: RawInline,
     signature_r: RawInline,
     signature_s: RawInline,
@@ -1444,8 +1453,8 @@ struct CollectionMapRecordHeader {
     span_blocks: [u8; 4],
     record_kind: RawInline,
     attached: RawInline,
-    node: RawInline,
     attachment: RawInline,
+    node: RawInline,
     public_key: RawInline,
     signature_r: RawInline,
     signature_s: RawInline,
@@ -1557,6 +1566,7 @@ const _: () = {
     assert!(std::mem::size_of::<LegacyCollectionDeriveRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<RetiredCollectionMergeV8RecordHeader>() == 2 * ENVELOPE_BLOCK_LEN);
     assert!(std::mem::size_of::<CollectionDeriveRecordHeader>() == ENVELOPE_HEADER_LEN);
+    assert!(std::mem::size_of::<RetiredCollectionDeriveV9RecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionMapRecordHeader>() == ENVELOPE_HEADER_LEN);
 };
 
@@ -2026,96 +2036,22 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
                 content: PileRecordContent::RetiredArtifactOfferV1,
             })
         }
-        record_kind::KIND_COLLECTION_COMMIT => {
+        record_kind::KIND_COLLECTION_COMMIT
+        | record_kind::KIND_COLLECTION_DERIVE
+        | record_kind::KIND_COLLECTION_MAP => {
             fixed_header()?;
-            let (header, _) =
-                CollectionCommitRecordHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
-            Ok(PileRecord {
-                offset,
-                len,
-                content: PileRecordContent::Collection {
-                    record: CollectionRecord::Commit(CollectionCommit::from_parts(
-                        Inline::new(header.collection),
-                        Inline::new(header.data),
-                        Inline::new(header.metadata),
-                        Inline::<ED25519PublicKey>::new(header.public_key),
-                        Inline::<ED25519RComponent>::new(header.signature_r),
-                        Inline::<ED25519SComponent>::new(header.signature_s),
-                    )),
-                },
-            })
+            let record = CollectionRecord::from_bytes_trusted(&bytes[FRAME_KIND_OFFSET..len])
+                .map_err(|_| corrupt())?;
+            Ok(PileRecord { offset, len, content: PileRecordContent::Collection { record } })
         }
         record_kind::KIND_COLLECTION_MERGE => {
-            // The count is a big-endian u32 in the last four bytes of the
-            // sixth dense slot, inside the first block. Bound it before the
-            // span arithmetic; the dense decoder repeats every check.
-            let count_at = FRAME_BODY_OFFSET + COLLECTION_MERGE_FIXED_BYTES_LEN - 4;
-            let count = u32::from_be_bytes(
-                bytes[count_at..count_at + 4]
-                    .try_into()
-                    .expect("the count lies inside the first block"),
-            ) as usize;
-            if !(MIN_MERGE_INPUTS..=MAX_MERGE_INPUTS).contains(&count) {
+            let canonical_end = FRAME_KIND_OFFSET + COLLECTION_MERGE_BYTES_LEN;
+            if declared_blocks != 2 || nonzero(&[&bytes[canonical_end..len]]) {
                 return Err(corrupt());
             }
-            let dense_len = collection_merge_bytes_len(count);
-            let expected_blocks =
-                envelope_blocks_for_prefixed_payload(FRAME_BODY_OFFSET, dense_len)
-                    .ok_or_else(corrupt)?;
-            if declared_blocks != expected_blocks {
-                return Err(corrupt());
-            }
-            let dense_end = FRAME_BODY_OFFSET + dense_len;
-            if nonzero(&[&bytes[dense_end..len]]) {
-                return Err(corrupt());
-            }
-            let record = CollectionMerge::from_bytes_trusted(&bytes[FRAME_BODY_OFFSET..dense_end])
+            let record = CollectionRecord::from_bytes_trusted(&bytes[FRAME_KIND_OFFSET..canonical_end])
                 .map_err(|_| corrupt())?;
-            Ok(PileRecord {
-                offset,
-                len,
-                content: PileRecordContent::Collection {
-                    record: CollectionRecord::Merge(record),
-                },
-            })
-        }
-        record_kind::KIND_COLLECTION_DERIVE => {
-            fixed_header()?;
-            let (header, _) =
-                CollectionDeriveRecordHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
-            Ok(PileRecord {
-                offset,
-                len,
-                content: PileRecordContent::Collection {
-                    record: CollectionRecord::Derive(CollectionDerive::from_parts(
-                        Inline::new(header.target),
-                        SourceLocator::from_raw(header.input),
-                        Inline::new(header.output),
-                        Inline::new(header.public_key),
-                        Inline::new(header.signature_r),
-                        Inline::new(header.signature_s),
-                    )),
-                },
-            })
-        }
-        record_kind::KIND_COLLECTION_MAP => {
-            fixed_header()?;
-            let (header, _) =
-                CollectionMapRecordHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
-            Ok(PileRecord {
-                offset,
-                len,
-                content: PileRecordContent::Collection {
-                    record: CollectionRecord::Map(CollectionMap::from_parts(
-                        Inline::new(header.attached),
-                        Inline::new(header.node),
-                        Inline::new(header.attachment),
-                        Inline::new(header.public_key),
-                        Inline::new(header.signature_r),
-                        Inline::new(header.signature_s),
-                    )),
-                },
-            })
+            Ok(PileRecord { offset, len, content: PileRecordContent::Collection { record } })
         }
         record_kind::KIND_COLLECTION_MERGE_V8 => {
             if declared_blocks != 2 {
@@ -2145,7 +2081,7 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
         record_kind::KIND_COLLECTION_DERIVE_V9 => {
             fixed_header()?;
             let (header, _) =
-                CollectionDeriveRecordHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+                RetiredCollectionDeriveV9RecordHeader::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
             Ok(PileRecord {
                 offset,
                 len,
@@ -2383,15 +2319,8 @@ fn decode_enveloped_record_v1(bytes: &[u8], offset: usize) -> Result<PileRecord,
             Ok(PileRecord {
                 offset,
                 len,
-                content: PileRecordContent::Collection {
-                    record: CollectionRecord::Commit(CollectionCommit::from_parts(
-                        Inline::new(header.collection),
-                        Inline::new(header.data),
-                        Inline::new(header.metadata),
-                        Inline::<ED25519PublicKey>::new(header.public_key),
-                        Inline::<ED25519RComponent>::new(header.signature_r),
-                        Inline::<ED25519SComponent>::new(header.signature_s),
-                    )),
+                content: PileRecordContent::Opaque {
+                    kind: OpaqueKind::Legacy(MAGIC_MARKER_COLLECTION_COMMIT_V4),
                 },
             })
         }
@@ -2708,15 +2637,8 @@ fn decode_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
             Ok(PileRecord {
                 offset,
                 len: V3_HEADER_LEN,
-                content: PileRecordContent::Collection {
-                    record: CollectionRecord::Commit(CollectionCommit::from_parts(
-                        Inline::new(header.collection),
-                        Inline::new(header.data),
-                        Inline::new(header.metadata),
-                        Inline::<ED25519PublicKey>::new(header.public_key),
-                        Inline::<ED25519RComponent>::new(header.signature_r),
-                        Inline::<ED25519SComponent>::new(header.signature_s),
-                    )),
+                content: PileRecordContent::Opaque {
+                    kind: OpaqueKind::Legacy(MAGIC_MARKER_COLLECTION_COMMIT_V4),
                 },
             })
         }
@@ -2991,9 +2913,8 @@ pub struct PileFile {
     /// carries its own lazy validation byte inline.
     blobs: PileBlobIndex,
     branches: PATCH<16, IdentitySchema, Inline<Handle<SimpleArchive>>>,
-    /// Every collection record's frame, keyed by
-    /// `collection || produced member || offset_be`. Key-only: the record is
-    /// read from its frame when asked for.
+    /// Exact fixed native record roots plus the disjoint variable-record
+    /// occurrence relation. Fixed records retain their original body bytes.
     collection_records: CollectionRecordIndex,
     /// Complete canonical proofs keyed by the BLAKE3 identity of exact bytes.
     /// Each value owns its validated mmap-backed view, shared by snapshots and readers.
@@ -3005,7 +2926,7 @@ pub struct PileFile {
     /// Every retired signed equation's frame (pile kinds v8 and v9), keyed
     /// like `collection_records`. Inert, but carried through retained
     /// rewrites so the clean-pile migration can read them.
-    retired_equations: CollectionRecordIndex,
+    retired_equations: CollectionOccurrenceIndex,
     /// Number of structurally valid records whose semantics this reader cannot
     /// safely interpret. This includes unknown generic-envelope kinds and
     /// retired local-cell encodings with former ownership semantics. Known
@@ -3071,7 +2992,7 @@ pub struct PileFileSnapshot {
     blobs: PileBlobIndex,
     collection_records: CollectionRecordIndex,
     legacy_collection_headers: LegacyCollectionHeaderIndex,
-    retired_equations: CollectionRecordIndex,
+    retired_equations: CollectionOccurrenceIndex,
     capability_proofs: CapabilityProofIndex,
     wants: PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>,
     /// The pile's retired capability-proof frames as of this prefix.
@@ -3105,7 +3026,7 @@ impl PileFileSnapshot {
         blobs: PileBlobIndex,
         collection_records: CollectionRecordIndex,
         legacy_collection_headers: LegacyCollectionHeaderIndex,
-        retired_equations: CollectionRecordIndex,
+        retired_equations: CollectionOccurrenceIndex,
         capability_proofs: CapabilityProofIndex,
         wants: PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>,
         retired_proof_frames: Arc<Vec<(usize, usize)>>,
@@ -3478,26 +3399,7 @@ impl super::StoreSnapshot for PileFileSnapshot {
                 .shares_root(&previous.collection_records)
         } else {
             dependencies.records.iter().any(|selector| {
-                let collection = match selector {
-                    CollectionRecordSelector::ProducedMember(collection, output)
-                    | CollectionRecordSelector::CommitMember(collection, output) => {
-                        let mut prefix = [0; 64];
-                        prefix[..32].copy_from_slice(&collection.raw);
-                        prefix[32..].copy_from_slice(&output.raw);
-                        return !self
-                            .collection_records
-                            .shares_prefix(&previous.collection_records, &prefix);
-                    }
-                    CollectionRecordSelector::Collection(collection)
-                    | CollectionRecordSelector::MergeCollection(collection)
-                    | CollectionRecordSelector::DeriveTarget(collection)
-                    | CollectionRecordSelector::Foundations(collection) => collection,
-                };
-                // Kind selectors conservatively share the whole collection
-                // prefix; exact producer routes above are narrower.
-                !self
-                    .collection_records
-                    .shares_prefix(&previous.collection_records, &collection.raw)
+                !self.collection_records.shares_selected(&previous.collection_records, selector)
             })
         };
         if records_changed {
@@ -3937,7 +3839,7 @@ impl PileFile {
             collection_records: CollectionRecordIndex::new(),
             capability_proofs: CapabilityProofIndex::new(),
             legacy_collection_headers: LegacyCollectionHeaderIndex::new(),
-            retired_equations: CollectionRecordIndex::new(),
+            retired_equations: CollectionOccurrenceIndex::new(),
             opaque_records: 0,
             opaque_frames: Vec::new(),
             retired_proof_frames: Arc::new(Vec::new()),
@@ -4069,23 +3971,23 @@ impl PileFile {
             PileRecordContent::RetiredWantAssert { .. }
             | PileRecordContent::RetiredWantRetract { .. } => Applied::RetiredWantState,
             PileRecordContent::Collection { record } => {
-                // Every frame is indexed, including one that repeats a record
-                // an earlier frame already holds. Replay used to compare each
-                // frame against every earlier producer of the same member,
-                // decoding each to check, so a member with k producers cost
-                // about k²/2 decodes: 294 million per open of a 68 GB pile,
-                // ~98% of a faculty call's CPU, and it never collapsed
-                // anything, since a byte-level scan of that pile found all
-                // 1,367,796 of its collection frames distinct. Nothing needs
-                // it here. `insert` still refuses to append a record the file
-                // holds, so a repeated frame can only come from concatenating
-                // piles; the coverage fold is idempotent, so seeing a record
-                // twice changes nothing it derives; and the reads that promise
-                // each record once skip repeats within the member's run of
-                // keys. The price is an extra index entry per repeated frame,
-                // until a compaction rewrites the pile through `insert`.
-                self.collection_records
-                    .insert(&Entry::new(&collection_record_key(&record, start_offset)));
+                if !matches!(record, CollectionRecord::Merge(_)) {
+                    // Semantic replay has one fixed-record layout. Raw
+                    // inspection and explicit reframe still decode historical
+                    // frames, but they must be migrated before opening here.
+                    if !slice.starts_with(&FRAME_MAGIC) {
+                        return Err(ReadError::UnsupportedRecord {
+                            offset: start_offset,
+                            marker: slice[..16].try_into().expect("decoded frame marker"),
+                        });
+                    }
+                    self.collection_records.insert_current_fixed(&record, slice, &self.mmap)?;
+                } else {
+                    // MERGE retains the occurrence path. The other kinds
+                    // never get an occurrence leaf in this relation.
+                    self.collection_records.occurrences
+                        .insert(&Entry::new(&collection_record_key(&record, start_offset)));
+                }
                 Applied::Collection { record }
             }
             PileRecordContent::CapabilityProof {
@@ -4453,6 +4355,7 @@ impl BlobStoreList for PileFileSnapshot {
 /// the index walked in key order, each record read from its frame and handed
 /// out once, however many frames hold it.
 pub struct PileCollectionRecordIter {
+    fixed: record_index::FixedRecordIter,
     keys: crate::patch::PATCHIntoOrderedIterator<72, collection_record_key::Schema, (), XorSip128>,
     mmap: Arc<MmapRaw>,
     covered_len: usize,
@@ -4507,6 +4410,9 @@ impl Iterator for PileCollectionRecordIter {
     type Item = Result<CollectionRecord, ReadError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(record) = self.fixed.next() {
+            return Some(Ok(record));
+        }
         loop {
             let key = self.keys.next()?;
             let offset =
@@ -4742,19 +4648,74 @@ impl PileFile {
 
 impl crate::collection::covered::RecordDelta for PileFileSnapshot {
     fn for_each_record_since(&self, since: Option<&Self>, each: &mut dyn FnMut(&CollectionRecord)) {
-        let fresh = match since {
+        let mut fresh = match since {
             Some(since) => self
                 .collection_records
                 .difference(&since.collection_records),
             None => self.collection_records.clone(),
         };
-        for key in fresh.iter_ordered() {
-            each(&self.record_at(&key[64..].try_into().expect("key tail is the offset")));
+        let independent = since.filter(|old| !Arc::ptr_eq(&self.record_origin, &old.record_origin));
+        if independent.is_some() {
+            fresh.occurrences = self.collection_records.occurrences.clone();
+        }
+        let occurrences = fresh.occurrences.clone();
+        for record in fresh.into_fixed() {
+            each(&record);
+        }
+        // Same-origin MERGE preserves the occurrence feed: repeated physical
+        // evidence is harmless to the idempotent coverage/held consumers. It
+        // must not cause a history scan for every fresh witness.
+        // Only independent origins need semantic comparison. These sets are
+        // scratch for one member within this invocation, never retained state.
+        let mut member: Option<[u8; 64]> = None;
+        let mut prior = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        for key in occurrences.iter_ordered() {
+            let record = self.record_at(key[64..].try_into().expect("offset tail"));
+            if let Some(old) = independent {
+                let prefix: [u8; 64] = key[..64].try_into().unwrap();
+                if member != Some(prefix) {
+                    prior.clear();
+                    seen.clear();
+                    old.collection_records.occurrences.infixes(&prefix, |offset: &[u8; 8]| {
+                        prior.insert(old.record_at(offset));
+                    });
+                    member = Some(prefix);
+                }
+                if !prior.contains(&record) && seen.insert(record) {
+                    each(&record);
+                }
+            } else {
+                each(&record);
+            }
         }
     }
 }
 
 impl PileFileSnapshot {
+    /// Physical offsets are not fixed-record identity. Rewrites that need
+    /// first-frame positions/census reconstruct this sorted scratch relation
+    /// from their frozen prefix, rather than retaining it on every replay.
+    fn collection_occurrences(&self) -> Result<Vec<[u8; 72]>, ReadError> {
+        // SAFETY: the snapshot owns this immutable applied prefix. The Bytes
+        // directly shares its existing MmapRaw owner, with no new mapping.
+        let bytes = unsafe {
+            Bytes::from_raw_parts(
+                &*slice_from_raw_parts(self.mmap.as_ptr(), self.covered_len),
+                self.mmap.clone(),
+            )
+        };
+        let mut keys = Vec::new();
+        for frame in (PileRecords { bytes, offset: 0, failed: false }) {
+            let frame = frame?;
+            if let PileRecordContent::Collection { record } = frame.content {
+                keys.push(collection_record_key(&record, frame.offset));
+            }
+        }
+        keys.sort_unstable();
+        Ok(keys)
+    }
+
     fn select_record_index(
         &self,
         index: &CollectionRecordIndex,
@@ -4763,6 +4724,8 @@ impl PileFileSnapshot {
         if selectors.is_empty() {
             return Ok(Vec::new());
         }
+        let mut result = index.select_fixed(selectors);
+        let index = &index.occurrences;
         let mut keys = Vec::new();
         let mut frames_under = |prefix: [u8; 64]| {
             index.infixes(&prefix, |offset: &[u8; 8]| {
@@ -4774,8 +4737,7 @@ impl PileFileSnapshot {
         };
         for selector in selectors {
             let collection = match selector {
-                CollectionRecordSelector::ProducedMember(collection, output)
-                | CollectionRecordSelector::CommitMember(collection, output) => {
+                CollectionRecordSelector::ProducedMember(collection, output) => {
                     let mut prefix = [0; 64];
                     prefix[..32].copy_from_slice(&collection.raw);
                     prefix[32..].copy_from_slice(&output.raw);
@@ -4783,9 +4745,10 @@ impl PileFileSnapshot {
                     continue;
                 }
                 CollectionRecordSelector::Collection(collection)
-                | CollectionRecordSelector::MergeCollection(collection)
-                | CollectionRecordSelector::DeriveTarget(collection)
-                | CollectionRecordSelector::Foundations(collection) => collection,
+                | CollectionRecordSelector::MergeCollection(collection) => collection,
+                CollectionRecordSelector::CommitMember(..)
+                | CollectionRecordSelector::DeriveTarget(_)
+                | CollectionRecordSelector::Foundations(_) => continue,
             };
             // An infix is one segment: the members first, then each
             // member's frames.
@@ -4805,14 +4768,15 @@ impl PileFileSnapshot {
         keys.sort_unstable();
         keys.dedup();
         let mut run = MemberRun::new();
-        Ok(keys
+        result.extend(keys
             .iter()
             .filter_map(|key| {
                 let record = self.record_at(key[64..].try_into().expect("key tail is the offset"));
                 (selectors_match_record(selectors, record) && run.first(key, record))
                     .then_some(record)
             })
-            .collect())
+        );
+        Ok(result)
     }
 
     /// The record whose frame the index named.
@@ -4833,7 +4797,8 @@ impl CollectionRead for PileFileSnapshot {
     /// of the index, and the mapping it reads from.
     fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
         Ok(PileCollectionRecordIter {
-            keys: self.collection_records.clone().into_iter_ordered(),
+            fixed: self.collection_records.clone().into_fixed(),
+            keys: self.collection_records.occurrences.clone().into_iter_ordered(),
             mmap: self.mmap.clone(),
             covered_len: self.covered_len,
             run: MemberRun::new(),
@@ -4843,12 +4808,7 @@ impl CollectionRead for PileFileSnapshot {
     /// The first segment of the record index, one entry per collection; no
     /// frame is read.
     fn collections(&self) -> Result<Vec<CollectionHandle>, Self::RecordsError> {
-        let mut collections = Vec::new();
-        self.collection_records
-            .infixes(&[], |collection: &[u8; 32]| {
-                collections.push(Inline::new(*collection));
-            });
-        Ok(collections)
+        Ok(self.collection_records.collections())
     }
 
     fn select_records(
@@ -4856,6 +4816,36 @@ impl CollectionRead for PileFileSnapshot {
         selectors: &BTreeSet<CollectionRecordSelector>,
     ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
         self.select_record_index(&self.collection_records, selectors)
+    }
+
+    fn select_record_views(
+        &self,
+        selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<Vec<crate::collection::CollectionRecordView>, Self::RecordsError> {
+        if selectors.is_empty() { return Ok(Vec::new()); }
+        // Native body views serve the foundation overlay boundary.
+        // Other selections retain the existing backend algorithm and codec.
+        if selectors.iter().all(|s| matches!(s, CollectionRecordSelector::Foundations(_))) {
+            return Ok(self.collection_records.select_foundation_views(selectors));
+        }
+        Ok(self.select_records(selectors)?.into_iter().map(Into::into).collect())
+    }
+
+    fn select_record_view_changes(
+        &self,
+        previous: &Self,
+        selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<(Vec<crate::collection::CollectionRecordView>, Vec<crate::collection::CollectionRecordView>), Self::RecordsError> {
+        if selectors.is_empty() { return Ok((Vec::new(), Vec::new())); }
+        if selectors.iter().all(|s| matches!(s, CollectionRecordSelector::Foundations(_))) {
+            return Ok((
+                self.collection_records.difference(&previous.collection_records).select_foundation_views(selectors),
+                previous.collection_records.difference(&self.collection_records).select_foundation_views(selectors),
+            ));
+        }
+        // In particular, keep the prior exact MERGE comparison unchanged.
+        let (added, removed) = self.select_record_changes(previous, selectors)?;
+        Ok((added.into_iter().map(Into::into).collect(), removed.into_iter().map(Into::into).collect()))
     }
 
     fn select_record_changes(
@@ -4866,18 +4856,18 @@ impl CollectionRead for PileFileSnapshot {
         if selectors.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
-        // Physical keys can name different bytes in independently opened or
-        // rewritten piles. Only a shared append-only reader lineage proves
-        // offset identity. In-place overwrites violate snapshot immutability.
-        if !Arc::ptr_eq(&self.record_origin, &previous.record_origin) {
-            return crate::collection::store::selected_record_changes(self, previous, selectors);
-        }
-        let added = self
+        let mut added = self
             .collection_records
             .difference(&previous.collection_records);
-        let removed = previous
+        let mut removed = previous
             .collection_records
             .difference(&self.collection_records);
+        // Fixed keys use fingerprint identity across owners and offsets. Only
+        // MERGE occurrence keys still need lineage-qualified offsets.
+        if !Arc::ptr_eq(&self.record_origin, &previous.record_origin) {
+            added.occurrences = self.collection_records.occurrences.clone();
+            removed.occurrences = previous.collection_records.occurrences.clone();
+        }
         let added: BTreeSet<_> = self
             .select_record_index(&added, selectors)?
             .into_iter()
@@ -5854,26 +5844,6 @@ fn equation_key(
     (collection, low, high, result)
 }
 
-/// The binary equation a current record states, if it states one a retired
-/// frame could also state: a two-input MERGE. A locator DERIVE names no
-/// source handle, so no retired frame shares its equation.
-fn record_equation_key(record: &CollectionRecord) -> Option<EquationKey> {
-    match record {
-        CollectionRecord::Merge(record) => match record.inputs() {
-            [low, high] => Some(equation_key(
-                record.collection().raw,
-                low.raw,
-                high.raw,
-                record.result().raw,
-            )),
-            _ => None,
-        },
-        CollectionRecord::Derive(_) | CollectionRecord::Commit(_) | CollectionRecord::Map(_) => {
-            None
-        }
-    }
-}
-
 /// The equation a retired signed record states. It endorsed exactly what an
 /// older retired frame with the same key did, so it supersedes that frame.
 fn retired_equation_equation_key(equation: &RetiredCollectionEquation) -> EquationKey {
@@ -6021,8 +5991,7 @@ pub struct RetainedRewritePlan {
 /// The encoding generation of one collection-algebra frame.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CollectionFrameGeneration {
-    /// A current COMMIT, n-ary MERGE (pile kind v10) or locator DERIVE (pile
-    /// kind v11).
+    /// A current literal-prefix COMMIT, exact-eight MERGE, locator DERIVE, or MAP.
     Current,
     /// A signed equation under a kind lattice v2 retired: the binary MERGE
     /// (pile kind v8) or the handle DERIVE (pile kind v9).
@@ -6765,11 +6734,8 @@ impl PileFile {
         };
         match mode {
             FrameRetention::EveryIndexedFrame => {
-                for key in reader.collection_records.iter() {
-                    root_record(
-                        &mut roots,
-                        reader.record_at(key[64..].try_into().expect("key tail is the offset")),
-                    );
+                for record in reader.records().expect("indexed snapshot") {
+                    root_record(&mut roots, record.expect("indexed record"));
                 }
                 for handle in reader.legacy_unsigned_collection_references() {
                     if resident(handle) {
@@ -7027,20 +6993,10 @@ impl PileFile {
         self.physical_rewrite_guard()
             .map_err(PileRewriteError::Source)?;
         let covered = reader.covered_len;
-        let collection_records = reader.collection_records.clone();
-        // A retired equation, unsigned or signed under a retired kind, is
-        // inert evidence kept for one purpose, an explicit endorsement. Once
-        // a current signed equation with the same collection, inputs and
-        // result is present, that purpose is served and the old frame is
-        // baggage: it is not carried. One without a twin still is, as the
-        // only evidence something could endorse.
+        // Current exact-eight MERGEs and locator DERIVEs cannot state a
+        // retired binary/handle equation. Only an identical retired signed
+        // equation can supersede older evidence of that same equation.
         let mut signed_equations = BTreeSet::new();
-        for key in collection_records.iter_ordered() {
-            let record = reader.record_at(key[64..].try_into().expect("key tail is the offset"));
-            if let Some(equation) = record_equation_key(&record) {
-                signed_equations.insert(equation);
-            }
-        }
         // The retired signed kinds v8 and v9 are themselves carried, but they
         // endorse the same equations older retired frames did, so they
         // supersede those frames exactly as they did while they were live.
@@ -7061,8 +7017,8 @@ impl PileFile {
             .collect();
         if !drained.is_empty() {
             let mut candidates: BTreeSet<[u8; 32]> = BTreeSet::new();
-            for key in collection_records.iter_ordered() {
-                candidates.insert(key[..32].try_into().expect("key head is the collection"));
+            for collection in reader.collections().map_err(PileRewriteError::Source)? {
+                candidates.insert(collection.raw);
             }
             for equation in reader.retired_collection_equations() {
                 candidates.insert(equation.collection().raw);
@@ -7225,7 +7181,10 @@ impl PileFile {
 
         let mut current_records = Vec::new();
         let mut run = MemberRun::new();
-        for key in collection_records.iter_ordered() {
+        // Operation-local physical scratch, released before returning the
+        // prepared plan. Preserve its established collection/member/offset
+        // order, first occurrence, filter calls and repeated-frame accounting.
+        for key in &reader.collection_occurrences().map_err(PileRewriteError::Source)? {
             let offset: [u8; 8] = key[64..].try_into().expect("key tail is the offset");
             let record = reader.record_at(&offset);
             if !run.first(key, record) {
@@ -7273,6 +7232,7 @@ impl PileFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("pile/record_index_tests.rs");
     use crate::repo::WANT_REQUEST_KIND_DERIVE_V1;
 
     use ed25519_dalek::SigningKey;
@@ -7599,8 +7559,9 @@ mod tests {
 
         let low = collection_test_hash(6);
         let high = collection_test_hash(7);
+        let inputs = [6, 7, 10, 11, 12, 13, 14, 15].map(collection_test_hash);
         let result = collection_test_hash(8);
-        for payload in [low, high] {
+        for payload in inputs {
             pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
                 &authority,
                 collection.handle(),
@@ -7610,7 +7571,7 @@ mod tests {
             .unwrap();
         }
         pile.insert(CollectionRecord::Merge(
-            CollectionMerge::sign(&authority, collection.handle(), [low, high], result).unwrap(),
+            CollectionMerge::sign(&authority, collection.handle(), inputs, result).unwrap(),
         ))
         .unwrap();
         pile.refresh().unwrap();
@@ -7634,7 +7595,7 @@ mod tests {
                 .coverage_index()
                 .coverage(lineage, result)
                 .map(|row| row.len()),
-            Some(2)
+            Some(8)
         );
         // A commit stands for itself and nothing else.
         assert_eq!(
@@ -7657,12 +7618,12 @@ mod tests {
         let path = fresh_empty_pile_path(&dir, "coverage-rebuild.pile");
         let authority = SigningKey::from_bytes(&[0xAA; 32]);
         let low = collection_test_hash(6);
-        let high = collection_test_hash(7);
+        let inputs = [6, 7, 10, 11, 12, 13, 14, 15].map(collection_test_hash);
         let result = collection_test_hash(8);
         let handle = {
             let mut pile = Pile::open_as(&path, authority.verifying_key()).unwrap();
             let collection = register_simplearchive_collection(&mut pile, "coverage-rebuild");
-            for payload in [low, high] {
+            for payload in inputs {
                 pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
                     &authority,
                     collection.handle(),
@@ -7672,7 +7633,7 @@ mod tests {
                 .unwrap();
             }
             pile.insert(CollectionRecord::Merge(
-                CollectionMerge::sign(&authority, collection.handle(), [low, high], result)
+                CollectionMerge::sign(&authority, collection.handle(), inputs, result)
                     .unwrap(),
             ))
             .unwrap();
@@ -7689,7 +7650,7 @@ mod tests {
                 .coverage_index()
                 .coverage(handle, result)
                 .map(|row| row.len()),
-            Some(2)
+            Some(8)
         );
         assert!(reopened
             .snapshot()
@@ -7792,10 +7753,9 @@ mod tests {
         let mut pile = Pile::open_as(&path, authority.verifying_key()).unwrap();
         let collection = register_simplearchive_collection(&mut pile, "coverage-agreement");
 
-        let low = collection_test_hash(6);
-        let high = collection_test_hash(7);
+        let inputs = [6, 7, 10, 11, 12, 13, 14, 15].map(collection_test_hash);
         let result = collection_test_hash(8);
-        for payload in [low, high] {
+        for payload in inputs {
             pile.insert(CollectionRecord::Commit(CollectionCommit::sign(
                 &authority,
                 collection.handle(),
@@ -7805,7 +7765,7 @@ mod tests {
             .unwrap();
         }
         pile.insert(CollectionRecord::Merge(
-            CollectionMerge::sign(&authority, collection.handle(), [low, high], result).unwrap(),
+            CollectionMerge::sign(&authority, collection.handle(), inputs, result).unwrap(),
         ))
         .unwrap();
         // A record nobody can admit, one naming a collection with no
@@ -7823,7 +7783,7 @@ mod tests {
             CollectionMerge::sign(
                 &stranger,
                 collection.handle(),
-                [low, high],
+                inputs,
                 collection_test_hash(10),
             )
             .unwrap(),
@@ -7864,7 +7824,7 @@ mod tests {
                 CollectionMerge::sign(
                     &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                     source,
-                    [collection_test_hash(6), collection_test_hash(7)],
+                    [6, 7, 10, 11, 12, 13, 14, 15].map(collection_test_hash),
                     collection_test_hash(8),
                 )
                 .unwrap(),
@@ -8469,89 +8429,60 @@ mod tests {
         let high = collection_test_hash(84);
         assert!(low < high);
         let merge = CollectionRecord::Merge(
-            CollectionMerge::sign(&signer, collection, [low, high], collection_test_hash(85))
+            CollectionMerge::sign(&signer, collection, [83, 84, 86, 87, 88, 89, 90, 91].map(collection_test_hash), collection_test_hash(85))
                 .unwrap(),
         );
         let mut frame = collection_record_header(&merge);
-        // The inputs follow the six fixed dense slots, from envelope byte 256.
-        assert_eq!(&frame[256..288], low.raw.as_slice());
-        frame[256..288].copy_from_slice(&high.raw);
-        frame[288..320].copy_from_slice(&low.raw);
+        // Inputs follow kind, collection, result and author, at frame byte 160.
+        assert_eq!(&frame[160..192], low.raw.as_slice());
+        frame[160..192].copy_from_slice(&high.raw);
+        frame[192..224].copy_from_slice(&low.raw);
         assert!(matches!(
             decode_record(&frame, 0),
             Err(ReadError::CorruptPile { valid_length: 0 })
         ));
     }
 
-    /// An n-ary merge frame spans exactly `ceil((256 + 32k) / 256)` blocks,
-    /// decodes back to the record, and every other framing of it is corrupt.
+    /// Canonical MERGE occupies 448 bytes, followed by exactly 32 carrier padding bytes.
     #[test]
-    fn n_ary_merge_frames_span_by_arity_and_refuse_noncanonical_framing() {
+    fn fixed_eight_merge_frame_refuses_noncanonical_framing() {
         let key = SigningKey::from_bytes(&[91; 32]);
-        let collection = collection_test_collection(92);
-        let merge = |count: u8| {
-            CollectionMerge::sign(
-                &key,
-                collection,
-                (1..=count).map(collection_test_hash),
-                collection_test_hash(200),
-            )
-            .unwrap()
-        };
-        for (count, blocks) in [(2u8, 2usize), (7, 2), (8, 2), (9, 3), (16, 3)] {
-            let record = CollectionRecord::Merge(merge(count));
-            let frame = collection_record_header(&record);
-            assert_eq!(frame.len(), blocks * ENVELOPE_BLOCK_LEN, "{count} inputs");
-            let decoded = decode_record(&frame, 0).unwrap();
-            assert_eq!(decoded.len, frame.len());
-            assert!(matches!(
-                decoded.content,
-                PileRecordContent::Collection { record: decoded } if decoded == record
-            ));
-            let dense_end = FRAME_BODY_OFFSET + collection_merge_bytes_len(count as usize);
-            assert_eq!(
-                &frame[FRAME_BODY_OFFSET..dense_end],
-                &record.to_bytes()[1..]
-            );
-            assert!(frame[dense_end..].iter().all(|byte| *byte == 0));
-        }
-        // Eight inputs fill two blocks exactly: no padding at all.
-        assert_eq!(
-            FRAME_BODY_OFFSET + collection_merge_bytes_len(8),
-            2 * ENVELOPE_BLOCK_LEN
-        );
+        let record = CollectionRecord::Merge(CollectionMerge::sign(
+            &key,
+            collection_test_collection(92),
+            (1..=8).map(collection_test_hash),
+            collection_test_hash(200),
+        ).unwrap());
+        let frame = collection_record_header(&record);
+        assert_eq!(frame.len(), 2 * ENVELOPE_BLOCK_LEN);
+        let decoded = decode_record(&frame, 0).unwrap();
+        assert_eq!(decoded.len, frame.len());
+        assert!(matches!(decoded.content, PileRecordContent::Collection { record: decoded } if decoded == record));
+        let canonical_end = FRAME_KIND_OFFSET + COLLECTION_MERGE_BYTES_LEN;
+        assert_eq!(&frame[FRAME_KIND_OFFSET..canonical_end], record.to_bytes());
+        assert_eq!(canonical_end, 480);
+        assert!(frame[canonical_end..].iter().all(|byte| *byte == 0));
 
-        let frame = collection_record_header(&CollectionRecord::Merge(merge(3)));
-        let corrupt = |frame: &[u8]| {
-            matches!(
-                decode_record(frame, 0),
-                Err(ReadError::CorruptPile { valid_length: 0 })
-            )
-        };
-        // A span one block longer than the arity needs.
-        let mut long = frame.clone();
-        long[FRAME_MAGIC_LEN..FRAME_MAGIC_LEN + 4].copy_from_slice(&3u32.to_le_bytes());
-        long.extend_from_slice(&[0; ENVELOPE_BLOCK_LEN]);
-        assert!(corrupt(&long));
-        // A count below two, above sixteen, or naming zero padding as inputs.
-        for count in [0u32, 1, 17, 4] {
-            let mut arity = frame.clone();
-            arity[252..256].copy_from_slice(&count.to_be_bytes());
-            assert!(corrupt(&arity), "count {count}");
+        let corrupt = |frame: &[u8]| matches!(
+            decode_record(frame, 0),
+            Err(ReadError::CorruptPile { valid_length: 0 })
+        );
+        for blocks in [1u32, 3] {
+            let mut wrong_span = frame.clone();
+            wrong_span[FRAME_MAGIC_LEN..FRAME_MAGIC_LEN + 4].copy_from_slice(&blocks.to_le_bytes());
+            wrong_span.resize(blocks as usize * ENVELOPE_BLOCK_LEN, 0);
+            assert!(corrupt(&wrong_span));
         }
-        // A nonzero count pad, and nonzero padding after the last input.
-        let mut pad = frame.clone();
-        pad[224] = 1;
-        assert!(corrupt(&pad));
         let mut tail = frame.clone();
         *tail.last_mut().unwrap() = 1;
         assert!(corrupt(&tail));
-        // A duplicated input.
         let mut duplicate = frame.clone();
-        let (first, second) = (256..288, 288..320);
-        let copy = duplicate[first].to_vec();
-        duplicate[second].copy_from_slice(&copy);
+        let first = duplicate[160..192].to_vec();
+        duplicate[192..224].copy_from_slice(&first);
         assert!(corrupt(&duplicate));
+        for length in [32, 256, 479, 480, 511] {
+            assert!(decode_record(&frame[..length], 0).is_err());
+        }
     }
 
     #[test]
@@ -8570,8 +8501,9 @@ mod tests {
             &frame[FRAME_BODY_OFFSET - 32..FRAME_BODY_OFFSET],
             record_kind::KIND_COLLECTION_DERIVE.as_slice()
         );
-        assert_eq!(&frame[96..128], derive.input().as_bytes().as_slice());
-        assert_ne!(&frame[96..128], source_payload.raw.as_slice());
+        assert_eq!(&frame[96..128], derive.output().raw.as_slice());
+        assert_eq!(&frame[128..160], derive.input().as_bytes().as_slice());
+        assert_ne!(&frame[128..160], source_payload.raw.as_slice());
         assert!(matches!(
             decode_record(&frame, 0).unwrap().content,
             PileRecordContent::Collection {
@@ -8595,7 +8527,7 @@ mod tests {
             &frame[FRAME_BODY_OFFSET - 32..FRAME_BODY_OFFSET],
             record_kind::KIND_COLLECTION_MAP.as_slice()
         );
-        assert_eq!(&frame[FRAME_BODY_OFFSET..], map.to_bytes().as_slice());
+        assert_eq!(&frame[FRAME_KIND_OFFSET..], map.to_bytes().as_slice());
         assert!(matches!(
             decode_record(&frame, 0).unwrap().content,
             PileRecordContent::Collection {
@@ -8774,9 +8706,9 @@ mod tests {
             // A commit's six 32-byte fields fill 64..256 exactly: the tightest
             // record the pile writes, and the one that fixes the body offset.
             (record_kind::KIND_COLLECTION_COMMIT, 1, None),
-            // A two-input merge: 64 framing bytes, six fixed slots and two
-            // inputs end at 320; the rest of the second block is zero.
-            (record_kind::KIND_COLLECTION_MERGE, 2, Some(320usize)),
+            // The 448-byte canonical MERGE begins at frame byte 32;
+            // only the final 32 carrier-padding bytes are zero.
+            (record_kind::KIND_COLLECTION_MERGE, 2, Some(480usize)),
             // A derive's six fields fill one block exactly, just as a commit's
             // do.
             (record_kind::KIND_COLLECTION_DERIVE, 1, None),
@@ -9338,7 +9270,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v4_commit_remains_current_and_unsigned_equations_are_inert() {
+    fn legacy_v4_commits_and_unsigned_equations_remain_inert() {
         for record in collection_test_records() {
             let mut header = [0u8; V3_HEADER_LEN];
             match record {
@@ -9359,9 +9291,8 @@ mod tests {
                     );
                 }
                 CollectionRecord::Merge(merge) => {
-                    let &[low, high] = merge.inputs() else {
-                        unreachable!("binary fixture merge")
-                    };
+                    // Historical binary fixture, not an encoding of the current eight-input assertion.
+                    let [low, high] = [merge.inputs()[0], merge.inputs()[1]];
                     header.copy_from_slice(
                         CollectionMergeHeaderV4 {
                             magic_marker: MAGIC_MARKER_COLLECTION_MERGE_V4,
@@ -9401,9 +9332,7 @@ mod tests {
                     PileRecordContent::RetiredCollectionDeriveV4
                 )),
                 CollectionRecord::Merge(merge) => {
-                    let &[low, high] = merge.inputs() else {
-                        unreachable!("binary fixture merge")
-                    };
+                    let [low, high] = [merge.inputs()[0], merge.inputs()[1]];
                     let expected = LegacyUnsignedCollectionEquation::Merge {
                         collection: merge.collection(),
                         low,
@@ -9417,7 +9346,7 @@ mod tests {
                 }
                 CollectionRecord::Commit(_) => assert!(matches!(
                     decoded.content,
-                    PileRecordContent::Collection { record: decoded } if decoded == record
+                    PileRecordContent::Opaque { .. }
                 )),
                 CollectionRecord::Map(_) => unreachable!("the fixture holds no MAP"),
             }
@@ -9433,7 +9362,7 @@ mod tests {
             let mut header = collection_record_header(&record);
             // Alter S, not framing or MERGE padding. Raw replay is deliberately
             // structural; checked dense ingress is a different boundary.
-            header[FRAME_BODY_OFFSET + record.to_bytes().len() - 2] ^= 1;
+            header[FRAME_KIND_OFFSET + record.to_bytes().len() - 2] ^= 1;
             append_test_bytes(&source_path, &header);
         }
         let mut source = Pile::open(&source_path).unwrap();
@@ -10379,14 +10308,13 @@ mod tests {
         let mut second = PileFile::open(&second_path).unwrap();
         second.insert(replacement).unwrap();
         let replaced = second.snapshot().unwrap();
-        // `before` also indexes the repeated frame, so the control is that
-        // every key `replaced` holds is one `before` holds too.
-        assert_eq!(before.collection_records.len(), 2);
+        // The physical census remains separate from logical keys. Identical
+        // C/member/offset coordinates may name different canonical records.
+        assert_eq!(before.collection_occurrences().unwrap().len(), 2);
+        assert_eq!(before.collection_records.len(), 1);
         assert!(
-            replaced
-                .collection_records
-                .difference(&before.collection_records)
-                .is_empty(),
+            before.collection_occurrences().unwrap()
+                .contains(&replaced.collection_occurrences().unwrap()[0]),
             "control: identical C/member/offset keys can hold different record bodies"
         );
         assert_eq!(
@@ -10504,13 +10432,12 @@ mod tests {
         let doubled_path = dir.path().join("repeat-doubled.pile");
         let compact_path = fresh_empty_pile_path(&dir, "repeat-compact.pile");
         let authority = SigningKey::from_bytes(&[0xAA; 32]);
-        let low = collection_test_hash(6);
-        let high = collection_test_hash(7);
+        let inputs = [6, 7, 10, 11, 12, 13, 14, 15].map(collection_test_hash);
         let result = collection_test_hash(8);
         let (lineage, records) = {
             let mut pile = Pile::open_as(&single_path, authority.verifying_key()).unwrap();
             let lineage = register_simplearchive_collection(&mut pile, "repeat").handle();
-            let mut records: Vec<_> = [low, high]
+            let mut records: Vec<_> = inputs
                 .into_iter()
                 .map(|payload| {
                     CollectionRecord::Commit(CollectionCommit::sign(
@@ -10522,7 +10449,7 @@ mod tests {
                 })
                 .collect();
             records.push(CollectionRecord::Merge(
-                CollectionMerge::sign(&authority, lineage, [low, high], result).unwrap(),
+                CollectionMerge::sign(&authority, lineage, inputs, result).unwrap(),
             ));
             for record in &records {
                 pile.insert(*record).unwrap();
@@ -10539,10 +10466,11 @@ mod tests {
         let mut repeated = Pile::open_as(&doubled_path, authority.verifying_key()).unwrap();
         let one = single.snapshot().unwrap();
         let two = repeated.snapshot().unwrap();
-        // Control: the repeat really is indexed, once per frame.
+        // Control: physical history still holds both copies, independently
+        // of exact fixed-record keys collapsing them during replay.
         assert_eq!(
-            two.collection_records.len(),
-            2 * one.collection_records.len()
+            two.collection_occurrences().unwrap().len(),
+            2 * one.collection_occurrences().unwrap().len()
         );
         assert_eq!(
             two.records()
@@ -10566,7 +10494,7 @@ mod tests {
             one.coverage_index()
                 .coverage(lineage, result)
                 .map(|row| row.len()),
-            Some(2),
+            Some(8),
             "control: the fixture derives something"
         );
         let (one_coverage, two_coverage) = (one.coverage(), two.coverage());
@@ -10574,7 +10502,7 @@ mod tests {
         assert_eq!(
             one_coverage.frontier(lineage).collect::<Vec<_>>(),
             vec![result],
-            "control: the merge consumed both commits"
+            "control: the merge consumed all eight commits"
         );
         assert_eq!(
             two_coverage.frontier(lineage).collect::<Vec<_>>(),
@@ -10630,7 +10558,7 @@ mod tests {
                 CollectionMerge::sign(
                     &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                     collection,
-                    [collection_test_hash(43), collection_test_hash(44)],
+                    [43, 44, 48, 49, 50, 51, 52, 53].map(collection_test_hash),
                     collection_test_hash(45),
                 )
                 .unwrap(),
@@ -10727,19 +10655,19 @@ mod tests {
             empty_metadata_handle(),
         ));
         let merge_a = CollectionRecord::Merge(
-            CollectionMerge::sign(&key, collection, [a.data(), c.data()], output).unwrap(),
+            CollectionMerge::sign(&key, collection, [44, 45, 48, 49, 50, 51, 52, 53].map(collection_test_hash), output).unwrap(),
         );
         // A second author over the same payloads: still two distinct records
         // producing one member, which is what this fixture needs. It used to
         // be spelled as two witnesses over one payload, and that spelling is
         // exactly the redundancy the witness fields were.
         let merge_b = CollectionRecord::Merge(
-            CollectionMerge::sign(&second_key, collection, [a.data(), c.data()], output).unwrap(),
+            CollectionMerge::sign(&second_key, collection, [44, 45, 48, 49, 50, 51, 52, 53].map(collection_test_hash), output).unwrap(),
         );
         // An absorbing merge, whose result is one of its inputs, is one more
         // producer of that result.
         let repeated = CollectionRecord::Merge(
-            CollectionMerge::sign(&key, collection, [a.data(), output], output).unwrap(),
+            CollectionMerge::sign(&key, collection, [44, 46, 48, 49, 50, 51, 52, 53].map(collection_test_hash), output).unwrap(),
         );
         let derive_a = CollectionRecord::Derive(CollectionDerive::sign(
             &key,
@@ -11394,7 +11322,7 @@ mod tests {
         let merge = CollectionMerge::sign(
             &signer,
             target,
-            [derive.output(), collection_test_hash(90)],
+            std::iter::once(derive.output()).chain((90..97).map(collection_test_hash)),
             derive.output(),
         )
         .unwrap();
@@ -11484,7 +11412,7 @@ mod tests {
                 CollectionMerge::sign(
                     &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                     descriptor_handle,
-                    [Inline::new(equation_owned.raw), collection_test_hash(15)],
+                    std::iter::once(Inline::new(equation_owned.raw)).chain((20..27).map(collection_test_hash)),
                     collection_test_hash(16),
                 )
                 .unwrap(),
@@ -13656,16 +13584,14 @@ mod tests {
         append_test_bytes(&source_path, &retired_equation_frame(&derive_twin));
 
         let mut source = Pile::open(&source_path).unwrap();
-        // A current two-input merge states the same equation as the unsigned
-        // and the witnessed merge.
+        // A current eight-input merge has the same output but a different
+        // equation. It must not supersede the retired binary assertions.
         let merge_twin = CollectionRecord::Merge(
             CollectionMerge::sign(
                 &signer,
                 CollectionHandle::new(collection.raw),
-                [
-                    Inline::<Hash<Blake3>>::new([0; 32]),
-                    Inline::<Hash<Blake3>>::new(input.raw),
-                ],
+                std::iter::once(Inline::<Hash<Blake3>>::new(input.raw))
+                    .chain((100..107).map(collection_test_hash)),
                 Inline::<Hash<Blake3>>::new(output.raw),
             )
             .unwrap(),
@@ -13690,16 +13616,14 @@ mod tests {
                 WantRewritePolicy::Drop,
             )
             .unwrap();
-        assert_eq!(stats.superseded_equations, 3);
-        assert_eq!(stats.opaque_frames, 1);
+        assert_eq!(stats.superseded_equations, 1);
+        assert_eq!(stats.opaque_frames, 2);
         assert_eq!(stats.retired_equations, 1);
         let reader = destination.snapshot().unwrap();
         let carried: Vec<_> = reader.legacy_unsigned_collection_equations().collect();
-        assert_eq!(carried.len(), 1);
-        assert!(matches!(
-            carried[0],
-            LegacyUnsignedCollectionEquation::Derive { .. }
-        ));
+        assert_eq!(carried.len(), 2);
+        assert!(carried.iter().any(|equation| matches!(equation, LegacyUnsignedCollectionEquation::Merge { .. })));
+        assert!(carried.iter().any(|equation| matches!(equation, LegacyUnsignedCollectionEquation::Derive { .. })));
         let records: Vec<_> = reader
             .records()
             .unwrap()
@@ -13711,7 +13635,7 @@ mod tests {
             vec![derive_twin]
         );
         drop(reader);
-        assert_eq!(destination.opaque_record_count().unwrap(), 1);
+        assert_eq!(destination.opaque_record_count().unwrap(), 2);
         destination.close().unwrap();
         source.close().unwrap();
     }
@@ -13907,7 +13831,7 @@ mod tests {
             CollectionMerge::sign(
                 &key,
                 root,
-                [collection_test_hash(1), collection_test_hash(2)],
+                (1..=8).map(collection_test_hash),
                 Inline::new(joined.raw),
             )
             .unwrap(),
@@ -14231,7 +14155,7 @@ mod tests {
                 CollectionMerge::sign(
                     &key,
                     root,
-                    [collection_test_hash(1), collection_test_hash(2)],
+                    (1..=8).map(collection_test_hash),
                     Inline::new(joined.raw),
                 )
                 .unwrap(),
@@ -14589,7 +14513,7 @@ mod tests {
                 CollectionMerge::sign(
                     &key,
                     root,
-                    [collection_test_hash(1), collection_test_hash(2)],
+                    (1..=8).map(collection_test_hash),
                     collection_test_hash(3),
                 )
                 .unwrap(),

@@ -8,7 +8,7 @@
 //! | 0x06 | VALUE         | key32, nonempty bytes           |
 //! | 0x07 | DONE          | empty                           |
 //! | 0x08 | LANDED        | empty                           |
-//! | 0x09 | RIBLT_ROOT    | profile-key16, hash32, u64       |
+//! | 0x09 | RIBLT_ROOT    | hash32, u64                     |
 //! | 0x0a | RIBLT_CELL    | index:u32, symbol32, hash:u64, count:i64 |
 //! | 0x0b | HAVE          | offered depth:u8, prefix32, hash32, u64 |
 //!
@@ -22,9 +22,12 @@
 //! A kind or OPEN walk kind not understood is skipped. A known payload must
 //! decode completely and canonically; malformed frames end only the exchange.
 //! Unknown OPEN algorithms are refused. Prefix=0 and CachedRiblt=1 are separate
-//! explicit ALPN32 algorithms. Prefix offer profiles 2/3 additionally bind the
+//! explicit ALPN33 algorithms. Prefix offer profiles 2/3 additionally bind the
 //! opener's send/receive-only role; profile 0 always remains pull Prefix.
 //! This is not an old-wire compatibility negotiation.
+//! Cached RIBLT derives its checksum key from OPEN locally; ROOT is exactly
+//! 40 payload bytes. DONE/LANDED belong only to Prefix. Cached completion uses
+//! clean write-half FIN after proof, actual landing and all owed frame writes.
 
 use triblespace_core::collection::CollectionHandle;
 
@@ -44,7 +47,7 @@ pub const FRAME_RIBLT_ROOT: u8 = 0x09;
 pub const FRAME_RIBLT_CELL: u8 = 0x0a;
 pub const FRAME_HAVE: u8 = 0x0b;
 
-/// Explicit ALPN32 discovery profile. CachedRiblt is the default for mutually
+/// Explicit ALPN33 discovery profile. CachedRiblt is the default for mutually
 /// authorized peers. Prefix remains selectable and is required
 /// when either direction lacks collection READ authority. Unknown profiles are
 /// refused, never interpreted as Prefix or as successful cache exhaustion.
@@ -112,7 +115,6 @@ pub(crate) enum Frame {
     Done,
     Landed,
     RibltRoot {
-        key: [u8; 16],
         summary: PatchSummary,
     },
     RibltCell {
@@ -162,8 +164,7 @@ impl Frame {
             }
             Self::Done => FRAME_DONE,
             Self::Landed => FRAME_LANDED,
-            Self::RibltRoot { key, summary } => {
-                payload.extend_from_slice(key);
+            Self::RibltRoot { summary } => {
                 push_summary(&mut payload, *summary);
                 FRAME_RIBLT_ROOT
             }
@@ -250,7 +251,6 @@ impl Frame {
             FRAME_DONE => Self::Done,
             FRAME_LANDED => Self::Landed,
             FRAME_RIBLT_ROOT => Self::RibltRoot {
-                key: rest.take(16)?.try_into().unwrap(),
                 summary: rest.summary()?,
             },
             FRAME_RIBLT_CELL => Self::RibltCell {
@@ -301,7 +301,8 @@ mod tests {
     #[test]
     fn every_frame_round_trips() {
         for kind in [
-            WalkKind::Records,
+            WalkKind::Commit,
+            WalkKind::Derive,
             WalkKind::Authorization,
             WalkKind::References,
         ] {
@@ -366,6 +367,27 @@ mod tests {
     }
 
     #[test]
+    fn cached_root_is_only_exact_summary_without_redundant_key() {
+        for summary in [
+            PatchSummary::new(None, 0).unwrap(),
+            PatchSummary::new(Some([9; 32]), 257).unwrap(),
+        ] {
+            let payload = roundtrip(Frame::RibltRoot { summary });
+            assert_eq!(payload.len(), 40);
+            assert_eq!(payload.len() + 5, 45);
+            for length in 0..40 {
+                assert!(Frame::decode(FRAME_RIBLT_ROOT, &payload[..length]).is_err());
+            }
+            let mut retired = vec![7; 16];
+            retired.extend_from_slice(&payload);
+            assert!(Frame::decode(FRAME_RIBLT_ROOT, &retired).is_err());
+            let mut trailing = payload;
+            trailing.push(0);
+            assert!(Frame::decode(FRAME_RIBLT_ROOT, &trailing).is_err());
+        }
+    }
+
+    #[test]
     fn root_and_leaf_have_no_special_wire_kind() {
         assert_eq!(
             [
@@ -387,7 +409,7 @@ mod tests {
     fn malformed_payloads_are_malformed_and_unknown_kinds_are_skipped() {
         let (_, open) = Frame::Open {
             collection: CollectionHandle::new([7; 32]),
-            kind: WalkKind::Records,
+            kind: WalkKind::Commit,
             algorithm: Algorithm::Prefix,
             offer: None,
         }
@@ -442,7 +464,7 @@ mod tests {
             );
         }
         let mut unknown = open.clone();
-        unknown[32] = 3;
+        unknown[32] = 4;
         assert_eq!(Frame::decode(FRAME_OPEN, &unknown), Ok(None));
         assert_eq!(Frame::decode(0x7F, b"anything"), Ok(None));
         assert_eq!(Frame::decode(0, &[]), Ok(None));
@@ -548,7 +570,7 @@ mod sim_tests {
         let (_send, mut recv) = open_walk(
             &connection,
             collection,
-            WalkKind::Records,
+            WalkKind::Commit,
             Algorithm::Prefix,
             None,
         )
@@ -561,7 +583,8 @@ mod sim_tests {
         let (commands, mut incoming) = mpsc::unbounded_channel();
         acceptor.table.walks(WalksHandle(commands));
         for (index, kind) in [
-            WalkKind::Records,
+            WalkKind::Commit,
+            WalkKind::Derive,
             WalkKind::Authorization,
             WalkKind::References,
         ]
@@ -605,7 +628,7 @@ mod sim_tests {
                 open_walk(
                     &connection,
                     collection,
-                    WalkKind::Records,
+                    WalkKind::Commit,
                     Algorithm::Prefix,
                     None,
                 ),

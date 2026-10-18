@@ -793,7 +793,7 @@ mod tests {
                 CollectionMerge::sign(
                     &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                     collection,
-                    [Inline::new([4; 32]), Inline::new([5; 32])],
+                    (4..12).map(|byte| Inline::new([byte; 32])),
                     Inline::new([6; 32]),
                 )
                 .unwrap(),
@@ -1566,7 +1566,8 @@ mod tests {
             QuorumOutcome::Unmet
         );
         let initial_frontier = frontier().unwrap();
-        assert_eq!(initial_frontier.records, manifest(&initial_overlay).records);
+        assert_eq!(initial_frontier.commits, manifest(&initial_overlay).commits);
+        assert_eq!(initial_frontier.derives, manifest(&initial_overlay).derives);
         assert_eq!(
             initial_frontier.authorization_evidence,
             manifest(&initial_overlay).authorization_evidence
@@ -1646,7 +1647,8 @@ mod tests {
         );
         // Health commits to the complete semantic record and AUTH PATCHes.
         let published = frontier_after_refresh.unwrap();
-        assert_eq!(published.records, manifest(&expected).records);
+        assert_eq!(published.commits, manifest(&expected).commits);
+        assert_eq!(published.derives, manifest(&expected).derives);
         assert_eq!(
             published.authorization_evidence,
             manifest(&expected).authorization_evidence

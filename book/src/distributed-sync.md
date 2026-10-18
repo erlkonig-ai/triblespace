@@ -452,8 +452,9 @@ send/receive directions; credentials provide fallback admission only when there
 is no active peering. A false send flag cannot be widened by another grant.
 
 An agreement G is immutable PATCH state scoped to peer, collection, kind and
-connection. It contains only keys known held on both sides, retained after both
-LANDEDs and successful actual writes and stream finish. Failure clears local G
+connection. Prefix retains it only after both LANDEDs and successful actual
+writes and stream finish. Cached mode uses the verified union transiently after
+both gated FINs, then releases it. Failure clears local G
 without retracting landed values; close/deselection clears it and retires running
 drivers, so a stale completion cannot restore it. G is not durable. Fresh
 connections may compare full sets again, with equal-prefix pruning.
@@ -467,8 +468,8 @@ receipt added here.
 
 ## Walk streams
 
-The opener writes the stream tag and OPEN naming collection, kind (records
-`0`, authorization `1`, references `2`) and profile (`0` pull Prefix, `1` cached
+The opener writes the stream tag and OPEN naming collection, kind (COMMIT
+`0`, authorization `1`, references `2`, DERIVE `3`) and profile (`0` pull Prefix, `1` cached
 RIBLT, `2` offer Prefix with opener sending, `3` offer Prefix with opener receiving).
 OPEN remains 34 bytes. Profiles 2/3 require Records or AUTH and the opposite
 locally authorized one-way role before driver registration. Profile 0 always
@@ -488,9 +489,14 @@ collection32 || proof-id32 key. Integers are big-endian.
 | `0x06` | VALUE | key32, nonempty encoded bytes |
 | `0x07` | DONE | empty |
 | `0x08` | LANDED | empty |
-| `0x09` | RIBLT_ROOT | profile-key16, hash32, leaf-count:u64 |
+| `0x09` | RIBLT_ROOT | hash32, leaf-count:u64 |
 | `0x0a` | RIBLT_CELL | index:u32, symbol32, checksum:u64, count:i64 |
 | `0x0b` | HAVE | exact offered depth:u8, prefix32, hash32, leaf-count:u64 |
+
+DONE/LANDED are Prefix-only; cached RIBLT refuses them and uses the gated FIN
+semantics below. RIBLT_ROOT has 40 payload bytes (45 framed), with no repeated
+profile key. This remains the unreleased ALPN33 boundary, not compatibility
+with earlier private33 variants or deployed32.
 
 Every SUBTREE payload is 73 bytes, 78 including the frame header, regardless of
 fanout. Depth is 0..32; all prefix bytes outside depth must be zero. Depth0 is the
@@ -610,7 +616,7 @@ liveness or throughput.
 
 ### Cached full-component discovery
 
-This source-only ALPN32 candidate defaults to cached RIBLT for mutually
+This source-only ALPN33 candidate defaults to cached RIBLT for mutually
 authorized locally opened streams, through both the CLI and
 `Algorithm::default()`. Explicit `trible pile net sync --walk-algorithm prefix`
 or `PeerConfig::walk_algorithm = Algorithm::Prefix` retains the Prefix option;
@@ -677,12 +683,13 @@ by `0xda942042e4dd58b5`, then compute
 and saturating-add that integer gap to the index. Operations use IEEE754 binary64
 in the stated order, matching `RandomMapping`; cross-platform profile parity is a requirement, not a
 Rust-layout assumption. This is a public deterministic map, not authentication
-or adversarial-workload protection. Roots reject a different profile key.
+or adversarial-workload protection. The key is derived locally from OPEN's
+collection, kind and fixed selected profile; it is not repeated in ROOT.
 
 Cells describe the **whole component**, never `source \\ G`. The sender emits its
 root immediately but deliberately waits for the peer's root
-before preparing or sending any cells. This initial feedback barrier validates
-the profile and avoids both cold preparation and coded oversend for equal roots;
+before preparing or sending any cells. This initial feedback barrier avoids
+both cold preparation and coded oversend for equal roots;
 it does add startup latency and is not a feedback-free root-plus-cells stream.
 After that exchange, cells proceed without cell-by-cell request rounds. A bounded
 residual-only decoder receives peer cells minus cached local cells: XOR symbol
@@ -716,16 +723,41 @@ admission independently guard final landing.
 Once this exact proof holds, stop coded output only when the **complete locally
 written** cell prefix reaches the decoded incoming prefix. Opposite residual
 counts and identical XOR equations then give the peer the same solvable prefix.
-Equal root/count with the same profile/domain can stop at zero cells; the
-upstream decoder's initially true `decoded()` alone cannot. DONE before this
-proof fails. Eager bodies take priority over unqueued cells; one active write,
+Equal root/count with the same locally derived profile/domain can stop at zero
+cells; the upstream decoder's initially true `decoded()` alone cannot. A full
+ROOT write receipt is still required. Eager bodies take priority over unqueued cells; one active write,
 one queued frame and a single deferred cell bound coded lookahead independently
 of prepared megabytes. Each cell is locked/copied/encoded individually: 52 payload
 bytes, 57 framed bytes, not zero-copy wire. Root, OPEN, control frames and bodies
-are additional traffic. Body/fetch/landing obligations, both LANDEDs, actual
-LANDED write, successful finish and current Task generation all remain required.
-Premature EOF, reset, malformed data, failed landing or retired drivers cannot
-turn decoding into success.
+are additional traffic.
+
+Cached mode uses clean write-half FIN for completion, not DONE/LANDED. Local
+eligibility requires exact decoding/proof, the complete-written matching cell
+prefix and ROOT, all decoded receive work scheduled, no missing typed bodies,
+and successful completion of local fetches and actual insertions. It does NOT
+require peer FIN. The writer drains every queued/owed frame before successful
+shutdown; enqueue and eager-cursor advancement are not write receipts.
+
+The read direction remains alive after local half-close. Clean EOF supplies the
+peer's directional completion promise but never cancels local insertion/fetch
+debt. Missing typed bodies or undecoded proof at EOF fail; References have no
+VALUE frames, so their unscheduled local fetch cursor may legitimately remain
+beyond the 64-slot window. A newer live snapshot can satisfy a decoded key before
+its first eager VALUE arrives: that late body may create new insertion debt
+after local FIN, and final confirmation rechecks it. Both peers can half-close
+independently; neither waits for peer FIN to become locally eligible.
+
+The finished send handle retains reset ownership until task retirement. Failed
+writes/finish, truncation, reset, replacement and failed/deferred landing cannot
+produce shared agreement. Only successful local half-close, valid peer FIN,
+current semantic completion and the current Task generation establish success.
+Post-FIN reset is best-effort cancellation, not retraction of already received
+or landed data. A successful local finish is not a peer transport ACK.
+Peer-FIN waiting alone has no frame-progress timeout, just as Prefix LANDED
+waiting does not; missing incoming frames and blob fetches retain their progress
+deadlines. These are protocol/landing receipts, not disk durability or hydration
+acknowledgements. Ordinary pull Prefix still serves VALUE_REQUEST after DONE and
+keeps LANDED; no Prefix half-close rule is inferred from cached completion.
 
 ### Landing
 
@@ -1344,8 +1376,10 @@ collection is recomputed as if newly tracked. Short-lived readers of the same
 pile track nothing.
 
 Two Full neighbours push each other their held sets like any other tree
-(*Walk streams*): matching prefix commitments prune independently held overlap,
-and unchanged agreed sets send an empty-prefix empty delta, DONE and LANDED.
+(*Walk streams*). Prefix prunes independently held overlap with matching
+commitments and completes with DONE/LANDED; cached RIBLT proves the held-set
+difference and uses the gated FIN semantics above. Unchanged equal sets need
+no cached cells, but still require complete ROOT writes and both clean FINs.
 
 This set is partial and conservative. A readable aligned word is not a
 typed semantic reference; an absent word says nothing about global residency.

@@ -86,7 +86,7 @@ pub(crate) fn roots(snapshot: &StoreSnapshot) -> impl Iterator<Item = (Collectio
             collection,
             record_root(
                 collection,
-                repair.records().summary(),
+                repair.records().summaries(),
                 repair.authorization_evidence().summary(),
             ),
         ))
@@ -234,7 +234,8 @@ impl Schedules {
                 if !neighbour.exchanges() {
                     continue;
                 }
-                starts.push((*peer, collection, WalkKind::Records));
+                starts.push((*peer, collection, WalkKind::Commit));
+                starts.push((*peer, collection, WalkKind::Derive));
                 starts.push((*peer, collection, WalkKind::Authorization));
                 if neighbour.full {
                     starts.push((*peer, collection, WalkKind::References));
@@ -294,7 +295,7 @@ mod tests {
     /// with. A neighbour the collection flows neither way with gets
     /// nothing.
     #[test]
-    fn an_opportunity_exchanges_two_trees_with_each_neighbour_and_three_with_a_full_one() {
+    fn an_opportunity_exchanges_three_trees_with_each_neighbour_and_four_with_a_full_one() {
         let c = collection(1);
         let mut now = crate::clock::mono_now();
         let mut node = Schedules::default();
@@ -308,7 +309,8 @@ mod tests {
         assert_eq!(
             to(&starts, A),
             [
-                (c, WalkKind::Records),
+                (c, WalkKind::Commit),
+                (c, WalkKind::Derive),
                 (c, WalkKind::Authorization),
                 (c, WalkKind::References)
             ]
@@ -323,11 +325,11 @@ mod tests {
         );
         let starts = advance(&mut node, &mut now, Duration::from_secs(4));
         let to_b = to(&starts, B);
-        assert!(!to_b.is_empty() && to_b.len() <= 4, "{to_b:?}");
-        for pair in to_b.chunks(2) {
-            assert_eq!(pair, [(c, WalkKind::Records), (c, WalkKind::Authorization)]);
+        assert!(!to_b.is_empty() && to_b.len() <= 6, "{to_b:?}");
+        for pair in to_b.chunks(3) {
+            assert_eq!(pair, [(c, WalkKind::Commit), (c, WalkKind::Derive), (c, WalkKind::Authorization)]);
         }
-        assert_eq!(to(&starts, A).len() / 3, to_b.len() / 2);
+        assert_eq!(to(&starts, A).len() / 4, to_b.len() / 3);
     }
 
     #[test]
@@ -349,7 +351,7 @@ mod tests {
         for step in 1..=2_400_u32 {
             now = now + STEP;
             for (_, collection, kind) in node.poll(now) {
-                if kind == WalkKind::Records {
+                if kind == WalkKind::Commit {
                     opened
                         .entry(collection)
                         .or_default()
@@ -403,7 +405,7 @@ mod tests {
         node.event(
             Event::Receiving {
                 collection: c,
-                kind: WalkKind::Records,
+                kind: WalkKind::Commit,
             },
             now,
         );
@@ -412,12 +414,12 @@ mod tests {
             during.extend(advance(&mut node, &mut now, Duration::from_secs(1)));
             node.observe([(c, root(landed))], now);
         }
-        assert!(during.len() <= 2, "{during:?}");
+        assert!(during.len() <= 3, "{during:?}");
 
         node.event(
             Event::Received {
                 collection: c,
-                kind: WalkKind::Records,
+                kind: WalkKind::Commit,
                 landed: true,
             },
             now,
@@ -425,7 +427,7 @@ mod tests {
         let starts = advance(&mut node, &mut now, Duration::from_secs(2));
         assert_eq!(
             to(&starts, B),
-            [(c, WalkKind::Records), (c, WalkKind::Authorization)]
+            [(c, WalkKind::Commit), (c, WalkKind::Derive), (c, WalkKind::Authorization)]
         );
         // Twelve seconds on, the interval has doubled past the minimum, so
         // a reset would move the deadline. A receive during which the root
@@ -434,10 +436,10 @@ mod tests {
         // the next opportunity.
         advance(&mut node, &mut now, Duration::from_secs(12));
         for (kind, landed, changed) in [
-            (WalkKind::Records, false, false),
-            (WalkKind::Records, true, false),
+            (WalkKind::Commit, false, false),
+            (WalkKind::Commit, true, false),
             (WalkKind::References, true, false),
-            (WalkKind::Records, false, true),
+            (WalkKind::Commit, false, true),
         ] {
             let deadline = node.deadline();
             node.event(
@@ -463,7 +465,7 @@ mod tests {
         // A change during a receive that lands resets once it ends, even
         // when another receive is still running.
         let deadline = node.deadline();
-        for kind in [WalkKind::Records, WalkKind::Authorization] {
+        for kind in [WalkKind::Commit, WalkKind::Authorization] {
             node.event(
                 Event::Receiving {
                     collection: c,
@@ -485,7 +487,7 @@ mod tests {
         node.event(
             Event::Received {
                 collection: c,
-                kind: WalkKind::Records,
+                kind: WalkKind::Commit,
                 landed: true,
             },
             now,
@@ -508,7 +510,7 @@ mod tests {
         );
         assert!(node.deadline().is_some());
         let starts = advance(&mut node, &mut now, Duration::from_secs(2));
-        assert_eq!(to(&starts, A).len(), 2);
+        assert_eq!(to(&starts, A).len(), 3);
         assert!(starts.iter().all(|(_, collection, _)| *collection == c));
 
         node.observe([(d, root(0))], now);

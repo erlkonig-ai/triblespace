@@ -207,7 +207,7 @@ impl BlobStoreGet for ResidentBlobReader {
 /// One collection's immutable server overlay.
 pub(crate) struct CollectionSnapshot {
     repair: Arc<CollectionRepairOverlay>,
-    caches: [Arc<crate::riblt_cache::Generation>; 3],
+    caches: [Arc<crate::riblt_cache::Generation>; 4],
 }
 
 impl CollectionSnapshot {
@@ -248,9 +248,10 @@ impl CollectionSnapshot {
             .map_err(|error| anyhow::anyhow!("RIBLT cache publication: {error:?}"))
         };
         let caches = [
-            advance(0, WalkKind::Records)?,
+            advance(0, WalkKind::Commit)?,
             advance(1, WalkKind::Authorization)?,
             advance(2, WalkKind::References)?,
+            advance(3, WalkKind::Derive)?,
         ];
         Ok(Self { repair, caches })
     }
@@ -258,9 +259,10 @@ impl CollectionSnapshot {
     pub(crate) fn cache(&self, kind: crate::walk::WalkKind) -> Arc<crate::riblt_cache::Generation> {
         use crate::walk::WalkKind;
         self.caches[match kind {
-            WalkKind::Records => 0,
+            WalkKind::Commit => 0,
             WalkKind::Authorization => 1,
             WalkKind::References => 2,
+            WalkKind::Derive => 3,
         }]
         .clone()
     }
@@ -2722,8 +2724,8 @@ mod tests {
         .unwrap();
         let after_collection = serving_after.collection(collection).unwrap();
         assert_eq!(
-            after_collection.repair.records().summary(),
-            before_collection.repair.records().summary()
+            after_collection.repair.records().summaries(),
+            before_collection.repair.records().summaries()
         );
         assert_eq!(
             after_collection.repair.authorization_evidence().summary(),

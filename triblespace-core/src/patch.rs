@@ -12,6 +12,9 @@
 #![allow(unstable_name_collisions)]
 
 mod branch;
+mod checked_insert;
+#[cfg(test)]
+mod entry_tests;
 /// Byte-indexed lookup tables used by PATCH branch nodes.
 pub mod bytetable;
 mod entry;
@@ -1398,6 +1401,22 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Head<KEY_LEN,
         }
     }
 
+    /// The caller has already reached a leaf; this never performs a lookup.
+    fn leaf_entry(&self) -> (&[u8; KEY_LEN], &V) {
+        match self.body_ref() {
+            BodyRef::Leaf(leaf) => (&leaf.key, &leaf.value),
+            BodyRef::LocalLeaf(bytes) => {
+                // SAFETY: archive insertion is available only for V = ().
+                // The enclosing borrowed PATCH or consuming cursor retains
+                // the archive cover for the entire borrow of `bytes`.
+                static UNIT: () = ();
+                let value = unsafe { &*(&UNIT as *const () as *const V) };
+                (bytes, value)
+            }
+            BodyRef::Branch(_) => unreachable!("entry requires a leaf"),
+        }
+    }
+
     // Slot wrapper defined at module level (moved to below the impl block)
 
     /// Find the first depth in [start_depth, limit) where the tree-ordered
@@ -2305,6 +2324,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Head<KEY_LEN,
         match self.body_ref() {
             BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => 1,
             BodyRef::Branch(branch) => branch.traversal_depth::<PREFIX_LEN>(at_depth, prefix),
+        }
+    }
+
+    fn get_key<'a>(&'a self, at_depth: usize, key: &[u8; KEY_LEN]) -> Option<&'a [u8; KEY_LEN]> {
+        match self.body_ref() {
+            BodyRef::Leaf(leaf) => leaf::key_ops::matches::<KEY_LEN, O>(&leaf.key, at_depth, key).then_some(&leaf.key),
+            BodyRef::LocalLeaf(bytes) => leaf::key_ops::matches::<KEY_LEN, O>(bytes, at_depth, key).then_some(bytes),
+            BodyRef::Branch(branch) => branch.get_key(at_depth, key),
         }
     }
 
@@ -3229,6 +3256,38 @@ where
         self.debug_check_owner_invariant();
     }
 
+    /// Insert a lazily constructed value, or check the existing value.
+    ///
+    /// `key` uses the shared key layout, just like [`Entry::with_value`],
+    /// not the schema's tree ordering. Complete key bytes determine occupancy;
+    /// subtree fingerprints are not used for this decision. Exactly one of
+    /// `vacant` or `occupied` runs. An occupied key keeps its first value, and
+    /// `vacant` is not called or allocated on its behalf.
+    ///
+    /// Returns `true` for insertion and `false` for an existing key. An error
+    /// or callback panic leaves the keys, values and root sharing unchanged.
+    /// Interior mutation performed by a callback is outside this guarantee.
+    /// Like [`Self::insert`], this does not give values identity in set algebra.
+    pub fn try_insert_with<E>(
+        &mut self,
+        key: &[u8; KEY_LEN],
+        vacant: impl FnOnce() -> V,
+        occupied: impl FnOnce(&V) -> Result<(), E>,
+    ) -> Result<bool, E> {
+        let inserted = match self.root.as_mut() {
+            Some(root) => root.try_insert_with(key, 0, vacant, occupied)?,
+            None => {
+                // Even destruction of an unused callback can run user code.
+                drop(occupied);
+                let entry = Entry::with_value(key, vacant());
+                self.root = Some(entry.leaf());
+                true
+            }
+        };
+        self.debug_check_owner_invariant();
+        Ok(inserted)
+    }
+
     /// Inserts a key into the PATCH, replacing the value if it already exists.
     ///
     /// If the replaced value's destructor panics, the replacement is already
@@ -3320,6 +3379,12 @@ where
     /// Fixed branch header bytes, excluding the trailing child table.
     pub fn branch_header_bytes() -> usize {
         std::mem::size_of::<Branch<KEY_LEN, O, [Option<Head<KEY_LEN, O, V, H>>; 0], V, H>>()
+    }
+
+    /// Test-only exact allocation size of one owned heap leaf.
+    #[cfg(test)]
+    pub(crate) fn heap_leaf_bytes() -> usize {
+        std::mem::size_of::<Leaf<KEY_LEN, V, H>>()
     }
 
     /// Per-end-depth `(branch_count, filled_children)` histogram (65 buckets,
@@ -3468,6 +3533,13 @@ where
     /// Returns the value associated with `key` if present.
     pub fn get(&self, key: &[u8; KEY_LEN]) -> Option<&V> {
         self.root.as_ref().and_then(|root| root.get(0, key))
+    }
+
+    /// Find a tree-ordered lookup key and borrow its actual stored physical
+    /// bytes in canonical key order. This is not reconstructed ordering scratch.
+    /// The borrow is tied to this immutable root and covers heap/archive leaves.
+    pub fn get_key(&self, key: &[u8; KEY_LEN]) -> Option<&[u8; KEY_LEN]> {
+        self.root.as_ref().and_then(|root| root.get_key(0, key))
     }
 
     /// Allows iteratig over all infixes of a given length with a given prefix.
@@ -3737,6 +3809,12 @@ where
     /// [`PATCH::iter_prefix_count`].
     pub fn iter_ordered<'a>(&'a self) -> PATCHOrderedIterator<'a, KEY_LEN, O, V, H> {
         PATCHOrderedIterator::new(self)
+    }
+
+    /// Stream shared-layout keys and their values in schema tree order.
+    /// No per-key lookup or value clone is performed.
+    pub fn iter_entries_ordered(&self) -> PATCHEntriesOrderedIterator<'_, KEY_LEN, O, V, H> {
+        PATCHEntriesOrderedIterator(self.iter_ordered())
     }
 
     /// Iterate over all prefixes of the given length in the PATCH.
@@ -4980,41 +5058,41 @@ pub struct PATCHIntoOrderedIterator<
     _owners: Option<Arc<OwnerCover>>,
 }
 
-impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Iterator
-    for PATCHIntoOrderedIterator<KEY_LEN, O, V, H>
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
+    PATCHIntoOrderedIterator<KEY_LEN, O, V, H>
 {
-    type Item = [u8; KEY_LEN];
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let q = &mut self.queue;
-        while let Some(mut head) = q.pop() {
-            // Match the mutable body directly — we own `head` so calling
-            // `body_mut()` is safe and allows returning the copied leaf key
-            // or mutating the branch child table in-place.
-            match head.body_mut() {
-                BodyMut::Leaf(leaf) => {
+    /// Visit the next key/value pair while the cursor retains its leaf owner.
+    ///
+    /// The callback may return owned data, but cannot return a reference into
+    /// the cursor. Keys use shared layout and traversal uses schema tree order.
+    /// No value clone or second lookup is required. If the callback panics,
+    /// that item is consumed and the cursor remains valid.
+    ///
+    /// ```compile_fail
+    /// use triblespace_core::patch::{Entry, IdentitySchema, PATCH};
+    /// let mut patch = PATCH::<1, IdentitySchema, String>::new();
+    /// patch.insert(&Entry::with_value(&[1], String::from("value")));
+    /// let mut cursor = patch.into_iter_ordered();
+    /// let escaped = cursor.next_with(|_, value| value);
+    /// drop(cursor);
+    /// println!("{escaped:?}");
+    /// ```
+    pub fn next_with<R>(&mut self, visit: impl FnOnce(&[u8; KEY_LEN], &V) -> R) -> Option<R> {
+        while let Some(head) = self.queue.pop() {
+            match head.body_ref() {
+                BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => {
                     self.remaining = self.remaining.saturating_sub(1);
-                    return Some(leaf.key);
+                    let (key, value) = head.leaf_entry();
+                    return Some(visit(key, value));
                 }
-                BodyMut::LocalLeaf(bytes) => {
-                    self.remaining = self.remaining.saturating_sub(1);
-                    return Some(*bytes);
-                }
-                BodyMut::Branch(branch) => {
-                    let slice: &mut [Option<Head<KEY_LEN, O, V, H>>] = &mut branch.child_table;
-                    // Sort children by their byte-key, placing empty slots (None)
-                    // after all occupied slots. Using `sort_unstable_by_key` with
-                    // a simple key projection is clearer than a custom
-                    // comparator; it also avoids allocating temporaries. The
-                    // old comparator manually handled None/Some cases — we
-                    // express that intent directly by sorting on the tuple
-                    // (is_none, key_opt).
-                    slice
-                        .sort_unstable_by_key(|opt| (opt.is_none(), opt.as_ref().map(|h| h.key())));
-                    for slot in slice.iter_mut().rev() {
-                        if let Some(c) = slot.take() {
-                            q.push(c);
-                        }
+                BodyRef::Branch(branch) => {
+                    // Clone persistent Heads, not branches or values. Mutating
+                    // a snapshot's child table would COW just to enumerate it.
+                    let mut children = ArrayVec::<&Head<KEY_LEN, O, V, H>, 256>::new();
+                    children.extend(branch.child_table.iter().filter_map(Option::as_ref));
+                    children.sort_unstable_by_key(|child| child.key());
+                    for child in children.into_iter().rev() {
+                        self.queue.push(child.clone());
                     }
                 }
             }
@@ -5022,6 +5100,20 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Iterator
         None
     }
 }
+
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Iterator
+    for PATCHIntoOrderedIterator<KEY_LEN, O, V, H>
+{
+    type Item = [u8; KEY_LEN];
+
+    fn next(&mut self) -> Option<Self::Item> { self.next_with(|key, _| *key) }
+    fn size_hint(&self) -> (usize, Option<usize>) { (self.remaining, Some(self.remaining)) }
+}
+
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> ExactSizeIterator
+    for PATCHIntoOrderedIterator<KEY_LEN, O, V, H> {}
+impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> std::iter::FusedIterator
+    for PATCHIntoOrderedIterator<KEY_LEN, O, V, H> {}
 
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> IntoIterator
     for PATCH<KEY_LEN, O, V, H>
@@ -5145,19 +5237,17 @@ impl<const KEY_LEN: usize, const PREFIX_LEN: usize, O: KeySchema<KEY_LEN>, V, H:
 {
 }
 
-impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Iterator
-    for PATCHOrderedIterator<'a, KEY_LEN, O, V, H>
+impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
+    PATCHOrderedIterator<'a, KEY_LEN, O, V, H>
 {
-    type Item = &'a [u8; KEY_LEN];
-
-    fn next(&mut self) -> Option<Self::Item> {
+    fn next_leaf(&mut self) -> Option<&'a Head<KEY_LEN, O, V, H>> {
         let mut level = self.stack.last_mut()?;
         loop {
             if let Some(child) = level.pop() {
                 match child.body_ref() {
                     BodyRef::Leaf(_) | BodyRef::LocalLeaf(_) => {
                         self.remaining = self.remaining.saturating_sub(1);
-                        return Some(child.childleaf_key());
+                        return Some(child);
                     }
                     BodyRef::Branch(branch) => {
                         self.stack.push(ArrayVec::new());
@@ -5173,10 +5263,39 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Iterator
         }
     }
 
+}
+
+impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Iterator
+    for PATCHOrderedIterator<'a, KEY_LEN, O, V, H>
+{
+    type Item = &'a [u8; KEY_LEN];
+
+    fn next(&mut self) -> Option<Self::Item> { self.next_leaf().map(Head::childleaf_key) }
+
     fn size_hint(&self) -> (usize, Option<usize>) {
         (self.remaining, Some(self.remaining))
     }
 }
+
+/// Borrowed streaming key/value pairs in schema tree order.
+/// Keys use shared layout; values borrow the PATCH, not the iterator itself.
+pub struct PATCHEntriesOrderedIterator<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash = XorSip128>(
+    PATCHOrderedIterator<'a, KEY_LEN, O, V, H>,
+);
+
+impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Iterator
+    for PATCHEntriesOrderedIterator<'a, KEY_LEN, O, V, H>
+{
+    type Item = (&'a [u8; KEY_LEN], &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> { self.0.next_leaf().map(Head::leaf_entry) }
+    fn size_hint(&self) -> (usize, Option<usize>) { self.0.size_hint() }
+}
+
+impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> ExactSizeIterator
+    for PATCHEntriesOrderedIterator<'a, KEY_LEN, O, V, H> {}
+impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> std::iter::FusedIterator
+    for PATCHEntriesOrderedIterator<'a, KEY_LEN, O, V, H> {}
 
 impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> ExactSizeIterator
     for PATCHOrderedIterator<'a, KEY_LEN, O, V, H>

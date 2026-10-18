@@ -46,6 +46,7 @@ hifitime = "4.1.2"
 iroh = { version = "1.0", features = ["test-utils", "unstable-custom-transports"] }
 
 [features]
+matched-probe-meter = []
 # Deterministic simulation testing: in-memory transport (transport::sim),
 # seeded id minting. (Host wiring — host::wire / host::run_host — is
 # always public: it is also how integration tests run real Peers over an

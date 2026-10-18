@@ -65,6 +65,10 @@ struct OneHop {
 }
 
 fn one_hop() -> OneHop {
+    one_hop_with_facts(facts(1, 21))
+}
+
+fn one_hop_with_facts(source_facts: TribleSet) -> OneHop {
     let source_owner = SigningKey::from_bytes(&[11; 32]);
     let producer = SigningKey::from_bytes(&[12; 32]);
     let source_descriptor =
@@ -75,7 +79,7 @@ fn one_hop() -> OneHop {
     let target = store
         .derive::<TestImage>(source, (), policy(&producer))
         .unwrap();
-    let source_blob = facts(1, 21).to_blob();
+    let source_blob = source_facts.to_blob();
     let metadata = facts(2, 22).to_blob();
     let commit = CollectionCommit::sign(
         &source_owner,
@@ -371,24 +375,27 @@ fn unauthorized_target_producers_neither_admit_outputs_nor_hide_authorized_input
     admit_source(&mut fixture);
     fixture.store.insert(fixture.equation).unwrap();
     let outsider = SigningKey::from_bytes(&[31; 32]);
-    let other_source: Blob<SimpleArchive> = facts(3, 23).to_blob();
-    let other_commit = CollectionCommit::sign(
-        &outsider,
-        fixture.source.handle(),
-        data(&other_source),
-        fixture.metadata.get_handle(),
-    );
-    let wrong = TestImage::image(&other_source);
-    fixture.store.put::<TestImage, _>(wrong.clone()).unwrap();
-    fixture
-        .store
-        .insert(CollectionRecord::Derive(CollectionDerive::sign(
+    let unauthorized: [Blob<TestImage>; 7] = std::array::from_fn(|index| {
+        let other_source: Blob<SimpleArchive> = facts(index as u8 + 3, index as u8 + 23).to_blob();
+        let other_commit = CollectionCommit::sign(
             &outsider,
-            fixture.target.handle(),
-            crate::collection::SourceLocator::of(other_commit.data().raw),
-            data(&wrong),
-        )))
-        .unwrap();
+            fixture.source.handle(),
+            data(&other_source),
+            fixture.metadata.get_handle(),
+        );
+        let output = TestImage::image(&other_source);
+        fixture.store.put::<TestImage, _>(output.clone()).unwrap();
+        fixture
+            .store
+            .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                &outsider,
+                fixture.target.handle(),
+                crate::collection::SourceLocator::of(other_commit.data().raw),
+                data(&output),
+            )))
+            .unwrap();
+        output
+    });
     fixture
         .store
         .insert(CollectionRecord::Merge(
@@ -397,8 +404,8 @@ fn unauthorized_target_producers_neither_admit_outputs_nor_hide_authorized_input
                 fixture.target.handle(),
                 // Another key's absorption of the authorized output: not
                 // the store's host, so never folded.
-                [data(&fixture.output), data(&wrong)],
-                data(&wrong),
+                std::iter::once(data(&fixture.output)).chain(unauthorized.iter().map(data)),
+                data(&unauthorized[0]),
             )
             .unwrap(),
         ))
@@ -418,58 +425,73 @@ fn absent_target_parent_is_read_through_its_resident_merge_inputs() {
     let mut fixture = one_hop();
     admit_source(&mut fixture);
     fixture.store.insert(fixture.equation).unwrap();
-    let other_source: Blob<SimpleArchive> = facts(3, 23).to_blob();
-    let other_commit = CollectionCommit::sign(
-        &fixture.source_owner,
-        fixture.source.handle(),
-        data(&other_source),
-        fixture.metadata.get_handle(),
-    );
-    fixture
-        .store
-        .insert(CollectionRecord::Commit(other_commit))
-        .unwrap();
-    let other_output = TestImage::image(&other_source);
-    fixture
-        .store
-        .put::<TestImage, _>(other_output.clone())
-        .unwrap();
-    let other_equation = CollectionRecord::Derive(CollectionDerive::sign(
-        &fixture.producer,
-        fixture.target.handle(),
-        crate::collection::SourceLocator::of(other_commit.data().raw),
-        data(&other_output),
-    ));
-    fixture.store.insert(other_equation).unwrap();
-    let mut union = facts(1, 21);
-    union.union(facts(3, 23));
+    let mut union = TribleSet::new();
+    let sources: [Blob<SimpleArchive>; 8] = std::array::from_fn(|index| {
+        let source = if index == 0 {
+            facts(1, 21)
+        } else {
+            facts(index as u8 + 2, index as u8 + 22)
+        };
+        let blob = (&source).to_blob();
+        union += source;
+        blob
+    });
+    assert_eq!(sources[0], fixture.source_blob);
+    let outputs = sources.each_ref().map(TestImage::image);
+    for (source, output) in sources.iter().zip(&outputs).skip(1) {
+        let commit = CollectionCommit::sign(
+            &fixture.source_owner,
+            fixture.source.handle(),
+            data(source),
+            fixture.metadata.get_handle(),
+        );
+        fixture
+            .store
+            .insert(CollectionRecord::Commit(commit))
+            .unwrap();
+        fixture.store.put::<TestImage, _>(output.clone()).unwrap();
+        fixture
+            .store
+            .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                &fixture.producer,
+                fixture.target.handle(),
+                crate::collection::SourceLocator::of(commit.data().raw),
+                data(output),
+            )))
+            .unwrap();
+    }
     let union_blob = TestImage::image(&union.clone().to_blob());
     // The parent's record is here; its bytes are not. The frontier is the
     // parent alone, and the read descends through the MERGE that produced
-    // it to the two resident images beneath.
+    // it to the eight resident images beneath.
     let parent = CollectionRecord::Merge(
         CollectionMerge::sign(
             &fixture.producer,
             fixture.target.handle(),
-            [data(&fixture.output), data(&other_output)],
+            outputs.iter().map(data),
             data(&union_blob),
         )
         .unwrap(),
     );
     fixture.store.insert(parent).unwrap();
-    let both = fixture
+    let all_sources = fixture
         .source
-        .cover([fixture.source_blob.get_handle(), other_source.get_handle()]);
+        .cover(sources.iter().map(|source| source.get_handle()));
     let before = fixture
         .store
         .snapshot()
         .unwrap()
         .collection(fixture.target)
         .unwrap();
-    assert_eq!(before.cover().len(), 2);
-    assert!(before.cover().contains(fixture.output.get_handle()));
-    assert!(before.cover().contains(other_output.get_handle()));
-    assert_eq!(crate::collection::test_support::stood_for(&before), both);
+    assert_eq!(before.cover().len(), 8);
+    assert!(outputs
+        .iter()
+        .all(|output| before.cover().contains(output.get_handle())));
+    assert_eq!(before.support().unwrap().len(), 8);
+    assert_eq!(
+        crate::collection::test_support::stood_for(&before),
+        all_sources
+    );
     assert_eq!(before.view::<TribleSet>().unwrap(), union);
 
     fixture
@@ -486,9 +508,13 @@ fn absent_target_parent_is_read_through_its_resident_merge_inputs() {
         after.cover().members().collect::<Vec<_>>(),
         [union_blob.get_handle()]
     );
-    assert_eq!(crate::collection::test_support::stood_for(&after), both);
+    assert_eq!(after.support().unwrap().len(), 8);
+    assert_eq!(
+        crate::collection::test_support::stood_for(&after),
+        all_sources
+    );
     assert_eq!(after.view::<TribleSet>().unwrap(), union);
-    assert_eq!(before.cover().len(), 2);
+    assert_eq!(before.cover().len(), 8);
     assert_eq!(before.view::<TribleSet>().unwrap(), union);
 }
 
@@ -703,7 +729,16 @@ fn empty_pile(dir: &tempfile::TempDir) -> Pile {
 
 #[test]
 fn pile_observation_tracks_only_consulted_lineage_and_target_changes() {
-    let fixture = one_hop();
+    // Seven genuine absent subset images and their resident union make an
+    // eight-input absorption without inventing input hashes or duplicate slots.
+    let mut visible = facts(1, 21);
+    let absent: [Blob<TestImage>; 7] = std::array::from_fn(|index| {
+        let subset = facts(index as u8 + 3, index as u8 + 23);
+        let source = (&subset).to_blob();
+        visible += subset;
+        TestImage::image(&source)
+    });
+    let fixture = one_hop_with_facts(visible.clone());
     let dir = tempfile::tempdir().unwrap();
     let mut pile = empty_pile(&dir);
     assert_eq!(
@@ -723,6 +758,7 @@ fn pile_observation_tracks_only_consulted_lineage_and_target_changes() {
         observed.cover().members().collect::<Vec<_>>(),
         [fixture.output.get_handle()]
     );
+    assert_eq!(observed.view::<TribleSet>().unwrap(), visible);
     assert!(observed.is_current(&before));
 
     let unrelated_descriptor = descriptor::naming::<SimpleArchive>(
@@ -780,16 +816,16 @@ fn pile_observation_tracks_only_consulted_lineage_and_target_changes() {
     // A new target equation with the same visible bytes invalidates the
     // observation too: target membership, not only output hashes, was read.
     let fresh = after_second.collection(fixture.target).unwrap();
+    assert!(absent
+        .iter()
+        .all(|output| !after_second.contains_blob(output.get_handle()).unwrap()));
     pile.insert(CollectionRecord::Merge(
         CollectionMerge::sign(
             &fixture.producer,
             fixture.target.handle(),
-            // An absorbing merge whose other input is not here: it adds no
-            // row, yet it is a new target record the observation read past.
-            [
-                data(&fixture.output),
-                crate::collection::CollectionData::new([0xAB; 32]),
-            ],
+            // These seven subset inputs are absent. Their union with the
+            // resident image adds no row, but this is a new target record.
+            std::iter::once(data(&fixture.output)).chain(absent.iter().map(data)),
             data(&fixture.output),
         )
         .unwrap(),
@@ -804,7 +840,7 @@ fn pile_observation_tracks_only_consulted_lineage_and_target_changes() {
             .unwrap()
             .view::<TribleSet>()
             .unwrap(),
-        facts(1, 21)
+        visible
     );
 }
 

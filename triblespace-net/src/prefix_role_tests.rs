@@ -11,7 +11,7 @@ fn prefix_offer_open_roles_roundtrip_and_reject_wrong_components() {
         (Some(OfferRole::Send), 2),
         (Some(OfferRole::Receive), 3),
     ] {
-        for kind in [WalkKind::Records, WalkKind::Authorization] {
+        for kind in [WalkKind::Commit, WalkKind::Authorization] {
             let frame = Frame::Open {
                 collection: CollectionHandle::new([9; 32]),
                 kind,
@@ -54,7 +54,7 @@ fn prefix_offer_open_role_mismatch_refused_and_pull_never_infers_eager() {
         } else {
             OfferRole::Send
         };
-        for kind in [WalkKind::Records, WalkKind::Authorization] {
+        for kind in [WalkKind::Commit, WalkKind::Authorization] {
             let outgoing = local.walks.start(peer.id(), collection, kind).unwrap();
             assert_eq!(outgoing.offer_role(), Some(wrong));
             assert!(
@@ -119,7 +119,7 @@ fn prefix_offer_open_role_mismatch_refused_and_pull_never_infers_eager() {
                 .start_incoming(
                     peer.id(),
                     collection,
-                    WalkKind::Records,
+                    WalkKind::Commit,
                     Algorithm::Prefix,
                     Some(role)
                 )

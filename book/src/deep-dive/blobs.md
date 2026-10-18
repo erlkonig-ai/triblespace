@@ -50,6 +50,48 @@ attachments. `store.commit(collection, &signing_key, fragment)` copies those
 attachments before it publishes the signed commit which refers to them. There
 is no separate staging manifest to keep in sync.
 
+## Bundles export a blob root
+
+Use `Bundle<S>` when a value's interface is one typed blob handle rather than
+the entity IDs exported by a `Fragment`. The bundle owns its root bytes and an
+explicitly supplied `MemoryBlobStore`; `root()`, `blobs()`, and `into_parts()`
+expose those two parts. Its existing `Spread` implementation emits exactly one
+`Inline<Handle<S>>` and carries all the blobs through attachment-only extras:
+
+```rust,ignore
+use triblespace::prelude::*;
+use triblespace::prelude::blobencodings::{SimpleArchive, UTF8String};
+use triblespace::prelude::inlineencodings::Handle;
+
+attributes! {
+    text: Handle<UTF8String>;
+    body: Handle<SimpleArchive>;
+}
+
+let inner = entity! { text: "inside the archive" };
+let root: Blob<SimpleArchive> = inner.facts().to_blob();
+let bundle = Bundle::new(root, inner.blobs().clone());
+let root_handle = bundle.root();
+let outer = entity! { body*: bundle };
+
+assert_eq!(outer.facts().len(), 1); // Only the body handle, not the inner facts.
+// store.commit(collection, &signing_key, outer) publishes the carried bytes
+// through the ordinary Fragment path.
+```
+
+`Bundle::new` inserts the actual root blob using its cached content handle,
+deduplicating shared bytes through the ordinary store. It preserves every
+supplied attachment, including extras unrelated to the root. It does not scan
+the root, fetch dependencies, or certify transitive completeness. Archiving a
+fragment's facts alone does not include its metafacts; the producer chooses
+which graph channels to encode and which attachments to carry.
+
+A bundle is an in-memory ownership value, not a new blob encoding or pile
+record. Publication copies its carried bytes, but merely carrying a blob does
+not durably root it: later GC and synchronization follow references exposed by
+the stored formats under their existing reachability rules. Nor does keeping
+an inner graph out of the outer facts encrypt or conceal its archived bytes.
+
 ## Put and get explicitly when needed
 
 Low-level code can still work directly with a store:

@@ -701,7 +701,7 @@ mod tests {
                 CollectionMerge::sign(
                     &key,
                     collection.handle(),
-                    [Inline::new(input.raw), Inline::new([10; 32])],
+                    std::iter::once(Inline::new(input.raw)).chain((10..17).map(|byte| Inline::new([byte; 32]))),
                     missing_result,
                 )
                 .unwrap(),

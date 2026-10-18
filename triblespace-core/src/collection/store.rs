@@ -11,7 +11,7 @@ use std::error::Error;
 use std::fmt::Debug;
 
 use super::coverage::{Coverage, CoverageIndex};
-use super::{CollectionData, CollectionHandle, CollectionRecord};
+use super::{CollectionData, CollectionHandle, CollectionRecord, CollectionRecordView};
 
 /// One raw selection route into the grow-only collection-record set.
 ///
@@ -158,6 +158,29 @@ pub trait CollectionRead {
         Ok(selected)
     }
 
+    /// Selected immutable canonical bodies, with the same semantics and order
+    /// as `select_records`. The generic path owns encoded bodies; native stores
+    /// may retain borrowed body storage instead, without changing admission.
+    fn select_record_views(
+        &self,
+        selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<Vec<CollectionRecordView>, Self::RecordsError> {
+        if selectors.is_empty() { return Ok(Vec::new()); }
+        Ok(self.select_records(selectors)?.into_iter().map(Into::into).collect())
+    }
+
+    /// Exact selected semantic delta represented as immutable canonical bodies.
+    /// The default preserves the backend's existing selected-delta algorithm.
+    fn select_record_view_changes(
+        &self,
+        previous: &Self,
+        selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<(Vec<CollectionRecordView>, Vec<CollectionRecordView>), Self::RecordsError> {
+        if selectors.is_empty() { return Ok((Vec::new(), Vec::new())); }
+        let (added, removed) = self.select_record_changes(previous, selectors)?;
+        Ok((added.into_iter().map(Into::into).collect(), removed.into_iter().map(Into::into).collect()))
+    }
+
     /// Canonical records added and removed between two immutable observations
     /// of exactly these routes, returned as `(added, removed)`.
     ///
@@ -276,6 +299,19 @@ where
         (**self).select_records(selectors)
     }
 
+    fn select_record_views(
+        &self, selectors: &std::collections::BTreeSet<crate::collection::CollectionRecordSelector>,
+    ) -> Result<Vec<crate::collection::CollectionRecordView>, Self::RecordsError> {
+        (**self).select_record_views(selectors)
+    }
+
+    fn select_record_view_changes(
+        &self, previous: &Self,
+        selectors: &std::collections::BTreeSet<crate::collection::CollectionRecordSelector>,
+    ) -> Result<(Vec<crate::collection::CollectionRecordView>, Vec<crate::collection::CollectionRecordView>), Self::RecordsError> {
+        (**self).select_record_view_changes(*previous, selectors)
+    }
+
     fn select_record_changes(
         &self,
         previous: &Self,
@@ -375,7 +411,7 @@ mod tests {
                 CollectionMerge::sign(
                     &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                     source,
-                    [data(4), data(5)],
+                    [4, 5, 8, 9, 10, 11, 12, 13].map(data),
                     data(6),
                 )
                 .unwrap(),
@@ -384,7 +420,7 @@ mod tests {
                 CollectionMerge::sign(
                     &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                     other,
-                    [data(4), data(5)],
+                    [4, 5, 8, 9, 10, 11, 12, 13].map(data),
                     data(7),
                 )
                 .unwrap(),
@@ -556,7 +592,7 @@ mod tests {
                 CollectionMerge::sign(
                     &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                     expected,
-                    [data(1), data(2)],
+                    [1, 2, 5, 6, 7, 8, 9, 10].map(data),
                     data(3),
                 )
                 .unwrap(),
@@ -577,7 +613,7 @@ mod tests {
                 CollectionMerge::sign(
                     &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                     other,
-                    [data(1), data(2)],
+                    [1, 2, 5, 6, 7, 8, 9, 10].map(data),
                     data(3),
                 )
                 .unwrap(),

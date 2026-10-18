@@ -2,6 +2,7 @@
 //! The scripted peer deliberately separates discovery, bodies and landing ACKs.
 
 use super::*;
+use anybytes::Bytes;
 use std::sync::Mutex;
 use tokio::io::{AsyncReadExt, DuplexStream, ReadHalf, WriteHalf};
 use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy};
@@ -50,6 +51,36 @@ impl SendStream for Tx {
         *self.1.lock().unwrap() = Some(code);
     }
 }
+
+/// Fault injection at actual shutdown, not at channel closure or readiness.
+struct FinishTx(Tx, bool, Arc<Mutex<bool>>);
+
+impl AsyncWrite for FinishTx {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, bytes)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        *self.2.lock().unwrap() = true;
+        if self.1 {
+            Poll::Pending
+        } else {
+            Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "scripted FIN failure")))
+        }
+    }
+}
+
+impl SendStream for FinishTx {
+    fn reset(&mut self, code: u32) {
+        self.0.reset(code);
+    }
+}
 impl AsyncRead for Rx {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -76,9 +107,8 @@ fn pair() -> (Node, Node, CollectionHandle, CollectionRecord) {
 }
 
 fn root(node: &Node, collection: CollectionHandle) -> Frame {
-    let generation = node.pinned(collection).cache(WalkKind::Records);
+    let generation = node.pinned(collection).cache(WalkKind::Commit);
     Frame::RibltRoot {
-        key: generation.key(),
         summary: generation.summary(),
     }
 }
@@ -86,7 +116,7 @@ fn root(node: &Node, collection: CollectionHandle) -> Frame {
 fn cell(node: &Node, collection: CollectionHandle, index: usize) -> Frame {
     let cell = node
         .pinned(collection)
-        .cache(WalkKind::Records)
+        .cache(WalkKind::Commit)
         .cell(index)
         .unwrap();
     Frame::RibltCell {
@@ -98,11 +128,11 @@ fn cell(node: &Node, collection: CollectionHandle, index: usize) -> Frame {
 }
 
 fn receiver(node: &Node, collection: CollectionHandle) -> Exchange {
-    Exchange::start_riblt(collection, WalkKind::Records, node.pinned(collection))
+    Exchange::start_riblt(collection, WalkKind::Commit, node.pinned(collection))
 }
 
 #[test]
-fn riblt_runtime_rejects_profile_count_index_and_premature_done_before_landing() {
+fn riblt_runtime_rejects_count_index_and_retired_controls_before_landing() {
     let (local, peer, collection, _) = pair();
     let valid = cell(&peer, collection, 0);
     let Frame::RibltCell { symbol, hash, .. } = valid else {
@@ -140,6 +170,7 @@ fn riblt_runtime_rejects_profile_count_index_and_premature_done_before_landing()
             count: i64::MIN,
         },
         Frame::Done,
+        Frame::Landed,
     ];
     for frame in malformed {
         let mut exchange = receiver(&local, collection);
@@ -151,15 +182,8 @@ fn riblt_runtime_rejects_profile_count_index_and_premature_done_before_landing()
         assert!(exchange.end().agreed.is_none());
     }
     let mut exchange = receiver(&local, collection);
-    let Frame::RibltRoot { mut key, summary } = root(&peer, collection) else {
-        unreachable!()
-    };
-    key[0] ^= 1;
-    assert!(
-        exchange
-            .on_frame(Frame::RibltRoot { key, summary }, Some(local.snapshot()))
-            .is_empty()
-    );
+    exchange.on_frame(root(&peer, collection), Some(local.snapshot()));
+    assert!(exchange.on_fin().is_empty());
     assert_eq!(exchange.outcome(), Some(Outcome::Failed(Failure::Protocol)));
 
     let mut exchange = receiver(&local, collection);
@@ -192,7 +216,8 @@ fn riblt_runtime_nonzero_symbol_is_not_a_zero_residual() {
 fn riblt_runtime_large_source_summaries_do_not_impose_a_small_absolute_n_limit() {
     let (local, _, collection, _) = pair();
     for kind in [
-        WalkKind::Records,
+        WalkKind::Commit,
+        WalkKind::Derive,
         WalkKind::Authorization,
         WalkKind::References,
     ] {
@@ -203,10 +228,7 @@ fn riblt_runtime_large_source_summaries_do_not_impose_a_small_absolute_n_limit()
             assert!(
                 exchange
                     .on_frame(
-                        Frame::RibltRoot {
-                            key: cache.key(),
-                            summary
-                        },
+                        Frame::RibltRoot { summary },
                         Some(local.snapshot())
                     )
                     .is_empty()
@@ -241,7 +263,6 @@ fn riblt_runtime_large_source_summaries_do_not_impose_a_small_absolute_n_limit()
         let mut exchange = Exchange::start_riblt(collection, kind, local.pinned(collection));
         exchange.on_frame(
             Frame::RibltRoot {
-                key: cache.key(),
                 summary: PatchSummary::new(Some([0x44; 32]), i64::MAX as u64 + 1).unwrap(),
             },
             Some(local.snapshot()),
@@ -257,7 +278,6 @@ fn riblt_runtime_large_source_summaries_do_not_impose_a_small_absolute_n_limit()
 #[test]
 fn riblt_runtime_large_source_still_bounds_actual_residual_difference() {
     let (local, _, collection, _) = pair();
-    let cache = local.pinned(collection).cache(WalkKind::Records);
     let advertised = MAX_CELLS as u64 + 100;
     for (count, failure) in [
         (MAX_CELLS as i64 + 1, Failure::ResourceLimit),
@@ -267,7 +287,6 @@ fn riblt_runtime_large_source_still_bounds_actual_residual_difference() {
         let mut exchange = receiver(&local, collection);
         exchange.on_frame(
             Frame::RibltRoot {
-                key: cache.key(),
                 summary: PatchSummary::new(Some([0x44; 32]), advertised).unwrap(),
             },
             Some(local.snapshot()),
@@ -305,14 +324,14 @@ fn riblt_runtime_transient_cow_frontier_can_exceed_absolute_source_limit() {
     assert_eq!(
         local
             .pinned(collection)
-            .cache(WalkKind::Records)
+            .cache(WalkKind::Commit)
             .summary()
             .leaf_count(),
         2
     );
     assert_eq!(
         peer.pinned(collection)
-            .cache(WalkKind::Records)
+            .cache(WalkKind::Commit)
             .summary()
             .leaf_count(),
         2
@@ -351,7 +370,7 @@ fn riblt_runtime_transient_cow_frontier_can_exceed_absolute_source_limit() {
     prefix_node.observe();
     let mut prefix = Exchange::start(
         collection,
-        WalkKind::Records,
+        WalkKind::Commit,
         prefix_node.pinned(collection),
         None,
         true,
@@ -362,7 +381,7 @@ fn riblt_runtime_transient_cow_frontier_can_exceed_absolute_source_limit() {
             prefix: Vec::new(),
             summary: prefix_node
                 .pinned(collection)
-                .cache(WalkKind::Records)
+                .cache(WalkKind::Commit)
                 .summary(),
         },
         Some(prefix_node.snapshot()),
@@ -394,6 +413,7 @@ fn riblt_runtime_stop_requires_written_matching_prefix_but_not_bodies() {
     let (local, peer, collection, _) = pair();
     let mut exchange = receiver(&local, collection);
     assert_eq!(exchange.next_delta(), Some(root(&local, collection)));
+    assert!(exchange.on_root_written().is_empty());
     exchange.on_frame(root(&peer, collection), Some(local.snapshot()));
     assert!(matches!(
         exchange.next_delta(),
@@ -413,15 +433,11 @@ fn riblt_runtime_stop_requires_written_matching_prefix_but_not_bodies() {
         exchange.discovery_stopped(),
         "exact sparse root closes before the owed body"
     );
-    assert_eq!(exchange.next_delta(), Some(Frame::Done));
-    assert!(
-        exchange
-            .on_frame(Frame::Done, Some(local.snapshot()))
-            .is_empty()
-    );
+    assert_eq!(exchange.next_delta(), None);
+    assert!(!exchange.ready_to_finish(), "an owed body forbids local FIN");
     assert!(
         exchange.awaits(),
-        "a body remains owed after discovery Done"
+        "a body remains owed after coded discovery stops"
     );
     assert!(exchange.end().agreed.is_none());
 }
@@ -441,7 +457,7 @@ fn riblt_runtime_codec_pins_lengths_and_rejects_unknown_algorithm() {
     }
     let (kind, mut bytes) = Frame::Open {
         collection,
-        kind: WalkKind::Records,
+        kind: WalkKind::Commit,
         algorithm: Algorithm::CachedRiblt,
         offer: None,
     }
@@ -459,7 +475,7 @@ async fn riblt_runtime_writer_receipts_exclude_partial_frames_and_cancelled_tail
     let (frames, queued) = mpsc::channel(1);
     let (reset, resetting) = oneshot::channel();
     let (failed, _failures) = oneshot::channel();
-    let (progress, mut receipts) = watch::channel(0usize);
+    let (progress, mut receipts) = watch::channel(Written::default());
     let writer = tokio::spawn(write_stream_progress(
         Box::new(Tx(send, reset_note.clone())),
         queued,
@@ -467,6 +483,19 @@ async fn riblt_runtime_writer_receipts_exclude_partial_frames_and_cancelled_tail
         failed,
         Some(progress),
     ));
+    let frame = Frame::RibltRoot {
+        summary: PatchSummary::new(None, 0).unwrap(),
+    };
+    let wire_len = 5 + frame.encode().1.len();
+    frames.send(frame).await.unwrap();
+    let mut partial = vec![0; wire_len - 2];
+    recv.read_exact(&mut partial).await.unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(*receipts.borrow(), Written::default(), "partial ROOT is not a receipt");
+    let mut tail = [0; 2];
+    recv.read_exact(&mut tail).await.unwrap();
+    receipts.changed().await.unwrap();
+    assert_eq!(*receipts.borrow_and_update(), Written { root: true, cells: 0 });
     let frame = Frame::RibltCell {
         index: 0,
         symbol: [1; 32],
@@ -479,11 +508,11 @@ async fn riblt_runtime_writer_receipts_exclude_partial_frames_and_cancelled_tail
     let mut partial = vec![0; wire_len - 2];
     recv.read_exact(&mut partial).await.unwrap();
     tokio::task::yield_now().await;
-    assert_eq!(*receipts.borrow(), 0);
+    assert_eq!(*receipts.borrow(), Written { root: true, cells: 0 });
     let mut tail = [0; 2];
     recv.read_exact(&mut tail).await.unwrap();
     receipts.changed().await.unwrap();
-    assert_eq!(*receipts.borrow_and_update(), 1);
+    assert_eq!(*receipts.borrow_and_update(), Written { root: true, cells: 1 });
     frames
         .send(Frame::RibltCell {
             index: 1,
@@ -496,7 +525,7 @@ async fn riblt_runtime_writer_receipts_exclude_partial_frames_and_cancelled_tail
     tokio::task::yield_now().await;
     reset.send(RESET_WALK_FAILED).unwrap();
     assert_eq!(writer.await.unwrap(), (false, false));
-    assert_eq!(*receipts.borrow(), 1);
+    assert_eq!(*receipts.borrow(), Written { root: true, cells: 1 });
     assert_eq!(*reset_note.lock().unwrap(), Some(RESET_WALK_FAILED));
 }
 
@@ -521,6 +550,16 @@ fn driven_with_capacity(
     collection: CollectionHandle,
     capacity: usize,
 ) -> Driven {
+    driven_with_writer(local, peer, collection, capacity, |tx| Box::new(tx))
+}
+
+fn driven_with_writer(
+    local: &Node,
+    peer: &Node,
+    collection: CollectionHandle,
+    capacity: usize,
+    wrap: impl FnOnce(Tx) -> Box<dyn SendStream>,
+) -> Driven {
     let net = SimNet::new(0xC011, SimConfig::default());
     let harness = net.join(&local.key);
     let (snapshots, observed) = watch::channel(Some(local.snapshot()));
@@ -534,12 +573,12 @@ fn driven_with_capacity(
         id: 1,
         peer: peer.id(),
         collection,
-        kind: WalkKind::Records,
+        kind: WalkKind::Commit,
     };
     let (script, stream) = tokio::io::duplex(capacity);
     let (recv, send) = tokio::io::split(stream);
     let reset = Arc::new(Mutex::new(None));
-    let tx = Tx(send, reset.clone());
+    let tx = wrap(Tx(send, reset.clone()));
     let rx = Rx(recv, reset.clone());
     let exchange = receiver(local, collection);
     let (acked, acks) = mpsc::unbounded_channel();
@@ -548,7 +587,7 @@ fn driven_with_capacity(
         drive(
             &driver,
             exchange,
-            Box::new(tx),
+            tx,
             Box::new(rx),
             acks,
             replaced,
@@ -574,11 +613,13 @@ async fn send_frame(send: &mut WriteHalf<DuplexStream>, frame: Frame) {
 }
 
 async fn receive_frame(recv: &mut ReadHalf<DuplexStream>) -> Frame {
-    let (kind, bytes) = read_frame(recv)
-        .await
-        .unwrap()
-        .expect("expected a complete frame");
-    Frame::decode(kind, &bytes).unwrap().unwrap()
+    receive_or_fin(recv).await.expect("expected a complete frame")
+}
+
+async fn receive_or_fin(recv: &mut ReadHalf<DuplexStream>) -> Option<Frame> {
+    read_frame(recv).await.unwrap().map(|(kind, bytes)| {
+        Frame::decode(kind, &bytes).unwrap().expect("known frame")
+    })
 }
 
 async fn discover_without_body(
@@ -590,15 +631,17 @@ async fn discover_without_body(
     assert_eq!(receive_frame(&mut run.recv).await, root(local, collection));
     send_frame(&mut run.send, root(peer, collection)).await;
     send_frame(&mut run.send, cell(peer, collection, 0)).await;
-    send_frame(&mut run.send, Frame::Done).await;
     let mut cells = 0;
     for _ in 0..32 {
-        match receive_frame(&mut run.recv).await {
-            Frame::RibltCell { index, .. } => {
+        // A stopped coded stream owes a body, so neither side may send FIN.
+        // The duplex writer can finish each small cell immediately as we read;
+        // one second of idle virtual time is below the frame-progress deadline.
+        match tokio::time::timeout(Duration::from_secs(1), receive_or_fin(&mut run.recv)).await {
+            Ok(Some(Frame::RibltCell { index, .. })) => {
                 assert_eq!(index as usize, cells);
                 cells += 1;
             }
-            Frame::Done => {
+            Err(_) => {
                 assert!(
                     (1..16).contains(&cells),
                     "prepared capacity must not be queued wholesale"
@@ -615,7 +658,7 @@ async fn discover_without_body(
 #[tokio::test(start_paused = true)]
 async fn riblt_runtime_driver_stops_large_prepared_cache_then_waits_for_body_and_land_ack() {
     let (local, peer, collection, record) = pair();
-    let cache = local.pinned(collection).cache(WalkKind::Records);
+    let cache = local.pinned(collection).cache(WalkKind::Commit);
     cache.cell(65_535).unwrap(); // 3 MiB prepared, not 3 MiB queued.
     assert_eq!(cache.prepared().unwrap(), 65_536);
     let mut run = driven(&local, &peer, collection);
@@ -632,20 +675,20 @@ async fn riblt_runtime_driver_stops_large_prepared_cache_then_waits_for_body_and
     let (id, events) = run.landings.recv().await.unwrap();
     assert_eq!(id, 1);
     assert!(matches!(&events[..], [NetEvent::CollectionRecord(value)] if *value == record));
-    send_frame(&mut run.send, Frame::Landed).await;
+    run.send.shutdown().await.unwrap();
     tokio::task::yield_now().await;
     assert!(
         !run.done.is_finished(),
-        "received bytes and peer LANDED do not acknowledge local insertion"
+        "received bytes and peer FIN do not acknowledge local insertion"
     );
     run.acked.send((1, 0)).unwrap();
-    assert_eq!(receive_frame(&mut run.recv).await, Frame::Landed);
+    assert_eq!(receive_or_fin(&mut run.recv).await, None);
     let (ended, duplicate) = run.done.await.unwrap();
     assert!(!duplicate);
     assert!(ended.landed && ended.confirmed && ended.agreed.is_some());
     assert_eq!(
         ended.agreed.unwrap().summary(),
-        peer.pinned(collection).cache(WalkKind::Records).summary()
+        peer.pinned(collection).cache(WalkKind::Commit).summary()
     );
     assert_eq!(*run.reset.lock().unwrap(), None);
 }
@@ -654,11 +697,11 @@ async fn riblt_runtime_driver_stops_large_prepared_cache_then_waits_for_body_and
 async fn riblt_runtime_equal_empty_roots_finish_without_cells_or_cache_preparation() {
     let mut local = Node::new(201);
     let mut peer = Node::new(202);
-    let collection = local.hold("riblt-empty-early-done", open());
-    assert_eq!(peer.hold("riblt-empty-early-done", open()), collection);
-    let cache = local.pinned(collection).cache(WalkKind::Records);
-    // Pin the exact edge independently of scheduler order: peer DONE before our
-    // DONE was generated. Its completed write must wake settling even at prefix0.
+    let collection = local.hold("riblt-empty-early-fin", open());
+    assert_eq!(peer.hold("riblt-empty-early-fin", open()), collection);
+    let cache = local.pinned(collection).cache(WalkKind::Commit);
+    // Peer FIN arrives before the local ROOT write completes. A zero-cell
+    // receipt cannot stand in for the complete ROOT receipt.
     let mut exchange = receiver(&local, collection);
     exchange.next_delta();
     assert!(
@@ -666,33 +709,31 @@ async fn riblt_runtime_equal_empty_roots_finish_without_cells_or_cache_preparati
             .on_frame(root(&peer, collection), Some(local.snapshot()))
             .is_empty()
     );
-    assert!(
-        exchange
-            .on_frame(Frame::Done, Some(local.snapshot()))
-            .is_empty()
-    );
-    assert_eq!(exchange.next_delta(), Some(Frame::Done));
-    assert!(matches!(
-        &exchange.on_written(0)[..],
-        [Out::Send(Frame::Landed)]
-    ));
+    assert!(exchange.on_fin().is_empty());
+    assert_eq!(exchange.next_delta(), None);
+    assert!(exchange.on_written(0).is_empty());
+    assert!(!exchange.ready_to_finish());
+    assert_eq!(exchange.outcome(), None);
+    assert!(exchange.on_root_written().is_empty());
+    assert!(exchange.ready_to_finish());
+    assert_eq!(exchange.outcome(), Some(Outcome::Confirmed));
 
-    // Actual reader/driver/writer: deliver peer ROOT+DONE while the one-byte
+    // Actual reader/driver/writer: deliver peer ROOT+FIN while the one-byte
     // outbound pipe still blocks this side's initial ROOT write.
     let mut run = driven_with_capacity(&local, &peer, collection, 1);
     send_frame(&mut run.send, root(&peer, collection)).await;
-    send_frame(&mut run.send, Frame::Done).await;
+    run.send.shutdown().await.unwrap();
+    tokio::task::yield_now().await;
+    assert!(!run.done.is_finished(), "the outbound ROOT is still blocked");
     assert_eq!(receive_frame(&mut run.recv).await, root(&local, collection));
-    assert_eq!(receive_frame(&mut run.recv).await, Frame::Done);
-    assert_eq!(receive_frame(&mut run.recv).await, Frame::Landed);
-    send_frame(&mut run.send, Frame::Landed).await;
+    assert_eq!(receive_or_fin(&mut run.recv).await, None);
     let (ended, duplicate) = run.done.await.unwrap();
     assert!(!duplicate && ended.landed && ended.confirmed);
     assert_eq!(ended.agreed.unwrap().summary(), cache.summary());
     assert_eq!(cache.prepared().unwrap(), 0);
     assert_eq!(
         peer.pinned(collection)
-            .cache(WalkKind::Records)
+            .cache(WalkKind::Commit)
             .prepared()
             .unwrap(),
         0
@@ -727,35 +768,30 @@ async fn riblt_runtime_driver_eagerly_writes_each_local_only_body_once() {
     assert_eq!(receive_frame(&mut run.recv).await, root(&full, collection));
     send_frame(&mut run.send, root(&empty, collection)).await;
     send_frame(&mut run.send, cell(&empty, collection, 0)).await;
-    send_frame(&mut run.send, Frame::Done).await;
+    run.send.shutdown().await.unwrap();
     let mut bodies = 0;
     let mut cells = 0;
-    let mut done = false;
-    let mut landed = false;
+    let mut fin = false;
     for _ in 0..32 {
-        match receive_frame(&mut run.recv).await {
-            Frame::RibltCell { index, .. } => {
+        match receive_or_fin(&mut run.recv).await {
+            Some(Frame::RibltCell { index, .. }) => {
                 assert_eq!(index as usize, cells);
                 cells += 1;
             }
-            Frame::Value { key, bytes } => {
+            Some(Frame::Value { key, bytes }) => {
                 assert_eq!(key, record.fingerprint().raw());
                 assert_eq!(decode_record(collection, &bytes).unwrap(), record);
                 bodies += 1;
             }
-            Frame::Done => {
-                done = true;
-                send_frame(&mut run.send, Frame::Landed).await;
-            }
-            Frame::Landed => {
-                landed = true;
+            None => {
+                fin = true;
                 break;
             }
             unexpected => panic!("unexpected eager transfer frame: {unexpected:?}"),
         }
     }
     assert_eq!(bodies, 1);
-    assert!(done && landed);
+    assert!(fin);
     assert!((1..16).contains(&cells));
     let (ended, _) = run.done.await.unwrap();
     assert!(ended.landed && ended.confirmed && ended.agreed.is_some());
@@ -763,6 +799,358 @@ async fn riblt_runtime_driver_eagerly_writes_each_local_only_body_once() {
         run.landings.try_recv().is_err(),
         "the empty peer owed no body"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn riblt_runtime_peer_fin_cannot_hide_a_failed_insertion_ack() {
+    let (local, peer, collection, record) = pair();
+    let mut run = driven(&local, &peer, collection);
+    discover_without_body(&mut run, &local, &peer, collection).await;
+    send_frame(&mut run.send, Frame::Value {
+        key: record.fingerprint().raw(),
+        bytes: encode_record(collection, record).unwrap(),
+    }).await;
+    assert!(matches!(&run.landings.recv().await.unwrap().1[..],
+        [NetEvent::CollectionRecord(value)] if *value == record));
+    run.send.shutdown().await.unwrap();
+    tokio::task::yield_now().await;
+    assert!(!run.done.is_finished());
+    run.acked.send((0, 1)).unwrap();
+    let (ended, duplicate) = run.done.await.unwrap();
+    // A processed peer FIN may independently confirm the sending direction;
+    // it cannot establish local landing or a shared agreement after this ACK.
+    assert!(!duplicate && !ended.landed && ended.agreed.is_none());
+    assert_eq!(*run.reset.lock().unwrap(), Some(RESET_WALK_FAILED));
+}
+
+#[tokio::test(start_paused = true)]
+async fn riblt_runtime_late_first_value_after_local_fin_reopens_insertion_debt() {
+    for failed in [false, true] {
+        let (mut local, peer, collection, record) = pair();
+        let mut run = driven(&local, &peer, collection);
+        let pinned_root = root(&local, collection);
+        // The exchange pins an empty source, but remember() sees this newer
+        // publication before the decoded remote-only key's eager VALUE arrives.
+        assert_eq!(local.insert(vec![NetEvent::CollectionRecord(record)]), (1, 0));
+        local.observe();
+        run._snapshots.send(Some(local.snapshot())).unwrap();
+        assert_eq!(receive_frame(&mut run.recv).await, pinned_root);
+        send_frame(&mut run.send, root(&peer, collection)).await;
+        send_frame(&mut run.send, cell(&peer, collection, 0)).await;
+        let mut cells = 0;
+        loop {
+            match receive_or_fin(&mut run.recv).await {
+                Some(Frame::RibltCell { index, .. }) => {
+                    assert_eq!(index as usize, cells);
+                    cells += 1;
+                    assert!(cells < 16);
+                }
+                None => break,
+                other => panic!("unexpected frame before local FIN: {other:?}"),
+            }
+        }
+        assert!(cells > 0);
+        assert!(!run.done.is_finished(), "local FIN does not wait for peer FIN");
+        assert!(run.landings.try_recv().is_err(), "remember used resident evidence");
+
+        send_frame(&mut run.send, Frame::Value {
+            key: record.fingerprint().raw(),
+            bytes: encode_record(collection, record).unwrap(),
+        }).await;
+        assert!(matches!(&run.landings.recv().await.unwrap().1[..],
+            [NetEvent::CollectionRecord(value)] if *value == record));
+        run.send.shutdown().await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!run.done.is_finished(), "peer FIN cannot latch the earlier readiness");
+        run.acked.send(if failed { (0, 1) } else { (1, 0) }).unwrap();
+        let (ended, duplicate) = run.done.await.unwrap();
+        assert!(!duplicate);
+        if failed {
+            assert!(!ended.landed && ended.agreed.is_none());
+            assert_eq!(*run.reset.lock().unwrap(), Some(RESET_WALK_FAILED));
+        } else {
+            assert!(ended.landed && ended.confirmed);
+            assert_eq!(ended.agreed.unwrap().summary().leaf_count(), 1);
+            assert_eq!(*run.reset.lock().unwrap(), None);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn riblt_runtime_local_fin_does_not_wait_for_peer_fin_and_replacement_still_resets() {
+    for replace in [false, true] {
+        let mut local = Node::new(203);
+        let mut peer = Node::new(204);
+        let collection = local.hold("riblt-half-close-ownership", open());
+        assert_eq!(peer.hold("riblt-half-close-ownership", open()), collection);
+        let mut run = driven(&local, &peer, collection);
+        assert_eq!(receive_frame(&mut run.recv).await, root(&local, collection));
+        send_frame(&mut run.send, root(&peer, collection)).await;
+        assert_eq!(receive_or_fin(&mut run.recv).await, None,
+            "equal roots permit local FIN while the peer's write half stays open");
+        assert!(!run.done.is_finished());
+        if replace {
+            run._replace.send(()).unwrap();
+        } else {
+            run.send.shutdown().await.unwrap();
+        }
+        let (ended, duplicate) = run.done.await.unwrap();
+        assert!(!duplicate);
+        if replace {
+            assert!(!ended.confirmed && ended.agreed.is_none());
+            assert_eq!(*run.reset.lock().unwrap(), Some(RESET_WALK_FAILED));
+        } else {
+            assert!(ended.landed && ended.confirmed && ended.agreed.is_some());
+            assert_eq!(*run.reset.lock().unwrap(), None);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn riblt_runtime_failed_or_blocked_finish_never_retains_agreement() {
+    // Immediate shutdown error, a stalled shutdown deadline, and replacement
+    // while shutdown is blocked are distinct from semantic eligibility.
+    for mode in 0..3 {
+        let mut local = Node::new(205);
+        let mut peer = Node::new(206);
+        let collection = local.hold("riblt-finish-failure", open());
+        assert_eq!(peer.hold("riblt-finish-failure", open()), collection);
+        let attempted = Arc::new(Mutex::new(false));
+        let note = attempted.clone();
+        let mut run = driven_with_writer(&local, &peer, collection, 128, |tx| {
+            Box::new(FinishTx(tx, mode != 0, note))
+        });
+        assert_eq!(receive_frame(&mut run.recv).await, root(&local, collection));
+        send_frame(&mut run.send, root(&peer, collection)).await;
+        run.send.shutdown().await.unwrap();
+        // Keep virtual time still until actual poll_shutdown is observed.
+        for _ in 0..100 {
+            if *attempted.lock().unwrap() { break; }
+            tokio::task::yield_now().await;
+        }
+        assert!(*attempted.lock().unwrap());
+        if mode != 0 {
+            assert!(!run.done.is_finished());
+            if mode == 1 {
+                tokio::time::advance(WALK_DEADLINE + Duration::from_secs(1)).await;
+            } else {
+                run._replace.send(()).unwrap();
+            }
+        }
+        let (ended, duplicate) = run.done.await.unwrap();
+        assert!(!duplicate && !ended.landed && ended.agreed.is_none());
+        assert_eq!(*run.reset.lock().unwrap(), Some(RESET_WALK_FAILED));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn riblt_runtime_truncated_value_is_not_clean_fin() {
+    let (local, peer, collection, record) = pair();
+    let mut run = driven(&local, &peer, collection);
+    discover_without_body(&mut run, &local, &peer, collection).await;
+    let (kind, bytes) = Frame::Value {
+        key: record.fingerprint().raw(),
+        bytes: encode_record(collection, record).unwrap(),
+    }.encode();
+    run.send.write_all(&[kind]).await.unwrap();
+    run.send.write_all(&(bytes.len() as u32).to_be_bytes()).await.unwrap();
+    run.send.write_all(&bytes[..bytes.len() - 1]).await.unwrap();
+    run.send.shutdown().await.unwrap();
+    let (ended, duplicate) = run.done.await.unwrap();
+    assert!(!duplicate && !ended.landed && !ended.confirmed && ended.agreed.is_none());
+    assert!(run.landings.try_recv().is_err());
+    assert_eq!(*run.reset.lock().unwrap(), Some(RESET_WALK_FAILED));
+}
+
+#[test]
+fn riblt_runtime_peer_fin_leaves_more_than_one_reference_fetch_window_alive() {
+    use triblespace_core::collection::HeldStore;
+
+    let mut local = Node::new(207);
+    let mut peer = Node::new(208);
+    let collection = local.hold("riblt-reference-fin", open());
+    assert_eq!(peer.hold("riblt-reference-fin", open()), collection);
+    local.store.track_held([collection]);
+    peer.store.track_held([collection]);
+    let blobs: Vec<_> = (0u64..130).map(|index| {
+        let blob = Blob::<UnknownBlob>::new(Bytes::from_source(index.to_be_bytes().to_vec()));
+        let handle = blob.get_handle().raw;
+        assert_eq!(peer.insert(vec![NetEvent::Blob(blob.clone()),
+            NetEvent::Held { collection, handle }]), (2, 0));
+        (handle, blob)
+    }).collect();
+    local.observe();
+    peer.observe();
+    let kind = WalkKind::References;
+    let cache = peer.pinned(collection).cache(kind);
+    let mut exchange = Exchange::start_riblt(collection, kind, local.pinned(collection));
+    assert!(matches!(exchange.next_delta(), Some(Frame::RibltRoot { .. })));
+    assert!(exchange.on_root_written().is_empty());
+    assert!(exchange.on_frame(Frame::RibltRoot { summary: cache.summary() },
+        Some(local.snapshot())).is_empty());
+    let mut pending = VecDeque::new();
+    for index in 0..8192 {
+        assert!(matches!(exchange.next_delta(), Some(Frame::RibltCell { .. })));
+        assert!(exchange.on_written(index + 1).is_empty());
+        let item = cache.cell(index).unwrap();
+        for out in exchange.on_frame(Frame::RibltCell {
+            index: index as u32, symbol: item.symbol.0, hash: item.hash, count: item.count,
+        }, Some(local.snapshot())) {
+            match out {
+                Out::Fetch { handle, proof: None } => pending.push_back(handle),
+                other => panic!("unexpected reference discovery work: {other:?}"),
+            }
+        }
+        if exchange.discovery_stopped() { break; }
+    }
+    assert!(exchange.discovery_stopped());
+    assert_eq!(pending.len(), 64, "remaining references have not entered the fetch window");
+    assert!(exchange.on_fin().is_empty());
+    assert_eq!(exchange.outcome(), None);
+    assert!(!exchange.awaits(), "remaining work is local fetch/landing, not peer frames");
+    assert!(!exchange.ready_to_finish());
+    let mut fetched = Vec::new();
+    while let Some(handle) = pending.pop_front() {
+        fetched.push(handle);
+        let blob = blobs.iter().find(|(key, _)| *key == handle).unwrap().1.clone();
+        let mut landed = 0;
+        for out in exchange.on_fetched(handle, None, Some(blob)) {
+            match out {
+                Out::Fetch { handle, proof: None } => pending.push_back(handle),
+                Out::Land(events) => {
+                    assert!(matches!(&events[..], [NetEvent::Blob(_), NetEvent::Held { .. }]));
+                    let (ok, failed) = local.insert(events);
+                    assert_eq!((ok, failed), (2, 0));
+                    landed += ok;
+                }
+                other => panic!("unexpected reference completion work: {other:?}"),
+            }
+        }
+        assert_eq!(landed, 2);
+        assert_eq!(exchange.outcome(), None, "the current fetched blob still owes its ACK");
+        assert!(exchange.on_landed_ack(landed, 0).is_empty());
+    }
+    assert_eq!(fetched.len(), 130, "each remote-only blob is fetched once");
+    fetched.sort_unstable();
+    fetched.dedup();
+    assert_eq!(fetched.len(), 130);
+    assert!(exchange.ready_to_finish());
+    assert_eq!(exchange.outcome(), Some(Outcome::Confirmed));
+    assert_eq!(exchange.end().agreed.unwrap().summary(), cache.summary());
+}
+
+#[test]
+fn riblt_runtime_auth_fin_waits_for_descriptor_and_both_landing_acks() {
+    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+    use triblespace_core::capability::policy::{resource_collection, resource_policy};
+    use triblespace_core::capability::{CapabilityProof, CapabilityResource};
+    use triblespace_core::inline::Inline;
+    use triblespace_core::macros::entity;
+    use triblespace_core::repo::{BlobStoreGet, BlobStorePut, CapabilityProofStore, SnapshotSource};
+    use crate::walk::tests::walking::key;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Case { Success, Missing, Wrong, FirstAckFails, SecondAckFails }
+    for case in [Case::Success, Case::Missing, Case::Wrong,
+        Case::FirstAckFails, Case::SecondAckFails] {
+        // Same routed-resource fixture as the Prefix descriptor regression:
+        // the proof is signed correctly, but cannot land before its descriptor.
+        let mut peer = Node::new(211);
+        let mut local = Node::new(212);
+        let collection = peer.hold("cached-auth-fin-descriptor", open());
+        assert_eq!(local.hold("cached-auth-fin-descriptor", open()), collection);
+        let resource_root = key(213);
+        let capability = Inline::new([10; 32]);
+        let resource = peer.store.put::<SimpleArchive, _>(entity! {
+            resource_collection: collection,
+            resource_policy*: AdmissionPolicy::direct(resource_root.verifying_key())
+                .binding(capability),
+        }.facts().clone()).unwrap();
+        let proof = CapabilityProof::new(CapabilityResource::from(resource),
+            &resource_root, capability, local.key.verifying_key());
+        proof.verify_signatures().unwrap();
+        peer.store.insert_proof(proof.clone()).unwrap();
+        peer.observe();
+        local.observe();
+        assert!(peer.pinned(collection).repair().authorization_evidence()
+            .get(proof.id()).is_some());
+        assert!(local.pinned(collection).repair().authorization_evidence()
+            .get(proof.id()).is_none());
+
+        let kind = WalkKind::Authorization;
+        let cache = peer.pinned(collection).cache(kind);
+        let mut exchange = Exchange::start_riblt(collection, kind, local.pinned(collection));
+        assert!(matches!(exchange.next_delta(), Some(Frame::RibltRoot { .. })));
+        assert!(exchange.on_root_written().is_empty());
+        assert!(exchange.on_frame(Frame::RibltRoot { summary: cache.summary() },
+            Some(local.snapshot())).is_empty());
+        for index in 0..16 {
+            assert!(matches!(exchange.next_delta(), Some(Frame::RibltCell { .. })));
+            assert!(exchange.on_written(index + 1).is_empty());
+            let item = cache.cell(index).unwrap();
+            assert!(exchange.on_frame(Frame::RibltCell {
+                index: index as u32, symbol: item.symbol.0, hash: item.hash, count: item.count,
+            }, Some(local.snapshot())).is_empty());
+            if exchange.discovery_stopped() { break; }
+        }
+        assert!(exchange.discovery_stopped());
+        let fetched = exchange.on_frame(Frame::Value {
+            key: proof.id().raw, bytes: proof.as_bytes().to_vec(),
+        }, Some(local.snapshot()));
+        assert!(matches!(&fetched[..], [Out::Fetch { handle, proof: Some(value) }]
+            if *handle == resource.raw && *value == proof));
+        assert!(exchange.on_fin().is_empty());
+        assert_eq!(exchange.outcome(), None, "{case:?}: FIN cannot discharge the fetch");
+        assert!(!exchange.ready_to_finish());
+        assert!(!exchange.awaits(), "only local descriptor/landing work remains");
+
+        let descriptor = match case {
+            Case::Missing => None,
+            Case::Wrong => Some(Blob::<UnknownBlob>::new(Bytes::from_source(
+                b"not the signed resource descriptor".to_vec()))),
+            _ => Some(BlobStoreGet::get::<Blob<UnknownBlob>, UnknownBlob>(
+                &peer.store.snapshot().unwrap(), Inline::new(resource.raw)).unwrap()),
+        };
+        let mut work = exchange.on_fetched(resource.raw, Some(proof.clone()), descriptor);
+        if matches!(case, Case::Missing | Case::Wrong) {
+            assert!(work.is_empty());
+            assert_eq!(exchange.outcome(), Some(Outcome::Failed(Failure::DeferredProof)));
+            let ended = exchange.end();
+            assert!(ended.confirmed && !ended.landed && ended.agreed.is_none());
+            continue;
+        }
+        assert_eq!(work.len(), 1);
+        let Out::Land(events) = work.pop().unwrap() else { panic!("descriptor and proof land") };
+        assert!(matches!(&events[..], [NetEvent::Blob(blob), NetEvent::CapabilityProof(value)]
+            if blob.get_handle().raw == resource.raw && *value == proof));
+        assert_eq!(exchange.outcome(), None);
+        assert!(!exchange.ready_to_finish());
+        for (index, event) in events.into_iter().enumerate() {
+            // Successful ACKs come from actual synthetic store insertions;
+            // the two negative cases inject a store failure at either position.
+            let failed = (case == Case::FirstAckFails && index == 0)
+                || (case == Case::SecondAckFails && index == 1);
+            let (landed, failures) = if failed { (0, 1) } else { local.insert(vec![event]) };
+            assert_eq!((landed, failures), if failed { (0, 1) } else { (1, 0) });
+            assert!(exchange.on_landed_ack(landed, failures).is_empty());
+            if index == 0 {
+                assert_eq!(exchange.outcome(), None, "one event still owes its actual ACK");
+                assert!(!exchange.ready_to_finish());
+            }
+        }
+        if case == Case::Success {
+            assert!(exchange.ready_to_finish());
+            assert_eq!(exchange.outcome(), Some(Outcome::Confirmed));
+            local.observe();
+            assert!(local.pinned(collection).repair().authorization_evidence()
+                .get(proof.id()).is_some());
+            assert_eq!(exchange.end().agreed.unwrap().summary(), cache.summary());
+        } else {
+            assert_eq!(exchange.outcome(), Some(Outcome::Failed(Failure::InsertFailed)));
+            let ended = exchange.end();
+            assert!(ended.confirmed && !ended.landed && ended.agreed.is_none());
+        }
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -779,7 +1167,7 @@ async fn riblt_runtime_one_way_walks_use_prefix_and_refuse_incoming_riblt() {
     local.walks.algorithm = Algorithm::CachedRiblt;
     let mut exchange = local
         .walks
-        .start(peer.id(), collection, WalkKind::Records)
+        .start(peer.id(), collection, WalkKind::Commit)
         .unwrap();
     assert_eq!(exchange.algorithm(), Algorithm::Prefix);
     assert!(exchange.receives());
@@ -814,7 +1202,7 @@ async fn riblt_runtime_one_way_walks_use_prefix_and_refuse_incoming_riblt() {
     task.incoming(
         peer.id(),
         collection,
-        WalkKind::Records,
+        WalkKind::Commit,
         Algorithm::CachedRiblt,
         None,
         Box::new(Tx(send, reset.clone())),
@@ -847,6 +1235,8 @@ fn riblt_runtime_more_than_one_body_window_cannot_finish_at_an_empty_current_win
     let mut right = receiver(&b, collection);
     let a_root = left.next_delta().unwrap();
     let b_root = right.next_delta().unwrap();
+    assert!(left.on_root_written().is_empty());
+    assert!(right.on_root_written().is_empty());
     assert!(left.on_frame(b_root, Some(a.snapshot())).is_empty());
     assert!(right.on_frame(a_root, Some(b.snapshot())).is_empty());
     for prefix in 1..8192 {
@@ -864,10 +1254,9 @@ fn riblt_runtime_more_than_one_body_window_cannot_finish_at_an_empty_current_win
         }
     }
     assert!(left.discovery_stopped() && right.discovery_stopped());
-    assert_eq!(left.next_delta(), Some(Frame::Done));
-    assert_eq!(right.next_delta(), Some(Frame::Done));
-    assert!(left.on_frame(Frame::Done, Some(a.snapshot())).is_empty());
-    assert!(right.on_frame(Frame::Done, Some(b.snapshot())).is_empty());
+    assert_eq!(left.next_delta(), None);
+    assert_eq!(right.next_delta(), None);
+    assert!(!left.ready_to_finish() && !right.ready_to_finish());
 
     let mut a_bodies = Vec::new();
     let mut b_bodies = Vec::new();
@@ -892,7 +1281,7 @@ fn riblt_runtime_more_than_one_body_window_cannot_finish_at_an_empty_current_win
         assert_eq!(keys.len(), 130, "each local-only body is pushed once");
     }
     // All current 64-entry windows drain more than once; withhold the last body
-    // in each direction until after both coded DONEs and all other landing ACKs.
+    // in each direction until coded discovery stops and all other ACKs arrive.
     let a_last = a_bodies.pop().unwrap();
     let b_last = b_bodies.pop().unwrap();
     for (a_body, b_body) in a_bodies.into_iter().zip(b_bodies) {
@@ -917,16 +1306,14 @@ fn riblt_runtime_more_than_one_body_window_cannot_finish_at_an_empty_current_win
         &right.on_frame(a_last, Some(b.snapshot()))[..],
         [Out::Land(_)]
     ));
-    assert!(matches!(
-        &left.on_landed_ack(1, 0)[..],
-        [Out::Send(Frame::Landed)]
-    ));
-    assert!(matches!(
-        &right.on_landed_ack(1, 0)[..],
-        [Out::Send(Frame::Landed)]
-    ));
-    left.on_frame(Frame::Landed, Some(a.snapshot()));
-    right.on_frame(Frame::Landed, Some(b.snapshot()));
+    assert!(left.on_landed_ack(1, 0).is_empty());
+    assert!(right.on_landed_ack(1, 0).is_empty());
+    assert!(left.ready_to_finish() && right.ready_to_finish(),
+        "both halves may finish without waiting for the other's FIN");
+    assert_eq!(left.outcome(), None);
+    assert_eq!(right.outcome(), None);
+    left.on_fin();
+    right.on_fin();
     assert_eq!(left.outcome(), Some(Outcome::Confirmed));
     assert_eq!(right.outcome(), Some(Outcome::Confirmed));
     let a_union = left.end().agreed.unwrap();
@@ -957,7 +1344,7 @@ async fn riblt_runtime_simultaneous_open_tie_break_preserves_winners_explicit_al
             assert_eq!(
                 local
                     .walks
-                    .start(peer.id(), collection, WalkKind::Records)
+                    .start(peer.id(), collection, WalkKind::Commit)
                     .unwrap()
                     .algorithm(),
                 local.walks.algorithm
@@ -980,7 +1367,7 @@ async fn riblt_runtime_simultaneous_open_tie_break_preserves_winners_explicit_al
             };
             let (old_acks, _old_acked) = mpsc::unbounded_channel();
             let (old_replace, mut old_replaced) = oneshot::channel();
-            let exchange_key = (peer.id(), collection.raw, WalkKind::Records);
+            let exchange_key = (peer.id(), collection.raw, WalkKind::Commit);
             task.running.insert(
                 exchange_key,
                 Running {
@@ -997,7 +1384,7 @@ async fn riblt_runtime_simultaneous_open_tie_break_preserves_winners_explicit_al
             task.incoming(
                 peer.id(),
                 collection,
-                WalkKind::Records,
+                WalkKind::Commit,
                 incoming,
                 None,
                 Box::new(Tx(send, reset.clone())),
@@ -1047,7 +1434,7 @@ async fn riblt_runtime_task_retains_prefix_agreement_but_releases_cached_source_
         let collection = local.hold("riblt-no-retained-peer-source", open());
         local.commit(collection, 1);
         local.observe();
-        let kind = WalkKind::Records;
+        let kind = WalkKind::Commit;
         let snapshot = local.snapshot();
         let source = Arc::new(Tree::pinned(kind, local.pinned(collection).repair()));
         let source_summary = source.summary();
@@ -1101,13 +1488,23 @@ async fn riblt_runtime_task_retains_prefix_agreement_but_releases_cached_source_
             _ => panic!("expected the explicitly selected root"),
         }
         assert!(exchange.on_frame(root, Some(snapshot.clone())).is_empty());
-        assert_eq!(exchange.next_delta(), Some(Frame::Done));
-        exchange.on_written(0);
-        assert!(matches!(
-            &exchange.on_frame(Frame::Done, Some(snapshot.clone()))[..],
-            [Out::Send(Frame::Landed)]
-        ));
-        exchange.on_frame(Frame::Landed, Some(snapshot));
+        match selected {
+            Algorithm::Prefix => {
+                assert_eq!(exchange.next_delta(), Some(Frame::Done));
+                exchange.on_written(0);
+                assert!(matches!(
+                    &exchange.on_frame(Frame::Done, Some(snapshot.clone()))[..],
+                    [Out::Send(Frame::Landed)]
+                ));
+                exchange.on_frame(Frame::Landed, Some(snapshot));
+            }
+            Algorithm::CachedRiblt => {
+                assert_eq!(exchange.next_delta(), None);
+                assert!(exchange.on_root_written().is_empty());
+                assert!(exchange.ready_to_finish());
+                exchange.on_fin();
+            }
+        }
         assert_eq!(exchange.outcome(), Some(Outcome::Confirmed));
         let ended = exchange.end();
         assert_eq!(ended.retain_agreement, selected == Algorithm::Prefix);
@@ -1146,7 +1543,7 @@ async fn riblt_runtime_task_retains_prefix_agreement_but_releases_cached_source_
             .find(|item| item.peer == peer)
             .unwrap();
         assert!(pair.pushes.last_ok && pair.receives.last_ok);
-        assert_eq!(pair.confirmed.records, Some(source_summary));
-        assert_eq!(pair.received.records, Some(source_summary));
+        assert_eq!(pair.confirmed.commits, Some(source_summary));
+        assert_eq!(pair.received.commits, Some(source_summary));
     }
 }

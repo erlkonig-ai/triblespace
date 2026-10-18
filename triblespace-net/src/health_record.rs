@@ -314,12 +314,11 @@ pub fn measurements(
                         Some(entry.received)
                     });
                     Evidence {
-                        local_records: local.map(|frontier| frontier.records.leaf_count()),
+                        local_records: local.map(|frontier| frontier.commits.leaf_count() + frontier.derives.leaf_count()),
                         local_authorizations: local
                             .map(|frontier| frontier.authorization_evidence.leaf_count()),
                         remote_records: remote
-                            .and_then(|roots| roots.records)
-                            .map(|root| root.leaf_count()),
+                            .and_then(|roots| Some(roots.commits?.leaf_count() + roots.derives?.leaf_count())),
                         remote_authorizations: remote
                             .and_then(|roots| roots.authorization_evidence)
                             .map(|root| root.leaf_count()),
@@ -600,7 +599,8 @@ mod tests {
             .to_bytes();
         let frontier = RepairFrontier {
             wake_root: [5; 32],
-            records: PatchSummary::new(Some([5; 32]), 10).unwrap(),
+            commits: PatchSummary::new(Some([5; 32]), 10).unwrap(),
+            derives: PatchSummary::new(None, 0).unwrap(),
             authorization_evidence: PatchSummary::new(None, 0).unwrap(),
         };
         sample.collections.push(CollectionHealth {
@@ -635,14 +635,17 @@ mod tests {
         use crate::walk::WalkKind;
 
         health.with_peer(collection, peer, |pair| {
-            pair.pushed(at, WalkKind::Records, frontier.records, true);
+            pair.pushed(at, WalkKind::Commit, frontier.commits, true);
+            pair.pushed(at, WalkKind::Derive, frontier.derives, true);
             pair.pushed(
                 at,
                 WalkKind::Authorization,
                 frontier.authorization_evidence,
                 true,
             );
-            pair.received(at, WalkKind::Records, Some(frontier.records), true);
+            pair.received(at, WalkKind::Commit, Some(frontier.commits), true);
+            pair.received(at, WalkKind::Derive, Some(frontier.derives), true);
+            pair.received(at, WalkKind::Authorization, Some(frontier.authorization_evidence), true);
         });
     }
 
@@ -663,9 +666,9 @@ mod tests {
         let now = at + PROGRESS_GRACE + Duration::from_secs(1);
         let (health, collection, remote_key, frontier) = pair(at, now);
         health.with_peer(collection, remote_key, |pair| {
-            pair.pushed(at, WalkKind::Records, frontier.records, false);
-            pair.received(at, WalkKind::Records, None, true);
-            pair.pushed(now, WalkKind::Records, frontier.records, false);
+            pair.pushed(at, WalkKind::Commit, frontier.commits, false);
+            pair.received(at, WalkKind::Commit, None, true);
+            pair.pushed(now, WalkKind::Commit, frontier.commits, false);
         });
         health.update(|health| health.collections[0].last_local_change_at = Some(now));
         let condition = collection_condition(&health, now);
@@ -708,7 +711,7 @@ mod tests {
         for multiplier in 1..=3 {
             let now = at + PROGRESS_GRACE * multiplier + Duration::from_secs(1);
             let written = RepairFrontier {
-                records: PatchSummary::new(
+                commits: PatchSummary::new(
                     Some([multiplier as u8; 32]),
                     10 + u64::from(multiplier),
                 )
@@ -723,15 +726,18 @@ mod tests {
             });
             // The push that ends now pinned the tree before this write.
             health.with_peer(collection, remote_key, |pair| {
-                pair.pushed(now, WalkKind::Records, frontier.records, true);
+                pair.pushed(now, WalkKind::Commit, frontier.commits, true);
+                pair.received(now, WalkKind::Commit, Some(frontier.commits), true);
+                pair.received(now, WalkKind::Derive, Some(frontier.derives), true);
+                pair.received(now, WalkKind::Authorization, Some(frontier.authorization_evidence), true);
             });
             let condition = collection_condition(&health, now);
             assert_eq!(condition.state, State::Progressing);
             assert!(!condition.alert);
 
             health.with_peer(collection, remote_key, |pair| {
-                pair.pushed(now, WalkKind::Records, written.records, true);
-                pair.received(now, WalkKind::Records, Some(written.records), true);
+                pair.pushed(now, WalkKind::Commit, written.commits, true);
+                pair.received(now, WalkKind::Commit, Some(written.commits), true);
             });
             let condition = collection_condition(&health, now);
             assert_eq!(condition.state, State::Current);
@@ -743,7 +749,7 @@ mod tests {
                 .unwrap()
                 .evidence;
             assert_eq!(evidence.remote_records, Some(10 + u64::from(multiplier)));
-            assert_eq!(evidence.remote_authorizations, None);
+            assert_eq!(evidence.remote_authorizations, Some(frontier.authorization_evidence.leaf_count()));
         }
     }
 
@@ -757,16 +763,19 @@ mod tests {
         let failed_at = at + PROGRESS_GRACE + Duration::from_secs(1);
         let (health, collection, remote_key, frontier) = pair(at, failed_at);
         health.with_peer(collection, remote_key, |pair| {
-            pair.pushed(at, WalkKind::Records, frontier.records, true);
+            pair.pushed(at, WalkKind::Commit, frontier.commits, true);
+            pair.pushed(at, WalkKind::Derive, frontier.derives, true);
             pair.pushed(
                 at,
                 WalkKind::Authorization,
                 frontier.authorization_evidence,
                 true,
             );
-            pair.received(at, WalkKind::Records, None, false);
-            pair.pushed(failed_at, WalkKind::Records, frontier.records, true);
-            pair.received(failed_at, WalkKind::Records, None, false);
+            pair.received(at, WalkKind::Commit, None, false);
+            pair.pushed(failed_at, WalkKind::Commit, frontier.commits, true);
+            pair.received(failed_at, WalkKind::Commit, None, false);
+            pair.received(at, WalkKind::Derive, Some(frontier.derives), true);
+            pair.received(at, WalkKind::Authorization, Some(frontier.authorization_evidence), true);
         });
         let condition = collection_condition(&health, failed_at);
         assert_eq!(condition.state, State::Stalled);
@@ -780,10 +789,12 @@ mod tests {
         health.with_peer(collection, remote_key, |pair| {
             pair.received(
                 recovered_at,
-                WalkKind::Records,
-                Some(frontier.records),
+                WalkKind::Commit,
+                Some(frontier.commits),
                 true,
             );
+            pair.received(recovered_at, WalkKind::Derive, Some(frontier.derives), true);
+            pair.received(recovered_at, WalkKind::Authorization, Some(frontier.authorization_evidence), true);
         });
         let condition = collection_condition(&health, recovered_at);
         assert_eq!(condition.state, State::Current);

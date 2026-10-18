@@ -259,11 +259,11 @@ pub(crate) fn candidate_order(
 ) -> Vec<PeerId> {
     let evidence = collection.repair().authorization_evidence();
     let proofs = evidence.proofs().cloned().collect::<Vec<_>>();
-    let signers = collection
-        .repair()
-        .records()
-        .records()
-        .map(|record| record.public_key().raw)
+    let records = collection.repair().records();
+    let signers = records.commits().iter_ordered()
+        .map(|key| records.commits().get(key).unwrap().author().raw)
+        .chain(records.derives().iter_ordered()
+            .map(|key| records.derives().get(key).unwrap().author().raw))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .filter(|signer| {
@@ -425,7 +425,7 @@ impl Peerings {
                 let repair = collection.repair();
                 (
                     repair.authorization_evidence().summary(),
-                    repair.records().summary(),
+                    repair.records().summaries(),
                 )
             };
             let changed = before

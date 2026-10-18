@@ -45,7 +45,7 @@ fn publish(
 
 /// A MERGE is believed on the store's host key, never on rights: the
 /// collection's WRITE root and a key granted READ each sign a merge of the
-/// same two commits, and neither is folded, while the host, which may
+/// same eight commits, and neither is folded, while the host, which may
 /// neither read nor write the collection, has its own merge believed.
 #[test]
 fn merges_are_believed_on_the_host_key_not_on_read_or_write_rights() {
@@ -62,11 +62,11 @@ fn merges_are_believed_on_the_host_key_not_on_read_or_write_rights() {
             ),
         )
         .unwrap();
-    let a = archive(2);
-    let b = archive(3);
-    let c = simplearchive_union::join(&a, &b).unwrap();
-    let _ca = publish(&mut store, collection, &root, a.clone());
-    let _cb = publish(&mut store, collection, &root, b.clone());
+    let inputs: [Blob<SimpleArchive>; 8] = std::array::from_fn(|index| archive(index as u8 + 2));
+    let c = simplearchive_union::join_all(&inputs).unwrap();
+    for input in &inputs {
+        publish(&mut store, collection, &root, input.clone());
+    }
     let c_handle = store.put::<SimpleArchive, _>(c).unwrap();
     let wrong = store
         .put::<SimpleArchive, _>(TribleSet::new().to_blob())
@@ -79,11 +79,12 @@ fn merges_are_believed_on_the_host_key_not_on_read_or_write_rights() {
     )
     .unwrap();
 
-    let low = Handle::<SimpleArchive>::to_hash(a.get_handle());
-    let high = Handle::<SimpleArchive>::to_hash(b.get_handle());
+    let members = inputs
+        .each_ref()
+        .map(|input| Handle::<SimpleArchive>::to_hash(input.get_handle()));
     let merge = |signer: &SigningKey, result| {
         CollectionRecord::Merge(
-            CollectionMerge::sign(signer, collection.handle(), [low, high], result).unwrap(),
+            CollectionMerge::sign(signer, collection.handle(), members, result).unwrap(),
         )
     };
     store
@@ -103,14 +104,20 @@ fn merges_are_believed_on_the_host_key_not_on_read_or_write_rights() {
     assert!(!collection
         .writer_is_admitted(&snapshot, host.verifying_key())
         .unwrap());
-    // Neither merge is the host's: the reader stands on both commits, and
+    assert!(!collection
+        .reader_is_admitted(&snapshot, host.verifying_key())
+        .unwrap());
+    // Neither merge is the host's: the reader stands on all eight commits, and
     // the reader's false result is nowhere.
     let attached = snapshot.collection(collection).unwrap();
     assert_eq!(
         attached.cover().members().collect::<BTreeSet<_>>(),
-        BTreeSet::from([a.get_handle(), b.get_handle()])
+        inputs
+            .iter()
+            .map(|input| input.get_handle())
+            .collect::<BTreeSet<_>>()
     );
-    assert_eq!(attached.view::<TribleSet>().unwrap().len(), 2);
+    assert_eq!(attached.view::<TribleSet>().unwrap().len(), 8);
     drop(attached);
     drop(snapshot);
 
@@ -124,7 +131,7 @@ fn merges_are_believed_on_the_host_key_not_on_read_or_write_rights() {
         attached.cover().members().collect::<Vec<_>>(),
         vec![c_handle]
     );
-    assert_eq!(attached.view::<TribleSet>().unwrap().len(), 2);
+    assert_eq!(attached.view::<TribleSet>().unwrap().len(), 8);
 }
 
 #[test]
@@ -235,20 +242,20 @@ fn equation_admission_uses_frozen_proof_evidence() {
             ),
         )
         .unwrap();
-    let a = archive(5);
-    let b = archive(6);
-    let x = archive(7);
-    let ca = publish(&mut store, collection, &root, a.clone());
-    let cb = publish(&mut store, collection, &root, b.clone());
+    let inputs: [Blob<SimpleArchive>; 8] = std::array::from_fn(|index| archive(index as u8 + 5));
+    let x = archive(13);
+    let commits = inputs
+        .each_ref()
+        .map(|input| publish(&mut store, collection, &root, input.clone()));
     let joined = store
-        .put::<SimpleArchive, _>(simplearchive_union::join(&a, &b).unwrap())
+        .put::<SimpleArchive, _>(simplearchive_union::join_all(&inputs).unwrap())
         .unwrap();
     store
         .insert(CollectionRecord::Merge(
             CollectionMerge::sign(
                 &producer,
                 collection.handle(),
-                [ca.data(), cb.data()],
+                commits.map(|commit| commit.data()),
                 Handle::<SimpleArchive>::to_hash(joined),
             )
             .unwrap(),
@@ -292,6 +299,24 @@ fn equation_admission_uses_frozen_proof_evidence() {
         .contains(Handle::<SimpleArchive>::from_hash(cx.data())));
     assert_eq!(later.collection(collection).unwrap().cover().len(), 2);
     assert_eq!(before.collection(collection).unwrap().cover().len(), 1);
+    assert_eq!(
+        before
+            .collection(collection)
+            .unwrap()
+            .view::<TribleSet>()
+            .unwrap()
+            .len(),
+        8
+    );
+    assert_eq!(
+        later
+            .collection(collection)
+            .unwrap()
+            .view::<TribleSet>()
+            .unwrap()
+            .len(),
+        9
+    );
     assert_eq!(
         later.records().unwrap().count(),
         before.records().unwrap().count()

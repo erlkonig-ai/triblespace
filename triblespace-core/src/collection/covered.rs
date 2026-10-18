@@ -56,9 +56,13 @@ use super::{
 /// What a snapshot exposes so the index can be fed by difference.
 pub trait RecordDelta {
     /// Offer every collection record `self` holds that `since` did not -- all
-    /// of them for `None` -- in a deterministic order. Cheap where the record
-    /// index is persistent: shared subtrees are skipped, so the walk is
-    /// proportional to the delta rather than to the store.
+    /// of them for `None` -- in a deterministic order. Consumers must fold
+    /// idempotently: an occurrence-backed backend may also offer repeated
+    /// evidence after a physical append. This is an incremental fold feed,
+    /// not the exact semantic set difference of `CollectionRead`.
+    /// Shared persistent subtrees are skipped where available. Independent
+    /// snapshots without comparable occurrence identities may need a semantic
+    /// comparison of affected history instead.
     fn for_each_record_since(&self, since: Option<&Self>, each: &mut dyn FnMut(&CollectionRecord));
 }
 
@@ -612,6 +616,19 @@ impl<T: CollectionRead> CollectionRead for CoveredSnapshot<T> {
         selectors: &BTreeSet<CollectionRecordSelector>,
     ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
         self.inner.select_records(selectors)
+    }
+
+    fn select_record_views(
+        &self, selectors: &std::collections::BTreeSet<crate::collection::CollectionRecordSelector>,
+    ) -> Result<Vec<crate::collection::CollectionRecordView>, Self::RecordsError> {
+        self.inner.select_record_views(selectors)
+    }
+
+    fn select_record_view_changes(
+        &self, previous: &Self,
+        selectors: &std::collections::BTreeSet<crate::collection::CollectionRecordSelector>,
+    ) -> Result<(Vec<crate::collection::CollectionRecordView>, Vec<crate::collection::CollectionRecordView>), Self::RecordsError> {
+        self.inner.select_record_view_changes(&previous.inner, selectors)
     }
 
     fn select_record_changes(

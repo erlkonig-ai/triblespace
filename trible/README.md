@@ -101,7 +101,62 @@ Run `trible <COMMAND>` to invoke a subcommand.
   deliberate one-time projection of retired demand history and is never part
   of an implicit run-all operation.
 
-Legacy piles can be migrated directly into native collections:
+#### Offline canonical assertion rewrite (source candidate)
+
+The one-time `/32` rewrite is separate from `clean`, `lattice-v3`, and
+`reframe`. Work only on an immutable, retained source copy after quiescing its
+writers. It does not operate on live piles or switch a daemon:
+
+```bash
+trible pile migrate SOURCE canonical-refresh --into OWN_REFRESH \
+  --key EXISTING_KEY --source-hash SOURCE_BLAKE3 --report NEW_EXPORT_REPORT
+trible pile migrate SOURCE canonical --into DESTINATION \
+  --key EXISTING_KEY --source-hash SOURCE_BLAKE3 \
+  --refresh OTHER_AUTHOR_REFRESH --report NEW_REWRITE_REPORT
+```
+
+`SOURCE_BLAKE3` is the 64-hex-character BLAKE3 digest of the complete source
+file. Exactly one existing key is supplied; no key is created or discovered.
+`canonical-refresh` exports only that author's strictly verified COMMIT/DERIVE
+foundations as an ordinary canonical native pile. It is **not** full migration
+completion. Classifiable unsupported frames and other authors' evidence remain
+in the source and are reported outside that export's scope. Framing errors or
+historical forms sharing a current parser variant can still refuse export;
+arbitrary historical source support is unproved. Exchange these refresh piles
+offline; never collect other authors' private keys.
+
+`canonical` verifies old signatures before resealing under the same author.
+Every foreign COMMIT/DERIVE needs a strict-valid refresh matching its original
+author and every semantic field. Payload equality alone is insufficient.
+Only matching assertions are imported: refresh AUTH, BLOBs and unrelated
+assertions are not copied. Signed but currently unadmitted foundations are
+retained too; conversion itself grants no authority. Current canonical
+assertions are verified and copied unchanged.
+
+All valid source BLOB and current AUTH frames are copied exactly, as are the
+exact current Want, Branch and BranchTombstone kinds. Unknown, retired WANT,
+historical collection/proof forms, invalid signatures or missing foreign
+refreshes refuse full-rewrite publication. This initial tool does not support
+every historical format or repair missing source dependencies.
+
+Owned MAP and exact-eight MERGE caches reseal field-for-field; signatures do
+not certify the cache's mathematical correctness. Other valid caches refuse
+by default. `--retain-unconverted-caches` explicitly accounts for each such
+frame as **original-only evidence in the retained source**, not migrated or
+rebuilt active state. Non-eight merges are never padded. Keep the original
+hash-bound source and its report: the output is not a substitute for that
+evidence, and later cache rebuilding is separate work.
+
+Destination, `DESTINATION.partial`, and report must be fresh non-aliasing
+paths. Failure leaves an explicitly incomplete partial, never a resumable
+destination; retry into another fresh path. After close/reopen validation,
+publication uses a no-replace hard link. Publication/report I/O errors remain
+errors even if a destination link has already become visible; inspect the
+reported paths before retrying. This is not a general power-loss recovery or
+atomic multi-file transaction protocol. `--dry-run` writes no files and emits
+accounting only to stdout; it conflicts with `--report`.
+
+Legacy piles can also be migrated directly into native collections:
 
 ```bash
 trible pile migrate <PILE> branch-to-collection \

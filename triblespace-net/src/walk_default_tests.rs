@@ -17,7 +17,8 @@ fn default_two_way_walks_use_cached_riblt_and_explicit_prefix_still_works() {
     walks.observe(local.snapshot());
 
     for kind in [
-        WalkKind::Records,
+        WalkKind::Commit,
+        WalkKind::Derive,
         WalkKind::Authorization,
         WalkKind::References,
     ] {
@@ -43,7 +44,7 @@ fn default_two_way_walks_use_cached_riblt_and_explicit_prefix_still_works() {
     let prefix = walks.with_algorithm(Algorithm::Prefix);
     assert_eq!(
         prefix
-            .start(peer.id(), collection, WalkKind::Records)
+            .start(peer.id(), collection, WalkKind::Commit)
             .unwrap()
             .algorithm(),
         Algorithm::Prefix,
@@ -53,7 +54,7 @@ fn default_two_way_walks_use_cached_riblt_and_explicit_prefix_still_works() {
             .start_selected(
                 peer.id(),
                 collection,
-                WalkKind::Records,
+                WalkKind::Commit,
                 Some(Algorithm::CachedRiblt),
             )
             .unwrap()
@@ -80,7 +81,8 @@ fn default_one_way_walks_use_prefix_without_disclosing_receive_only_holdings() {
         walks.observe(local.snapshot());
 
         for kind in [
-            WalkKind::Records,
+            WalkKind::Commit,
+            WalkKind::Derive,
             WalkKind::Authorization,
             WalkKind::References,
         ] {
@@ -107,7 +109,7 @@ fn default_one_way_walks_use_prefix_without_disclosing_receive_only_holdings() {
                     );
                     assert_eq!(exchange.next_delta(), Some(Frame::Done));
                     assert!(exchange.next_body().is_none());
-                    if kind == WalkKind::Records {
+                    if kind == WalkKind::Commit {
                         let outs = exchange.on_frame(
                             Frame::ValueRequest { key: private_key },
                             Some(local.snapshot()),

@@ -149,6 +149,24 @@ pub const KIND_COLLECTION_DERIVE_V9: RawInline =
 #[allow(dead_code)] // A tombstone: kept so the anchor is never minted again.
 pub const KIND_ID_COLLECTION_DERIVE_V9: Id = id_hex!("22919B84195046DF981C19D5B43F6DF3");
 
+/// Previous locator DERIVE body: target, locator, output, author, R, S.
+/// No current decoder accepts this kind; generic opaque retention preserves it.
+#[cfg(test)]
+pub const KIND_COLLECTION_DERIVE_V11: RawInline =
+    hex_literal::hex!("F3D2FA3E40FC0A4CCBC84603CAF2D3446662DA194391208BA6B932564F919A96");
+/// Historical description anchor, minted with `trible genid` on 2026-09-25.
+#[allow(dead_code)] // Tombstone: this anchor must never be reused.
+pub const KIND_ID_COLLECTION_DERIVE_V11: Id = id_hex!("0EB3BCDAC8AAD655FEFB489D8E5B4410");
+
+/// Previous MAP body: attached, node, attachment, author, R, S.
+/// No current decoder accepts this kind; generic opaque retention preserves it.
+#[cfg(test)]
+pub const KIND_COLLECTION_MAP_V1: RawInline =
+    hex_literal::hex!("32E0D7333FD2AD1F567AE9A030814F95CA8F7F4A87C0DEAA275FB9DD8FC5F408");
+/// Historical description anchor, minted with `trible genid` on 2026-09-28.
+#[allow(dead_code)] // Tombstone: this anchor must never be reused.
+pub const KIND_ID_COLLECTION_MAP_V1: Id = id_hex!("ED7B98CD20AD9A4D172F037A08CC47F1");
+
 /// Archive one description fragment and take its content identity.
 ///
 /// Only the fragment's facts are archived, exactly as a collection descriptor
@@ -229,32 +247,29 @@ record_kinds! {
         "pile-want-v3",
         "One element of the grow-only durable local WANT set, keyed by a canonical 97-byte WantRequest. Envelope byte 64 holds the versioned request tag, 65..96 are zeros, 96..128 hold field A, 128..160 field B, 160..192 field C, and 192..256 are zeros. Tag 1 is a blob request (A the BLAKE3 blob handle; B and C zero); tag 2 is a merge request (A the collection descriptor handle; B and C the input digests in lexicographic order); tag 4 is a derive request (A the target collection descriptor handle; B the input digest; C zero). The record spans exactly one 256-byte block and has no payload. Repeating an exact request is idempotent. There is no retraction kind; forgetting is a policy rewrite such as Yard reclaim.";
 
-    /// A signed collection commit.
-    CollectionCommitRecordV4 = KIND_ID_COLLECTION_COMMIT "CBF2CF97D52A3486E16C12D70D397C66",
-        KIND_COLLECTION_COMMIT hex_literal::hex!("A1322BB3F5214287C314D42AFCC1A97CB264FACD9A22B4938838BE78DB31AA59"),
-        "pile-collection-commit-v4",
-        "A signed COMMIT(collection, data, metadata) assertion. Envelope bytes 64..96 hold the collection descriptor handle, 96..128 the data digest, 128..160 the metadata archive handle, 160..192 the author Ed25519 public key, 192..224 the signature R component, and 224..256 the signature S component. This is the tightest record the pile writes: it fills the block exactly and reserves nothing. The signature covers a domain-separated transcript, not these bytes, so a commit survives reframing unchanged.";
+    /// Canonical literal-prefix COMMIT; anchor minted with `trible genid` on 2026-10-17.
+    CollectionCommitRecordV5 = KIND_ID_COLLECTION_COMMIT "FDB671F61026890184000D275E0AB0F7",
+        KIND_COLLECTION_COMMIT crate::collection::records::KIND_COLLECTION_COMMIT,
+        "collection-commit-prefix-v1",
+        "A canonical signed COMMIT assertion, exactly 224 bytes: kind32, collection descriptor handle32, produced data digest32, metadata archive handle32, author Ed25519 public key32, signature R32, signature S32. The kind is the BLAKE3 handle of this description archive. The Ed25519 signature covers exactly the first 160 bytes, including the kind and author, with no additional domain or version. The assertion fingerprint is BLAKE3 of all 224 canonical bytes. Collection, data and metadata are strong blob references. Authorship does not establish WRITE admission. Storage and wire carry these same bytes. Pile recovery framing is a separate 32-byte prefix; this canonical assertion fills the remainder of one 256-byte block.";
 
-    /// A signed n-ary MERGE. Anchor minted with `trible genid` on
-    /// 2026-09-25 for lattice v2.
-    CollectionMergeRecordV10 = KIND_ID_COLLECTION_MERGE "E3DC1829F876D861395386CD92CC428A",
-        KIND_COLLECTION_MERGE hex_literal::hex!("3C1B4C0D0A71AB17D079AC528576B6BD2E6A514E461E7F0C3D1EA4C8F0BC019E"),
-        "pile-collection-merge-v10",
-        "A signed n-ary MERGE(collection; inputs -> result) endorsement. Envelope bytes 64..96 hold the collection descriptor handle, 96..128 the result digest, 128..160 the author Ed25519 public key, 160..192 the signature R component, 192..224 the signature S component, and 224..256 the input count k as an unsigned big-endian 32-bit integer in bytes 252..256 with bytes 224..252 zero. Bytes 256..256+32k hold the k input digests, 32 bytes each, strictly increasing by raw bytes, with 2 <= k <= 16. The result may equal one of the inputs. The record spans ceil((256 + 32k) / 256) blocks, two for k <= 8 and three for 9 <= k <= 16, and every byte after the last input is zero. The bytes from envelope byte 64 through the last input are the record's canonical dense form. A record fingerprint is the full BLAKE3 digest of the 16-byte semantic kind D0D98881093C0A6F318E1E1525521F80 followed by that dense form, not a blob handle. The signature covers a transcript, not the pile framing: the 32-byte domain B75F4382781F565972D759D69C72703B2A2E525B9D3B13A249590235C7BE8C40, the semantic kind, the author key, the collection, k as a big-endian 32-bit integer, the inputs in order, and the result. The record names no input RECORD. An authorized producer endorses that those payloads join to that result; storing an endorsement does not itself establish WRITE admission or input availability.";
+    /// Canonical literal-prefix MERGE; anchor minted with `trible genid` on 2026-10-17.
+    CollectionMergeRecordV11 = KIND_ID_COLLECTION_MERGE "75B76CA9E028127AC06C550A156B469D",
+        KIND_COLLECTION_MERGE crate::collection::records::KIND_COLLECTION_MERGE,
+        "collection-merge-prefix-v1",
+        "A canonical signed MERGE assertion, exactly 448 bytes: kind32, collection descriptor handle32, produced result digest32, author Ed25519 public key32, eight input digests of 32 bytes each, signature R32, signature S32. The eight inputs are distinct and strictly increasing by raw bytes; there is no count, padding input, or smaller-arity form. The result may equal one input. The kind is the BLAKE3 handle of this description archive. The Ed25519 signature covers exactly the first 384 bytes, including the kind, author and all inputs, with no additional domain or version. The assertion fingerprint is BLAKE3 of all 448 canonical bytes. Collection, result and inputs are strong blob references. The assertion names payloads, not input records; a reader folds only its own host's assertion, without acquiring foreign trust. A MERGE adds no foundation and is not replicated. Pile recovery framing is a separate 32-byte prefix, followed by this assertion and 32 zero padding bytes to fill two 256-byte blocks; framing and padding are neither signed nor fingerprinted.";
 
-    /// A signed locator DERIVE, the leaf of a derived collection. Anchor
-    /// minted with `trible genid` on 2026-09-25 for lattice v2.
-    CollectionDeriveRecordV11 = KIND_ID_COLLECTION_DERIVE "0EB3BCDAC8AAD655FEFB489D8E5B4410",
-        KIND_COLLECTION_DERIVE hex_literal::hex!("F3D2FA3E40FC0A4CCBC84603CAF2D3446662DA194391208BA6B932564F919A96"),
-        "pile-collection-derive-v11",
-        "A signed locator DERIVE(target, L -> output) endorsement: one foundation of a derived collection. Envelope bytes 64..96 hold the target collection descriptor handle, 96..128 the source locator L, 128..160 the output digest, 160..192 the author Ed25519 public key, 192..224 the signature R component, and 224..256 the signature S component. It fills one 256-byte block exactly and reserves nothing. L is BLAKE3 of the 32-byte locator context 224DFBA2A0DE0FEC0A2073D78B8DCFEE91A037BC7749639A0D5E83DF307BA93A followed by the 32-byte handle of one foundation of the target's source collection: a one-way image of that handle, not a blob handle, so the record owns its target descriptor and its output and never L. The target descriptor names the source and the mapping. The bytes from envelope byte 64 are the record's canonical dense form. A record fingerprint is the full BLAKE3 digest of the 16-byte semantic kind 630BF5B294A3A1D85C0A7B185C9BC899 followed by that dense form, not a blob handle. The signature covers a transcript, not the pile framing: the 32-byte domain 3F33151333CCDE3566D792C723DF70A74ACCF357CD0B9A7E7E1C61913020D22F, the semantic kind, the author key, the target, the locator, and the output. An authorized producer endorses that the target's mapping takes the source foundation named by L to that output; storing an endorsement does not itself establish WRITE admission.";
+    /// Canonical literal-prefix DERIVE; anchor minted with `trible genid` on 2026-10-17.
+    CollectionDeriveRecordV13 = KIND_ID_COLLECTION_DERIVE "5D09D99A2B549A60BEA9942E7E5752FD",
+        KIND_COLLECTION_DERIVE crate::collection::records::KIND_COLLECTION_DERIVE,
+        "collection-derive-prefix-v1",
+        "A canonical signed DERIVE assertion, exactly 224 bytes: kind32, target collection descriptor handle32, produced output digest32, source locator32, author Ed25519 public key32, signature R32, signature S32. The kind is the BLAKE3 handle of this description archive. The Ed25519 signature covers exactly the first 160 bytes, including the kind and author, with no additional domain or version. The assertion fingerprint is BLAKE3 of all 224 canonical bytes. Target and output are strong blob references; the locator is not a blob handle. The locator is BLAKE3 of the locator context 224DFBA2A0DE0FEC0A2073D78B8DCFEE91A037BC7749639A0D5E83DF307BA93A followed by the source foundation handle. The target descriptor names the source collection and mapping. Authorship does not establish WRITE admission or mapping correctness. Storage and wire carry these same bytes. Pile recovery framing is a separate 32-byte prefix; this canonical assertion fills the remainder of one 256-byte block.";
 
-    /// A signed MAP: one parent node indexed into an attached collection.
-    /// Anchor minted with `trible genid` on 2026-09-28.
-    CollectionMapRecordV1 = KIND_ID_COLLECTION_MAP "ED7B98CD20AD9A4D172F037A08CC47F1",
-        KIND_COLLECTION_MAP hex_literal::hex!("32E0D7333FD2AD1F567AE9A030814F95CA8F7F4A87C0DEAA275FB9DD8FC5F408"),
-        "pile-collection-map-v1",
-        "A signed MAP(attached; node -> attachment): a host's own index of one node of a parent collection's lattice. Envelope bytes 64..96 hold the attached collection descriptor handle, 96..128 the node digest, 128..160 the attachment digest, 160..192 the author Ed25519 public key, 192..224 the signature R component, and 224..256 the signature S component. It fills one 256-byte block exactly and reserves nothing. The attached descriptor names the parent collection and the mapping; the node is a node of that parent named by its own handle. The record owns its attached descriptor and its attachment and never the node. The bytes from envelope byte 64 are the record's canonical dense form. A record fingerprint is the full BLAKE3 digest of the 16-byte semantic kind 329669AA662709605053C123671DF1D2 followed by that dense form, not a blob handle. The signature covers a transcript, not the pile framing: the 32-byte domain 4A5191C36898D0B453FEFF99ED0E38524AADD87ED8EB8620BD39623B5221B5BE, the semantic kind, the author key, the attached collection, the node, and the attachment. A MAP adds no foundation and is never replicated: a reader believes it only when its own host key signed it, and only for a node it reaches in the parent's lattice.";
+    /// Canonical literal-prefix MAP; anchor minted with `trible genid` on 2026-10-17.
+    CollectionMapRecordV3 = KIND_ID_COLLECTION_MAP "3D52F26EC0A2852BF2ED998A3A8A56F5",
+        KIND_COLLECTION_MAP crate::collection::records::KIND_COLLECTION_MAP,
+        "collection-map-prefix-v1",
+        "A canonical signed MAP assertion, exactly 224 bytes: kind32, attached collection descriptor handle32, produced attachment digest32, parent node digest32, author Ed25519 public key32, signature R32, signature S32. The kind is the BLAKE3 handle of this description archive. The Ed25519 signature covers exactly the first 160 bytes, including the kind and author, with no additional domain or version. The assertion fingerprint is BLAKE3 of all 224 canonical bytes. Attached collection and attachment are strong blob references; the parent node is not owned. The descriptor names the parent collection and mapping. A MAP adds no foundation and is not replicated; a reader believes only its own host's assertion for a reached parent node. Storage carries these canonical bytes. Pile recovery framing is a separate 32-byte prefix; this canonical assertion fills the remainder of one 256-byte block.";
 
     /// A self-contained prefix-signed capability proof.
     ///
@@ -337,5 +352,7 @@ mod tests {
         assert!(!writable.contains(&KIND_COLLECTION_DERIVE_WITNESSED_V7));
         assert!(!writable.contains(&KIND_COLLECTION_MERGE_V8));
         assert!(!writable.contains(&KIND_COLLECTION_DERIVE_V9));
+        assert!(!writable.contains(&KIND_COLLECTION_DERIVE_V11));
+        assert!(!writable.contains(&KIND_COLLECTION_MAP_V1));
     }
 }

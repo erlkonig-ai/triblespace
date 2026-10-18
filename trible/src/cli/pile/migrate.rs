@@ -7,6 +7,7 @@ use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{BlobStoreGet, SnapshotSource};
 
 mod branch_to_collection;
+mod canonical;
 mod clean;
 mod lattice_v3;
 mod shortstring_to_utf8;
@@ -21,6 +22,12 @@ pub enum Migration {
 
 #[derive(Parser, Debug)]
 pub enum Command {
+    /// Rewrite a frozen /32 pile without changing foundation authorship.
+    /// Missing foreign refreshes or unsupported history refuse publication.
+    Canonical(canonical::Args),
+    /// Export only this key's verified foundations as a canonical refresh pile.
+    /// This is NOT completion of a source migration.
+    CanonicalRefresh(canonical::RefreshArgs),
     /// List known migrations and whether they are needed for this pile.
     List,
     /// Re-encode a whole pile into the current record framing.
@@ -126,6 +133,8 @@ pub enum Command {
 
 pub fn run(pile_path: PathBuf, cmd: Command) -> Result<()> {
     match cmd {
+        Command::Canonical(args) => canonical::run(pile_path, args),
+        Command::CanonicalRefresh(args) => canonical::export(pile_path, args),
         Command::List => list_migrations(&pile_path),
         Command::Reframe { into } => reframe(&pile_path, &into),
         Command::Clean(args) => clean::run(pile_path, args),

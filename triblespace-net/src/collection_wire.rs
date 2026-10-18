@@ -17,14 +17,16 @@ pub(crate) const MAX_COLLECTION_LEAF_BYTES: usize = MAX_CAPABILITY_PROOF_BYTES;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CollectionRepairManifest {
     pub(crate) wake_root: [u8; 32],
-    pub(crate) records: PatchSummary,
+    pub(crate) commits: PatchSummary,
+    pub(crate) derives: PatchSummary,
     pub(crate) authorization_evidence: PatchSummary,
 }
 
 pub(crate) fn manifest(overlay: &CollectionRepairOverlay) -> CollectionRepairManifest {
     CollectionRepairManifest {
         wake_root: overlay.wake_root(),
-        records: overlay.records().summary(),
+        commits: overlay.records().summaries()[0],
+        derives: overlay.records().summaries()[1],
         authorization_evidence: overlay.authorization_evidence().summary(),
     }
 }

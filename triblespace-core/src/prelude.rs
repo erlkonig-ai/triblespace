@@ -36,6 +36,7 @@ pub mod inlineencodings;
 pub use crate::attribute::Attribute;
 pub use crate::blob::Blob;
 pub use crate::blob::BlobEncoding;
+pub use crate::blob::Bundle;
 pub use crate::blob::IntoBlob;
 pub use crate::blob::MemoryBlobStore;
 pub use crate::blob::TryFromBlob;

@@ -8,6 +8,7 @@
 // and `TryFromBlob` are used throughout the codebase.  `TryToBlob` and
 // `FromBlob` were never required and have been removed for simplicity.
 
+mod bundle;
 mod cache;
 /// Built-in blob encoding types and their conversion implementations.
 pub mod encodings;
@@ -27,6 +28,8 @@ use std::fmt::{self};
 use std::hash::Hash;
 use std::marker::PhantomData;
 
+/// Re-export of the rooted blob attachment carrier.
+pub use bundle::Bundle;
 /// Re-export of the blob cache wrapper.
 pub use cache::BlobCache;
 /// Re-export of the in-memory blob store.

@@ -55,3 +55,5 @@ pub mod transport;
 mod wake_schedule;
 pub mod walk;
 pub mod walk_stream;
+#[cfg(test)]
+mod native_index_probe;

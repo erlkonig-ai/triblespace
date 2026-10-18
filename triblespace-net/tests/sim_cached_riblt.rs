@@ -188,8 +188,11 @@ fn confirmed(
         .and_then(|item| item.peers.iter().find(|item| item.peer == other))
         .is_some_and(|item| {
             item.confirmed
-                .records
-                .is_some_and(|root| root.leaf_count() == record_count)
+                .commits
+                .zip(item.confirmed.derives)
+                .is_some_and(|(commits, derives)| {
+                    commits.leaf_count() + derives.leaf_count() == record_count
+                })
                 && item
                     .confirmed
                     .authorization_evidence
@@ -210,7 +213,9 @@ fn walk_counts(taps: &Taps, from: usize, other: [u8; 32]) -> (usize, usize, usiz
     )
 }
 
-fn cached_references_completed(taps: &Taps, from: usize, other: [u8; 32]) -> bool {
+// The tap observes framed discovery, not FIN. Actual landing and directional
+// completion are checked separately by `holds` and `confirmed` above.
+fn cached_references_crossed(taps: &Taps, from: usize, other: [u8; 32]) -> bool {
     let frames = taps.since(from, other, TAG_WALK);
     frames
         .iter()
@@ -222,13 +227,9 @@ fn cached_references_completed(taps: &Taps, from: usize, other: [u8; 32]) -> boo
                 .collect();
             stream.iter().any(|frame| frame.kind == FRAME_RIBLT_CELL)
                 && [true, false].into_iter().all(|sent| {
-                    [FRAME_RIBLT_ROOT, FRAME_DONE, FRAME_LANDED]
-                        .into_iter()
-                        .all(|kind| {
-                            stream
-                                .iter()
-                                .any(|frame| frame.sent == sent && frame.kind == kind)
-                        })
+                    stream.iter().any(|frame| {
+                        frame.sent == sent && frame.kind == FRAME_RIBLT_ROOT
+                    })
                 })
         })
 }
@@ -272,7 +273,7 @@ fn cached_riblt_two_hosts_land_records_auth_and_held_blobs_then_reconnect() {
                 && holds(&mut b, &handles)
                 && confirmed(&a, b_id, collection, 260, 2)
                 && confirmed(&b, a_id, collection, 260, 2)
-                && cached_references_completed(&taps, 0, b_id)
+                && cached_references_crossed(&taps, 0, b_id)
         })
         .await;
         let (roots, cells, bodies, requests) = walk_counts(&taps, 0, b_id);
@@ -288,8 +289,11 @@ fn cached_riblt_two_hosts_land_records_auth_and_held_blobs_then_reconnect() {
         assert!(
             taps.since(0, b_id, TAG_WALK)
                 .iter()
-                .all(|frame| frame.kind != FRAME_SUBTREE)
+                .all(|frame| !matches!(frame.kind, FRAME_SUBTREE | FRAME_DONE | FRAME_LANDED))
         );
+        assert!(taps.since(0, b_id, TAG_WALK).iter()
+            .filter(|frame| frame.kind == FRAME_RIBLT_ROOT)
+            .all(|frame| frame.wire_bytes == 45));
 
         let initial_dials = net.dial_count(a_id, b_id) + net.dial_count(b_id, a_id);
         net.partition(a_id, b_id);
@@ -313,7 +317,7 @@ fn cached_riblt_two_hosts_land_records_auth_and_held_blobs_then_reconnect() {
                 && holds(&mut b, &handles)
                 && confirmed(&a, b_id, collection, 262, 3)
                 && confirmed(&b, a_id, collection, 262, 3)
-                && cached_references_completed(&taps, from, b_id)
+                && cached_references_crossed(&taps, from, b_id)
         })
         .await;
         assert!(net.dial_count(a_id, b_id) + net.dial_count(b_id, a_id) > initial_dials);

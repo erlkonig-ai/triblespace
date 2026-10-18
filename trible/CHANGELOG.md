@@ -33,6 +33,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- Source-only offline `pile migrate canonical` and `canonical-refresh`: strict
+  deployed `/32` verification, exact-author foundation resealing/refresh,
+  unchanged source BLOB/AUTH frames, explicit original-only cache accounting,
+  fresh no-replace publication and stdout-only dry runs. Historical codecs are
+  CLI-private, not runtime replay compatibility. No live cutover is performed.
+
 - `pile net sync` records where it listens in the pile's own configuration
   collection, under its key (`selection::write_sync_addresses`), at start
   and whenever its endpoint is bound elsewhere; a socket bound on every

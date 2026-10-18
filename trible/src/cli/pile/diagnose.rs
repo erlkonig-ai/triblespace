@@ -1148,10 +1148,25 @@ mod conflict_tests {
     use super::{conflicts, ConflictTally};
     use ed25519_dalek::SigningKey;
     use triblespace_core::collection::{
-        CollectionDerive, CollectionMerge, CollectionRecord, CollectionStore,
+        CollectionData, CollectionDerive, CollectionMerge, CollectionRecord, CollectionStore,
     };
+    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+    use triblespace_core::blob::{Blob, IntoBlob};
+    use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::inline::Inline;
+    use triblespace_core::metadata;
+    use triblespace_core::prelude::entity;
     use triblespace_core::repo::pile::Pile;
+
+    // Real archive identities; this diagnostic deliberately compares signed
+    // assertions without fetching payloads or asking whether their unions hold.
+    fn merge_members() -> [CollectionData; 9] {
+        ["a", "b", "c", "d", "e", "f", "g", "h", "i"].map(|name| {
+            let blob: Blob<SimpleArchive> = entity! { metadata::name: name }
+                .facts().clone().to_blob();
+            Handle::<SimpleArchive>::to_hash(blob.get_handle())
+        })
+    }
 
     fn pile_with(records: impl IntoIterator<Item = CollectionRecord>) -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
@@ -1170,8 +1185,9 @@ mod conflict_tests {
         let one = SigningKey::from_bytes(&[1; 32]);
         let two = SigningKey::from_bytes(&[2; 32]);
         let collection = Inline::new([7; 32]);
-        let input = Inline::new([10; 32]);
-        let other = Inline::new([11; 32]);
+        let members = merge_members();
+        let input = members[0];
+        let inputs: Vec<_> = members[..8].to_vec();
         let agreed = pile_with([
             CollectionRecord::Derive(CollectionDerive::sign(
                 &one,
@@ -1188,7 +1204,7 @@ mod conflict_tests {
                 Inline::new([20; 32]),
             )),
             CollectionRecord::Merge(
-                CollectionMerge::sign(&one, collection, [input, other], Inline::new([30; 32]))
+                CollectionMerge::sign(&one, collection, inputs.iter().copied(), Inline::new([30; 32]))
                     .unwrap(),
             ),
         ]);
@@ -1198,11 +1214,11 @@ mod conflict_tests {
         // with itself. The same join named in either order is one input set.
         let disagreeing = pile_with([
             CollectionRecord::Merge(
-                CollectionMerge::sign(&one, collection, [input, other], Inline::new([30; 32]))
+                CollectionMerge::sign(&one, collection, inputs.iter().copied(), Inline::new([30; 32]))
                     .unwrap(),
             ),
             CollectionRecord::Merge(
-                CollectionMerge::sign(&one, collection, [other, input], Inline::new([31; 32]))
+                CollectionMerge::sign(&one, collection, inputs.iter().rev().copied(), Inline::new([31; 32]))
                     .unwrap(),
             ),
         ]);
@@ -1218,8 +1234,10 @@ mod conflict_tests {
         let one = SigningKey::from_bytes(&[1; 32]);
         let two = SigningKey::from_bytes(&[2; 32]);
         let collection = Inline::new([7; 32]);
-        let input = Inline::new([10; 32]);
-        let other = Inline::new([11; 32]);
+        let members = merge_members();
+        let input = members[0];
+        let other = members[1];
+        let inputs = &members[..8];
         let legal = pile_with([
             // A DERIVE is a relation: two outputs for one locator are two
             // leaves, from two keys or from one.
@@ -1250,11 +1268,11 @@ mod conflict_tests {
             // Two keys naming different results for one join are two private
             // lattices: a host never believes the other key's MERGE.
             CollectionRecord::Merge(
-                CollectionMerge::sign(&one, collection, [input, other], Inline::new([30; 32]))
+                CollectionMerge::sign(&one, collection, inputs.iter().copied(), Inline::new([30; 32]))
                     .unwrap(),
             ),
             CollectionRecord::Merge(
-                CollectionMerge::sign(&two, collection, [input, other], Inline::new([31; 32]))
+                CollectionMerge::sign(&two, collection, inputs.iter().copied(), Inline::new([31; 32]))
                     .unwrap(),
             ),
         ]);
@@ -1266,11 +1284,14 @@ mod conflict_tests {
         let one = SigningKey::from_bytes(&[1; 32]);
         let two = SigningKey::from_bytes(&[2; 32]);
         let collection = Inline::new([7; 32]);
-        let input = Inline::new([10; 32]);
-        let other = Inline::new([11; 32]);
-        let third = Inline::new([12; 32]);
+        let members = merge_members();
+        let (input, other, third) = (members[0], members[1], members[2]);
+        let first = [input, other, members[3], members[4], members[5], members[6], members[7], members[8]];
+        let second = [input, third, members[3], members[4], members[5], members[6], members[7], members[8]];
+        let mut reversed = second;
+        reversed.reverse();
         let merge = |key: &SigningKey,
-                     inputs: [triblespace_core::collection::CollectionData; 2],
+                     inputs: [CollectionData; 8],
                      result: u8| {
             CollectionRecord::Merge(
                 CollectionMerge::sign(key, collection, inputs, Inline::new([result; 32])).unwrap(),
@@ -1279,16 +1300,16 @@ mod conflict_tests {
         let mut tally = ConflictTally::default();
         // One join two keys disagree on, each consistent with itself: counted
         // across keys, and no conflict.
-        tally.add(&merge(&one, [input, other], 30));
-        tally.add(&merge(&two, [input, other], 31));
+        tally.add(&merge(&one, first, 30));
+        tally.add(&merge(&two, first, 31));
         // Another join, on which key one contradicts itself while key two
         // names a third result: a conflict of key one's, reported once among
         // the conflicts and not counted again across keys.
-        tally.add(&merge(&one, [input, third], 40));
-        tally.add(&merge(&one, [third, input], 41));
-        tally.add(&merge(&two, [input, third], 42));
+        tally.add(&merge(&one, second, 40));
+        tally.add(&merge(&one, reversed, 41));
+        tally.add(&merge(&two, second, 42));
         // A key repeating itself is one result, not two.
-        tally.add(&merge(&two, [input, other], 31));
+        tally.add(&merge(&two, first, 31));
         // Two outputs for one locator are two leaves.
         tally.add(&CollectionRecord::Derive(CollectionDerive::sign(
             &one,
@@ -1312,7 +1333,9 @@ mod conflict_tests {
         assert_eq!(disagreeing.len(), 1);
         let (join, results) = disagreeing[0];
         assert_eq!(join.signer, one.verifying_key().to_bytes());
-        assert_eq!(join.inputs, vec![input.raw, third.raw]);
+        let mut expected: Vec<_> = second.into_iter().map(|input| input.raw).collect();
+        expected.sort_unstable();
+        assert_eq!(join.inputs, expected);
         assert_eq!(
             results.iter().copied().collect::<Vec<_>>(),
             vec![[40; 32], [41; 32]]

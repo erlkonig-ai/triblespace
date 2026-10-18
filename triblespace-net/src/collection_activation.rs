@@ -43,7 +43,7 @@ const COLLECTION_REPAIR_ROOT_DOMAIN: &[u8] = b"triblespace.collection.repair-ove
 /// Version 4: records (foundations only, COMMIT and DERIVE) and
 /// authorization evidence, without held blobs. Version 3 also hashed the held
 /// set.
-const COLLECTION_REPAIR_ROOT_VERSION: u32 = 4;
+const COLLECTION_REPAIR_ROOT_VERSION: u32 = 5;
 
 type AuthorizationEvidencePatch = PATCH<64, IdentitySchema, CapabilityProof, Blake3Merkle>;
 /// Subject key | hash of the proof prefix that ends at that subject.
@@ -398,7 +398,7 @@ impl CollectionRepairOverlay {
     pub fn wake_root(&self) -> [u8; 32] {
         record_root(
             self.collection,
-            self.records.summary(),
+            self.records.summaries(),
             self.authorization_evidence.summary(),
         )
     }
@@ -467,14 +467,15 @@ impl CollectionRepairOverlay {
 /// record, count, nor component root is disclosed by this value.
 pub fn record_root(
     collection: CollectionHandle,
-    records: PatchSummary,
+    records: [PatchSummary; 2],
     authorization: PatchSummary,
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(COLLECTION_REPAIR_ROOT_DOMAIN);
     hasher.update(&COLLECTION_REPAIR_ROOT_VERSION.to_be_bytes());
     hasher.update(&collection.raw);
-    update_summary(&mut hasher, records);
+    update_summary(&mut hasher, records[0]);
+    update_summary(&mut hasher, records[1]);
     update_summary(&mut hasher, authorization);
     *hasher.finalize().as_bytes()
 }
@@ -1357,9 +1358,9 @@ mod tests {
                 .unwrap()
         );
 
-        assert_eq!(before.records().summary().leaf_count(), 1);
-        assert_eq!(after.records().summary().leaf_count(), 1);
-        assert_eq!(before.records().summary(), after.records().summary());
+        assert_eq!(before.records().len(), 1);
+        assert_eq!(after.records().len(), 1);
+        assert_eq!(before.records().summaries(), after.records().summaries());
         assert_ne!(
             before.authorization_evidence().summary(),
             after.authorization_evidence().summary()
@@ -1398,7 +1399,7 @@ mod tests {
         let second =
             collection_repair_overlay(&proof_first.snapshot().unwrap(), second_collection.handle())
                 .unwrap();
-        assert_eq!(first.records().summary(), second.records().summary());
+        assert_eq!(first.records().summaries(), second.records().summaries());
         assert_eq!(
             first.authorization_evidence().summary(),
             second.authorization_evidence().summary()
@@ -1439,7 +1440,7 @@ mod tests {
         let after_snapshot = store.snapshot().unwrap();
         let after = collection_repair_overlay(&after_snapshot, collection.handle()).unwrap();
 
-        assert_eq!(before.records().summary(), after.records().summary());
+        assert_eq!(before.records().summaries(), after.records().summaries());
         assert_eq!(before.authorization_evidence().len(), 0);
         assert_eq!(after.authorization_evidence().len(), 1);
         assert_ne!(before.wake_root(), after.wake_root());
@@ -1477,13 +1478,13 @@ mod tests {
 
         store
             .insert(CollectionRecord::Merge(
-                CollectionMerge::sign(&writer, collection.handle(), [data(31), data(32)], data(33))
+                CollectionMerge::sign(&writer, collection.handle(), (31..39).map(data), data(33))
                     .unwrap(),
             ))
             .unwrap();
         let merged_snapshot = store.snapshot().unwrap();
         let merged = collection_repair_overlay(&merged_snapshot, collection.handle()).unwrap();
-        assert_eq!(before.records().summary(), merged.records().summary());
+        assert_eq!(before.records().summaries(), merged.records().summaries());
         assert_eq!(before.wake_root(), merged.wake_root());
 
         store
@@ -1498,7 +1499,7 @@ mod tests {
         let after_snapshot = store.snapshot().unwrap();
         let after = collection_repair_overlay(&after_snapshot, collection.handle()).unwrap();
 
-        assert_ne!(before.records().summary(), after.records().summary());
+        assert_ne!(before.records().summaries(), after.records().summaries());
         assert_ne!(before.wake_root(), after.wake_root());
         assert_eq!(after.records().len(), 2);
         assert_eq!(

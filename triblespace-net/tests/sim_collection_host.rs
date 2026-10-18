@@ -1128,9 +1128,9 @@ fn demand_shallow_full_preserve_exact_wants_and_only_hydrate_selected_roots_with
     }
 }
 
-/// Transport generation 30 pushes collection trees on `walk/1`. A peer still
-/// speaking generation 29 is refused at the handshake; the current generation
-/// is served.
+/// Transport generation 33 separates COMMIT and DERIVE trees on `walk/1`.
+/// Generation 32's mixed inventory is refused at the handshake; the current
+/// generation is served.
 #[test]
 fn a_previous_generation_peer_is_refused() {
     let _guard = test_guard();
@@ -1151,7 +1151,7 @@ fn a_previous_generation_peer_is_refused() {
         let server_id = server_key.verifying_key().to_bytes();
         assert_eq!(
             triblespace_net::protocol::PILE_SYNC_ALPN,
-            b"/triblespace/pile-sync/32"
+            b"/triblespace/pile-sync/33"
         );
         let current = client
             .transport
@@ -1167,7 +1167,7 @@ fn a_previous_generation_peer_is_refused() {
         assert!(answer.is_ok(), "{answer:?}");
         let previous = client
             .transport
-            .dial(server_id, b"/triblespace/pile-sync/29")
+            .dial(server_id, b"/triblespace/pile-sync/32")
             .await
             .unwrap();
         let refused = tokio::time::timeout(

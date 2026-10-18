@@ -104,17 +104,23 @@ fn equations() -> [CollectionRecord; 3] {
             CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
         )
         .unwrap();
-    let low: Blob<SimpleArchive> = entity! { metadata::name: "low" }.facts().clone().to_blob();
-    let high: Blob<SimpleArchive> = entity! { metadata::name: "high" }.facts().clone().to_blob();
-    let low_handle = low.get_handle();
-    let high_handle = high.get_handle();
+    let members: Vec<Blob<SimpleArchive>> = ["a", "b", "c", "d", "e", "f", "g", "h"]
+        .into_iter().map(|name| entity! { metadata::name: name }.facts().clone().to_blob())
+        .collect();
+    let joined = triblespace_core::collection::simplearchive_union::join_all(&members).unwrap();
+    let low_handle = members[0].get_handle();
+    let high_handle = joined.get_handle();
     let low = Handle::<SimpleArchive>::to_hash(low_handle);
     let high = Handle::<SimpleArchive>::to_hash(high_handle);
     let a = CollectionCommit::sign(&signer, collection.handle(), low, low_handle);
     [
         CollectionRecord::Commit(a),
         CollectionRecord::Merge(
-            CollectionMerge::sign(&signer, collection.handle(), [low, high], high).unwrap(),
+            CollectionMerge::sign(
+                &signer, collection.handle(),
+                members.iter().map(|blob| Handle::<SimpleArchive>::to_hash(blob.get_handle())),
+                high,
+            ).unwrap(),
         ),
         CollectionRecord::Derive(CollectionDerive::sign(
             &signer,

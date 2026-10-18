@@ -201,6 +201,18 @@ impl<S: CollectionRead> CollectionRead for AcquiringReader<S> {
             .select_records(selectors)
             .map_err(crate::repo::ReadFailure::new)
     }
+
+    fn select_record_views(
+        &self, selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<Vec<crate::collection::CollectionRecordView>, Self::RecordsError> {
+        self.frozen.select_record_views(selectors).map_err(crate::repo::ReadFailure::new)
+    }
+
+    fn select_record_view_changes(
+        &self, previous: &Self, selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<(Vec<crate::collection::CollectionRecordView>, Vec<crate::collection::CollectionRecordView>), Self::RecordsError> {
+        self.frozen.select_record_view_changes(&previous.frozen, selectors).map_err(crate::repo::ReadFailure::new)
+    }
 }
 
 impl<S> crate::collection::CoverageRead for AcquiringReader<S>

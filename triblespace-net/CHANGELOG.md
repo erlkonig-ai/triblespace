@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Simplify the private ALPN33 cached-RIBLT wire: derive its SipHash key from
+  OPEN without repeating it in ROOT, and replace cached DONE/LANDED with gated
+  write-half FIN. Actual ROOT/body writes, exact proof and insertion/fetch debt
+  remain mandatory; each side may half-close without waiting for peer FIN.
+  Keep reset ownership until retirement and recheck late-body landing debt.
+  All Prefix modes retain DONE/LANDED; ordinary pull Prefix still accepts
+  post-DONE requests. No live rollout,
+  backward-wire fallback, hydration or durability acknowledgement is implied.
+
+- Isolated ALPN33 candidate: keep COMMIT and DERIVE in separate typed-view
+  fingerprint roots and walks, with kind-specific source caches and agreement.
+  MAP/MERGE remain local-only. Receive-side Current requires fresh successful
+  COMMIT, DERIVE and AUTH completion; last-landed roots remain diagnostics.
+  COMMIT/DERIVE eager bodies are the same full canonical kind32-prefixed
+  bytes used by typed views and persistence, without a dense u8 wrapper;
+  signatures cover the literal prefix and fingerprints cover the whole record. ALPN33
+  remains the unreleased boundary from deployed32. No live activation.
+
 - Source-only ALPN32: explicit one-way Records/AUTH Prefix offer roles in OPEN,
   exact offer-bound HAVE receipts and a 64-leaf speculative body window. Receipts
   use explicit leaf possession or immutable shared G, never private-prefix

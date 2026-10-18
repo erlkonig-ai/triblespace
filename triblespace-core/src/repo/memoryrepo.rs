@@ -615,7 +615,7 @@ mod tests {
             CollectionMerge::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 identity_for_tests(&descriptor),
-                [Inline::new([4; 32]), Inline::new([5; 32])],
+                (4..12).map(|byte| Inline::new([byte; 32])),
                 Inline::new([6; 32]),
             )
             .unwrap(),
@@ -699,7 +699,7 @@ mod tests {
             CollectionMerge::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 source,
-                [Inline::new([31; 32]), Inline::new([32; 32])],
+                (31..39).map(|byte| Inline::new([byte; 32])),
                 Inline::new([33; 32]),
             )
             .unwrap(),
@@ -821,7 +821,7 @@ mod tests {
             CollectionMerge::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 descriptor.transmute(),
-                [Inline::new(merge_input.raw), Inline::new([0xff; 32])],
+                std::iter::once(Inline::new(merge_input.raw)).chain((249..=255).map(|byte| Inline::new([byte; 32]))),
                 Inline::new(merge_output.raw),
             )
             .unwrap(),

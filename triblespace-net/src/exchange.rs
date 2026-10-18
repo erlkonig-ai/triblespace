@@ -3,6 +3,9 @@
 //! Cached mode binds a shared source/cache generation, peels full-source cell
 //! differences with eager bodies, and proves the native peer root before stopping
 //! at a completed-write frontier. It never subtracts connection agreement G.
+//! Its local landing readiness permits FIN independently of peer FIN. The
+//! driver drains all outgoing frames, half-closes, and continues receiving;
+//! fresh late-body insertion debt must settle before final confirmation.
 //! Prefix mode retains the continuous FIFO delta protocol described below.
 //!
 //! Each connection retains sound common-held agreement G. Asymmetric final
@@ -48,7 +51,9 @@ use std::sync::Arc;
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::capability::CapabilityProof;
-use triblespace_core::collection::{CollectionHandle, CollectionRecord};
+use triblespace_core::collection::CollectionHandle;
+#[cfg(test)]
+use triblespace_core::collection::CollectionRecord;
 use triblespace_core::patch::{Blake3Merkle, Entry, IdentitySchema, PATCH, PatchHash};
 
 use crate::channel::NetEvent;
@@ -92,7 +97,8 @@ fn locator_key(locator: &[u8]) -> [u8; KEY_BYTES + 1] {
 /// peer, collection and kind ([`crate::walk::Walks`]).
 #[derive(Clone)]
 pub(crate) enum Tree {
-    Records(PATCH<KEY_BYTES, IdentitySchema, CollectionRecord, Blake3Merkle>),
+    Commit(PATCH<KEY_BYTES, IdentitySchema, anybytes::View<triblespace_core::collection::EncodedCommit>, Blake3Merkle>),
+    Derive(PATCH<KEY_BYTES, IdentitySchema, anybytes::View<triblespace_core::collection::EncodedDerive>, Blake3Merkle>),
     /// Keyed by the collection, then the proof id.
     Authorization(
         CollectionHandle,
@@ -105,7 +111,8 @@ impl Tree {
     /// The `kind` tree of `overlay`, shared with it.
     pub(crate) fn pinned(kind: WalkKind, overlay: &CollectionRepairOverlay) -> Self {
         match kind {
-            WalkKind::Records => Self::Records(overlay.records().patch().clone()),
+            WalkKind::Commit => Self::Commit(overlay.records().commits().clone()),
+            WalkKind::Derive => Self::Derive(overlay.records().derives().clone()),
             WalkKind::Authorization => Self::Authorization(
                 overlay.collection(),
                 overlay.authorization_evidence().patch().clone(),
@@ -116,7 +123,8 @@ impl Tree {
 
     fn empty(kind: WalkKind, collection: CollectionHandle) -> Self {
         match kind {
-            WalkKind::Records => Self::Records(PATCH::new()),
+            WalkKind::Commit => Self::Commit(PATCH::new()),
+            WalkKind::Derive => Self::Derive(PATCH::new()),
             WalkKind::Authorization => Self::Authorization(collection, PATCH::new()),
             WalkKind::References => Self::References(PATCH::new()),
         }
@@ -132,7 +140,8 @@ impl Tree {
         keys: &PATCH<32, IdentitySchema, (), Blake3Merkle>,
     ) -> PatchSummary {
         match self {
-            Self::Records(patch) => crate::riblt_proof::union_summary(patch, keys),
+            Self::Commit(patch) => crate::riblt_proof::union_summary(patch, keys),
+            Self::Derive(patch) => crate::riblt_proof::union_summary(patch, keys),
             Self::References(patch) => crate::riblt_proof::union_summary(patch, keys),
             Self::Authorization(collection, patch) => {
                 let mut absolute = PATCH::<64, IdentitySchema, (), Blake3Merkle>::new();
@@ -152,7 +161,10 @@ impl Tree {
     /// strict subset is not new work and must not trigger an empty repush.
     pub(crate) fn has_new_keys(&self, current: &Self) -> bool {
         match (self, current) {
-            (Self::Records(agreed), Self::Records(current)) => {
+            (Self::Commit(agreed), Self::Commit(current)) => {
+                !current.difference(agreed).is_empty()
+            }
+            (Self::Derive(agreed), Self::Derive(current)) => {
                 !current.difference(agreed).is_empty()
             }
             (Self::Authorization(_, agreed), Self::Authorization(_, current)) => {
@@ -167,7 +179,8 @@ impl Tree {
 
     fn union(&mut self, other: Self) {
         match (self, other) {
-            (Self::Records(target), Self::Records(other)) => target.union(other),
+            (Self::Commit(target), Self::Commit(other)) => target.union(other),
+            (Self::Derive(target), Self::Derive(other)) => target.union(other),
             (
                 Self::Authorization(collection, target),
                 Self::Authorization(other_collection, other),
@@ -184,7 +197,8 @@ impl Tree {
     /// if present.
     pub(crate) fn at(&self, locator: &[u8]) -> Option<PatchSummary> {
         match self {
-            Self::Records(patch) => node_summary(patch, locator),
+            Self::Commit(patch) => node_summary(patch, locator),
+            Self::Derive(patch) => node_summary(patch, locator),
             Self::Authorization(collection, patch) => {
                 node_summary(patch, &[&collection.raw[..], locator].concat())
             }
@@ -195,8 +209,11 @@ impl Tree {
     /// Exact native key difference, for agreement omission or cache maintenance.
     pub(crate) fn difference(&self, agreed: &Self) -> Self {
         match (self, agreed) {
-            (Self::Records(patch), Self::Records(agreed)) => {
-                Self::Records(patch.difference(agreed))
+            (Self::Commit(patch), Self::Commit(agreed)) => {
+                Self::Commit(patch.difference(agreed))
+            }
+            (Self::Derive(patch), Self::Derive(agreed)) => {
+                Self::Derive(patch.difference(agreed))
             }
             (Self::Authorization(collection, patch), Self::Authorization(_, agreed)) => {
                 Self::Authorization(*collection, patch.difference(agreed))
@@ -211,7 +228,8 @@ impl Tree {
     /// Visit wire-relative keys without retaining a second symbol inventory.
     pub(crate) fn for_each_key(&self, mut visit: impl FnMut([u8; KEY_BYTES])) {
         match self {
-            Self::Records(patch) => patch.iter_ordered().for_each(|key| visit(*key)),
+            Self::Commit(patch) => patch.iter_ordered().for_each(|key| visit(*key)),
+            Self::Derive(patch) => patch.iter_ordered().for_each(|key| visit(*key)),
             Self::Authorization(_, patch) => patch.iter_ordered().for_each(|key| {
                 visit(key[KEY_BYTES..].try_into().expect("authorization suffix"));
             }),
@@ -237,7 +255,8 @@ impl Tree {
             Some((canonical, children))
         }
         match self {
-            Self::Records(patch) => shape(patch, &[], prefix),
+            Self::Commit(patch) => shape(patch, &[], prefix),
+            Self::Derive(patch) => shape(patch, &[], prefix),
             Self::Authorization(collection, patch) => shape(patch, &collection.raw, prefix),
             Self::References(patch) => shape(patch, &[], prefix),
         }
@@ -245,7 +264,10 @@ impl Tree {
 
     fn insert(&mut self, key: [u8; KEY_BYTES], value: Value) {
         match (self, value) {
-            (Self::Records(patch), Value::Record(record)) => {
+            (Self::Commit(patch), Value::Commit(record)) => {
+                patch.insert(&Entry::with_value(&key, record));
+            }
+            (Self::Derive(patch), Value::Derive(record)) => {
                 patch.insert(&Entry::with_value(&key, record));
             }
             (Self::Authorization(collection, patch), Value::Proof(proof)) => {
@@ -261,7 +283,10 @@ impl Tree {
 
     fn remove(&mut self, key: [u8; KEY_BYTES]) {
         match self {
-            Self::Records(patch) => {
+            Self::Commit(patch) => {
+                patch.remove(&key);
+            }
+            Self::Derive(patch) => {
                 patch.remove(&key);
             }
             Self::Authorization(collection, patch) => {
@@ -285,10 +310,17 @@ impl Tree {
             return;
         }
         match (self, source) {
-            (Self::Records(target), Self::Records(source)) => {
+            (Self::Commit(target), Self::Commit(source)) => {
                 if let Some(node) = source.merkle_node(locator) {
                     for key in node.items_after(None, usize::MAX) {
-                        target.insert(&Entry::with_value(&key, *source.get(&key).unwrap()));
+                        target.insert(&Entry::with_value(&key, source.get(&key).unwrap().clone()));
+                    }
+                }
+            }
+            (Self::Derive(target), Self::Derive(source)) => {
+                if let Some(node) = source.merkle_node(locator) {
+                    for key in node.items_after(None, usize::MAX) {
+                        target.insert(&Entry::with_value(&key, source.get(&key).unwrap().clone()));
                     }
                 }
             }
@@ -372,7 +404,8 @@ impl From<DecodeError> for Failure {
 pub(crate) struct Ended {
     pub(crate) sends: bool,
     pub(crate) receives: bool,
-    /// Directional receipt: the peer's LANDED, independently of shared G.
+    /// Directional receipt: peer LANDED (Prefix) or valid FIN (cached),
+    /// independently of shared G.
     pub(crate) confirmed: bool,
     pub(crate) landed: bool,
     /// Physical pinned observation, not the advertised delta summary.
@@ -415,6 +448,8 @@ pub(crate) struct Exchange {
     failed: u64,
     deferred: bool,
     peer_done: bool,
+    /// Prefix LANDED eligibility; in cached mode, current semantic readiness
+    /// only. The driver's `local_finished` records actual successful FIN.
     landed_sent: bool,
     landed_received: bool,
     outcome: Option<Outcome>,
@@ -427,6 +462,7 @@ struct Riblt {
     decoder: ResidualDecoder,
     generated: usize,
     written: usize,
+    root_written: bool,
     received: usize,
     local: usize,
     remote_queued: usize,
@@ -516,6 +552,7 @@ impl Exchange {
             cache,
             generated: 0,
             written: 0,
+            root_written: false,
             received: 0,
             local: 0,
             remote_queued: 0,
@@ -585,6 +622,45 @@ impl Exchange {
         outs
     }
 
+    /// A zero-cell proof still needs the complete local ROOT on the wire.
+    pub(crate) fn on_root_written(&mut self) -> Vec<Out> {
+        if let Some(riblt) = &mut self.riblt {
+            riblt.root_written = true;
+        }
+        let mut outs = Vec::new();
+        self.settle(&mut outs);
+        outs
+    }
+
+    /// Current cached semantic readiness, not a FIN receipt. It never waits for
+    /// peer FIN; the driver must still drain owed bodies and finish successfully.
+    pub(crate) fn ready_to_finish(&self) -> bool {
+        self.riblt.is_some() && self.landed_sent && !matches!(self.outcome, Some(Outcome::Failed(_)))
+    }
+
+    /// Clean EOF is the cached peer's landing promise, not our insertion ACK.
+    /// References have no VALUE frames: queued local fetches may outlive EOF.
+    pub(crate) fn on_fin(&mut self) -> Vec<Out> {
+        let mut outs = Vec::new();
+        if self.outcome.is_some() {
+            return outs;
+        }
+        if self.peer_done || !self.riblt.as_ref().is_some_and(|r| r.proven) {
+            self.fail(Failure::Protocol);
+            return outs;
+        }
+        if self.kind != WalkKind::References {
+            if let Err(failure) = self.verify_delta() {
+                self.fail(failure);
+                return outs;
+            }
+        }
+        self.peer_done = true;
+        self.landed_received = true;
+        self.settle(&mut outs);
+        outs
+    }
+
     /// Matching residual systems peel symmetrically only through the prefix
     /// actually written locally. Exact native root/count additionally discharges
     /// the probabilistic checksum, including upstream's zero-cell shortcut.
@@ -615,15 +691,12 @@ impl Exchange {
                     return None;
                 }
                 self.root_sent = true;
-                let r = self.riblt.as_ref().unwrap();
                 return Some(Frame::RibltRoot {
-                    key: r.cache.key(),
                     summary: self.delta.summary(),
                 });
             }
             if self.discovery_stopped() {
-                self.done_sent = true;
-                return Some(Frame::Done);
+                return None;
             }
             // A root is required before spending CPU or disclosing cell data.
             if self.peer_root.is_none() {
@@ -765,6 +838,14 @@ impl Exchange {
     }
 
     pub(crate) fn awaits(&self) -> bool {
+        if let Some(r) = &self.riblt {
+            // FIN/landing alone has no frame-progress deadline. References'
+            // pending cursor is local fetch work, not an owed VALUE frame.
+            return !self.peer_done
+                && (!r.proven || (self.kind != WalkKind::References
+                    && (!self.wanted.is_empty() || !self.requests.is_empty()
+                        || r.remote_queued < r.decoder.remote().len())));
+        }
         !self.peer_done
             || !self.requests.is_empty()
             || self.offers.as_ref().is_some_and(Offers::awaits)
@@ -811,9 +892,9 @@ impl Exchange {
     fn frame(&mut self, frame: Frame, outs: &mut Vec<Out>) -> Result<(), Failure> {
         match frame {
             Frame::Open { .. } => Err(Failure::Protocol),
-            Frame::RibltRoot { key, summary } => {
+            Frame::RibltRoot { summary } => {
                 let r = self.riblt.as_mut().ok_or(Failure::Protocol)?;
-                if self.peer_root.is_some() || key != r.cache.key() {
+                if self.peer_root.is_some() {
                     return Err(Failure::Protocol);
                 }
                 if summary.leaf_count() > i64::MAX as u64 {
@@ -1081,15 +1162,15 @@ impl Exchange {
                 Ok(())
             }
             Frame::Done => {
-                self.arriving()?;
-                if self.riblt.as_ref().is_some_and(|r| !r.proven) {
+                if self.riblt.is_some() {
                     return Err(Failure::Protocol);
                 }
+                self.arriving()?;
                 self.peer_done = true;
                 Ok(())
             }
             Frame::Landed => {
-                if !self.done_sent || self.landed_received {
+                if self.riblt.is_some() || !self.done_sent || self.landed_received {
                     return Err(Failure::Protocol);
                 }
                 self.landed_received = true;
@@ -1104,7 +1185,8 @@ impl Exchange {
 
     fn tree_value(&self, tree: &Tree, key: [u8; KEY_BYTES]) -> Option<Value> {
         match tree {
-            Tree::Records(patch) => patch.get(&key).copied().map(Value::Record),
+            Tree::Commit(patch) => patch.get(&key).cloned().map(Value::Commit),
+            Tree::Derive(patch) => patch.get(&key).cloned().map(Value::Derive),
             Tree::Authorization(collection, patch) => {
                 let absolute: [u8; 64] = [collection.raw.as_slice(), key.as_slice()]
                     .concat()
@@ -1275,6 +1357,13 @@ impl Exchange {
         if self.outcome.is_some() {
             return;
         }
+        // Cached readiness is a current predicate, not a latch. A newer live
+        // observation can satisfy a decoded key before its first eager VALUE
+        // arrives; that later body may create fresh insertion/fetch debt after
+        // our write half has finished. Peer FIN must not erase that debt.
+        if self.riblt.is_some() {
+            self.landed_sent = false;
+        }
         // The decoder already retains its sparse difference. Drain it by cursor
         // through bounded body scheduling, not another lifetime key queue.
         while self.wanted.len() < FLOOD_WANTED {
@@ -1323,8 +1412,10 @@ impl Exchange {
             return self.fail(Failure::CountMismatch);
         }
         if !self.landed_sent
-            && self.peer_done
-            && (self.riblt.is_none() || (self.done_sent && self.discovery_stopped()))
+            && match &self.riblt {
+                Some(r) => r.root_written && self.discovery_stopped(),
+                None => self.peer_done,
+            }
             && self
                 .riblt
                 .as_ref()
@@ -1346,7 +1437,9 @@ impl Exchange {
                 return self.fail(failure);
             }
             self.landed_sent = true;
-            outs.push(Out::Send(Frame::Landed));
+            if self.riblt.is_none() {
+                outs.push(Out::Send(Frame::Landed));
+            }
         }
         if self.landed_sent
             && self.landed_received
@@ -1374,6 +1467,43 @@ pub(crate) mod tests {
 
     use crate::collection_delta::{decode_record, encode_record};
     use crate::walk::tests::walking::{Node, open};
+
+    #[test]
+    fn valid_other_kind_bodies_are_rejected_by_every_exchange_path() {
+        use triblespace_core::collection::{CollectionCommit, CollectionDerive, SourceLocator};
+        use triblespace_core::inline::Inline;
+        let mut local = Node::new(197);
+        let collection = local.hold("typed-kind-isolation", open());
+        let commit = CollectionRecord::Commit(CollectionCommit::sign(&local.key, collection,
+            Inline::new([71; 32]), Inline::new([72; 32])));
+        let derive = CollectionRecord::Derive(CollectionDerive::sign(&local.key, collection,
+            SourceLocator::of([71; 32]), Inline::new([73; 32])));
+        local.observe();
+        for (kind, foreign) in [(WalkKind::Commit, derive), (WalkKind::Derive, commit)] {
+            let key = foreign.fingerprint().raw();
+            let declared = PatchSummary::new(Some(<Blake3Merkle as PatchHash>::leaf(&key)), 1).unwrap();
+            for mode in 0..3 {
+                let pin = local.pinned(collection);
+                let mut exchange = match mode {
+                    0 => Exchange::start(collection, kind, pin, None, true, true),
+                    1 => Exchange::start_one_way(collection, kind, pin, None, false, true),
+                    _ => Exchange::start_riblt(collection, kind, pin),
+                };
+                if mode == 2 {
+                    exchange.on_frame(Frame::RibltRoot {
+                        summary: declared,
+                    }, Some(local.snapshot()));
+                } else {
+                    exchange.on_frame(root(declared), Some(local.snapshot()));
+                    exchange.on_frame(leaf(key), Some(local.snapshot()));
+                }
+                assert!(exchange.outcome().is_none());
+                let outs = exchange.on_frame(Frame::Value { key, bytes: foreign.to_bytes() }, Some(local.snapshot()));
+                assert!(!outs.iter().any(|out| matches!(out, Out::Land(_))));
+                assert_eq!(exchange.outcome(), Some(Outcome::Failed(Failure::BadValue)), "mode={mode}, kind={kind:?}");
+            }
+        }
+    }
 
     fn root(summary: PatchSummary) -> Frame {
         Frame::Subtree {
@@ -1605,7 +1735,7 @@ pub(crate) mod tests {
     ) -> Vec<u8> {
         let overlay = node.pinned(collection);
         match kind {
-            WalkKind::Records => overlay
+            WalkKind::Commit | WalkKind::Derive => overlay
                 .repair()
                 .records()
                 .get(CollectionRecordFingerprint::from_raw(key))
@@ -1790,10 +1920,10 @@ pub(crate) mod tests {
     fn a_first_exchange_streams_the_whole_tree_to_an_empty_peer() {
         let (full, collection, records) = holding(30, "whole", 300);
         let (empty, _) = sharing(31, "whole", &[]);
-        let expected = tree(&full, collection, WalkKind::Records, &BTreeSet::new());
-        let root_summary = summary(WalkKind::Records, full.pinned(collection).repair());
-        let mut full = Side::both(full, collection, WalkKind::Records);
-        let mut empty = Side::both(empty, collection, WalkKind::Records);
+        let expected = tree(&full, collection, WalkKind::Commit, &BTreeSet::new());
+        let root_summary = summary(WalkKind::Commit, full.pinned(collection).repair());
+        let mut full = Side::both(full, collection, WalkKind::Commit);
+        let mut empty = Side::both(empty, collection, WalkKind::Commit);
         burst(&mut full, &mut empty);
         assert_eq!(full.outcome(), Some(Outcome::Confirmed));
         assert_eq!(empty.outcome(), Some(Outcome::Confirmed));
@@ -1822,7 +1952,7 @@ pub(crate) mod tests {
     fn an_unchanged_tree_against_the_agreed_tree_is_root_then_done() {
         let (a, collection, records) = holding(32, "same", 50);
         let (b, _) = sharing(33, "same", &records);
-        let kind = WalkKind::Records;
+        let kind = WalkKind::Commit;
         let agreed = Arc::new(Tree::pinned(kind, a.pinned(collection).repair()));
         let mut a = Side::new(a, collection, kind, Some(agreed.clone()), true, true);
         let mut b = Side::new(b, collection, kind, Some(agreed.clone()), true, true);
@@ -1846,7 +1976,7 @@ pub(crate) mod tests {
     #[test]
     fn a_match_that_arrives_mid_level_drops_the_work_queued_under_it() {
         let (a, collection, _) = holding(35, "mid", 300);
-        let mut a = Side::new(a, collection, WalkKind::Records, None, true, false);
+        let mut a = Side::new(a, collection, WalkKind::Commit, None, true, false);
         assert!(matches!(a.next(), Some(Frame::Subtree { prefix, .. }) if prefix.is_empty()));
         let first = loop {
             match a.next() {
@@ -1884,7 +2014,7 @@ pub(crate) mod tests {
     #[test]
     fn an_equal_root_announcement_ends_the_delta() {
         let (a, collection, _) = holding(36, "equal", 300);
-        let kind = WalkKind::Records;
+        let kind = WalkKind::Commit;
         let root = summary(kind, a.pinned(collection).repair());
         let mut a = Side::new(a, collection, kind, None, true, true);
         assert_eq!(
@@ -1916,7 +2046,7 @@ pub(crate) mod tests {
             .map(|data| b.commit(collection, 1_000 + data))
             .collect::<Vec<_>>();
         b.observe();
-        let kind = WalkKind::Records;
+        let kind = WalkKind::Commit;
         let mut a = Side::both(a, collection, kind);
         let mut b = Side::both(b, collection, kind);
         carry(&mut a, &mut b);
@@ -1948,7 +2078,7 @@ pub(crate) mod tests {
         let (mut owner, _) = sharing(40, "one way", &records[..10]);
         owner.commit(collection, 1_000);
         owner.observe();
-        let kind = WalkKind::Records;
+        let kind = WalkKind::Commit;
         let mut writer = Side::new(writer, collection, kind, None, true, false);
         let mut owner = Side::new(owner, collection, kind, None, false, true);
         carry(&mut writer, &mut owner);
@@ -2003,7 +2133,7 @@ pub(crate) mod tests {
         let (mut receiver, _) = sharing(42, "missing", &records[..100]);
         let foreign = receiver.commit(collection, 1_000);
         receiver.observe();
-        let kind = WalkKind::Records;
+        let kind = WalkKind::Commit;
         let mut sender = Side::both(sender, collection, kind);
         let mut receiver = Side::both(receiver, collection, kind);
         carry(&mut sender, &mut receiver);
@@ -2032,20 +2162,28 @@ pub(crate) mod tests {
     fn a_subtree_the_peer_announces_is_neither_streamed_nor_asked_for() {
         let (sender, collection, records) = holding(43, "pruned", 400);
         let Some(PatchNode::Branch { branch, .. }) =
-            node(WalkKind::Records, sender.pinned(collection).repair(), &[])
+            node(WalkKind::Commit, sender.pinned(collection).repair(), &[])
         else {
             panic!("400 records branch at the root");
         };
         assert_eq!(branch.end_depth, 0);
-        let edge = branch.children[0].edge;
+        // Fingerprint distributions change with the canonical record grammar.
+        // A singleton is announced as a leaf, not the shared subtree this
+        // test exercises, so select a genuinely multi-leaf child explicitly.
+        let child = branch.children.iter().find(|child| child.leaf_count > 1)
+            .expect("fixture has a multi-leaf child");
+        let edge = child.edge;
         let shared = records
             .iter()
             .filter(|record| record.fingerprint().raw()[0] == edge)
             .copied()
             .collect::<Vec<_>>();
         assert!(!shared.is_empty() && shared.len() < records.len());
+        assert_eq!(shared.len() as u64, child.leaf_count);
+        eprintln!("PREFIX_SHARED_SUBTREE first_child_leaves={} chosen_child_leaves={}",
+            branch.children[0].leaf_count, child.leaf_count);
         let (receiver, _) = sharing(44, "pruned", &shared);
-        let kind = WalkKind::Records;
+        let kind = WalkKind::Commit;
         let mut sender = Side::both(sender, collection, kind);
         let mut receiver = Side::both(receiver, collection, kind);
         carry(&mut sender, &mut receiver);
@@ -2081,8 +2219,8 @@ pub(crate) mod tests {
             .copied()
             .collect::<Vec<_>>();
         let (receiver, _) = sharing(46, "prefix overlap", &held);
-        let mut sender = Side::both(sender, collection, WalkKind::Records);
-        let mut receiver = Side::both(receiver, collection, WalkKind::Records);
+        let mut sender = Side::both(sender, collection, WalkKind::Commit);
+        let mut receiver = Side::both(receiver, collection, WalkKind::Commit);
         carry(&mut sender, &mut receiver);
         assert_eq!(sender.outcome(), Some(Outcome::Confirmed));
         assert_eq!(receiver.outcome(), Some(Outcome::Confirmed));
@@ -2113,7 +2251,7 @@ pub(crate) mod tests {
     #[test]
     fn the_delta_goes_breadth_first() {
         let (sender, collection, _) = holding(47, "breadth", 3000);
-        let mut sender = Side::new(sender, collection, WalkKind::Records, None, true, false);
+        let mut sender = Side::new(sender, collection, WalkKind::Commit, None, true, false);
         assert!(matches!(sender.next(), Some(Frame::Subtree { prefix, .. }) if prefix.is_empty()));
         let mut positions = 0;
         while !sender.exchange.queue.is_empty() {
@@ -2132,7 +2270,7 @@ pub(crate) mod tests {
     fn the_count_proof_fails_on_a_delta_that_omits_a_leaf() {
         let (sender, collection, records) = holding(48, "omitted", 60);
         let (receiver, _) = sharing(49, "omitted", &[]);
-        let kind = WalkKind::Records;
+        let kind = WalkKind::Commit;
         let mut receiver = Side::both(receiver, collection, kind);
         let omit = BTreeSet::from([records[7].fingerprint().raw()]);
         stream(&mut receiver, &sender, collection, kind, &omit);
@@ -2148,7 +2286,7 @@ pub(crate) mod tests {
     fn a_failed_insert_yields_no_landed() {
         let (sender, collection, _) = holding(50, "failed", 20);
         let (receiver, _) = sharing(51, "failed", &[]);
-        let kind = WalkKind::Records;
+        let kind = WalkKind::Commit;
         let mut receiver = Side::both(receiver, collection, kind);
         receiver.hold = true;
         stream(&mut receiver, &sender, collection, kind, &BTreeSet::new());
@@ -2186,7 +2324,7 @@ pub(crate) mod tests {
             CollectionMerge::sign(
                 &sender.key,
                 collection,
-                [CollectionData::new([2; 32]), CollectionData::new([3; 32])],
+                (2..10).map(|byte| CollectionData::new([byte; 32])),
                 CollectionData::new([4; 32]),
             )
             .unwrap(),
@@ -2203,7 +2341,7 @@ pub(crate) mod tests {
     fn requests_are_windowed_and_reading_stops_at_unlanded_values() {
         let (sender, collection, records) = holding(53, "window", MAX_WALK_UNLANDED as u64 + 100);
         let (receiver, _) = sharing(54, "window", &[]);
-        let kind = WalkKind::Records;
+        let kind = WalkKind::Commit;
         let mut receiver = Side::both(receiver, collection, kind);
         receiver.hold = true;
         let mut requests = Vec::new();
@@ -2273,17 +2411,17 @@ pub(crate) mod tests {
     #[test]
     fn frames_out_of_place_fail_the_exchange() {
         let (sender, collection, records) = holding(55, "order", 1);
-        let root_summary = summary(WalkKind::Records, sender.pinned(collection).repair());
+        let root_summary = summary(WalkKind::Commit, sender.pinned(collection).repair());
         let fresh = |byte| {
             let (node, _) = sharing(byte, "order", &[]);
-            Side::both(node, collection, WalkKind::Records)
+            Side::both(node, collection, WalkKind::Commit)
         };
         for frame in [
             leaf(records[0].fingerprint().raw()),
             Frame::Landed,
             Frame::Open {
                 collection,
-                kind: WalkKind::Records,
+                kind: WalkKind::Commit,
                 algorithm: Algorithm::Prefix,
                 offer: None,
             },
@@ -2307,7 +2445,7 @@ pub(crate) mod tests {
         receiver.feed(Frame::Done);
         receiver.feed(leaf(records[0].fingerprint().raw()));
         assert_eq!(receiver.outcome(), Some(Outcome::Failed(Failure::Protocol)));
-        let mut owner = Side::new(sender, collection, WalkKind::Records, None, false, true);
+        let mut owner = Side::new(sender, collection, WalkKind::Commit, None, false, true);
         owner.feed(Frame::ValueRequest {
             key: records[0].fingerprint().raw(),
         });
@@ -2318,7 +2456,7 @@ pub(crate) mod tests {
     fn an_exchange_that_ends_before_both_landed_is_not_confirmed() {
         let (sender, collection, _) = holding(63, "closed", 30);
         let (receiver, _) = sharing(64, "closed", &[]);
-        let kind = WalkKind::Records;
+        let kind = WalkKind::Commit;
         let mut sender = Side::both(sender, collection, kind);
         let mut receiver = Side::new(receiver, collection, kind, None, true, true);
         // The receiver's LANDED never crosses.
@@ -2358,7 +2496,7 @@ pub(crate) mod tests {
     #[test]
     fn the_peer_s_landed_counts_a_push_but_not_a_shared_agreement() {
         let (sender, collection, _) = holding(100, "one LANDED", 1);
-        let mut sender = Side::both(sender, collection, WalkKind::Records);
+        let mut sender = Side::both(sender, collection, WalkKind::Commit);
         while sender.next().is_some() {}
         sender.feed(Frame::Landed);
         assert_eq!(sender.outcome(), None);
@@ -2520,9 +2658,9 @@ pub(crate) mod tests {
     fn a_duplicated_or_foreign_leaf_does_not_close_the_count_proof() {
         let (sender, collection, records) = holding(68, "duplicated", 60);
         let (receiver, _) = sharing(69, "duplicated", &[]);
-        let mut receiver = Side::both(receiver, collection, WalkKind::Records);
+        let mut receiver = Side::both(receiver, collection, WalkKind::Commit);
         receiver.feed(root(summary(
-            WalkKind::Records,
+            WalkKind::Commit,
             sender.pinned(collection).repair(),
         )));
         let key = records[0].fingerprint().raw();
@@ -2536,19 +2674,19 @@ pub(crate) mod tests {
     fn a_node_whose_digest_is_not_the_parent_s_child_digest_fails_the_exchange() {
         let (sender, collection, records) = holding(70, "commitment", 400);
         let (receiver, _) = sharing(72, "commitment", &[]);
-        let mut frames = tree(&sender, collection, WalkKind::Records, &BTreeSet::new());
+        let mut frames = tree(&sender, collection, WalkKind::Commit, &BTreeSet::new());
         let changed = frames.iter_mut().find(|frame| matches!(frame, Frame::Subtree {prefix, summary} if !prefix.is_empty() && prefix.len()<KEY_BYTES && summary.leaf_count()>1)).unwrap();
         let Frame::Subtree { summary, .. } = changed else {
             unreachable!()
         };
         *summary = PatchSummary::new(Some([0xAB; 32]), summary.leaf_count()).unwrap();
-        let mut receiver = Side::both(receiver, collection, WalkKind::Records);
+        let mut receiver = Side::both(receiver, collection, WalkKind::Commit);
         for frame in frames {
             for reply in receiver.feed(frame) {
                 if let Frame::ValueRequest { key } = reply {
                     receiver.feed(Frame::Value {
                         key,
-                        bytes: value_of(&sender, collection, WalkKind::Records, key),
+                        bytes: value_of(&sender, collection, WalkKind::Commit, key),
                     });
                 }
             }
@@ -2562,9 +2700,9 @@ pub(crate) mod tests {
     fn a_leaf_outside_the_peer_s_tree_fails_the_exchange() {
         let (sender, collection, records) = holding(73, "outside", 60);
         let (receiver, _) = sharing(74, "outside", &[]);
-        let mut receiver = Side::both(receiver, collection, WalkKind::Records);
+        let mut receiver = Side::both(receiver, collection, WalkKind::Commit);
         receiver.feed(root(summary(
-            WalkKind::Records,
+            WalkKind::Commit,
             sender.pinned(collection).repair(),
         )));
         let key = records[0].fingerprint().raw();
@@ -2584,7 +2722,7 @@ pub(crate) mod tests {
         let (receiver, collection) = sharing(76, "flood", &[]);
         let (root, root_node, branches) = fabricated(256, FLOOD_WANTED / 256 + 2);
         assert!(root.leaf_count() as usize > FLOOD_WANTED + MAX_WALK_REQUESTS);
-        let kind = WalkKind::Records;
+        let kind = WalkKind::Commit;
         let mut receiver = Side::both(receiver, collection, kind);
         receiver.feed(Frame::Subtree {
             prefix: Vec::new(),
@@ -2636,7 +2774,7 @@ pub(crate) mod tests {
     fn a_wide_owed_frontier_is_not_mistaken_for_withheld_values() {
         let (receiver, collection) = sharing(79, "nodes", &[]);
         let (declared, _, branches) = fabricated(256, 256);
-        let mut receiver = Side::both(receiver, collection, WalkKind::Records);
+        let mut receiver = Side::both(receiver, collection, WalkKind::Commit);
         receiver.feed(root(declared));
         for (branch, _) in &branches {
             receiver.feed(branch.clone());
@@ -2656,7 +2794,7 @@ pub(crate) mod tests {
     fn a_first_exchange_above_32k_frontier_completes_without_dfs() {
         let (sender, collection, records) = holding(90, "wide FIFO", 70_000);
         let (receiver, _) = sharing(91, "wide FIFO", &[]);
-        let kind = WalkKind::Records;
+        let kind = WalkKind::Commit;
         let mut sender = Side::both(sender, collection, kind);
         let mut receiver = Side::both(receiver, collection, kind);
         receiver.observe_landings = false;
@@ -2707,7 +2845,7 @@ pub(crate) mod tests {
         let own_b = b.commit(collection, 2_000);
         a.observe();
         b.observe();
-        let kind = WalkKind::Records;
+        let kind = WalkKind::Commit;
         let root_a = node(kind, a.pinned(collection).repair(), &[]).unwrap();
         let PatchNode::Branch { branch, .. } = &root_a else {
             panic!("the root branches");
@@ -2749,7 +2887,7 @@ pub(crate) mod tests {
     #[test]
     fn a_receive_only_side_remembers_accounted_subtrees_without_leaf_frames() {
         let (sender, collection, records) = holding(95, "one-way shared", 1000);
-        let kind = WalkKind::Records;
+        let kind = WalkKind::Commit;
         let root = node(kind, sender.pinned(collection).repair(), &[]).unwrap();
         let PatchNode::Branch { branch, .. } = &root else {
             panic!("the root branches");
@@ -2791,7 +2929,7 @@ pub(crate) mod tests {
     fn a_lagging_pinned_snapshot_cannot_shrink_the_agreed_union() {
         let (b, collection, records) = holding(101, "lagged union", 100);
         let (a, _) = sharing(102, "lagged union", &records[..50]);
-        let kind = WalkKind::Records;
+        let kind = WalkKind::Commit;
         let agreed = Arc::new(Tree::pinned(kind, b.pinned(collection).repair()));
         let expected = agreed.summary();
         let mut a = Side::new(a, collection, kind, Some(agreed.clone()), true, true);
@@ -2815,7 +2953,7 @@ pub(crate) mod tests {
         let (prior, collection, records) = holding(111, "one-way lag", 100);
         let (writer, _) = sharing(112, "one-way lag", &records[..50]);
         let (owner, _) = sharing(113, "one-way lag", &records[..50]);
-        let kind = WalkKind::Records;
+        let kind = WalkKind::Commit;
         let agreed = Arc::new(Tree::pinned(kind, prior.pinned(collection).repair()));
         let expected = agreed.summary();
         let mut writer = Side::new(writer, collection, kind, Some(agreed.clone()), true, false);
@@ -2844,8 +2982,8 @@ pub(crate) mod tests {
     #[test]
     fn an_already_held_node_authenticates_children_before_announcing_them() {
         let (node, collection, _) = holding(97, "bounds", 300);
-        let declared = summary(WalkKind::Records, node.pinned(collection).repair());
-        let mut side = Side::both(node, collection, WalkKind::Records);
+        let declared = summary(WalkKind::Commit, node.pinned(collection).repair());
+        let mut side = Side::both(node, collection, WalkKind::Commit);
         side.feed(root(declared));
         let outs = side.exchange.on_frame(
             Frame::Subtree {
@@ -2861,7 +2999,7 @@ pub(crate) mod tests {
     #[test]
     fn exceeding_the_locator_budget_fails_instead_of_switching_to_dfs() {
         let (sender, collection, _) = holding(92, "bounded FIFO", 300);
-        let mut sender = Side::both(sender, collection, WalkKind::Records);
+        let mut sender = Side::both(sender, collection, WalkKind::Commit);
         sender.exchange.root_sent = true;
         sender.exchange.queue = std::iter::repeat_n(Vec::new(), FLOOD_LOCATORS).collect();
         assert_eq!(sender.next(), None);
@@ -2873,8 +3011,8 @@ pub(crate) mod tests {
     fn an_equal_or_agreed_root_is_accounted_whole() {
         let (sender, collection, records) = holding(80, "equal", 50);
         let (receiver, _) = sharing(81, "equal", &records);
-        let declared = summary(WalkKind::Records, sender.pinned(collection).repair());
-        let mut receiver = Side::both(receiver, collection, WalkKind::Records);
+        let declared = summary(WalkKind::Commit, sender.pinned(collection).repair());
+        let mut receiver = Side::both(receiver, collection, WalkKind::Commit);
         receiver.feed(root(declared));
         assert_eq!(receiver.feed(Frame::Done), [Frame::Landed]);
         while receiver.next().is_some() {}
@@ -2889,7 +3027,7 @@ pub(crate) mod tests {
     fn a_subtree_equal_to_the_agreed_tree_is_accounted_however_this_side_grew() {
         let (a, collection, records) = holding(82, "grew", 300);
         let (b, _) = sharing(83, "grew", &records);
-        let kind = WalkKind::Records;
+        let kind = WalkKind::Commit;
         let agreed = Arc::new(Tree::pinned(kind, a.pinned(collection).repair()));
         let mut a = Side::new(a, collection, kind, Some(agreed.clone()), true, true);
         let mut b = Side::new(b, collection, kind, Some(agreed.clone()), true, true);
@@ -2917,7 +3055,7 @@ pub(crate) mod tests {
     #[test]
     fn values_are_served_from_the_pinned_tree() {
         let (sender, collection, records) = holding(84, "served", 5);
-        let kind = WalkKind::Records;
+        let kind = WalkKind::Commit;
         let mut sender = Side::both(sender, collection, kind);
         let key = records[0].fingerprint().raw();
         let replies = sender.feed(Frame::ValueRequest { key });
@@ -2934,7 +3072,7 @@ pub(crate) mod tests {
     fn matching_prefix_before_or_after_our_announcement_sends_it_once_not_its_recursion() {
         for late in [false, true] {
             let (sender, collection, _) = holding(115, "match order", 1000);
-            let mut side = Side::new(sender, collection, WalkKind::Records, None, true, false);
+            let mut side = Side::new(sender, collection, WalkKind::Commit, None, true, false);
             side.next().unwrap(); // [] first, with all logical children queued.
             let prefix = side
                 .exchange
@@ -2973,7 +3111,7 @@ pub(crate) mod tests {
     #[test]
     fn a_compressed_delta_root_meets_the_same_prefix_inside_a_larger_delta() {
         let (large, collection, records) = holding(116, "compressed overlap", 1000);
-        let tree = Tree::pinned(WalkKind::Records, large.pinned(collection).repair());
+        let tree = Tree::pinned(WalkKind::Commit, large.pinned(collection).repair());
         let (_, children) = tree.shape(&[]).unwrap();
         let prefix = children
             .into_iter()
@@ -2985,8 +3123,8 @@ pub(crate) mod tests {
             .copied()
             .collect::<Vec<_>>();
         let (small, _) = sharing(117, "compressed overlap", &shared);
-        let mut large = Side::both(large, collection, WalkKind::Records);
-        let mut small = Side::both(small, collection, WalkKind::Records);
+        let mut large = Side::both(large, collection, WalkKind::Commit);
+        let mut small = Side::both(small, collection, WalkKind::Commit);
         carry(&mut large, &mut small);
         for side in [&large, &small] {
             assert_eq!(side.outcome(), Some(Outcome::Confirmed));
@@ -3015,16 +3153,16 @@ pub(crate) mod tests {
         let (mut receiver, _) = sharing(119, "foreign membership", &[]);
         let foreign = receiver.commit(collection, 1000);
         receiver.observe();
-        let mut side = Side::both(receiver, collection, WalkKind::Records);
+        let mut side = Side::both(receiver, collection, WalkKind::Commit);
         side.feed(root(summary(
-            WalkKind::Records,
+            WalkKind::Commit,
             sender.pinned(collection).repair(),
         )));
         let key = records[0].fingerprint().raw();
         assert_eq!(side.feed(leaf(key)), [Frame::ValueRequest { key }]);
         side.feed(Frame::Value {
             key,
-            bytes: value_of(&sender, collection, WalkKind::Records, key),
+            bytes: value_of(&sender, collection, WalkKind::Commit, key),
         });
         assert!(side.feed(leaf(foreign.fingerprint().raw())).is_empty());
         assert_eq!(side.exchange.peer.summary().leaf_count(), 2);
@@ -3045,7 +3183,7 @@ pub(crate) mod tests {
     fn a_wrong_prefix_cannot_close_even_with_the_right_hash_and_count() {
         let (sender, collection, records) = holding(120, "wrong prefix", 1000);
         let (receiver, _) = sharing(121, "wrong prefix", &records);
-        let tree = Tree::pinned(WalkKind::Records, sender.pinned(collection).repair());
+        let tree = Tree::pinned(WalkKind::Commit, sender.pinned(collection).repair());
         let (_, children) = tree.shape(&[]).unwrap();
         let prefix = children
             .into_iter()
@@ -3054,7 +3192,7 @@ pub(crate) mod tests {
         let declared = tree.at(&prefix).unwrap();
         let mut wrong = prefix.clone();
         wrong[0] ^= 0x80;
-        let mut side = Side::both(receiver, collection, WalkKind::Records);
+        let mut side = Side::both(receiver, collection, WalkKind::Commit);
         side.feed(root(tree.summary()));
         side.feed(Frame::Subtree {
             prefix: wrong,
@@ -3079,10 +3217,10 @@ pub(crate) mod tests {
             })
             .unwrap();
         let (holder, _) = sharing(123, "compressed alias", &pair);
-        let tree = Tree::pinned(WalkKind::Records, holder.pinned(collection).repair());
+        let tree = Tree::pinned(WalkKind::Commit, holder.pinned(collection).repair());
         let (canonical, _) = tree.shape(&[]).unwrap();
         assert!(canonical.len() >= 2);
-        let mut side = Side::both(holder, collection, WalkKind::Records);
+        let mut side = Side::both(holder, collection, WalkKind::Commit);
         side.feed(root(tree.summary()));
         side.feed(Frame::Subtree {
             prefix: canonical[..1].to_vec(),
@@ -3097,7 +3235,7 @@ pub(crate) mod tests {
     #[test]
     fn a_declared_delta_above_the_honest_proof_budget_is_refused() {
         let (node, collection) = sharing(124, "proof ceiling", &[]);
-        let mut side = Side::both(node, collection, WalkKind::Records);
+        let mut side = Side::both(node, collection, WalkKind::Commit);
         side.feed(root(
             PatchSummary::new(Some([0xAA; 32]), FLOOD_LOCATORS as u64 + 1).unwrap(),
         ));
@@ -3110,8 +3248,8 @@ pub(crate) mod tests {
     fn unequal_sound_bases_after_a_failed_finish_and_publication_lag_converge() {
         let (a, collection, records) = holding(127, "unequal bases", 2);
         let (b, _) = sharing(128, "unequal bases", &records[..1]);
-        let mut a = Side::both(a, collection, WalkKind::Records);
-        let mut b = Side::both(b, collection, WalkKind::Records);
+        let mut a = Side::both(a, collection, WalkKind::Commit);
+        let mut b = Side::both(b, collection, WalkKind::Commit);
         b.observe_landings = false;
         carry(&mut a, &mut b);
         assert_eq!(a.outcome(), Some(Outcome::Confirmed));
@@ -3128,12 +3266,12 @@ pub(crate) mod tests {
         let mut a = Side::new(
             a.node,
             collection,
-            WalkKind::Records,
+            WalkKind::Commit,
             Some(complete.clone()),
             true,
             true,
         );
-        let mut b = Side::new(b.node, collection, WalkKind::Records, None, true, true);
+        let mut b = Side::new(b.node, collection, WalkKind::Commit, None, true, true);
         carry(&mut a, &mut b);
         assert_eq!(a.outcome(), Some(Outcome::Confirmed));
         assert_eq!(b.outcome(), Some(Outcome::Confirmed));
@@ -3159,7 +3297,7 @@ pub(crate) mod tests {
         let mut a = Side::new(
             a.node,
             collection,
-            WalkKind::Records,
+            WalkKind::Commit,
             Some(complete.clone()),
             true,
             true,
@@ -3167,7 +3305,7 @@ pub(crate) mod tests {
         let mut b = Side::new(
             b.node,
             collection,
-            WalkKind::Records,
+            WalkKind::Commit,
             Some(b_base),
             true,
             true,
@@ -3211,8 +3349,8 @@ pub(crate) mod tests {
         }
         let (a, collection, records) = holding(125, "bytes", 3000);
         let (b, _) = sharing(126, "bytes", &[]);
-        let mut a = Side::both(a, collection, WalkKind::Records);
-        let mut b = Side::both(b, collection, WalkKind::Records);
+        let mut a = Side::both(a, collection, WalkKind::Commit);
+        let mut b = Side::both(b, collection, WalkKind::Commit);
         b.observe_landings = false;
         carry(&mut a, &mut b);
         b.node.observe();
@@ -3226,7 +3364,7 @@ pub(crate) mod tests {
         let mut a = Side::new(
             node,
             collection,
-            WalkKind::Records,
+            WalkKind::Commit,
             Some(agreed.clone()),
             true,
             true,
@@ -3234,7 +3372,7 @@ pub(crate) mod tests {
         let mut b = Side::new(
             b.node,
             collection,
-            WalkKind::Records,
+            WalkKind::Commit,
             Some(agreed),
             true,
             true,
@@ -3255,7 +3393,7 @@ pub(crate) mod tests {
     fn the_agreed_tree_mirrors_the_overlay_s_tree() {
         let (mut node, collection, records) = holding(85, "tree", 40);
         for kind in [
-            WalkKind::Records,
+            WalkKind::Commit,
             WalkKind::Authorization,
             WalkKind::References,
         ] {
@@ -3269,14 +3407,14 @@ pub(crate) mod tests {
                 );
             }
         }
-        let before = Tree::pinned(WalkKind::Records, node.pinned(collection).repair());
+        let before = Tree::pinned(WalkKind::Commit, node.pinned(collection).repair());
         let mut tree = before.clone();
         let record = node.commit(collection, 1_000);
         node.observe();
-        tree.insert(record.fingerprint().raw(), Value::Record(record));
+        tree.insert(record.fingerprint().raw(), Value::from_record_view(&record.into()).unwrap());
         assert_eq!(
             tree.summary(),
-            summary(WalkKind::Records, node.pinned(collection).repair())
+            summary(WalkKind::Commit, node.pinned(collection).repair())
         );
         assert_ne!(before.summary(), tree.summary(), "the clone is its own");
         assert!(

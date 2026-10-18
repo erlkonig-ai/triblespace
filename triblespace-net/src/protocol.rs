@@ -43,7 +43,11 @@ use crate::transport::PeerId;
 /// Generation 32 adds offer-bound HAVE receipts and bounded eager values for
 /// one-way Prefix. Older receivers reject those unsolicited values, so these
 /// semantics require a handshake boundary even when a walk selects Prefix.
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/32";
+/// Generation 33 separates COMMIT and DERIVE trees, summaries and exchanges.
+/// Generation 32's combined Records root has different meaning and is refused.
+/// This unreleased generation also removes the redundant cached ROOT key and
+/// uses gated FIN completion for cached RIBLT only; Prefix keeps DONE/LANDED.
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/33";
 
 // Stream type tags — first byte on each stream, read before any admission
 // permit is taken. An unknown tag resets only its own stream.

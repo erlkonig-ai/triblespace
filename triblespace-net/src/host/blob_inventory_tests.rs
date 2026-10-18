@@ -155,7 +155,8 @@ fn a_blob_only_child_is_held_after_a_report_not_by_its_arrival() {
     let new_collection = new.collection(fixture.collection).unwrap();
     let old_manifest = crate::collection_wire::manifest(&old_collection.repair);
     let new_manifest = crate::collection_wire::manifest(&new_collection.repair);
-    assert_eq!(old_manifest.records, new_manifest.records);
+    assert_eq!(old_manifest.commits, new_manifest.commits);
+    assert_eq!(old_manifest.derives, new_manifest.derives);
     assert_eq!(
         old_manifest.authorization_evidence,
         new_manifest.authorization_evidence
@@ -249,12 +250,12 @@ fn removed_parent_with_resident_child_invalidates_disconnected_inventory() {
             .unwrap()
             .repair
             .records()
-            .summary(),
+            .summaries(),
         old.collection(fixture.collection)
             .unwrap()
             .repair
             .records()
-            .summary()
+            .summaries()
     );
 }
 

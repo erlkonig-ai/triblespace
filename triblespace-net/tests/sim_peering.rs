@@ -320,7 +320,7 @@ fn a_host_peers_for_a_collection_only_while_its_pile_selects_it() {
         .await;
         assert!(pushed <= Duration::from_secs(4), "{pushed:?}");
         let confirmed = pair(&owner, collection, reader_id).unwrap();
-        assert!(confirmed.pushes.last_ok && confirmed.confirmed.records.is_some());
+        assert!(confirmed.pushes.last_ok && confirmed.confirmed.commits.is_some());
         assert_eq!(net.dial_count(reader_id, owner_id), 0);
         assert_eq!(net.dial_count(owner_id, reader_id), 1);
     }));
@@ -370,7 +370,7 @@ fn a_local_append_reaches_the_peer_within_the_timer() {
         assert!(landed <= Duration::from_secs(4), "{landed:?}");
         let after = pair(&owner, collection, reader_id).unwrap();
         assert!(after.pushes.ok > before.pushes.ok);
-        assert_ne!(after.confirmed.records, before.confirmed.records);
+        assert_ne!(after.confirmed.commits, before.confirmed.commits);
     }));
 }
 
@@ -593,8 +593,8 @@ fn a_writer_that_cannot_read_delivers_and_receives_nothing() {
         let delivered = pair(&writer, collection, owner_id).expect("the writer pushed");
         assert!(delivered.pushes.last_ok && delivered.pushes.ok >= 1);
         assert_eq!((delivered.receives.ok, delivered.receives.failed), (0, 0));
-        assert!(received.confirmed.records.is_some(), "{received:?}");
-        assert_eq!(received.confirmed.records, delivered.confirmed.records);
+        assert!(received.confirmed.commits.is_some(), "{received:?}");
+        assert_eq!(received.confirmed.commits, delivered.confirmed.commits);
         assert!(!holds(&mut writer, owned));
 
         // Five intervals at their sixty-second cap: the writer's unchanged
@@ -603,7 +603,7 @@ fn a_writer_that_cannot_read_delivers_and_receives_nothing() {
         let later = pair(&owner, collection, writer_id).unwrap();
         assert!(later.receives.ok > received.receives.ok && later.receives.failed == 0);
         assert_eq!((later.pushes.ok, later.pushes.failed), (0, 0));
-        assert_eq!(later.confirmed.records, received.confirmed.records);
+        assert_eq!(later.confirmed.commits, received.confirmed.commits);
         assert!(!holds(&mut writer, owned));
         let later = pair(&writer, collection, owner_id).unwrap();
         assert_eq!((later.receives.ok, later.receives.failed), (0, 0));

@@ -226,8 +226,8 @@ fn riblt_cache_collection_and_component_profiles_do_not_reuse_each_other() {
 
     let other_component = Generation::advance(
         collection,
-        WalkKind::Records,
-        Tree::Records(PATCH::new()),
+        WalkKind::Commit,
+        Tree::Commit(PATCH::new()),
         Some(&generation),
     )
     .unwrap();
@@ -244,8 +244,8 @@ fn riblt_cache_typed_records_and_authorization_suffixes_match_upstream() {
         node.commit(collection, number);
     }
     node.observe();
-    let records = Tree::pinned(WalkKind::Records, node.pinned(collection).repair());
-    let generation = Generation::advance(collection, WalkKind::Records, records, None).unwrap();
+    let records = Tree::pinned(WalkKind::Commit, node.pinned(collection).repair());
+    let generation = Generation::advance(collection, WalkKind::Commit, records, None).unwrap();
     assert_eq!(generation.summary().leaf_count(), 16);
     exact_prefix(&generation, 2049);
 
@@ -292,7 +292,7 @@ fn riblt_cache_snapshot_constructor_tracks_authored_and_inserted_record_deltas()
     )
     .unwrap();
     let old_pin = first.collection(collection).unwrap();
-    let old = old_pin.cache(WalkKind::Records);
+    let old = old_pin.cache(WalkKind::Commit);
     exact_prefix(&old, 2049);
     let old_root = old.summary();
 
@@ -312,20 +312,20 @@ fn riblt_cache_snapshot_constructor_tracks_authored_and_inserted_record_deltas()
     )
     .unwrap();
     let new_pin = second.collection(collection).unwrap();
-    let new = new_pin.cache(WalkKind::Records);
+    let new = new_pin.cache(WalkKind::Commit);
     assert!(!Arc::ptr_eq(&old, &new));
     assert_eq!(old.summary(), old_root);
     assert_eq!(new.summary().leaf_count(), old_root.leaf_count() + 2);
-    assert_eq!(new.summary(), new_pin.repair().records().summary());
-    let Tree::Records(old_records) = old.source() else {
+    assert_eq!(new.summary(), new_pin.repair().records().summaries()[0]);
+    let Tree::Commit(old_records) = old.source() else {
         panic!("record generation owns a record source");
     };
-    let Tree::Records(new_records) = new.source() else {
+    let Tree::Commit(new_records) = new.source() else {
         panic!("record generation owns a record source");
     };
     for record in [authored, incoming] {
         assert!(old_records.get(&record.fingerprint().raw()).is_none());
-        assert_eq!(new_records.get(&record.fingerprint().raw()), Some(&record));
+        assert_eq!(new_records.get(&record.fingerprint().raw()).map(|view| triblespace_core::collection::CollectionRecord::Commit(view.to_record().unwrap())), Some(record));
     }
     exact_prefix(&new, 4097);
     exact_prefix(&old, 4097);
@@ -341,7 +341,8 @@ fn riblt_cache_snapshot_constructor_tracks_authored_and_inserted_record_deltas()
     .unwrap();
     let unchanged = third.collection(collection).unwrap();
     for kind in [
-        WalkKind::Records,
+        WalkKind::Commit,
+        WalkKind::Derive,
         WalkKind::Authorization,
         WalkKind::References,
     ] {
@@ -402,17 +403,18 @@ fn riblt_sparse_summary_matches_real_record_and_scoped_authorization_trees() {
     for number in 0..24 {
         let record = node.commit(collection, number);
         let key = record.fingerprint().raw();
-        complete.insert(&Entry::with_value(&key, record));
+        let view = triblespace_core::collection::CollectionRecordView::from(record).as_commit().unwrap().clone();
+        complete.insert(&Entry::with_value(&key, view.clone()));
         if number % 3 != 0 {
-            records.insert(&Entry::with_value(&key, record));
+            records.insert(&Entry::with_value(&key, view));
         }
         if number % 3 != 1 {
             additions.insert(&Entry::new(&key));
         }
     }
     assert_eq!(
-        Tree::Records(records).summary_with_keys(&additions),
-        Tree::Records(complete).summary()
+        Tree::Commit(records).summary_with_keys(&additions),
+        Tree::Commit(complete).summary()
     );
 
     let root = SigningKey::from_bytes(&[102; 32]);

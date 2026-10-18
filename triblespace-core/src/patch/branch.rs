@@ -68,6 +68,42 @@ impl<'a, const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
         self.hash_dirty |= Branch::modify_child(&mut self.branch_nn, key, !self.hash_dirty, f);
     }
 
+    /// Checked insertion's unique-path update. Unlike `modify_child`, the
+    /// child stays installed while the callback can fail or panic. The private
+    /// callback must leave the child unchanged on error/panic, and report true
+    /// only after a successful insertion with no further user callbacks.
+    pub(super) fn try_update_child<E>(
+        &mut self,
+        key: u8,
+        update: impl FnOnce(&mut Head<KEY_LEN, O, V, H>) -> Result<bool, E>,
+    ) -> Result<bool, E> {
+        let branch = unsafe { self.branch_nn.as_mut() };
+        let depth = branch.end_depth as usize;
+        let child = branch.child_table.table_get_slot(key).unwrap().as_mut().unwrap();
+        let old_hash = child.hash();
+        let old_segments = child.count_segment(depth);
+        let old_count = child.count();
+        let represented = child.childleaf_ptr() == branch.childleaf;
+        if !update(child)? {
+            return Ok(false);
+        }
+        if H::INCREMENTAL_BRANCH && !self.hash_dirty {
+            branch.hash = H::edit_branch(branch.hash, key, Some(old_hash), Some(child.hash()));
+        } else {
+            self.hash_dirty = true;
+        }
+        branch.segment_count = branch.segment_count - old_segments + child.count_segment(depth);
+        branch.leaf_count = branch.leaf_count - old_count + child.count();
+        if represented {
+            branch.childleaf = child.childleaf_ptr();
+        }
+        #[cfg(debug_assertions)]
+        if !self.hash_dirty {
+            branch.debug_check_invariants();
+        }
+        Ok(true)
+    }
+
     /// Like [`modify_child`] but uses the supplied `inserted_hash`
     /// for the empty-slot insertion case instead of calling
     /// `inserted.hash()`. Lets archive ingest avoid recomputing
@@ -217,6 +253,10 @@ impl<
 impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, Table: ?Sized, V, H: PatchHash>
     Branch<KEY_LEN, O, Table, V, H>
 {
+    pub(super) fn is_unique(&self) -> bool {
+        self.rc.load(Acquire) == 1
+    }
+
     /// Returns the key bytes of the representative child leaf. The
     /// pointer is set to a heap `Leaf`'s `key` field (offset 0) or to
     /// a `LocalLeaf`'s archive-resident bytes; both yield the same
@@ -1324,6 +1364,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
         }
 
         1
+    }
+
+    pub(super) fn get_key<'a>(&'a self, at_depth: usize, key: &[u8; KEY_LEN]) -> Option<&'a [u8; KEY_LEN]> {
+        let end = self.end_depth as usize;
+        if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(self.childleaf_key(), at_depth, &key[..end.min(KEY_LEN)]) {
+            return None;
+        }
+        if end >= KEY_LEN { return Some(self.childleaf_key()); }
+        self.child_table.table_get(key[end]).and_then(|child| child.get_key(end, key))
     }
 
     pub fn get<'a>(&'a self, at_depth: usize, key: &[u8; KEY_LEN]) -> Option<&'a V>

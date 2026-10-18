@@ -29,6 +29,7 @@ clap_complete = "4.5.65"
 anyhow = "1.0.101"
 getrandom = "0.4.1"
 hex = "0.4.3"
+hex-literal = "1.0.0"
 memchr = "2.7.6"
 triblespace = { version = "0.47.0", path = "..", default-features = false }
 # Keep the CLI's serial Core selection pending matched-input feature measurements.

@@ -973,7 +973,7 @@ mod tests {
         let merge = CollectionMerge::sign(
             &old_key,
             old.handle(),
-            [commits[0].data(), commits[1].data()],
+            commits.iter().map(|commit| commit.data()).chain((0xD0..0xD6).map(|byte| Inline::new([byte; 32]))),
             crate::inline::Inline::new([0xEE; 32]),
         )
         .unwrap();

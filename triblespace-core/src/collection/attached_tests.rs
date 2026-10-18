@@ -297,21 +297,19 @@ fn a_foreign_map_is_never_used() {
 #[test]
 fn a_map_for_a_node_the_lattice_does_not_reach_is_never_used() {
     let (mut store, root, attached) = succinct_root("unreached");
-    let a = commit(&mut store, root, row(1, 2, 3));
-    let b = commit(&mut store, root, row(4, 5, 6));
-    // Another key merges a and b; this host believes no such node.
+    let nodes: Vec<_> = (1..=8).map(|n| commit(&mut store, root, row(n, 2, 3))).collect();
+    // Another key joins eight actual foundations; this host believes no such node.
     let snapshot = store.snapshot().unwrap();
-    let joined = simplearchive_union::join(
-        &snapshot.get(Handle::<SimpleArchive>::from_hash(a)).unwrap(),
-        &snapshot.get(Handle::<SimpleArchive>::from_hash(b)).unwrap(),
-    )
-    .unwrap();
+    let inputs: Vec<Blob<SimpleArchive>> = nodes.iter()
+        .map(|node| snapshot.get(Handle::<SimpleArchive>::from_hash(*node)).unwrap())
+        .collect();
+    let joined = simplearchive_union::join_all(&inputs).unwrap();
     drop(snapshot);
     let foreign = data(&joined);
     store.put::<SimpleArchive, _>(joined).unwrap();
     store
         .insert(CollectionRecord::Merge(
-            CollectionMerge::sign(&other(), root.handle(), [a, b], foreign).unwrap(),
+            CollectionMerge::sign(&other(), root.handle(), nodes.iter().copied(), foreign).unwrap(),
         ))
         .unwrap();
     let unreached = map_succinct(&mut store, attached, foreign, &host());
@@ -326,15 +324,15 @@ fn a_map_for_a_node_the_lattice_does_not_reach_is_never_used() {
     let taken = members(read.cover());
     assert!(!taken.contains(&unreached));
     assert!(!taken.contains(&stray_attachment));
-    assert_eq!(residual(&read), BTreeSet::from([a, b]));
+    assert_eq!(residual(&read), nodes.into_iter().collect::<BTreeSet<_>>());
 }
 
 /// A host join still waiting for an input's support is no producer, and it
 /// changes nothing a reader sees: the attached read of a store holding it is
 /// the read of the same store without it.
 ///
-/// The join claims `z` is `a + b + y`, where `a` and `b` are attached
-/// commits and `y` has no support, so it stays blocked and consumes nothing.
+/// The join claims `z` is seven attached foundations plus `y`, whose bytes
+/// exist but which has no support, so it stays blocked and consumes nothing.
 /// That is the whole observable contract. Whether a reader would descend a
 /// blocked join cannot be seen through the read at all: every node with a
 /// row is reachable through driven joins anyway, and a node without one is
@@ -343,19 +341,28 @@ fn a_map_for_a_node_the_lattice_does_not_reach_is_never_used() {
 fn a_blocked_own_join_changes_nothing_a_reader_sees() {
     fn read_with_join(blocked: bool) -> (BTreeSet<CollectionData>, BTreeSet<CollectionData>) {
         let (mut store, root, attached) = succinct_root("blocked");
-        let a = commit(&mut store, root, row(1, 2, 3));
-        let b = commit(&mut store, root, row(4, 5, 6));
-        let z = commit(&mut store, root, row(7, 8, 9));
-        let y: CollectionData = Inline::new([0x31; 32]);
+        let mut facts = TribleSet::new();
+        let mut inputs = Vec::new();
+        for n in 1..=7 {
+            facts += row(n, 2, 3);
+            inputs.push(commit(&mut store, root, row(n, 2, 3)));
+        }
+        let unattested: Blob<SimpleArchive> = row(8, 2, 3).to_blob();
+        let y = data(&unattested);
+        store.put::<SimpleArchive, _>(unattested).unwrap();
+        facts += row(8, 2, 3);
+        let z = commit(&mut store, root, facts);
         if blocked {
+            let joined = inputs.iter().copied().chain([y]);
             store
                 .insert(CollectionRecord::Merge(
-                    CollectionMerge::sign(&host(), root.handle(), [a, b, y], z).unwrap(),
+                    CollectionMerge::sign(&host(), root.handle(), joined, z).unwrap(),
                 ))
                 .unwrap();
         }
-        map_succinct(&mut store, attached, a, &host());
-        map_succinct(&mut store, attached, b, &host());
+        for input in inputs {
+            map_succinct(&mut store, attached, input, &host());
+        }
         let snapshot = store.snapshot().unwrap();
         let coverage = CoverageRead::coverage(&snapshot, &BTreeSet::from([root.handle()])).unwrap();
         assert_eq!(coverage.has_blocked(root.handle()), blocked);
@@ -370,7 +377,7 @@ fn a_blocked_own_join_changes_nothing_a_reader_sees() {
     assert_eq!(read_with_join(true), read_with_join(false));
 }
 
-/// An absorption `MERGE(c, m) -> m` names its own result among its inputs:
+/// An absorption `MERGE(c1..c7, m) -> m` names its result among its inputs:
 /// descending an unattached `m` skips that self-edge and ends. A cycle of
 /// host joins ends too.
 #[test]
@@ -390,7 +397,9 @@ fn a_self_edge_and_a_cycle_terminate() {
     drop(snapshot);
     store
         .insert(CollectionRecord::Merge(
-            CollectionMerge::sign(&host(), root.handle(), [children[0], merged], merged).unwrap(),
+            CollectionMerge::sign(
+                &host(), root.handle(), children[..7].iter().copied().chain([merged]), merged,
+            ).unwrap(),
         ))
         .unwrap();
     let mut attachments = BTreeSet::new();
@@ -403,13 +412,15 @@ fn a_self_edge_and_a_cycle_terminate() {
     assert!(read.residual().is_empty());
     drop(snapshot);
 
-    // A cycle of host joins over nodes without bytes: g joins f1 and f2, and
-    // f2 claims to be the join of g and f1.
+    // An adversarial cycle of host claims: g joins eight foundations, and
+    // the eighth claims to join g and the first seven. The fold must terminate
+    // even though the host's second assertion is not a valid payload union.
     let (mut store, root, attached) = succinct_root("cycle");
-    let f1 = commit(&mut store, root, row(1, 1, 1));
-    let f2 = commit(&mut store, root, row(2, 2, 2));
+    let foundations: Vec<_> = (1..=8)
+        .map(|n| commit(&mut store, root, row(n, 1, 1))).collect();
     let g: CollectionData = Inline::new([0x77; 32]);
-    for (inputs, result) in [([f1, f2], g), ([g, f1], f2)] {
+    let back_edge: Vec<_> = foundations[..7].iter().copied().chain([g]).collect();
+    for (inputs, result) in [(foundations.clone(), g), (back_edge, foundations[7])] {
         store
             .insert(CollectionRecord::Merge(
                 CollectionMerge::sign(&host(), root.handle(), inputs, result).unwrap(),
@@ -432,7 +443,7 @@ fn a_self_edge_and_a_cycle_terminate() {
             .map(|raw| Inline::new(*raw))
             .collect::<BTreeSet<CollectionData>>()
     );
-    assert!(residual(&read).is_subset(&BTreeSet::from([f1, f2])));
+    assert!(residual(&read).is_subset(&foundations.into_iter().collect::<BTreeSet<_>>()));
 }
 
 /// A foundation without an attachment is the residual, named, whether its
@@ -721,11 +732,12 @@ fn the_carry_refuses_an_attached_target() {
 /// nothing: it is dropped, not parked, and makes no row.
 #[test]
 fn a_commit_derive_or_merge_aimed_at_an_attached_handle_is_not_parked() {
-    let (mut store, _root, attached) = succinct_root("aimed");
+    let (mut store, root, attached) = succinct_root("aimed");
     let payload: Blob<SimpleArchive> = row(1, 2, 3).to_blob();
     let node = data(&payload);
     store.put::<SimpleArchive, _>(payload).unwrap();
-    let other_node: CollectionData = Inline::new([0x42; 32]);
+    let nodes: Vec<_> = (1..=8).map(|n| commit(&mut store, root, row(n, 2, 3))).collect();
+    let other_node = nodes[1];
     for record in [
         CollectionRecord::Commit(CollectionCommit::sign(
             &host(),
@@ -740,7 +752,7 @@ fn a_commit_derive_or_merge_aimed_at_an_attached_handle_is_not_parked() {
             other_node,
         )),
         CollectionRecord::Merge(
-            CollectionMerge::sign(&host(), attached.handle(), [node, other_node], node).unwrap(),
+            CollectionMerge::sign(&host(), attached.handle(), nodes, node).unwrap(),
         ),
     ] {
         store.insert(record).unwrap();
@@ -804,7 +816,7 @@ fn a_host_merge_into_an_attached_handle_before_its_descriptor_stays_inert() {
             CollectionMerge::sign(
                 &host(),
                 attached.handle(),
-                [nodes[0], Inline::new([0x42; 32])],
+                nodes.iter().copied(),
                 nodes[0],
             )
             .unwrap(),
@@ -1134,16 +1146,17 @@ fn lattice(name: &str, fragments: Vec<TribleSet>, random: &mut Stream) -> Lattic
     }
     for _ in 0..random.below(4) {
         let snapshot = store.snapshot().unwrap();
-        let nodes = lattice_nodes(&snapshot, root);
-        if nodes.len() < 2 {
+        let mut nodes = lattice_nodes(&snapshot, root);
+        if nodes.len() < 8 {
             break;
         }
-        let picked: BTreeSet<CollectionData> = (0..2 + random.below(2))
-            .map(|_| nodes[random.below(nodes.len() as u64) as usize])
-            .collect();
-        if picked.len() < 2 {
-            continue;
+        // Eight actual lattice nodes sampled without replacement; overlapping
+        // support (including absorptions) remains possible, duplicate handles do not.
+        for n in 0..8 {
+            let picked = n + random.below((nodes.len() - n) as u64) as usize;
+            nodes.swap(n, picked);
         }
+        let picked: BTreeSet<_> = nodes[..8].iter().copied().collect();
         let blobs: Vec<Blob<SimpleArchive>> = picked
             .iter()
             .map(|node| {

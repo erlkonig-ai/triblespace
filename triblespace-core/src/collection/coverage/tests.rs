@@ -39,7 +39,15 @@ fn commit(key: u8, into: CollectionHandle, payload: CollectionData) -> Collectio
     ))
 }
 
-/// A merge names its input PAYLOADS, two to sixteen of them.
+fn payloads(ids: impl IntoIterator<Item = u8>) -> Vec<CollectionData> {
+    ids.into_iter().map(data).collect()
+}
+
+fn raw_members(ids: impl IntoIterator<Item = u8>) -> Vec<[u8; 32]> {
+    ids.into_iter().map(|id| [id; 32]).collect()
+}
+
+/// A merge names exactly eight distinct input PAYLOADS.
 fn merge(
     key: u8,
     into: CollectionHandle,
@@ -48,7 +56,7 @@ fn merge(
 ) -> CollectionRecord {
     CollectionRecord::Merge(
         CollectionMerge::sign(&signer(key), into, inputs.iter().copied(), result)
-            .expect("fixture merges join two to sixteen distinct inputs"),
+            .expect("fixture merges join exactly eight distinct inputs"),
     )
 }
 
@@ -126,16 +134,16 @@ fn a_node_nobody_attested_has_no_row_at_all() {
 fn a_merge_covers_every_input() {
     let mut index = hosted(1);
     let c = collection(0);
-    for payload in 1..=3 {
+    for payload in 1..=8 {
         index.apply(&commit(1, c, data(payload)), &AdmitEveryRecord);
     }
     index.apply(
-        &merge(1, c, &[data(1), data(2), data(3)], data(9)),
+        &merge(1, c, &payloads(1..=8), data(9)),
         &AdmitEveryRecord,
     );
     assert_eq!(
         members(&index, c, data(9)),
-        vec![[1u8; 32], [2u8; 32], [3u8; 32]]
+        raw_members(1..=8)
     );
     assert_eq!(frontier(&index, c), vec![[9u8; 32]]);
 }
@@ -147,19 +155,20 @@ fn an_n_ary_join_is_all_or_nothing() {
     let mut index = hosted(1);
     let c = collection(0);
     index.apply(
-        &merge(1, c, &[data(1), data(2), data(3)], data(9)),
+        &merge(1, c, &payloads(1..=8), data(9)),
         &AdmitEveryRecord,
     );
-    index.apply(&commit(1, c, data(1)), &AdmitEveryRecord);
-    index.apply(&commit(1, c, data(2)), &AdmitEveryRecord);
-    // Two of three inputs: still nothing, and still blocked.
+    for payload in 1..=7 {
+        index.apply(&commit(1, c, data(payload)), &AdmitEveryRecord);
+    }
+    // Seven of eight inputs: still nothing, and still blocked.
     assert!(index.coverage(c, data(9)).is_none());
     assert!(index.published().has_blocked(c));
-    assert_eq!(frontier(&index, c), vec![[1u8; 32], [2u8; 32]]);
-    index.apply(&commit(1, c, data(3)), &AdmitEveryRecord);
+    assert_eq!(frontier(&index, c), raw_members(1..=7));
+    index.apply(&commit(1, c, data(8)), &AdmitEveryRecord);
     assert_eq!(
         members(&index, c, data(9)),
-        vec![[1u8; 32], [2u8; 32], [3u8; 32]]
+        raw_members(1..=8)
     );
     assert!(!index.published().has_blocked(c));
     assert_eq!(frontier(&index, c), vec![[9u8; 32]]);
@@ -180,9 +189,11 @@ fn a_leaf_contributes_its_own_output_and_reads_no_row() {
     assert!(!index.published().has_blocked(target));
     assert!(index.coverage(source, data(3)).is_none());
     // Source records never reach the target's rows.
-    index.apply(&commit(1, source, data(3)), &lineages);
-    index.apply(&commit(1, source, data(5)), &lineages);
-    index.apply(&merge(1, source, &[data(3), data(5)], data(6)), &lineages);
+    let inputs = payloads([3, 5, 7, 8, 9, 10, 11, 12]);
+    for input in &inputs {
+        index.apply(&commit(1, source, *input), &lineages);
+    }
+    index.apply(&merge(1, source, &inputs, data(6)), &lineages);
     assert_eq!(members(&index, target, data(4)), vec![[4u8; 32]]);
     assert_eq!(frontier(&index, target), vec![[4u8; 32]]);
 }
@@ -194,59 +205,63 @@ fn records_arriving_before_their_inputs_still_land() {
     // Reverse causal order: the upper merge first, then the merge it
     // consumes, then finally the commits underneath.
     index.apply(
-        &merge(1, c, &[data(3), data(4)], data(5)),
+        &merge(1, c, &payloads([20, 9, 10, 11, 12, 13, 14, 15]), data(21)),
         &AdmitEveryRecord,
     );
     index.apply(
-        &merge(1, c, &[data(1), data(2)], data(3)),
+        &merge(1, c, &payloads(1..=8), data(20)),
         &AdmitEveryRecord,
     );
-    index.apply(&commit(1, c, data(4)), &AdmitEveryRecord);
-    assert!(index.coverage(c, data(3)).is_none());
-    index.apply(&commit(1, c, data(1)), &AdmitEveryRecord);
-    // One side is not enough: a merge attests a join, not either half.
-    assert!(index.coverage(c, data(3)).is_none());
-    index.apply(&commit(1, c, data(2)), &AdmitEveryRecord);
-    assert_eq!(members(&index, c, data(3)), vec![[1u8; 32], [2u8; 32]]);
+    for payload in 9..=15 {
+        index.apply(&commit(1, c, data(payload)), &AdmitEveryRecord);
+    }
+    assert!(index.coverage(c, data(20)).is_none());
+    for payload in 1..=7 {
+        index.apply(&commit(1, c, data(payload)), &AdmitEveryRecord);
+    }
+    // Seven inputs are not enough: a merge attests the whole join.
+    assert!(index.coverage(c, data(20)).is_none());
+    index.apply(&commit(1, c, data(8)), &AdmitEveryRecord);
+    assert_eq!(members(&index, c, data(20)), raw_members(1..=8));
     // And the growth propagated through the upper merge already registered.
     assert_eq!(
-        members(&index, c, data(5)),
-        vec![[1u8; 32], [2u8; 32], [4u8; 32]]
+        members(&index, c, data(21)),
+        raw_members(1..=15)
     );
-    assert_eq!(frontier(&index, c), vec![[5u8; 32]]);
+    assert_eq!(frontier(&index, c), vec![[21u8; 32]]);
 }
 
 #[test]
 fn a_row_that_grows_later_widens_everything_downstream_of_it() {
     let c = collection(0);
     let mut index = hosted(1);
-    for payload in [1, 2, 6] {
+    for payload in 1..=15 {
         index.apply(&commit(1, c, data(payload)), &AdmitEveryRecord);
     }
     index.apply(
-        &merge(1, c, &[data(1), data(2)], data(3)),
+        &merge(1, c, &payloads(1..=8), data(30)),
         &AdmitEveryRecord,
     );
     index.apply(
-        &merge(1, c, &[data(3), data(6)], data(7)),
+        &merge(1, c, &payloads([30, 9, 10, 11, 12, 13, 14, 15]), data(31)),
         &AdmitEveryRecord,
     );
     assert_eq!(
-        members(&index, c, data(7)),
-        vec![[1u8; 32], [2u8; 32], [6u8; 32]]
+        members(&index, c, data(31)),
+        raw_members(1..=15)
     );
 
     // An alternative route attests that the same result also stands for a
-    // fifth commit. Coverage is a union over routes, so everything downstream
+    // sixteenth commit. Coverage is a union over routes, so everything downstream
     // widens with it without replaying anything.
-    index.apply(&commit(1, c, data(5)), &AdmitEveryRecord);
+    index.apply(&commit(1, c, data(16)), &AdmitEveryRecord);
     index.apply(
-        &merge(1, c, &[data(1), data(5)], data(3)),
+        &merge(1, c, &payloads([1, 2, 3, 4, 5, 6, 7, 16]), data(30)),
         &AdmitEveryRecord,
     );
     assert_eq!(
-        members(&index, c, data(7)),
-        vec![[1u8; 32], [2u8; 32], [5u8; 32], [6u8; 32]]
+        members(&index, c, data(31)),
+        raw_members(1..=16)
     );
 }
 
@@ -254,34 +269,32 @@ fn a_row_that_grows_later_widens_everything_downstream_of_it() {
 fn folding_the_same_record_twice_changes_nothing() {
     let mut index = hosted(1);
     let c = collection(0);
-    let records = [
-        commit(1, c, data(1)),
-        commit(1, c, data(2)),
-        merge(1, c, &[data(1), data(2)], data(3)),
-    ];
+    let mut records: Vec<_> = (1..=8).map(|id| commit(1, c, data(id))).collect();
+    records.push(merge(1, c, &payloads(1..=8), data(9)));
     for record in &records {
         index.apply(record, &AdmitEveryRecord);
     }
-    let once = members(&index, c, data(3));
+    let once = members(&index, c, data(9));
     for record in &records {
         index.apply(record, &AdmitEveryRecord);
     }
-    assert_eq!(members(&index, c, data(3)), once);
-    assert_eq!(index.len(), 3);
+    assert_eq!(members(&index, c, data(9)), once);
+    assert_eq!(index.len(), 9);
 }
 
 #[test]
 fn a_cycle_between_a_node_and_its_own_merge_terminates() {
     let mut index = hosted(1);
     let c = collection(0);
-    index.apply(&commit(1, c, data(1)), &AdmitEveryRecord);
-    index.apply(&commit(1, c, data(2)), &AdmitEveryRecord);
-    // MERGE(1, 2) -> 1: the result is also one of its own inputs.
+    for id in 1..=8 {
+        index.apply(&commit(1, c, data(id)), &AdmitEveryRecord);
+    }
+    // The result is also one of the eight inputs.
     index.apply(
-        &merge(1, c, &[data(1), data(2)], data(1)),
+        &merge(1, c, &payloads(1..=8), data(1)),
         &AdmitEveryRecord,
     );
-    assert_eq!(members(&index, c, data(1)), vec![[1u8; 32], [2u8; 32]]);
+    assert_eq!(members(&index, c, data(1)), raw_members(1..=8));
 }
 
 /// Admission decided once, at fold time.
@@ -312,13 +325,15 @@ impl RecordAdmission for OnlySigner {
 fn a_record_whose_signer_is_not_admitted_yet_is_parked_not_dropped() {
     let mut index = hosted(2);
     let c = collection(0);
-    index.apply(&commit(1, c, data(1)), &OnlySigner(1));
-    index.apply(&commit(2, c, data(2)), &OnlySigner(1));
-    index.apply(&merge(2, c, &[data(1), data(2)], data(3)), &OnlySigner(1));
+    for id in 1..=7 {
+        index.apply(&commit(1, c, data(id)), &OnlySigner(1));
+    }
+    index.apply(&commit(2, c, data(8)), &OnlySigner(1));
+    index.apply(&merge(2, c, &payloads(1..=8), data(9)), &OnlySigner(1));
 
     assert_eq!(members(&index, c, data(1)), vec![[1u8; 32]]);
-    assert!(index.coverage(c, data(2)).is_none());
-    assert!(index.coverage(c, data(3)).is_none());
+    assert!(index.coverage(c, data(8)).is_none());
+    assert!(index.coverage(c, data(9)).is_none());
     // Only the commit waits on a proof; the merge's signer is the host and
     // needs none. The merge is believed and blocked on its input instead.
     assert_eq!(index.parked_on_signers(), 1);
@@ -329,8 +344,8 @@ fn a_record_whose_signer_is_not_admitted_yet_is_parked_not_dropped() {
     // blocked merge through its consumer edge.
     index.resolve(&AdmitEveryRecord);
     assert_eq!(index.parked_on_signers(), 0);
-    assert_eq!(members(&index, c, data(2)), vec![[2u8; 32]]);
-    assert_eq!(members(&index, c, data(3)), vec![[1u8; 32], [2u8; 32]]);
+    assert_eq!(members(&index, c, data(8)), vec![[8u8; 32]]);
+    assert_eq!(members(&index, c, data(9)), raw_members(1..=8));
     assert!(!index.published().has_blocked(c));
 }
 
@@ -421,21 +436,21 @@ fn unadmitted_members_are_named_not_merely_counted() {
 fn a_foreign_route_contributes_nothing_to_a_node_a_host_route_reached() {
     let mut index = hosted(1);
     let c = collection(0);
-    for payload in [1, 2, 5] {
+    for payload in 1..=9 {
         index.apply(&commit(1, c, data(payload)), &AdmitEveryRecord);
     }
     index.apply(
-        &merge(1, c, &[data(1), data(2)], data(3)),
+        &merge(1, c, &payloads(1..=8), data(20)),
         &AdmitEveryRecord,
     );
     // A second attestation about the same result, by a key every admission
     // question would admit.
     index.apply(
-        &merge(2, c, &[data(1), data(5)], data(3)),
+        &merge(2, c, &payloads([1, 2, 3, 4, 5, 6, 7, 9]), data(20)),
         &AdmitEveryRecord,
     );
-    assert_eq!(members(&index, c, data(3)), vec![[1u8; 32], [2u8; 32]]);
-    assert_eq!(frontier(&index, c), vec![[3u8; 32], [5u8; 32]]);
+    assert_eq!(members(&index, c, data(20)), raw_members(1..=8));
+    assert_eq!(frontier(&index, c), raw_members([9, 20]));
     assert_eq!(index.stored_joins(), 1);
     assert_eq!(index.parked(), 0);
 }
@@ -469,18 +484,19 @@ fn only_a_leaf_parks_on_its_unresolvable_descriptor() {
     let source = collection(0);
     let target = collection(7);
     let mut index = hosted(1);
-    index.apply(&commit(1, source, data(1)), &NoDescriptor);
-    index.apply(&commit(1, source, data(2)), &NoDescriptor);
+    for id in 1..=8 {
+        index.apply(&commit(1, source, data(id)), &NoDescriptor);
+    }
     index.apply(
-        &merge(1, source, &[data(1), data(2)], data(3)),
+        &merge(1, source, &payloads(1..=8), data(9)),
         &NoDescriptor,
     );
-    index.apply(&derive(1, target, data(3), data(4)), &NoDescriptor);
+    index.apply(&derive(1, target, data(9), data(10)), &NoDescriptor);
 
     // The source lattice folded without any descriptor at all.
-    assert_eq!(members(&index, source, data(3)), vec![[1u8; 32], [2u8; 32]]);
+    assert_eq!(members(&index, source, data(9)), raw_members(1..=8));
     // The leaf cannot know whether its target is derived, so it waits.
-    assert!(index.coverage(target, data(4)).is_none());
+    assert!(index.coverage(target, data(10)).is_none());
     assert_eq!(index.parked_on_lineages(), 1);
     assert_eq!(index.parked_on_signers(), 0);
 
@@ -490,7 +506,7 @@ fn only_a_leaf_parks_on_its_unresolvable_descriptor() {
         [target],
         false,
     );
-    assert_eq!(members(&index, target, data(4)), vec![[4u8; 32]]);
+    assert_eq!(members(&index, target, data(10)), vec![[10u8; 32]]);
     assert_eq!(index.parked(), 0);
 }
 
@@ -522,22 +538,22 @@ fn settling_without_the_awaited_arrival_does_nothing() {
 fn set_algebra_between_two_nodes_is_patch_algebra() {
     let mut index = hosted(1);
     let c = collection(0);
-    for byte in 1..=3u8 {
+    for byte in 1..=9u8 {
         index.apply(&commit(1, c, data(byte)), &AdmitEveryRecord);
     }
     index.apply(
-        &merge(1, c, &[data(1), data(2)], data(4)),
+        &merge(1, c, &payloads(1..=8), data(20)),
         &AdmitEveryRecord,
     );
     index.apply(
-        &merge(1, c, &[data(2), data(3)], data(5)),
+        &merge(1, c, &payloads(2..=9), data(21)),
         &AdmitEveryRecord,
     );
 
-    let left = index.coverage(c, data(4)).expect("left row").clone();
-    let right = index.coverage(c, data(5)).expect("right row").clone();
+    let left = index.coverage(c, data(20)).expect("left row").clone();
+    let right = index.coverage(c, data(21)).expect("right row").clone();
     let shared: Vec<_> = left.intersect(&right).iter_ordered().copied().collect();
-    assert_eq!(shared, vec![[2u8; 32]]);
+    assert_eq!(shared, raw_members(2..=8));
     let only_left: Vec<_> = left.difference(&right).iter_ordered().copied().collect();
     assert_eq!(only_left, vec![[1u8; 32]]);
 }
@@ -554,20 +570,21 @@ fn one_payload_in_two_lattices_keeps_two_rows() {
     let mut index = hosted(1);
     let ledger = collection(0);
     let tally = collection(1);
-    let shared = data(3);
+    let shared = data(20);
 
     // `shared` is committed on its own authority into `ledger`.
     index.apply(&commit(1, ledger, shared), &AdmitEveryRecord);
-    // The very same bytes are the join of two commits in `tally`.
-    index.apply(&commit(1, tally, data(1)), &AdmitEveryRecord);
-    index.apply(&commit(1, tally, data(2)), &AdmitEveryRecord);
+    // The very same bytes are the join of eight commits in `tally`.
+    for id in 1..=8 {
+        index.apply(&commit(1, tally, data(id)), &AdmitEveryRecord);
+    }
     index.apply(
-        &merge(1, tally, &[data(1), data(2)], shared),
+        &merge(1, tally, &payloads(1..=8), shared),
         &AdmitEveryRecord,
     );
 
-    assert_eq!(members(&index, ledger, shared), vec![[3u8; 32]]);
-    assert_eq!(members(&index, tally, shared), vec![[1u8; 32], [2u8; 32]]);
+    assert_eq!(members(&index, ledger, shared), vec![[20u8; 32]]);
+    assert_eq!(members(&index, tally, shared), raw_members(1..=8));
 }
 
 /// The subsumption verdict a bare result key used to flip.
@@ -576,48 +593,50 @@ fn one_payload_in_two_lattices_keeps_two_rows() {
 /// the needed set is a known universe and a foreign member can never satisfy
 /// a real requirement. Asking "does this node subsume that one" — how a cover
 /// is minimised — has no universe to intersect against, so a foreign member
-/// could make a needed node read as redundant. `alias` covers only commits 1
-/// and 4 inside `tally`; a foreign lattice attesting that the same payload
-/// stands for commit 2 must not reach that row.
+/// could make a needed node read as redundant. `alias` does not cover commit
+/// 8 inside `tally`; a foreign lattice attesting that the same payload stands
+/// for commit 8 must not reach that row.
 #[test]
 fn a_foreign_member_cannot_flip_a_subsumption_verdict() {
     let tally = collection(0);
     let ledger = collection(1);
-    let alias = data(3);
+    let alias = data(20);
 
     let mut index = hosted(1);
-    for payload in [1, 2, 4] {
+    for payload in 1..=9 {
         index.apply(&commit(1, tally, data(payload)), &AdmitEveryRecord);
     }
     index.apply(
-        &merge(1, tally, &[data(1), data(4)], alias),
+        &merge(1, tally, &payloads([1, 2, 3, 4, 5, 6, 7, 9]), alias),
         &AdmitEveryRecord,
     );
     index.apply(
-        &merge(1, tally, &[data(1), data(2)], data(5)),
+        &merge(1, tally, &payloads(1..=8), data(21)),
         &AdmitEveryRecord,
     );
     // The foreign lattice commits its own copies of payload bytes and
     // reaches `alias` by its own route.
-    index.apply(&commit(1, ledger, data(2)), &AdmitEveryRecord);
-    index.apply(&commit(1, ledger, data(6)), &AdmitEveryRecord);
+    let foreign_inputs = payloads([8, 10, 11, 12, 13, 14, 15, 16]);
+    for input in &foreign_inputs {
+        index.apply(&commit(1, ledger, *input), &AdmitEveryRecord);
+    }
     index.apply(
-        &merge(1, ledger, &[data(2), data(6)], alias),
+        &merge(1, ledger, &foreign_inputs, alias),
         &AdmitEveryRecord,
     );
 
     let alias_row = index.coverage(tally, alias).expect("row").clone();
-    let pair = index.coverage(tally, data(5)).expect("row").clone();
+    let pair = index.coverage(tally, data(21)).expect("row").clone();
     assert_eq!(
         alias_row.iter_ordered().copied().collect::<Vec<_>>(),
-        vec![[1u8; 32], [4u8; 32]]
+        raw_members([1, 2, 3, 4, 5, 6, 7, 9])
     );
     assert!(
         !pair.difference(&alias_row).is_empty(),
         "a node tally still needs must not read as redundant"
     );
     // The foreign route kept its own row, and it says what it actually knows.
-    assert_eq!(members(&index, ledger, alias), vec![[2u8; 32], [6u8; 32]]);
+    assert_eq!(members(&index, ledger, alias), raw_members([8, 10, 11, 12, 13, 14, 15, 16]));
 }
 
 /// Who produced a foundation: the signer of every believed COMMIT or DERIVE
@@ -631,14 +650,17 @@ fn owners_name_the_signer_of_every_believed_foundation_and_no_join() {
     index.apply(&commit(1, c, data(1)), &OnlySigner(1));
     index.apply(&commit(2, c, data(2)), &AdmitEveryRecord);
     index.apply(&commit(1, c, data(4)), &OnlySigner(1));
+    for id in 10..=15 {
+        index.apply(&commit(1, c, data(id)), &OnlySigner(1));
+    }
     // The host's join: believed, driven, and nobody's to own.
-    index.apply(&merge(1, c, &[data(1), data(2)], data(5)), &OnlySigner(1));
+    index.apply(&merge(1, c, &payloads([1, 2, 10, 11, 12, 13, 14, 15]), data(5)), &OnlySigner(1));
     // Absorption into a foundation signer 2 committed: still signer 2's.
     index.apply(&commit(2, c, data(8)), &AdmitEveryRecord);
-    index.apply(&merge(1, c, &[data(4), data(8)], data(8)), &OnlySigner(1));
+    index.apply(&merge(1, c, &payloads([4, 8, 10, 11, 12, 13, 14, 15]), data(8)), &OnlySigner(1));
     // Another key's join: not folded, so it owns nothing either.
     index.apply(
-        &merge(3, c, &[data(1), data(4)], data(7)),
+        &merge(3, c, &payloads([1, 4, 10, 11, 12, 13, 14, 15]), data(7)),
         &AdmitEveryRecord,
     );
     // Signer 4 is not admitted: its attestation owns nothing yet.
@@ -650,11 +672,11 @@ fn owners_name_the_signer_of_every_believed_foundation_and_no_join() {
     assert!(!published.owned_by(c, data(2), public(1)));
     assert_eq!(published.owners(c, data(8)), vec![public(2)]);
     assert!(!published.owned_by(c, data(8), public(1)));
-    assert_eq!(members(&index, c, data(8)), vec![[4u8; 32], [8u8; 32]]);
+    assert_eq!(members(&index, c, data(8)), raw_members([4, 8, 10, 11, 12, 13, 14, 15]));
     assert!(published.owners(c, data(5)).is_empty());
     assert_eq!(
         members(&index, c, data(5)),
-        vec![[1u8; 32], [2u8; 32]],
+        raw_members([1, 2, 10, 11, 12, 13, 14, 15]),
         "control: the host's join was driven"
     );
     assert!(published.owners(c, data(7)).is_empty());
@@ -742,7 +764,7 @@ fn folding_a_realistic_lattice_is_cheap_enough_to_do_on_open() {
         while tier.len() > 1 {
             let mut above = Vec::with_capacity(tier.len().div_ceil(8));
             for group in tier.chunks(8) {
-                if group.len() >= 2 {
+                if group.len() == 8 {
                     let mut raw = [0u8; 32];
                     raw[..8].copy_from_slice(&next_result.to_be_bytes());
                     next_result += 1;
@@ -750,7 +772,7 @@ fn folding_a_realistic_lattice_is_cheap_enough_to_do_on_open() {
                     records.push(merge(1, source, group, result));
                     above.push(result);
                 } else {
-                    above.push(group[0]);
+                    above.extend_from_slice(group);
                 }
             }
             tier = above;
@@ -794,10 +816,11 @@ fn folding_a_realistic_lattice_is_cheap_enough_to_do_on_open() {
         );
     }
 
-    probe(410, 2);
-    probe(1_722, 2);
-    probe(14_980, 2);
-    probe(100_000, 2);
+    // Each count is 1 modulo 7, so exact-eight joins can reach one root.
+    probe(407, 2);
+    probe(1_716, 2);
+    probe(14_974, 2);
+    probe(99_996, 2);
 }
 
 fn frontier(index: &CoverageIndex, collection: CollectionHandle) -> Vec<[u8; 32]> {
@@ -812,32 +835,31 @@ fn frontier(index: &CoverageIndex, collection: CollectionHandle) -> Vec<[u8; 32]
 fn the_frontier_is_the_set_of_unmerged_nodes() {
     let mut index = hosted(1);
     let c = collection(0);
-    for payload in 1..=4 {
+    for payload in 1..=64 {
         index.apply(&commit(1, c, data(payload)), &AdmitEveryRecord);
     }
     assert_eq!(
         frontier(&index, c),
-        vec![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]]
+        raw_members(1..=64)
     );
+    for group in 0..8 {
+        let first = 1 + group * 8;
+        index.apply(
+            &merge(1, c, &payloads(first..first + 8), data(65 + group)),
+            &AdmitEveryRecord,
+        );
+    }
+    assert_eq!(frontier(&index, c), raw_members(65..=72));
     index.apply(
-        &merge(1, c, &[data(1), data(2)], data(5)),
+        &merge(1, c, &payloads(65..=72), data(73)),
         &AdmitEveryRecord,
     );
-    index.apply(
-        &merge(1, c, &[data(3), data(4)], data(6)),
-        &AdmitEveryRecord,
-    );
-    assert_eq!(frontier(&index, c), vec![[5u8; 32], [6u8; 32]]);
-    index.apply(
-        &merge(1, c, &[data(5), data(6)], data(7)),
-        &AdmitEveryRecord,
-    );
-    assert_eq!(frontier(&index, c), vec![[7u8; 32]]);
+    assert_eq!(frontier(&index, c), vec![[73u8; 32]]);
     let (support, unattested) = index.published().frontier_support(c);
     assert!(unattested.is_empty());
     assert_eq!(
         support.iter_ordered().copied().collect::<Vec<_>>(),
-        vec![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]]
+        raw_members(1..=64)
     );
 }
 
@@ -846,7 +868,7 @@ fn a_merge_arriving_before_its_inputs_settles_on_the_same_frontier() {
     let mut index = hosted(1);
     let c = collection(0);
     index.apply(
-        &merge(1, c, &[data(1), data(2)], data(5)),
+        &merge(1, c, &payloads(1..=8), data(9)),
         &AdmitEveryRecord,
     );
     assert!(frontier(&index, c).is_empty());
@@ -855,8 +877,10 @@ fn a_merge_arriving_before_its_inputs_settles_on_the_same_frontier() {
     // One side of a join that is not driven yet stays attachable on its own.
     assert_eq!(frontier(&index, c), vec![[1u8; 32]]);
     assert!(index.published().has_blocked(c));
-    index.apply(&commit(1, c, data(2)), &AdmitEveryRecord);
-    assert_eq!(frontier(&index, c), vec![[5u8; 32]]);
+    for id in 2..=8 {
+        index.apply(&commit(1, c, data(id)), &AdmitEveryRecord);
+    }
+    assert_eq!(frontier(&index, c), vec![[9u8; 32]]);
     assert!(!index.published().has_blocked(c));
 }
 
@@ -867,13 +891,9 @@ fn a_merge_arriving_before_its_inputs_settles_on_the_same_frontier() {
 #[test]
 fn blocked_joins_do_not_depend_on_arrival_order() {
     let c = collection(0);
-    let driven = merge(1, c, &[data(1), data(2)], data(20));
-    let stuck = merge(1, c, &[data(3), data(9)], data(20));
-    let foundations = [
-        commit(1, c, data(1)),
-        commit(1, c, data(2)),
-        commit(1, c, data(3)),
-    ];
+    let driven = merge(1, c, &payloads(1..=8), data(20));
+    let stuck = merge(1, c, &payloads([2, 3, 4, 5, 6, 7, 8, 10]), data(20));
+    let foundations: Vec<_> = (1..=9).map(|id| commit(1, c, data(id))).collect();
     let fold = |records: &[&CollectionRecord]| {
         let mut index = hosted(1);
         for record in records {
@@ -881,17 +901,16 @@ fn blocked_joins_do_not_depend_on_arrival_order() {
         }
         index
     };
-    let [a, b, d] = &foundations;
-    let driven_first = fold(&[a, b, d, &driven, &stuck]);
-    let stuck_first = fold(&[a, b, d, &stuck, &driven]);
+    let driven_first = fold(&foundations.iter().chain([&driven, &stuck]).collect::<Vec<_>>());
+    let stuck_first = fold(&foundations.iter().chain([&stuck, &driven]).collect::<Vec<_>>());
     assert!(driven_first.published().has_blocked(c));
     assert!(stuck_first.published().has_blocked(c));
     assert_eq!(driven_first.published(), stuck_first.published());
 
     // A join that arrives ahead of its inputs and is then driven publishes
     // exactly what the in-order history does.
-    let in_order = fold(&[a, b, &driven]);
-    let reversed = fold(&[&driven, b, a]);
+    let in_order = fold(&foundations.iter().chain([&driven]).collect::<Vec<_>>());
+    let reversed = fold(&std::iter::once(&driven).chain(foundations.iter().rev()).collect::<Vec<_>>());
     assert!(!in_order.published().has_blocked(c));
     assert!(!reversed.published().has_blocked(c));
     assert_eq!(in_order.published(), reversed.published());
@@ -901,67 +920,69 @@ fn blocked_joins_do_not_depend_on_arrival_order() {
 fn a_commit_arriving_after_the_merge_that_consumes_it_is_not_put_back() {
     let mut index = hosted(1);
     let c = collection(0);
-    index.apply(&commit(1, c, data(2)), &AdmitEveryRecord);
-    index.apply(&commit(1, c, data(3)), &AdmitEveryRecord);
+    for id in 2..=8 {
+        index.apply(&commit(1, c, data(id)), &AdmitEveryRecord);
+    }
     index.apply(
-        &merge(1, c, &[data(1), data(2), data(3)], data(5)),
+        &merge(1, c, &payloads(1..=8), data(9)),
         &AdmitEveryRecord,
     );
     index.apply(&commit(1, c, data(1)), &AdmitEveryRecord);
-    assert_eq!(frontier(&index, c), vec![[5u8; 32]]);
+    assert_eq!(frontier(&index, c), vec![[9u8; 32]]);
     // Driving the same records again moves nothing.
     index.apply(&commit(1, c, data(1)), &AdmitEveryRecord);
     index.apply(
-        &merge(1, c, &[data(1), data(2), data(3)], data(5)),
+        &merge(1, c, &payloads(1..=8), data(9)),
         &AdmitEveryRecord,
     );
-    assert_eq!(frontier(&index, c), vec![[5u8; 32]]);
+    assert_eq!(frontier(&index, c), vec![[9u8; 32]]);
 }
 
 #[test]
 fn two_routes_to_one_result_consume_both_routes() {
     let mut index = hosted(1);
     let c = collection(0);
-    for payload in 1..=4 {
+    for payload in 1..=16 {
         index.apply(&commit(1, c, data(payload)), &AdmitEveryRecord);
     }
     index.apply(
-        &merge(1, c, &[data(1), data(2)], data(5)),
+        &merge(1, c, &payloads(1..=8), data(20)),
         &AdmitEveryRecord,
     );
     // A second route producing the same payload: its support only grows.
     index.apply(
-        &merge(1, c, &[data(3), data(4)], data(5)),
+        &merge(1, c, &payloads(9..=16), data(20)),
         &AdmitEveryRecord,
     );
-    assert_eq!(frontier(&index, c), vec![[5u8; 32]]);
+    assert_eq!(frontier(&index, c), vec![[20u8; 32]]);
     assert_eq!(
-        members(&index, c, data(5)),
-        vec![[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]]
+        members(&index, c, data(20)),
+        raw_members(1..=16)
     );
 }
 
-/// `MERGE(a, c) -> c` absorbs `a` into `c`: `a` leaves the frontier and `c`,
-/// the result among the inputs, stays on it.
+/// An absorbing eight-input merge leaves its result on the frontier while
+/// consuming the other seven inputs.
 #[test]
 fn absorption_keeps_the_absorbing_node_on_the_frontier() {
     let mut index = hosted(1);
     let c = collection(0);
-    index.apply(&commit(1, c, data(1)), &AdmitEveryRecord);
-    index.apply(&commit(1, c, data(2)), &AdmitEveryRecord);
+    for id in 1..=8 {
+        index.apply(&commit(1, c, data(id)), &AdmitEveryRecord);
+    }
     index.apply(
-        &merge(1, c, &[data(1), data(2)], data(2)),
+        &merge(1, c, &payloads(1..=8), data(8)),
         &AdmitEveryRecord,
     );
-    assert_eq!(frontier(&index, c), vec![[2u8; 32]]);
-    assert_eq!(members(&index, c, data(2)), vec![[1u8; 32], [2u8; 32]]);
+    assert_eq!(frontier(&index, c), vec![[8u8; 32]]);
+    assert_eq!(members(&index, c, data(8)), raw_members(1..=8));
     // Replaying the absorption, or the absorbed commit, changes nothing.
     index.apply(&commit(1, c, data(1)), &AdmitEveryRecord);
     index.apply(
-        &merge(1, c, &[data(1), data(2)], data(2)),
+        &merge(1, c, &payloads(1..=8), data(8)),
         &AdmitEveryRecord,
     );
-    assert_eq!(frontier(&index, c), vec![[2u8; 32]]);
+    assert_eq!(frontier(&index, c), vec![[8u8; 32]]);
 }
 
 #[test]
@@ -970,36 +991,38 @@ fn leaves_join_the_target_frontier_and_a_target_merge_consumes_them() {
     let target = collection(7);
     let lineages = Lineages([(target, source)].into_iter().collect());
     let mut index = hosted(1);
-    index.apply(&commit(1, source, data(1)), &lineages);
-    index.apply(&commit(1, source, data(2)), &lineages);
-    index.apply(&derive(1, target, data(1), data(11)), &lineages);
-    index.apply(&derive(1, target, data(2), data(12)), &lineages);
-    assert_eq!(frontier(&index, target), vec![[11u8; 32], [12u8; 32]]);
+    for id in 1..=8 {
+        index.apply(&commit(1, source, data(id)), &lineages);
+    }
+    for id in 1..=7 {
+        index.apply(&derive(1, target, data(id), data(id + 10)), &lineages);
+    }
+    assert_eq!(frontier(&index, target), raw_members(11..=17));
     // A leaf whose source foundation is not here stands anyway: nothing
     // blocks on a source.
     index.apply(&derive(1, target, data(9), data(19)), &lineages);
     assert!(!index.published().has_blocked(target));
     assert_eq!(
         frontier(&index, target),
-        vec![[11u8; 32], [12u8; 32], [19u8; 32]]
+        raw_members([11, 12, 13, 14, 15, 16, 17, 19])
     );
     // The source's frontier is its own: leaves consume nothing there.
-    assert_eq!(frontier(&index, source), vec![[1u8; 32], [2u8; 32]]);
+    assert_eq!(frontier(&index, source), raw_members(1..=8));
     // A merge inside the target consumes its leaves; its support is the
     // target's own foundations.
     index.apply(
-        &merge(1, target, &[data(11), data(12), data(19)], data(13)),
+        &merge(1, target, &payloads([11, 12, 13, 14, 15, 16, 17, 19]), data(30)),
         &lineages,
     );
-    assert_eq!(frontier(&index, target), vec![[13u8; 32]]);
+    assert_eq!(frontier(&index, target), vec![[30u8; 32]]);
     assert_eq!(
-        members(&index, target, data(13)),
-        vec![[11u8; 32], [12u8; 32], [19u8; 32]]
+        members(&index, target, data(30)),
+        raw_members([11, 12, 13, 14, 15, 16, 17, 19])
     );
     // A source merge changes the source's frontier and nothing in the target.
-    index.apply(&merge(1, source, &[data(1), data(2)], data(3)), &lineages);
-    assert_eq!(frontier(&index, source), vec![[3u8; 32]]);
-    assert_eq!(frontier(&index, target), vec![[13u8; 32]]);
+    index.apply(&merge(1, source, &payloads(1..=8), data(31)), &lineages);
+    assert_eq!(frontier(&index, source), vec![[31u8; 32]]);
+    assert_eq!(frontier(&index, target), vec![[30u8; 32]]);
 }
 
 #[test]
@@ -1060,13 +1083,13 @@ fn a_join_keeps_its_inputs_once_however_many_edges_and_fresh_copies_name_it() {
     // The same join, and a different one, signed by another key are not
     // kept at all: neither parked nor stored.
     index.apply(&merge(9, c, &inputs, result), &admission);
-    index.apply(&merge(9, c, &inputs[..4], data(42)), &admission);
+    index.apply(&merge(9, c, &inputs, data(42)), &admission);
     assert_eq!(index.parked(), 0);
     assert_eq!(index.stored_joins(), 1);
     // A different host join parked twice by replay is one more entry, and
     // its two fresh copies name the one kept.
     let other = data(41);
-    let second = merge(7, c, &inputs[..4], other);
+    let second = merge(7, c, &inputs, other);
     index.park_record(&second);
     index.park_record(&second);
     assert_eq!(index.stored_joins(), 2);
@@ -1078,7 +1101,7 @@ fn a_join_keeps_its_inputs_once_however_many_edges_and_fresh_copies_name_it() {
     assert_eq!(index.parked(), 0);
     assert_eq!(
         members(&index, c, other),
-        inputs[..4]
+        inputs
             .iter()
             .map(|input| input.raw)
             .collect::<Vec<_>>()
@@ -1093,12 +1116,13 @@ fn a_parked_leaf_and_a_parked_join_come_back_whole() {
     let lineages = Lineages([(view, root)].into_iter().collect());
     let mut index = hosted(5);
     // Replay parks everything first; the batch's settle decides it.
-    index.park_record(&derive(5, view, data(10), data(20)));
-    index.park_record(&derive(5, view, data(11), data(21)));
-    index.park_record(&merge(5, view, &[data(20), data(21)], data(22)));
+    for id in 10..=17 {
+        index.park_record(&derive(5, view, data(id), data(id + 10)));
+    }
+    index.park_record(&merge(5, view, &payloads(20..=27), data(30)));
     assert_eq!(index.stored_joins(), 1);
     index.settle(&lineages, std::iter::empty(), false);
-    assert_eq!(members(&index, view, data(22)), vec![[20; 32], [21; 32]]);
+    assert_eq!(members(&index, view, data(30)), raw_members(20..=27));
     assert!(index
         .published()
         .has_leaf(view, SourceLocator::of(data(10).raw)));
@@ -1110,12 +1134,12 @@ fn a_parked_leaf_and_a_parked_join_come_back_whole() {
     );
     assert_eq!(
         index.published().frontier(view).collect::<Vec<_>>(),
-        vec![data(22)]
+        vec![data(30)]
     );
 }
 
-/// Another key's absorption `A + B -> A` would, if folded, make `A` stand
-/// for `B` too and take `B` off the frontier. It is dropped before anything
+/// Another key's absorption would, if folded, make `A` stand for its seven
+/// peers too and take `B` off the frontier. It is dropped before anything
 /// sees it: the index, published half and bookkeeping alike, equals a fold
 /// that never saw the record, whether it arrives before its inputs, after
 /// them, or through replay's park-then-settle path -- and whatever that key
@@ -1124,16 +1148,11 @@ fn a_parked_leaf_and_a_parked_join_come_back_whole() {
 fn a_foreign_merge_leaves_the_index_as_a_fold_without_it() {
     let c = collection(0);
     let (a, b) = (data(1), data(2));
-    let own = [
-        commit(1, c, a),
-        commit(1, c, b),
-        commit(1, c, data(3)),
-        commit(2, c, data(4)),
-        // The host's own join, so the joins table and consumer edges are
-        // not trivially empty.
-        merge(1, c, &[data(3), data(4)], data(5)),
-    ];
-    let foreign = merge(2, c, &[a, b], a);
+    let mut own = vec![commit(1, c, a), commit(1, c, b)];
+    own.extend((3..=10).map(|id| commit(2, c, data(id))));
+    // The host's own join makes the joins table and consumer edges nonempty.
+    own.push(merge(1, c, &payloads(3..=10), data(20)));
+    let foreign = merge(2, c, &payloads(1..=8), a);
     let applied = |records: &[&CollectionRecord]| {
         let mut index = hosted(1);
         for record in records {
@@ -1157,7 +1176,7 @@ fn a_foreign_merge_leaves_the_index_as_a_fold_without_it() {
     assert_eq!(members(&reference, c, a), vec![[1u8; 32]]);
     assert_eq!(
         frontier(&reference, c),
-        vec![[1u8; 32], [2u8; 32], [5u8; 32]]
+        raw_members([1, 2, 20])
     );
     assert_eq!(reference.stored_joins(), 1);
     for (name, index) in [
@@ -1179,42 +1198,42 @@ fn a_foreign_merge_leaves_the_index_as_a_fold_without_it() {
 fn a_host_join_over_a_node_only_a_foreign_merge_produced_stays_blocked() {
     let c = collection(0);
     let mut index = hosted(1);
-    for payload in [1, 2, 3] {
+    for payload in 1..=15 {
         index.apply(&commit(1, c, data(payload)), &AdmitEveryRecord);
     }
     index.apply(
-        &merge(2, c, &[data(1), data(2)], data(5)),
+        &merge(2, c, &payloads(1..=8), data(20)),
         &AdmitEveryRecord,
     );
     index.apply(
-        &merge(1, c, &[data(5), data(3)], data(6)),
+        &merge(1, c, &payloads([20, 9, 10, 11, 12, 13, 14, 15]), data(21)),
         &AdmitEveryRecord,
     );
 
-    assert!(index.coverage(c, data(5)).is_none());
-    assert!(index.coverage(c, data(6)).is_none());
+    assert!(index.coverage(c, data(20)).is_none());
+    assert!(index.coverage(c, data(21)).is_none());
     assert!(index.published().has_blocked(c));
-    assert!(index.published().producers(c, data(6)).is_empty());
-    assert!(index.published().producers(c, data(5)).is_empty());
-    assert_eq!(frontier(&index, c), vec![[1u8; 32], [2u8; 32], [3u8; 32]]);
-    let blocked = MergeInputs::new([data(3), data(5)]).unwrap();
-    assert!(!index.published().producers(c, data(6)).contains(&blocked));
+    assert!(index.published().producers(c, data(21)).is_empty());
+    assert!(index.published().producers(c, data(20)).is_empty());
+    assert_eq!(frontier(&index, c), raw_members(1..=15));
+    let blocked = MergeInputs::new(payloads([20, 9, 10, 11, 12, 13, 14, 15])).unwrap();
+    assert!(!index.published().producers(c, data(21)).contains(&blocked));
     // Believed, but not driven: the consumer side still names it.
-    assert_eq!(index.joins_reading(c, data(3)), vec![(blocked, data(6))]);
+    assert_eq!(index.joins_reading(c, data(9)), vec![(blocked, data(21))]);
 
     // The host's own route to the same node.
     index.apply(
-        &merge(1, c, &[data(1), data(2)], data(5)),
+        &merge(1, c, &payloads(1..=8), data(20)),
         &AdmitEveryRecord,
     );
     assert!(!index.published().has_blocked(c));
-    assert!(index.published().producers(c, data(6)).contains(&blocked));
-    assert_eq!(index.published().producers(c, data(6)), vec![blocked]);
+    assert!(index.published().producers(c, data(21)).contains(&blocked));
+    assert_eq!(index.published().producers(c, data(21)), vec![blocked]);
     assert_eq!(
-        members(&index, c, data(6)),
-        vec![[1u8; 32], [2u8; 32], [3u8; 32]]
+        members(&index, c, data(21)),
+        raw_members(1..=15)
     );
-    assert_eq!(frontier(&index, c), vec![[6u8; 32]]);
+    assert_eq!(frontier(&index, c), vec![[21u8; 32]]);
 }
 
 /// Admits commits by one writer and knows no descriptor at all: every other
@@ -1247,19 +1266,20 @@ fn a_host_join_is_believed_without_write_or_a_descriptor() {
     let c = collection(0);
     let admission = OnlyWriterAndNoDescriptor(public(1));
     let mut index = hosted(9);
-    index.apply(&commit(1, c, data(1)), &admission);
-    index.apply(&commit(1, c, data(2)), &admission);
-    index.apply(&commit(9, c, data(3)), &admission);
-    index.apply(&merge(9, c, &[data(1), data(2)], data(4)), &admission);
+    for id in 1..=8 {
+        index.apply(&commit(1, c, data(id)), &admission);
+    }
+    index.apply(&commit(9, c, data(10)), &admission);
+    index.apply(&merge(9, c, &payloads(1..=8), data(20)), &admission);
 
-    assert_eq!(members(&index, c, data(4)), vec![[1u8; 32], [2u8; 32]]);
-    assert_eq!(frontier(&index, c), vec![[4u8; 32]]);
+    assert_eq!(members(&index, c, data(20)), raw_members(1..=8));
+    assert_eq!(frontier(&index, c), vec![[20u8; 32]]);
     // Only the host's own commit waits, on the descriptor; nothing waits on
     // a proof.
     assert_eq!(index.parked_on_lineages(), 1);
     assert_eq!(index.parked_on_signers(), 0);
     assert_eq!(index.unadmitted_nodes_in(c), BTreeSet::new());
-    assert!(index.coverage(c, data(3)).is_none());
+    assert!(index.coverage(c, data(10)).is_none());
 }
 
 /// `producers` names exactly the host's driven joins of a node, by the
@@ -1269,28 +1289,28 @@ fn a_host_join_is_believed_without_write_or_a_descriptor() {
 fn producers_are_the_host_joins_that_drive_a_node() {
     let c = collection(0);
     let mut index = hosted(1);
-    for payload in [1, 2, 3, 4] {
+    for payload in 1..=16 {
         index.apply(&commit(1, c, data(payload)), &AdmitEveryRecord);
     }
-    let first = MergeInputs::new([data(1), data(2)]).unwrap();
-    let second = MergeInputs::new([data(3), data(4)]).unwrap();
-    let waiting = MergeInputs::new([data(3), data(9)]).unwrap();
-    let absorbing = MergeInputs::new([data(4), data(7)]).unwrap();
+    let first = MergeInputs::new(payloads(1..=8)).unwrap();
+    let second = MergeInputs::new(payloads(9..=16)).unwrap();
+    let waiting = MergeInputs::new(payloads([9, 10, 11, 12, 13, 14, 15, 20])).unwrap();
+    let absorbing = MergeInputs::new(payloads([1, 2, 3, 4, 5, 6, 7, 30])).unwrap();
     for inputs in [first, second, waiting] {
-        index.apply(&merge(1, c, inputs.as_slice(), data(7)), &AdmitEveryRecord);
+        index.apply(&merge(1, c, inputs.as_slice(), data(30)), &AdmitEveryRecord);
     }
     index.apply(
-        &merge(1, c, absorbing.as_slice(), data(7)),
+        &merge(1, c, absorbing.as_slice(), data(30)),
         &AdmitEveryRecord,
     );
     // Another key's route never shows up either.
     index.apply(
-        &merge(2, c, &[data(2), data(3)], data(7)),
+        &merge(2, c, &payloads(2..=9), data(30)),
         &AdmitEveryRecord,
     );
 
     let mut expected = vec![first, second, absorbing];
-    let producers = index.published().producers(c, data(7));
+    let producers = index.published().producers(c, data(30));
     assert_eq!(producers.len(), 3);
     expected.retain(|inputs| producers.contains(inputs));
     assert_eq!(expected.len(), 3);
@@ -1298,7 +1318,7 @@ fn producers_are_the_host_joins_that_drive_a_node() {
     assert!(index.published().producers(c, data(1)).is_empty());
     assert!(index
         .published()
-        .producers(collection(5), data(7))
+        .producers(collection(5), data(30))
         .is_empty());
 }
 
@@ -1313,12 +1333,12 @@ fn producers_are_the_host_joins_that_drive_a_node() {
 fn a_host_join_nobody_has_decided_is_no_producer() {
     let (earlier, read) = (collection(1), collection(2));
     let mut index = hosted(1);
-    for payload in [1, 3] {
+    for payload in [1, 3, 10, 11, 12, 13, 14, 15] {
         index.park_record(&commit(1, earlier, data(payload)));
     }
     index.settle_collections(&AdmitEveryRecord, &BTreeSet::from([earlier]));
-    let waiting = MergeInputs::new([data(1), data(2)]).unwrap();
-    let drivable = MergeInputs::new([data(1), data(3)]).unwrap();
+    let waiting = MergeInputs::new(payloads([1, 2, 10, 11, 12, 13, 14, 15])).unwrap();
+    let drivable = MergeInputs::new(payloads([1, 3, 10, 11, 12, 13, 14, 15])).unwrap();
     index.park_record(&merge(1, earlier, waiting.as_slice(), data(5)));
     index.park_record(&merge(1, earlier, drivable.as_slice(), data(6)));
     index.park_record(&commit(1, read, data(9)));

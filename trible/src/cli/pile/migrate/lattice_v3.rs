@@ -887,7 +887,7 @@ fn parse_attached(ids: &[String]) -> Result<BTreeSet<Id>> {
     Ok(attached)
 }
 
-fn refuse_if_open(path: &Path) -> Result<()> {
+pub(super) fn refuse_if_open(path: &Path) -> Result<()> {
     let openers = other_openers(path)?;
     if !openers.is_empty() {
         bail!(

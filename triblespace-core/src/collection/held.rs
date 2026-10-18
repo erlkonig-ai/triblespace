@@ -1131,7 +1131,7 @@ mod tests {
                 CollectionMerge::sign(
                     &key(),
                     c,
-                    [Inline::new(data), Inline::new([3; 32])],
+                    std::iter::once(Inline::new(data)).chain((3..10).map(|byte| Inline::new([byte; 32]))),
                     Inline::new(result),
                 )
                 .unwrap(),
@@ -1737,7 +1737,7 @@ mod tests {
             CollectionMerge::sign(
                 &key(),
                 c,
-                [Inline::new([2; 32]), Inline::new([4; 32])],
+                [2, 4, 6, 7, 8, 9, 10, 11].map(|byte| Inline::new([byte; 32])),
                 Inline::new([5; 32]),
             )
             .unwrap(),

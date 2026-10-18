@@ -72,7 +72,7 @@ use super::{
 
 /// How many held nodes of one tier a root carry joins into one MERGE, and the
 /// base of the tier logarithm.
-pub const MERGE_FAN_IN: usize = 8;
+pub const MERGE_FAN_IN: usize = super::records::MERGE_INPUTS;
 
 /// Which tier a node carries in: `floor(log_8 |support|)`.
 fn tier(support: u64) -> u32 {
@@ -1713,9 +1713,18 @@ mod tests {
             Err(CollectionRealizationError::Stalled { .. })
         ));
         // A different driven producer for this output cannot satisfy the check.
+        let other = Inline::new([9; 32]);
+        index.apply(
+            &CollectionRecord::Commit(CollectionCommit::sign(
+                &host, collection, other, empty_metadata_handle(),
+            )),
+            &AdmitEveryRecord,
+        );
+        let mut different = inputs;
+        different[0] = other;
         index.apply(
             &CollectionRecord::Merge(
-                CollectionMerge::sign(&host, collection, [inputs[0], result], result).unwrap(),
+                CollectionMerge::sign(&host, collection, different, result).unwrap(),
             ),
             &AdmitEveryRecord,
         );

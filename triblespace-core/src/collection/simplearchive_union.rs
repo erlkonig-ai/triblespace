@@ -131,10 +131,8 @@ impl From<io::Error> for SimpleArchiveJoinError {
 pub enum ElementRole {
     /// Data introduced by a signed commit.
     CommitData,
-    /// Canonically lower merge input.
-    MergeLow,
-    /// Canonically higher merge input.
-    MergeHigh,
+    /// Merge input at this zero-based index in the claim's canonical order.
+    MergeInput(usize),
     /// Claimed merge output.
     MergeResult,
 }
@@ -143,8 +141,7 @@ impl fmt::Display for ElementRole {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::CommitData => write!(f, "commit data"),
-            Self::MergeLow => write!(f, "merge low input"),
-            Self::MergeHigh => write!(f, "merge high input"),
+            Self::MergeInput(index) => write!(f, "merge input {index}"),
             Self::MergeResult => write!(f, "merge result"),
         }
     }
@@ -173,11 +170,8 @@ pub enum SimpleArchiveUnionValidationError {
         role: ElementRole,
         source: UnarchiveError,
     },
-    /// The claimed result is not the exact canonical union of the two inputs.
+    /// The claimed result is not the exact canonical union of the eight inputs.
     WrongMergeResult,
-    /// This validator checks two-input joins; the claim names this many
-    /// inputs.
-    UnsupportedMergeArity(usize),
 }
 
 impl fmt::Display for SimpleArchiveUnionValidationError {
@@ -209,12 +203,6 @@ impl fmt::Display for SimpleArchiveUnionValidationError {
             }
             Self::WrongMergeResult => {
                 write!(f, "merge result is not the exact canonical input union")
-            }
-            Self::UnsupportedMergeArity(inputs) => {
-                write!(
-                    f,
-                    "cannot validate a merge of {inputs} inputs; expected two"
-                )
             }
         }
     }
@@ -499,14 +487,16 @@ pub(crate) fn validate_member(
 
 /// Validate a claimed exact union without materializing another result blob.
 ///
-/// All endpoints are first bound to their record hashes and validated as
-/// canonical archives. The expected two-way union is then compared row-for-row
-/// with `result`, using constant auxiliary space.
+/// The eight inputs must follow the strictly increasing hash order of
+/// [`CollectionMerge::inputs`]. All endpoints are first bound to their record
+/// hashes and validated as canonical archives. The expected eight-way union is
+/// then compared row-for-row with `result`, using constant auxiliary space.
+/// The record's strict self-signature and the caller's admission policy remain
+/// separate prerequisites.
 pub fn validate_merge(
     descriptor: &Fragment,
     claim: &CollectionMerge,
-    low: &Blob<SimpleArchive>,
-    high: &Blob<SimpleArchive>,
+    inputs: [&Blob<SimpleArchive>; 8],
     result: &Blob<SimpleArchive>,
 ) -> Result<(), SimpleArchiveUnionValidationError> {
     validate_descriptor(descriptor)?;
@@ -514,28 +504,21 @@ pub fn validate_merge(
         crate::blob::IntoBlob::<SimpleArchive>::to_blob(descriptor.facts().clone()).get_handle();
     validate_collection(collection, claim.collection())?;
 
-    // A2: n-ary validation. This still checks two-input joins only.
-    let &[expected_low, expected_high] = claim.inputs() else {
-        return Err(SimpleArchiveUnionValidationError::UnsupportedMergeArity(
-            claim.inputs().len(),
-        ));
-    };
-    validate_handle(ElementRole::MergeLow, expected_low, low)?;
-    validate_handle(ElementRole::MergeHigh, expected_high, high)?;
+    for (index, input) in inputs.iter().enumerate() {
+        validate_handle(ElementRole::MergeInput(index), claim.inputs()[index], input)?;
+    }
     validate_handle(ElementRole::MergeResult, claim.result(), result)?;
 
-    let low_rows = canonical_rows(low).map_err(|source| {
-        SimpleArchiveUnionValidationError::InvalidElement {
-            role: ElementRole::MergeLow,
-            source,
-        }
-    })?;
-    let high_rows = canonical_rows(high).map_err(|source| {
-        SimpleArchiveUnionValidationError::InvalidElement {
-            role: ElementRole::MergeHigh,
-            source,
-        }
-    })?;
+    let input_rows = inputs.map(canonical_rows);
+    let mut streams: [&[[u8; TRIBLE_LEN]]; 8] = [&[]; 8];
+    for (index, rows) in input_rows.iter().enumerate() {
+        streams[index] = rows.as_deref().map_err(|&source| {
+            SimpleArchiveUnionValidationError::InvalidElement {
+                role: ElementRole::MergeInput(index),
+                source,
+            }
+        })?;
+    }
     let result_rows = canonical_rows(result).map_err(|source| {
         SimpleArchiveUnionValidationError::InvalidElement {
             role: ElementRole::MergeResult,
@@ -543,7 +526,20 @@ pub fn validate_merge(
         }
     })?;
 
-    if !UnionRows::new(&low_rows, &high_rows).eq(result_rows.iter()) {
+    let expected = std::iter::from_fn(|| {
+        let least = streams
+            .iter()
+            .filter_map(|rows| rows.first())
+            .min()
+            .copied()?;
+        for rows in &mut streams {
+            if rows.first() == Some(&least) {
+                *rows = &rows[1..];
+            }
+        }
+        Some(least)
+    });
+    if !expected.eq(result_rows.iter().copied()) {
         return Err(SimpleArchiveUnionValidationError::WrongMergeResult);
     }
     Ok(())
@@ -901,18 +897,37 @@ mod tests {
         Inline::<Hash<Blake3>>::new(Blake3::digest(&blob.bytes))
     }
 
-    /// A merge or derive names its input PAYLOAD. This used to wrap it
-    /// beside a fingerprint citing a record that produced it; nothing
-    /// cites anything now, so it is just the payload.
-    fn ordered_inputs<'a>(
-        left: &'a Blob<SimpleArchive>,
-        right: &'a Blob<SimpleArchive>,
-    ) -> (&'a Blob<SimpleArchive>, &'a Blob<SimpleArchive>) {
-        if data(left) <= data(right) {
-            (left, right)
-        } else {
-            (right, left)
-        }
+    fn eight_archives() -> [Blob<SimpleArchive>; 8] {
+        std::array::from_fn(|index| {
+            let value = index as u8 + 1;
+            archive([row(value, 1, value), row(9, 1, 9)])
+        })
+    }
+
+    fn ordered_inputs(inputs: &[Blob<SimpleArchive>; 8]) -> [&Blob<SimpleArchive>; 8] {
+        let mut inputs = inputs.each_ref();
+        inputs.sort_unstable_by_key(|input| data(input));
+        assert!(inputs.windows(2).all(|pair| data(pair[0]) < data(pair[1])));
+        inputs
+    }
+
+    fn invalid_archives() -> [(Blob<SimpleArchive>, UnarchiveError); 5] {
+        [
+            (
+                Blob::new(vec![0_u8; TRIBLE_LEN - 1].into()),
+                UnarchiveError::BadArchive,
+            ),
+            (raw_archive(vec![row(0, 1, 1)]), UnarchiveError::BadTrible),
+            (raw_archive(vec![row(1, 0, 1)]), UnarchiveError::BadTrible),
+            (
+                raw_archive(vec![row(1, 1, 1), row(1, 1, 1)]),
+                UnarchiveError::BadCanonicalizationRedundancy,
+            ),
+            (
+                raw_archive(vec![row(2, 1, 2), row(1, 1, 1)]),
+                UnarchiveError::BadCanonicalizationOrdering,
+            ),
+        ]
     }
 
     fn put_event<S>(blob: &Blob<S>) -> ProbeEvent
@@ -1475,76 +1490,168 @@ mod tests {
     #[test]
     fn merge_validation_is_exact_and_binds_every_endpoint() {
         let descriptor = root("first");
-        let left = archive([row(1, 1, 1), row(3, 1, 3)]);
-        let right = archive([row(2, 1, 2), row(3, 1, 3)]);
-        let result = join(&left, &right).unwrap();
+        let members = eight_archives();
+        let inputs = ordered_inputs(&members);
+        let result = archive((1..=9).map(|value| row(value, 1, value)));
+        let signer = SigningKey::from_bytes(&[7; 32]);
         let claim = CollectionMerge::sign(
-            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+            &signer,
             identity_for_tests(&descriptor),
-            [data(&left), data(&right)],
+            inputs.map(data),
             data(&result),
         )
         .unwrap();
-        let (low, high) = ordered_inputs(&left, &right);
-        validate_merge(&descriptor, &claim, low, high, &result).unwrap();
+        assert_eq!(claim.inputs(), inputs.map(data));
+        validate_merge(&descriptor, &claim, inputs, &result).unwrap();
+
+        assert!(matches!(
+            validate_merge(&test_naming(id(9)), &claim, inputs, &result),
+            Err(SimpleArchiveUnionValidationError::WrongRepresentation { .. })
+        ));
 
         let wrong_collection = CollectionMerge::sign(
-            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+            &signer,
             identity_for_tests(&root("ninth")),
-            [data(low), data(high)],
+            inputs.map(data),
             data(&result),
         )
         .unwrap();
         assert!(matches!(
-            validate_merge(&descriptor, &wrong_collection, low, high, &result),
+            validate_merge(&descriptor, &wrong_collection, inputs, &result),
             Err(SimpleArchiveUnionValidationError::WrongCollection { .. })
         ));
 
+        let mut swapped = inputs;
+        swapped.swap(0, 7);
         assert!(matches!(
-            validate_merge(&descriptor, &claim, high, low, &result),
+            validate_merge(&descriptor, &claim, swapped, &result),
             Err(SimpleArchiveUnionValidationError::EndpointMismatch {
-                role: ElementRole::MergeLow,
+                role: ElementRole::MergeInput(0),
                 ..
             })
         ));
 
-        let other_result = archive([row(4, 1, 4)]);
-        assert!(matches!(
-            validate_merge(&descriptor, &claim, low, high, &other_result),
+        let other_result = archive([row(10, 1, 10)]);
+        for index in 0..8 {
+            let mut wrong_inputs = inputs;
+            wrong_inputs[index] = &other_result;
+            assert_eq!(
+                validate_merge(&descriptor, &claim, wrong_inputs, &result),
+                Err(SimpleArchiveUnionValidationError::EndpointMismatch {
+                    role: ElementRole::MergeInput(index),
+                    expected: claim.inputs()[index],
+                    actual: data(&other_result),
+                })
+            );
+        }
+        assert_eq!(
+            validate_merge(&descriptor, &claim, inputs, &other_result),
             Err(SimpleArchiveUnionValidationError::EndpointMismatch {
                 role: ElementRole::MergeResult,
-                ..
-            })
-        ));
-
-        let wrong_result = archive([row(1, 1, 1), row(2, 1, 2)]);
-        let wrong_claim = CollectionMerge::sign(
-            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-            identity_for_tests(&descriptor),
-            [data(low), data(high)],
-            data(&wrong_result),
-        )
-        .unwrap();
-        assert_eq!(
-            validate_merge(&descriptor, &wrong_claim, low, high, &wrong_result),
-            Err(SimpleArchiveUnionValidationError::WrongMergeResult)
-        );
-
-        let invalid_result = raw_archive(vec![row(2, 1, 2), row(1, 1, 1)]);
-        let invalid_claim = CollectionMerge::sign(
-            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-            identity_for_tests(&descriptor),
-            [data(low), data(high)],
-            data(&invalid_result),
-        )
-        .unwrap();
-        assert_eq!(
-            validate_merge(&descriptor, &invalid_claim, low, high, &invalid_result),
-            Err(SimpleArchiveUnionValidationError::InvalidElement {
-                role: ElementRole::MergeResult,
-                source: UnarchiveError::BadCanonicalizationOrdering,
+                expected: data(&result),
+                actual: data(&other_result),
             })
         );
+
+        // Missing the unique contribution of any input, or the shared row,
+        // must fail even when the claimed result hash matches its bytes.
+        let wrong_results = (1..=9)
+            .map(|missing| {
+                archive(
+                    (1..=9)
+                        .filter(|&value| value != missing)
+                        .map(|value| row(value, 1, value)),
+                )
+            })
+            .chain([
+                archive([]),
+                archive((1..=10).map(|value| row(value, 1, value))),
+            ]);
+        for wrong_result in wrong_results {
+            let wrong_claim = CollectionMerge::sign(
+                &signer,
+                identity_for_tests(&descriptor),
+                inputs.map(data),
+                data(&wrong_result),
+            )
+            .unwrap();
+            assert_eq!(
+                validate_merge(&descriptor, &wrong_claim, inputs, &wrong_result),
+                Err(SimpleArchiveUnionValidationError::WrongMergeResult)
+            );
+        }
+    }
+
+    #[test]
+    fn merge_validation_accepts_empty_and_overlapping_distinct_inputs() {
+        let descriptor = root("first");
+        let mut members = eight_archives();
+        members[0] = archive([]);
+        let inputs = ordered_inputs(&members);
+        let result = archive((2..=9).map(|value| row(value, 1, value)));
+        let claim = CollectionMerge::sign(
+            &SigningKey::from_bytes(&[7; 32]),
+            identity_for_tests(&descriptor),
+            inputs.map(data),
+            data(&result),
+        )
+        .unwrap();
+        validate_merge(&descriptor, &claim, inputs, &result).unwrap();
+    }
+
+    #[test]
+    fn merge_validation_rejects_noncanonical_inputs_and_results() {
+        let descriptor = root("first");
+        let signer = SigningKey::from_bytes(&[7; 32]);
+        let result = archive((1..=9).map(|value| row(value, 1, value)));
+        for (invalid, source) in invalid_archives() {
+            for replaced in 0..8 {
+                let mut members = eight_archives();
+                members[replaced] = invalid.clone();
+                let inputs = ordered_inputs(&members);
+                let index = inputs
+                    .iter()
+                    .position(|input| data(input) == data(&invalid))
+                    .unwrap();
+                let claim = CollectionMerge::sign(
+                    &signer,
+                    identity_for_tests(&descriptor),
+                    inputs.map(data),
+                    data(&result),
+                )
+                .unwrap();
+                let error = validate_merge(&descriptor, &claim, inputs, &result).unwrap_err();
+                assert_eq!(
+                    error,
+                    SimpleArchiveUnionValidationError::InvalidElement {
+                        role: ElementRole::MergeInput(index),
+                        source,
+                    }
+                );
+                assert!(error.to_string().contains(&format!("merge input {index}")));
+                assert_eq!(
+                    error.source().unwrap().downcast_ref::<UnarchiveError>(),
+                    Some(&source)
+                );
+            }
+
+            let members = eight_archives();
+            let inputs = ordered_inputs(&members);
+            let claim = CollectionMerge::sign(
+                &signer,
+                identity_for_tests(&descriptor),
+                inputs.map(data),
+                data(&invalid),
+            )
+            .unwrap();
+            assert_eq!(
+                validate_merge(&descriptor, &claim, inputs, &invalid),
+                Err(SimpleArchiveUnionValidationError::InvalidElement {
+                    role: ElementRole::MergeResult,
+                    source,
+                })
+            );
+        }
     }
 
     #[cfg(feature = "proptest")]
@@ -1591,17 +1698,39 @@ mod tests {
                 let actual = join(&left, &right).unwrap();
 
                 prop_assert_eq!(&actual, &expected);
-                // A MERGE names two to sixteen distinct inputs, so two equal
-                // sides -- both empty, say -- have no claim to check.
-                if data(&left) != data(&right) {
-                    let collection = root("first");
-                    let claim = CollectionMerge::sign(&ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
-                        identity_for_tests(&collection), [data(&left), data(&right)],
-                        data(&actual),).unwrap();
-                    let (low, high) = ordered_inputs(&left, &right);
-                    prop_assert!(validate_merge(&collection, &claim, low, high, &actual).is_ok());
-                }
                 prop_assert_eq!(actual, join(&right, &left).unwrap());
+            }
+
+            #[test]
+            fn eight_input_merge_validation_matches_the_patch_oracle(
+                sets in prop::array::uniform8(arb_set(32)),
+                shared in arb_set(16),
+            ) {
+                let mut expected = TribleSet::new();
+                let members: [Blob<SimpleArchive>; 8] = std::array::from_fn(|index| {
+                    let mut facts = sets[index].clone() + shared.clone();
+                    // Each archive has a distinct fact outside arb_trible's
+                    // all-nonzero entity domain, even after shrinking.
+                    let mut unique = row(index as u8 + 1, 1, 1);
+                    unique[1] = 0;
+                    facts.insert(&Trible::force_raw(unique).unwrap());
+                    let archive = (&facts).to_blob();
+                    expected += facts;
+                    archive
+                });
+                let expected: Blob<SimpleArchive> = expected.to_blob();
+                let inputs = ordered_inputs(&members);
+                let collection = root("first");
+                let claim = CollectionMerge::sign(
+                    &SigningKey::from_bytes(&[7; 32]),
+                    identity_for_tests(&collection),
+                    inputs.map(data),
+                    data(&expected),
+                )
+                .unwrap();
+
+                prop_assert!(validate_merge(&collection, &claim, inputs, &expected).is_ok());
+                prop_assert_eq!(join_all(&members).unwrap(), expected);
             }
 
             #[test]

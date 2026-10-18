@@ -1939,6 +1939,20 @@ mod tests {
     use triblespace_core::collection::{CollectionPolicy, CollectionStoreExt};
     use triblespace_core::repo::memoryrepo::MemoryRepo;
 
+    fn eight_input_merge(collection: CollectionHandle) -> triblespace_core::collection::CollectionMerge {
+        let members: Vec<Blob<SimpleArchive>> = ["a", "b", "c", "d", "e", "f", "g", "h"]
+            .into_iter().map(|name| {
+                triblespace_core::prelude::entity! { metadata::name: name }
+                    .facts().clone().to_blob()
+            }).collect();
+        let joined = triblespace_core::collection::simplearchive_union::join_all(&members).unwrap();
+        triblespace_core::collection::CollectionMerge::sign(
+            &SigningKey::from_bytes(&[1; 32]), collection,
+            members.iter().map(|blob| Handle::<SimpleArchive>::to_hash(blob.get_handle())),
+            Handle::<SimpleArchive>::to_hash(joined.get_handle()),
+        ).unwrap()
+    }
+
     fn direct_policy(root: ed25519_dalek::VerifyingKey) -> CollectionPolicy {
         CollectionPolicy::new(AdmissionPolicy::direct(root), AdmissionPolicy::direct(root))
     }
@@ -2035,7 +2049,7 @@ mod tests {
     /// of a derive, not just commit targets.
     #[test]
     fn enumeration_covers_merges_and_derive_targets() {
-        use triblespace_core::collection::records::{CollectionDerive, CollectionMerge};
+        use triblespace_core::collection::records::CollectionDerive;
 
         fn collection(byte: u8) -> CollectionHandle {
             Inline::new([byte; 32])
@@ -2045,15 +2059,7 @@ mod tests {
         }
 
         let records = vec![
-            CollectionRecord::Merge(
-                CollectionMerge::sign(
-                    &SigningKey::from_bytes(&[1; 32]),
-                    collection(1),
-                    [data(10), data(11)],
-                    data(12),
-                )
-                .unwrap(),
-            ),
+            CollectionRecord::Merge(eight_input_merge(collection(1))),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &SigningKey::from_bytes(&[1; 32]),
                 collection(3),
@@ -2195,7 +2201,7 @@ mod tests {
     /// records belong to a collection.
     #[test]
     fn log_filters_records_by_the_same_question_the_tally_counts() {
-        use triblespace_core::collection::records::{CollectionDerive, CollectionMerge};
+        use triblespace_core::collection::records::CollectionDerive;
 
         fn collection(byte: u8) -> CollectionHandle {
             Inline::new([byte; 32])
@@ -2205,15 +2211,7 @@ mod tests {
         }
 
         let records = vec![
-            CollectionRecord::Merge(
-                CollectionMerge::sign(
-                    &SigningKey::from_bytes(&[1; 32]),
-                    collection(1),
-                    [data(10), data(11)],
-                    data(12),
-                )
-                .unwrap(),
-            ),
+            CollectionRecord::Merge(eight_input_merge(collection(1))),
             CollectionRecord::Derive(CollectionDerive::sign(
                 &SigningKey::from_bytes(&[1; 32]),
                 collection(3),

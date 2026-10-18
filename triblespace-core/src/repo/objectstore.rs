@@ -27,10 +27,10 @@ use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
 use crate::collection::{
-    CollectionRecord, CollectionRecordFingerprint, LegacyUnsignedCollectionEquation,
-    RecordDecodeError, RetiredCollectionEquation, COLLECTION_RECORD_KIND_DERIVE_V2,
-    COLLECTION_RECORD_KIND_MERGE_V2,
+    CollectionRecord, CollectionRecordFingerprint, RecordDecodeError,
 };
+#[cfg(test)]
+use crate::collection::{LegacyUnsignedCollectionEquation, RetiredCollectionEquation};
 #[cfg(test)]
 use crate::id::Id;
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
@@ -211,11 +211,9 @@ impl AsyncSnapshotSource for ObjectStoreRemote {
             let mut listed_records = self.store.list(Some(&record_prefix));
             while let Some(item) = listed_records.next().await {
                 let meta = item.map_err(ListCollectionRecordsErr::List)?;
-                if let Some(record) =
-                    read_collection_record(&*self.store, &record_prefix, meta.location).await?
-                {
-                    collection_records.insert(record.fingerprint(), record);
-                }
+                let record =
+                    read_collection_record(&*self.store, &record_prefix, meta.location).await?;
+                collection_records.insert(record.fingerprint(), record);
             }
             let collection_records = collection_records.into_values().collect();
 
@@ -447,7 +445,7 @@ async fn read_collection_record(
     store: &dyn ObjectStore,
     prefix: &Path,
     location: Path,
-) -> Result<Option<CollectionRecord>, ListCollectionRecordsErr> {
+) -> Result<CollectionRecord, ListCollectionRecordsErr> {
     let path_fingerprint = collection_record_fingerprint_from_path(prefix, &location)?;
     let object = store
         .get(&location)
@@ -457,32 +455,16 @@ async fn read_collection_record(
         .bytes()
         .await
         .map_err(ListCollectionRecordsErr::Get)?;
-    let (record, record_fingerprint) = if matches!(bytes.first(), Some(2 | 3)) {
-        let legacy = LegacyUnsignedCollectionEquation::from_bytes(&bytes)
-            .map_err(ListCollectionRecordsErr::Decode)?;
-        (None, legacy.fingerprint())
-    } else if matches!(
-        bytes.first(),
-        Some(&COLLECTION_RECORD_KIND_MERGE_V2 | &COLLECTION_RECORD_KIND_DERIVE_V2)
-    ) {
-        // The live MERGE and DERIVE until lattice v2. Skipped rather than
-        // failing the snapshot, so a namespace written before the cutover
-        // still opens; their fingerprint is still checked against the path.
-        let retired = RetiredCollectionEquation::from_bytes(&bytes)
-            .map_err(ListCollectionRecordsErr::Decode)?;
-        (None, retired.fingerprint())
-    } else {
-        let record = CollectionRecord::from_bytes_trusted(&bytes)
-            .map_err(ListCollectionRecordsErr::Decode)?;
-        (Some(record), record.fingerprint())
-    };
+    let decoded = CollectionRecord::from_bytes_trusted(&bytes)
+        .map_err(ListCollectionRecordsErr::Decode)?;
+    let record_fingerprint = decoded.fingerprint();
     if record_fingerprint != path_fingerprint {
         return Err(ListCollectionRecordsErr::FingerprintMismatch {
             path: path_fingerprint,
             record: record_fingerprint,
         });
     }
-    Ok(record)
+    Ok(decoded)
 }
 
 /// Failure while freezing one object-store observation.
@@ -747,8 +729,8 @@ mod tests {
     use crate::blob::encodings::rawbytes::RawBytes;
     use crate::collection::descriptor::{identity_for_tests, named_for_tests};
     use crate::collection::{
-        collection_merge_bytes_len, CollectionMerge, CollectionRead, CollectionStore,
-        COLLECTION_RECORD_KIND_MERGE_V4,
+        CollectionMerge, CollectionRead, CollectionStore, COLLECTION_MERGE_BYTES_LEN,
+        KIND_COLLECTION_MERGE,
     };
     use crate::repo::async_store::{
         AsyncBlobStoreGet, AsyncBlobStoreList, AsyncBlobStorePut, AsyncCollectionRead,
@@ -772,11 +754,8 @@ mod tests {
             CollectionMerge::sign(
                 &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
                 identity_for_tests(&descriptor),
-                [
-                    Inline::new([tag.wrapping_add(3); 32]),
-                    Inline::new([tag.wrapping_add(4); 32]),
-                ],
-                Inline::new([tag.wrapping_add(5); 32]),
+                (3..11).map(|offset| Inline::new([tag.wrapping_add(offset); 32])),
+                Inline::new([tag.wrapping_add(11); 32]),
             )
             .unwrap(),
         )
@@ -812,8 +791,13 @@ mod tests {
                 .bytes()
                 .await
                 .unwrap();
-            assert_eq!(stored.len(), 1 + collection_merge_bytes_len(2));
-            assert_eq!(stored[0], COLLECTION_RECORD_KIND_MERGE_V4);
+            assert_eq!(stored.len(), COLLECTION_MERGE_BYTES_LEN);
+            assert_eq!(stored[..32], KIND_COLLECTION_MERGE);
+            assert_eq!(stored.as_ref(), first.to_bytes().as_slice());
+            assert_eq!(
+                first.fingerprint().as_bytes(),
+                blake3::hash(&stored).as_bytes()
+            );
 
             let snapshot = AsyncSnapshotSource::snapshot(&mut store).await.unwrap();
             assert!(AsyncCollectionRead::records(&before)
@@ -851,17 +835,18 @@ mod tests {
     }
 
     #[test]
-    fn retired_dense_equation_objects_stay_present_but_semantically_inert() {
+    fn retired_dense_equation_objects_are_preserved_but_reject_snapshot_publication() {
         block_on(async {
-            let mut store = remote();
             let current = record(1);
-            AsyncCollectionStore::insert(&mut store, current)
-                .await
-                .unwrap();
             for (tag, fields) in [
                 (2, vec![[1; 32], [2; 32], [3; 32], [4; 32]]),
                 (3, vec![[1; 32], [2; 32], [4; 32]]),
             ] {
+                let mut store = remote();
+                AsyncCollectionStore::insert(&mut store, current)
+                    .await
+                    .unwrap();
+                let before = AsyncSnapshotSource::snapshot(&mut store).await.unwrap();
                 let mut bytes = vec![tag];
                 bytes.extend(fields.into_iter().flatten());
                 let legacy = LegacyUnsignedCollectionEquation::from_bytes(&bytes).unwrap();
@@ -870,9 +855,14 @@ mod tests {
                     .child(COLLECTION_RECORD_INFIX)
                     .child(hex::encode(legacy.fingerprint().raw()));
                 store.store.put(&path, bytes.clone().into()).await.unwrap();
-                let snapshot = AsyncSnapshotSource::snapshot(&mut store).await.unwrap();
+                assert!(matches!(
+                    AsyncSnapshotSource::snapshot(&mut store).await,
+                    Err(ObjectStoreSnapshotError::CollectionRecords(
+                        ListCollectionRecordsErr::Decode(RecordDecodeError::InvalidKind(_))
+                    ))
+                ));
                 assert_eq!(
-                    AsyncCollectionRead::records(&snapshot).await.unwrap(),
+                    AsyncCollectionRead::records(&before).await.unwrap(),
                     vec![current]
                 );
                 assert_eq!(
@@ -891,16 +881,12 @@ mod tests {
         });
     }
 
-    /// The live MERGE and DERIVE until lattice v2 (tags 4 and 5) are skipped
-    /// by a snapshot, never a reason to refuse the namespace.
+    /// Retired tagged signatures cannot be relabeled as canonical assertions.
+    /// Snapshot rejection leaves both the objects and older observations intact.
     #[test]
-    fn retired_live_equation_objects_are_skipped_not_fatal() {
+    fn retired_live_equation_objects_are_rejected_without_conversion() {
         block_on(async {
-            let mut store = remote();
             let current = record(1);
-            AsyncCollectionStore::insert(&mut store, current)
-                .await
-                .unwrap();
             let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
             for retired in [
                 RetiredCollectionEquation::sign_merge_v8(
@@ -917,6 +903,11 @@ mod tests {
                     Inline::new([4; 32]),
                 ),
             ] {
+                let mut store = remote();
+                AsyncCollectionStore::insert(&mut store, current)
+                    .await
+                    .unwrap();
+                let before = AsyncSnapshotSource::snapshot(&mut store).await.unwrap();
                 let bytes = retired.to_bytes();
                 assert!(matches!(bytes[0], 4 | 5));
                 let path = store
@@ -924,10 +915,27 @@ mod tests {
                     .child(COLLECTION_RECORD_INFIX)
                     .child(hex::encode(retired.fingerprint().raw()));
                 store.store.put(&path, bytes.clone().into()).await.unwrap();
-                let snapshot = AsyncSnapshotSource::snapshot(&mut store).await.unwrap();
+                assert!(matches!(
+                    AsyncSnapshotSource::snapshot(&mut store).await,
+                    Err(ObjectStoreSnapshotError::CollectionRecords(
+                        ListCollectionRecordsErr::Decode(RecordDecodeError::InvalidKind(_))
+                    ))
+                ));
                 assert_eq!(
-                    AsyncCollectionRead::records(&snapshot).await.unwrap(),
+                    AsyncCollectionRead::records(&before).await.unwrap(),
                     vec![current]
+                );
+                assert_eq!(
+                    store
+                        .store
+                        .get(&path)
+                        .await
+                        .unwrap()
+                        .bytes()
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    bytes
                 );
             }
         });

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- In the canonical source candidate, retain fixed collection records as typed
+  PATCH values under stable BLAKE3 keys. Add checked lazy insertion and streaming
+  ordered key/value traversal; preserve first-owner duplicate handling and
+  collision refusal without a get-then-insert pass. Full enumeration no longer
+  materializes and sorts canonical bodies; selector order follows the same
+  per-kind key order. No format, signature, network or live deployment change.
+
+- Add `blob::Bundle<S>`, a typed blob root with explicitly carried attachments.
+  Existing `entity!` spreading emits its root handle and unions the carried
+  bytes without merging an archived inner graph into the outer facts.
+
 - Source-only ALPN32: explicitly negotiated one-way Records/AUTH Prefix offers
   add possession-safe HAVE feedback and bounded speculative bodies. Preserve
   final delta proof, admission, landing/finish and retirement guards; leave
