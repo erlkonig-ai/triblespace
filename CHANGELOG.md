@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Back capability proofs with a typed, zero-copy slice-DST view of their
+  existing header and encoded edges. Preserve exact AUTH bytes, proof IDs,
+  literal-prefix signatures, validation boundaries and shared owner lifetimes;
+  no format or wire change.
+
 - In the isolated canonical candidate, retain typed fixed-record occurrences
   under collection/member/offset PATCH keys, without body hashing during replay.
   Streaming enumeration and selections expose bags; coverage folds remain

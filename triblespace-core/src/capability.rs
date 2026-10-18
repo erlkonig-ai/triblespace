@@ -26,6 +26,7 @@ use anybytes::{Bytes, View};
 use ed25519::signature::Signer;
 use ed25519::Signature;
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes, Unaligned};
 
 use crate::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
 use crate::id::{id_hex, ExclusiveId, Id};
@@ -164,13 +165,46 @@ struct CapabilityProofEdge {
     signature_offset: usize,
 }
 
+/// The unchanged wire layout. Byte arrays keep every field aligned to one
+/// byte; `IntoBytes` also checks that these structs contain no padding.
+#[derive(
+    Debug, Eq, Hash, PartialEq, TryFromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+#[repr(C)]
+struct EncodedCapabilityProofHeader {
+    magic: [u8; 32],
+    resource: [u8; 32],
+    root: [u8; 32],
+}
+
+#[derive(
+    Debug, Eq, Hash, PartialEq, TryFromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+#[repr(C)]
+struct EncodedCapabilityEdge {
+    capability: [u8; 32],
+    delegate: [u8; 32],
+    signature: [u8; 64],
+}
+
+/// Slice metadata comes from the exact, unpadded body length. Layout validity
+/// alone does not establish the magic, edge bounds, keys, or signatures.
+#[derive(
+    Debug, Eq, Hash, PartialEq, TryFromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+#[repr(C)]
+struct EncodedCapabilityProof {
+    header: EncodedCapabilityProofHeader,
+    edges: [EncodedCapabilityEdge],
+}
+
 /// Structurally canonical proof bytes with shared immutable ownership.
 ///
 /// Construction and cloning assign no authority. Byte-only signature checks
 /// and descriptor interpretation remain separate from framing and residency.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct CapabilityProof {
-    bytes: View<[u8]>,
+    bytes: View<EncodedCapabilityProof>,
 }
 
 /// One exact signed prefix, borrowed without allocating or copying its bytes.
@@ -207,14 +241,17 @@ impl<'a> CapabilityProofPrefix<'a> {
     }
     /// This prefix as a standalone proof that shares the parent's bytes. An
     /// exact prefix of a canonical proof is canonical, so nothing is copied
-    /// or decoded again.
+    /// again; the shorter slice metadata is inferred from its exact length.
     pub fn to_proof(self) -> CapabilityProof {
         CapabilityProof {
             bytes: self
                 .proof
                 .bytes
                 .field_to_view(self.as_bytes())
-                .expect("a prefix lies inside its proof's bytes"),
+                .expect("a prefix lies inside its proof's bytes")
+                .bytes()
+                .view()
+                .expect("an exact proof prefix has the encoded proof layout"),
         }
     }
 }
@@ -235,7 +272,9 @@ impl CapabilityProof {
     /// Retain bytes already accepted by the native decoder or constructed here.
     pub(crate) fn from_validated_bytes(bytes: Bytes) -> Self {
         Self {
-            bytes: bytes.view().expect("every byte slice has a u8 view"),
+            bytes: bytes
+                .view()
+                .expect("validated bytes have the encoded proof layout"),
         }
     }
 
@@ -247,23 +286,21 @@ impl CapabilityProof {
                 actual: bytes.len(),
             });
         }
-        if bytes[..CAPABILITY_PROOF_MAGIC.len()] != CAPABILITY_PROOF_MAGIC {
+        let encoded = EncodedCapabilityProof::try_ref_from_bytes(bytes)
+            .expect("the checked length has the unaligned encoded proof layout");
+        if encoded.header.magic != CAPABILITY_PROOF_MAGIC {
             return Err(CapabilityProofDecodeError::InvalidMagic);
         }
-        let steps = (bytes.len() - CAPABILITY_PROOF_HEADER_LEN) / CAPABILITY_PROOF_EDGE_LEN;
+        let steps = encoded.edges.len();
         if steps > MAX_CAPABILITY_PROOF_STEPS {
             return Err(CapabilityProofDecodeError::TooManySteps {
                 count: steps,
                 limit: MAX_CAPABILITY_PROOF_STEPS,
             });
         }
-        parse_key(&bytes[CAPABILITY_PROOF_MAGIC.len() + RESOURCE_LEN..CAPABILITY_PROOF_HEADER_LEN])
-            .ok_or(CapabilityProofDecodeError::InvalidKey { key: 0 })?;
-        for (step, edge) in bytes[CAPABILITY_PROOF_HEADER_LEN..]
-            .chunks_exact(CAPABILITY_PROOF_EDGE_LEN)
-            .enumerate()
-        {
-            parse_key(&edge[CAPABILITY_HANDLE_LEN..EDGE_BODY_LEN])
+        parse_key(&encoded.header.root).ok_or(CapabilityProofDecodeError::InvalidKey { key: 0 })?;
+        for (step, edge) in encoded.edges.iter().enumerate() {
+            parse_key(&edge.delegate)
                 .ok_or(CapabilityProofDecodeError::InvalidKey { key: step + 1 })?;
         }
         Ok(())
@@ -323,36 +360,29 @@ impl CapabilityProof {
         }
         self.verify_signatures()
             .map_err(CapabilityIssueError::InvalidParent)?;
-        let mut bytes = Vec::with_capacity(self.bytes.len() + CAPABILITY_PROOF_EDGE_LEN);
-        bytes.extend_from_slice(&self.bytes);
+        let mut bytes = Vec::with_capacity(self.as_bytes().len() + CAPABILITY_PROOF_EDGE_LEN);
+        bytes.extend_from_slice(self.as_bytes());
         append_edge(&mut bytes, signer, capability, delegate);
         Ok(Self::from_validated_bytes(Bytes::from_source(bytes)))
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes
+        self.bytes.as_bytes()
     }
     pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes.to_vec()
+        self.as_bytes().to_vec()
     }
     pub fn id(&self) -> CapabilityProofId {
         Inline::new(Blake3::digest(self.as_bytes()))
     }
     pub fn resource(&self) -> CapabilityResource {
-        CapabilityResource::new(
-            self.bytes[CAPABILITY_PROOF_MAGIC.len()..CAPABILITY_PROOF_MAGIC.len() + RESOURCE_LEN]
-                .try_into()
-                .expect("fixed resource bytes"),
-        )
+        CapabilityResource::new(self.bytes.header.resource)
     }
     pub fn step_count(&self) -> usize {
-        (self.bytes.len() - CAPABILITY_PROOF_HEADER_LEN) / CAPABILITY_PROOF_EDGE_LEN
+        self.bytes.edges.len()
     }
     pub fn root_key(&self) -> VerifyingKey {
-        parse_key(
-            &self.bytes[CAPABILITY_PROOF_MAGIC.len() + RESOURCE_LEN..CAPABILITY_PROOF_HEADER_LEN],
-        )
-        .expect("proof root was validated at construction")
+        parse_key(&self.bytes.header.root).expect("proof root was validated at construction")
     }
     pub fn leaf_key(&self) -> VerifyingKey {
         self.edges()
@@ -370,15 +400,10 @@ impl CapabilityProof {
         self.edges().map(|edge| edge.delegate)
     }
     pub fn capabilities(&self) -> impl ExactSizeIterator<Item = CapabilityHandle> + '_ {
-        self.bytes[CAPABILITY_PROOF_HEADER_LEN..]
-            .chunks_exact(CAPABILITY_PROOF_EDGE_LEN)
-            .map(|edge| {
-                Inline::new(
-                    edge[..CAPABILITY_HANDLE_LEN]
-                        .try_into()
-                        .expect("fixed handle"),
-                )
-            })
+        self.bytes
+            .edges
+            .iter()
+            .map(|edge| Inline::new(edge.capability))
     }
     pub fn prefixes(&self) -> impl ExactSizeIterator<Item = CapabilityProofPrefix<'_>> + '_ {
         (0..self.step_count()).map(|step| CapabilityProofPrefix {
@@ -392,7 +417,7 @@ impl CapabilityProof {
         let mut issuer = self.root_key();
         for (step, edge) in self.edges().enumerate() {
             issuer
-                .verify_strict(&self.bytes[..edge.signature_offset], &edge.signature)
+                .verify_strict(&self.as_bytes()[..edge.signature_offset], &edge.signature)
                 .map_err(|_| CapabilityProofError::InvalidSignature { step })?;
             issuer = edge.delegate;
         }
@@ -453,18 +478,12 @@ impl CapabilityProof {
     /// so a single step must not go through [`Self::edges`].
     fn edge(&self, step: usize) -> CapabilityProofEdge {
         let start = CAPABILITY_PROOF_HEADER_LEN + step * CAPABILITY_PROOF_EDGE_LEN;
-        let edge = &self.bytes[start..start + CAPABILITY_PROOF_EDGE_LEN];
+        let edge = &self.bytes.edges[step];
         CapabilityProofEdge {
-            capability: Inline::new(
-                edge[..CAPABILITY_HANDLE_LEN]
-                    .try_into()
-                    .expect("fixed capability handle"),
-            ),
-            delegate: parse_key(&edge[CAPABILITY_HANDLE_LEN..EDGE_BODY_LEN])
+            capability: Inline::new(edge.capability),
+            delegate: parse_key(&edge.delegate)
                 .expect("proof delegate was validated at construction"),
-            signature: Signature::from_bytes(
-                edge[EDGE_BODY_LEN..].try_into().expect("fixed signature"),
-            ),
+            signature: Signature::from_bytes(&edge.signature),
             signature_offset: start + EDGE_BODY_LEN,
         }
     }
@@ -515,7 +534,7 @@ where
     let mut parent: Option<TribleSet> = None;
     for (step, edge) in proof.edges().enumerate() {
         issuer
-            .verify_strict(&proof.bytes[..edge.signature_offset], &edge.signature)
+            .verify_strict(&proof.as_bytes()[..edge.signature_offset], &edge.signature)
             .map_err(|_| CapabilityProofError::InvalidSignature { step })?;
         let child = definition(reader, definitions, edge.capability, step)?;
         if let Some(parent) = &parent {
@@ -1020,6 +1039,130 @@ mod tests {
             definition(&mut repo, &[ACTION_WRITE], &[]),
             write_capability()
         );
+    }
+
+    #[test]
+    fn typed_proof_preserves_the_existing_literal_bytes_and_identity() {
+        // Captured from the pre-DST synthetic admission fixture, signed with
+        // public test seed 7 for delegate seed 8. Not generated by this test.
+        let bytes = hex_literal::hex!(
+            "9e00f6eb8d63e5eb1a3ecfa284118f157b2f08cbdc95ecceb8c2392ad794069d
+             8c76ac60569ce55a7e02971a5dfccafbe5ebed0f43a217534a04dc8bcf1415da
+             ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c
+             358d2c2bfb3aa65028c0d2ff8d45c6646e6bb90cc4c57704daf2b00a1ab71285
+             1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca
+             3483021010a0e72f58967f6e65d1c527471d2c194a6389935e6bfcea6cdfe94e
+             a0c4880a1fb7f9b7b0047f3e4200ace07de0f9f2a33aab0dfbe7a8c96660260e"
+        );
+        let id = CapabilityProofId::new(hex_literal::hex!(
+            "5cc79644ba451b64d416353bf7eb26e44479ca4202c5175d867a7e1f2f940e20"
+        ));
+        let copied = CapabilityProof::from_bytes(&bytes).unwrap();
+        assert_ne!(copied.as_bytes().as_ptr(), bytes.as_ptr());
+        let owned = CapabilityProof::from_owned_bytes(Bytes::from_source(bytes.to_vec())).unwrap();
+        let signed = CapabilityProof::new(
+            CapabilityResource::new(bytes[32..64].try_into().unwrap()),
+            &key(7),
+            CapabilityHandle::new(bytes[96..128].try_into().unwrap()),
+            key(8).verifying_key(),
+        );
+        for proof in [copied, owned, signed] {
+            assert_eq!(proof.as_bytes(), bytes);
+            assert_eq!(proof.id(), id);
+            assert_eq!(proof.bytes.edges.len(), 1);
+            proof.verify_signatures().unwrap();
+            assert_eq!(proof.clone().into_bytes(), bytes);
+            assert_eq!(
+                CapabilityProof::from_bytes(proof.as_bytes()).unwrap(),
+                proof
+            );
+        }
+    }
+
+    #[test]
+    fn typed_proof_layout_and_maximum_prefix_metadata_are_exact() {
+        assert_eq!(std::mem::size_of::<EncodedCapabilityProofHeader>(), 96);
+        assert_eq!(std::mem::align_of::<EncodedCapabilityProofHeader>(), 1);
+        assert_eq!(std::mem::size_of::<EncodedCapabilityEdge>(), 128);
+        assert_eq!(std::mem::align_of::<EncodedCapabilityEdge>(), 1);
+        let signer = key(1);
+        let cap = CapabilityHandle::new([4; 32]);
+        let mut bytes =
+            CapabilityProof::new(resource(9), &signer, cap, signer.verifying_key()).into_bytes();
+        for _ in 1..MAX_CAPABILITY_PROOF_STEPS {
+            append_edge(&mut bytes, &signer, cap, signer.verifying_key());
+        }
+        let proof = CapabilityProof::from_owned_bytes(Bytes::from_source(bytes)).unwrap();
+        assert_eq!(proof.as_bytes().len(), MAX_CAPABILITY_PROOF_BYTES);
+        assert_eq!(proof.bytes.edges.len(), MAX_CAPABILITY_PROOF_STEPS);
+        assert_eq!(std::mem::align_of_val(&*proof.bytes), 1);
+        assert_eq!(std::mem::size_of_val(&*proof.bytes), proof.as_bytes().len());
+        proof.verify_signatures().unwrap();
+        let two = proof.prefixes().nth(1).unwrap().to_proof();
+        let one = two.prefixes().next().unwrap().to_proof();
+        assert_eq!(two.bytes.edges.len(), 2);
+        assert_eq!(one.bytes.edges.len(), 1);
+        for prefix in [&two, &one] {
+            assert_eq!(prefix.as_bytes().as_ptr(), proof.as_bytes().as_ptr());
+            assert_eq!(
+                prefix.as_bytes(),
+                &proof.as_bytes()[..prefix.as_bytes().len()]
+            );
+            prefix.verify_signatures().unwrap();
+        }
+        for length in 0..MIN_CAPABILITY_PROOF_BYTES {
+            assert!(matches!(
+                CapabilityProof::from_bytes(&proof.as_bytes()[..length]),
+                Err(CapabilityProofDecodeError::InvalidLength { .. })
+            ));
+        }
+        assert!(
+            CapabilityProof::from_bytes(&proof.as_bytes()[..MAX_CAPABILITY_PROOF_BYTES - 1])
+                .is_err()
+        );
+        let mut excess = proof.as_bytes().to_vec();
+        excess.extend_from_slice(&one.as_bytes()[CAPABILITY_PROOF_HEADER_LEN..]);
+        assert!(matches!(
+            CapabilityProof::from_bytes(&excess),
+            Err(CapabilityProofDecodeError::TooManySteps { count: 256, .. })
+        ));
+    }
+
+    #[test]
+    fn typed_native_proof_excludes_even_edge_frame_padding() {
+        use crate::repo::pile::{Pile, PileRecordContent, PileRecords};
+        use crate::repo::{CapabilityProofRead, CapabilityProofStore, StorageClose};
+
+        let cap = CapabilityHandle::new([4; 32]);
+        let proof = CapabilityProof::new(resource(9), &key(1), cap, key(2).verifying_key())
+            .delegate(&key(2), cap, key(3).verifying_key())
+            .unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut pile = Pile::open(file.path()).unwrap();
+        pile.insert_proof(proof.clone()).unwrap();
+        assert_eq!(file.as_file().metadata().unwrap().len(), 512);
+        let snapshot = pile.snapshot().unwrap();
+        let mapped = snapshot.proof(proof.id()).unwrap().unwrap();
+        assert_eq!(mapped.bytes.edges.len(), 2);
+        assert_eq!(mapped.as_bytes().len(), 352);
+        assert_eq!(mapped, proof);
+        let mut records = PileRecords::open(file.path()).unwrap();
+        let record = records.next().unwrap().unwrap();
+        let PileRecordContent::CapabilityProof {
+            data_offset,
+            data_len,
+            ..
+        } = record.content
+        else {
+            panic!("expected a capability proof");
+        };
+        assert_eq!((data_offset, data_len), (32, 352));
+        assert_eq!(&records.bytes()[384..512], &[0; 128]);
+        assert!(records.next().is_none());
+        drop((snapshot, records));
+        pile.close().unwrap();
+        mapped.verify_signatures().unwrap();
+        assert_eq!(mapped.id(), proof.id());
     }
 
     #[test]

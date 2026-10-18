@@ -150,7 +150,13 @@ Native Pile and MemoryRepo insertion verify proof signatures. Trusted native
 replay and `CapabilityProof::from_bytes` check structure without repeating
 cryptography. The generic authorization kernel still verifies the signatures
 of the prefixes it consumes; structural decoding alone is not its trust
-boundary. Pile indexes retain shared owning `anybytes::View` values.
+boundary. Proofs retain an owning `View<EncodedCapabilityProof>` over the
+unchanged 96-byte header and trailing slice of 128-byte encoded edges. The
+alignment-one, padding-free layout derives its slice metadata from the exact
+unpadded body; it does not validate keys or signatures by itself. Owned-byte
+construction and prefix views share their original owner without copying the
+body, while the borrowed-byte convenience constructor still copies. Pile
+indexes retain these same typed views over their immutable mappings.
 
 The generic Pile framing magic and block span precede the canonical proof.
 Framing and zero padding are outside its signatures and hash. A zero padding
