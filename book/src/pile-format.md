@@ -544,8 +544,11 @@ This is not migration or deployment. Old native kinds remain opaque (or
 explicit retired evidence); they never become current assertions around old
 signatures. In particular old COMMIT frames lose active typed visibility while
 their bytes remain preserved. Old dense wrappers are rejected even by trusted
-ObjectStore decoding. A coordinated cutover still needs an explicit own-key
-re-attestation tool, policy, rehearsal, and adoption preflight.
+ObjectStore decoding. The offline `pile migrate canonical` and
+`canonical-refresh` commands provide explicit own-key re-attestation and exact
+foreign-author refresh. Their synthetic acceptance is not a live cutover:
+retained-source inventory, supported-history and refresh availability, an
+operator policy, rehearsal, and coordinated adoption preflight remain necessary.
 
 The collection itself is identified by a canonical `SimpleArchive` descriptor.
 Its 32-byte blob handle is the sole `CollectionHandle`. Records carry this
@@ -633,17 +636,13 @@ root and required representation closure are resident; otherwise it descends
 to attachments below that node. Typed materialization still validates the
 selected raw/index pair.
 
-Pile fixed-record roots retain the whole 224-byte canonical assertion in PATCH,
-with direct segments `[32, 32, 32, 128]`: kind, collection, produced member,
-and the full remaining signed tail. The constant per-kind prefix participates
-in selectors. Borrowed typed views retain their complete root/archive owner;
-heap leaves are never extended backwards to pretend an absent kind exists.
-MERGE retains its occurrence-based index route. The final index architecture
-can change without changing canonical bytes.
-
+Pile's typed occurrence index is independent of these canonical signed bytes,
+as described above: per-kind collection/member/offset keys route to values
+retaining the actual immutable mappings. MERGE also uses an occurrence route.
 `Collection(C)` and `ProducedMember(C, H)`, plus kind-specific selectors,
-return every distinct full assertion once. Repeated physical frames do not
-change set semantics; physical diagnostics still expose every occurrence.
+return matching typed occurrences, including repeated physical copies.
+Overlapping selectors do not repeat the same occurrence. Consumers that need
+semantic sets perform that projection explicitly; coverage remains idempotent.
 Indexing does not perform capability admission, signature rechecks, or blob
 loads. Public structural views require checked conversion before foreign
 claims become trusted records.
