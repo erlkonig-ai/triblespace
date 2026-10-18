@@ -61,9 +61,9 @@ fn observed_and_borrowed_wrappers_forward_views_without_owned_fallback() {
             &self,
             _: &Self,
             _: &BTreeSet<CollectionRecordSelector>,
-        ) -> Result<(Vec<CollectionRecordView>, Vec<CollectionRecordView>), Self::RecordsError>
+        ) -> Result<triblespace_core::collection::RecordViewChanges, Self::RecordsError>
         {
-            Ok((self.0.clone(), vec![]))
+            Ok(triblespace_core::collection::RecordViewChanges::Append(self.0.clone()))
         }
     }
     let c = Inline::new([30; 32]);
@@ -286,4 +286,65 @@ fn body_views_keep_kind_identity_and_reject_nonfoundation_eager_values() {
         decode_record(c, &foreign).is_err(),
         "wire ingress still verifies the literal existing kind's signature"
     );
+}
+
+#[test]
+fn occurrence_append_and_replacement_preserve_semantic_peer_inventory() {
+    use std::io::Write;
+    use triblespace_core::collection::RecordViewChanges;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("two-copies.pile");
+    std::fs::File::create(&path).unwrap();
+    let mut pile = PileFile::open(&path).unwrap();
+    let c = Inline::new([71; 32]);
+    let make = |n| CollectionRecord::Commit(CollectionCommit::sign(
+        &SigningKey::from_bytes(&[72; 32]), c, Inline::new([73; 32]), Inline::new([n; 32]),
+    ));
+    let a = make(74);
+    let b = make(75); // same C/member, different signed body
+    pile.insert(a).unwrap();
+    let frame = std::fs::read(&path).unwrap();
+    std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(&frame).unwrap();
+    let before = pile.snapshot().unwrap();
+    assert_eq!(before.records().unwrap().count(), 2);
+    let initial = collection_record_patch(&before, c).unwrap();
+    assert_eq!(initial.len(), 1);
+    let held = overlay_value(&initial, a);
+    std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(&frame).unwrap();
+    let after = pile.snapshot().unwrap();
+    let selectors = BTreeSet::from([CollectionRecordSelector::Foundations(c)]);
+    assert!(matches!(after.select_record_view_changes(&before, &selectors).unwrap(),
+        RecordViewChanges::Append(v) if v.len() == 1));
+    let appended = update_collection_record_patch(&after, &before, &initial).unwrap();
+    assert_eq!(appended.len(), 1);
+    assert_eq!(value_body(&overlay_value(&appended, a)).as_ptr(), value_body(&held).as_ptr(),
+        "duplicate append retains the first canonical body owner");
+
+    let one_path = dir.path().join("one-copy.pile");
+    std::fs::write(&one_path, &frame).unwrap();
+    let mut one = PileFile::open(&one_path).unwrap();
+    let one_snapshot = one.snapshot().unwrap();
+    assert!(matches!(one_snapshot.select_record_view_changes(&after, &selectors).unwrap(), RecordViewChanges::Rebuild));
+    let rebuilt = update_collection_record_patch(&one_snapshot, &after, &appended).unwrap();
+    assert_eq!(rebuilt.len(), 1);
+    assert_eq!(rebuilt.get(a.fingerprint()), Some(a));
+
+    let different_path = dir.path().join("different-body.pile");
+    std::fs::File::create(&different_path).unwrap();
+    let mut different = PileFile::open(&different_path).unwrap();
+    different.insert(b).unwrap();
+    let different_snapshot = different.snapshot().unwrap();
+    let replaced = update_collection_record_patch(&different_snapshot, &one_snapshot, &rebuilt).unwrap();
+    assert_eq!(replaced.len(), 1);
+    assert_eq!(replaced.get(a.fingerprint()), None);
+    assert_eq!(replaced.get(b.fingerprint()), Some(b));
+
+    let empty_path = dir.path().join("empty.pile");
+    std::fs::File::create(&empty_path).unwrap();
+    let mut empty = PileFile::open(&empty_path).unwrap();
+    let empty_snapshot = empty.snapshot().unwrap();
+    assert!(update_collection_record_patch(&empty_snapshot, &different_snapshot, &replaced).unwrap().is_empty());
+    drop((before, after, one_snapshot, different_snapshot, empty_snapshot, initial, appended, rebuilt, replaced));
+    pile.close().unwrap(); one.close().unwrap(); different.close().unwrap(); empty.close().unwrap();
+    assert_eq!(held.bytes(c).unwrap(), a.to_bytes());
 }

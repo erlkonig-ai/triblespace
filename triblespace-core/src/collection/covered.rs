@@ -61,8 +61,8 @@ pub trait RecordDelta {
     /// evidence after a physical append. This is an incremental fold feed,
     /// not the exact semantic set difference of `CollectionRead`.
     /// Shared persistent subtrees are skipped where available. Independent
-    /// snapshots without comparable occurrence identities may need a semantic
-    /// comparison of affected history instead.
+    /// snapshots without comparable occurrence identities may offer the whole
+    /// current bag instead. This feed does not describe semantic removals.
     fn for_each_record_since(&self, since: Option<&Self>, each: &mut dyn FnMut(&CollectionRecord));
 }
 
@@ -627,7 +627,7 @@ impl<T: CollectionRead> CollectionRead for CoveredSnapshot<T> {
     fn select_record_view_changes(
         &self, previous: &Self,
         selectors: &std::collections::BTreeSet<crate::collection::CollectionRecordSelector>,
-    ) -> Result<(Vec<crate::collection::CollectionRecordView>, Vec<crate::collection::CollectionRecordView>), Self::RecordsError> {
+    ) -> Result<crate::collection::RecordViewChanges, Self::RecordsError> {
         self.inner.select_record_view_changes(&previous.inner, selectors)
     }
 

@@ -120,8 +120,10 @@ pub trait CollectionRead {
     where
         Self: 'a;
 
-    /// Enumerate currently known records, each once, in a deterministic
-    /// order.
+    /// Enumerate the known record bag in a deterministic backend order for
+    /// this snapshot. Equal canonical records may occur more than once.
+    /// Consumers that need a set must fold idempotently or deduplicate there.
+    /// Order and multiplicity need not agree between independently built stores.
     fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError>;
 
     /// Every collection at least one known record names, each once, in
@@ -137,8 +139,9 @@ pub trait CollectionRead {
     ///
     /// The default implementation performs exactly one ordinary enumeration
     /// and filters it. Backends with primary or secondary indexes may override
-    /// this method without changing the grow-only set contract. Each selected
-    /// record is returned once, in the backend's deterministic order. An empty
+    /// this method without changing the bag contract. Each selected occurrence
+    /// is returned once even if several routes match it; equal records at
+    /// different occurrences remain repeated, in the backend's order. An empty
     /// union returns immediately without asking the backend for a view.
     fn select_records(
         &self,
@@ -169,16 +172,21 @@ pub trait CollectionRead {
         Ok(self.select_records(selectors)?.into_iter().map(Into::into).collect())
     }
 
-    /// Exact selected semantic delta represented as immutable canonical bodies.
-    /// The default preserves the backend's existing selected-delta algorithm.
+    /// Advance a consumer's selected semantic set from this record bag.
+    /// The result distinguishes repeated append evidence, an exact semantic
+    /// delta, and replacement that requires rebuilding from the current view.
+    /// The default preserves the backend's exact selected-delta algorithm.
     fn select_record_view_changes(
         &self,
         previous: &Self,
         selectors: &BTreeSet<CollectionRecordSelector>,
-    ) -> Result<(Vec<CollectionRecordView>, Vec<CollectionRecordView>), Self::RecordsError> {
-        if selectors.is_empty() { return Ok((Vec::new(), Vec::new())); }
+    ) -> Result<RecordViewChanges, Self::RecordsError> {
+        if selectors.is_empty() { return Ok(RecordViewChanges::Append(Vec::new())); }
         let (added, removed) = self.select_record_changes(previous, selectors)?;
-        Ok((added.into_iter().map(Into::into).collect(), removed.into_iter().map(Into::into).collect()))
+        Ok(RecordViewChanges::Delta {
+            added: added.into_iter().map(Into::into).collect(),
+            removed: removed.into_iter().map(Into::into).collect(),
+        })
     }
 
     /// Canonical records added and removed between two immutable observations
@@ -197,6 +205,23 @@ pub trait CollectionRead {
     ) -> Result<(Vec<CollectionRecord>, Vec<CollectionRecord>), Self::RecordsError> {
         selected_record_changes(self, previous, selectors)
     }
+}
+
+/// Selected evidence for advancing a semantic record set between snapshots.
+#[derive(Clone, Debug)]
+pub enum RecordViewChanges {
+    /// Append-only evidence. Bodies may repeat records already in the consumer
+    /// or elsewhere in this batch; apply them idempotently. Nothing is removed.
+    Append(Vec<CollectionRecordView>),
+    /// Exact semantic additions and removals, independent of physical copies.
+    Delta {
+        added: Vec<CollectionRecordView>,
+        removed: Vec<CollectionRecordView>,
+    },
+    /// Occurrence coordinates are incomparable or the source is not an append
+    /// of the previous observation. Rebuild from the current selected bag;
+    /// physical removals are not semantic removals.
+    Rebuild,
 }
 
 pub(crate) fn selected_record_changes<R: CollectionRead + ?Sized>(
@@ -308,7 +333,7 @@ where
     fn select_record_view_changes(
         &self, previous: &Self,
         selectors: &std::collections::BTreeSet<crate::collection::CollectionRecordSelector>,
-    ) -> Result<(Vec<crate::collection::CollectionRecordView>, Vec<crate::collection::CollectionRecordView>), Self::RecordsError> {
+    ) -> Result<crate::collection::RecordViewChanges, Self::RecordsError> {
         (**self).select_record_view_changes(*previous, selectors)
     }
 

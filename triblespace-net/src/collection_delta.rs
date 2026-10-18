@@ -16,7 +16,7 @@ use anybytes::View;
 
 use triblespace_core::collection::{
     CollectionHandle, CollectionRead, CollectionRecord, CollectionRecordView, CollectionRecordFingerprint,
-    CollectionRecordSelector, RecordDecodeError, EncodedCommit, EncodedDerive,
+    CollectionRecordSelector, RecordDecodeError, RecordViewChanges, EncodedCommit, EncodedDerive,
 };
 use triblespace_core::patch::{Blake3Merkle, Entry as PatchEntry, IdentitySchema, PATCH};
 
@@ -188,8 +188,9 @@ where
     canonical_records(collection, records).map_err(CollectionRecordPatchError::Evidence)
 }
 
-/// Advance the PATCH built from `previous` using only selected semantic record
-/// additions and removals. `prior` must describe that previous snapshot and
+/// Advance the PATCH built from `previous` using selected append evidence or
+/// exact semantic changes; rebuild when physical sources are incomparable.
+/// `prior` must describe that previous snapshot and
 /// retains its unchanged persistent Merkle subtrees; no old record body is
 /// rehashed simply because another record arrived in its collection.
 pub fn update_collection_record_patch<R>(
@@ -202,9 +203,14 @@ where
 {
     let expected = prior.collection;
     let selectors = BTreeSet::from([CollectionRecordSelector::Foundations(expected)]);
-    let (added, removed) = current
+    let changes = current
         .select_record_view_changes(previous, &selectors)
         .map_err(CollectionRecordPatchError::Store)?;
+    let (added, removed) = match changes {
+        RecordViewChanges::Append(added) => (added, Vec::new()),
+        RecordViewChanges::Delta { added, removed } => (added, removed),
+        RecordViewChanges::Rebuild => return collection_record_patch(current, expected),
+    };
     // Operation-local deltas: edit the retained Merkle trie once per batch,
     // rather than rehashing its wide ancestors after every changed record.
     // PATCH equality only observes keys, so validate attached values before
@@ -219,7 +225,7 @@ where
                     CollectionDeltaError::FingerprintCollision(fingerprint),
                 ));
             }
-            insert_record(expected, &mut removals, record)
+            insert_fingerprinted_record(&mut removals, record, fingerprint)
                 .map_err(CollectionRecordPatchError::Evidence)?;
         }
     }
@@ -237,7 +243,7 @@ where
         }
         // Checks duplicates/collisions within this batch independently of the
         // retained tree. Actual values, not placeholders, enter the delta.
-        insert_record(expected, &mut additions, record)
+        insert_fingerprinted_record(&mut additions, record, fingerprint)
             .map_err(CollectionRecordPatchError::Evidence)?;
     }
     next.commits.union(additions.commits);
@@ -311,6 +317,16 @@ fn insert_record(
     let record = record.into();
     validate_view(expected, &record)?;
     let fingerprint = record.fingerprint();
+    insert_fingerprinted_record(canonical, record, fingerprint)
+}
+
+// The caller validated the collection/kind and computed this fingerprint for
+// this exact view. Incremental membership checks and batch insertion reuse it.
+fn insert_fingerprinted_record(
+    canonical: &mut CollectionRecordPatch,
+    record: CollectionRecordView,
+    fingerprint: CollectionRecordFingerprint,
+) -> Result<(), CollectionDeltaError> {
     let key = fingerprint.raw();
     if let Some(matches) = canonical.matches(fingerprint, &record) {
         if !matches {

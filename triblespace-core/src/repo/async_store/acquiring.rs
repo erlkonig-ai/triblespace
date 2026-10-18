@@ -210,7 +210,7 @@ impl<S: CollectionRead> CollectionRead for AcquiringReader<S> {
 
     fn select_record_view_changes(
         &self, previous: &Self, selectors: &BTreeSet<CollectionRecordSelector>,
-    ) -> Result<(Vec<crate::collection::CollectionRecordView>, Vec<crate::collection::CollectionRecordView>), Self::RecordsError> {
+    ) -> Result<crate::collection::RecordViewChanges, Self::RecordsError> {
         self.frozen.select_record_view_changes(&previous.frozen, selectors).map_err(crate::repo::ReadFailure::new)
     }
 }

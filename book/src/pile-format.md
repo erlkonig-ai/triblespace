@@ -504,23 +504,41 @@ AUTH's existing complete prefix-signed proof grammar is unchanged. ALPN33
 remains this unreleased candidate's boundary from deployed32.
 
 The in-memory fixed-record index stores ordinary typed `View` values in PATCH
-leaves, keyed by `collection32 | produced-member32 | BLAKE3(canonical-body)32`.
-Each value retains its actual immutable mapping, not a whole record-root owner.
-Replay's checked lazy insertion keeps the first value/owner for an exact
-duplicate without constructing another view. Equal complete keys with unequal
-bodies report an error without repairing or truncating the source. This check
-does not turn key-only cross-root set algebra into a collision detector: the
-index still assumes fingerprint identity there.
+leaves, keyed by `collection32 | produced-member32 | frame-offset-be8`, with
+separate COMMIT, DERIVE and MAP roots. Each value retains its actual immutable
+mapping, not a whole record-root owner. Distinct physical frames remain distinct
+occurrences, including byte-identical assertions and different signed assertions
+with the same collection/member. Replay does not compute a body fingerprint for
+this index. Checked lazy insertion preserves the first owner at an already-held
+coordinate and refuses unequal bodies there without truncating the source.
+Offsets identify frames only within one append-only source generation: all
+cross-snapshot key shortcuts must establish that origin first.
 
 Full fixed-record enumeration streams one leaf at a time. This implementation
 groups COMMIT, DERIVE, MAP and orders each kind by its stable key; consumers
-rely on deterministic backend order, not a particular index layout. It does
+rely on deterministic order within a snapshot, not cross-file physical order. It does
 not sort canonical bodies or promise their former byte order. Prefix-local
 selectors deduplicate overlapping routes and return the corresponding filtered
-enumeration order. A record decoded to the existing owned return type needs no
+enumeration order, retaining distinct copies. A record decoded to the owned return type needs no
 temporary `View` clone; an escaping body view retains its own mapping. The
-already-computed fingerprint accompanies native body views for peer indexing.
-MERGE's occurrence path and all persisted/signed bytes remain unchanged.
+peer's shared per-collection overlay computes the canonical BLAKE3 fingerprint
+and checks exact bodies before deduplicating its semantic set. Its update feed
+distinguishes repeated append evidence from exact semantic deltas and a required
+rebuild. Origin changes or a decreasing observed prefix request a rebuild;
+physical removal of one duplicate must never delete a still-present assertion.
+The same overlay and its caches are reused across peer observations; there is no
+per-neighbor storage index.
+
+`CollectionRead::records` and selections are typed known-record bags, including
+MERGE's existing occurrence path. Listing/counting these results reports
+occurrences unless the caller explicitly computes distinct assertions. Coverage
+folds remain idempotent; authored `insert` still avoids appending an already-held
+assertion. Explicit owned `select_record_changes` remains a semantic set
+operation and can require selecting/comparing both sides across origins; it is
+not a hidden deduplication step on every read. `raw_records`/`PileRecords` is the
+separate complete physical-frame API, in file order with offsets, including
+BLOB, AUTH, retired and opaque frames. This change does not alter their formats
+or indexes, persisted/signed bytes, or live deployment.
 
 This is not migration or deployment. Old native kinds remain opaque (or
 explicit retired evidence); they never become current assertions around old

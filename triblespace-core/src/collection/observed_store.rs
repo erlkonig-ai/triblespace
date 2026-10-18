@@ -319,7 +319,7 @@ impl<R: CollectionRead> CollectionRead for ObservedStore<R> {
 
     fn select_record_view_changes(
         &self, previous: &Self, selectors: &BTreeSet<CollectionRecordSelector>,
-    ) -> Result<(Vec<crate::collection::CollectionRecordView>, Vec<crate::collection::CollectionRecordView>), Self::RecordsError> {
+    ) -> Result<crate::collection::RecordViewChanges, Self::RecordsError> {
         for tracker in [&self.tracker, &previous.tracker] {
             tracker.lock().expect("store dependency tracker is not poisoned")
                 .records.extend(selectors.iter().copied());

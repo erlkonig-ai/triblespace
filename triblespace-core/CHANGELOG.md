@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Isolated occurrence-view candidate: fixed records use 72-byte
+  collection/member/offset PATCH keys and typed mmap-owning values. Typed record
+  enumeration/selection preserves physical duplicates; overlapping routes do
+  not repeat the same occurrence. Expose append/exact-delta/rebuild semantics
+  for view consumers, guard physical source identity before key shortcuts, and
+  retain explicit semantic owned deltas and idempotent authored insertion.
+  Counts/listings now describe occurrences unless a consumer requests a set.
+
 - Add a synthetic native-Pile rewrite rehearsal, using actual deployed /32
   writer fixtures and a test-only old-kind adapter. It copies validated BLOB
   and AUTH frames unchanged, reseals owned foundations/MAP/exact-eight MERGE,
@@ -32,12 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DERIVE `5D09D99A2B549A60BEA9942E7E5752FD`,
   MAP `3D52F26EC0A2852BF2ED998A3A8A56F5`,
   MERGE `75B76CA9E028127AC06C550A156B469D`.
-- Full 224-byte archive-backed PATCH keys retain every signed field and the
-  kind, with direct kind/collection/member/tail segmentation. Sealed store
-  views keep complete root/archive ownership; public structural views require
-  strict conversion. Fixed duplicate occurrences collapse while diagnostics
-  retain physical occurrences. MERGE keeps its occurrence index; final index
-  selection remains independent of the canonical format.
+- Typed fixed-record views retain canonical signed bodies and actual mapping
+  ownership; public structural views require strict conversion. The selected
+  in-memory occurrence layout remains independent of the canonical format.
 - Old native signatures are never wrapped in current kinds: old frames remain
   opaque or explicitly retired evidence, and old dense wrappers are rejected.
   Current eight-input MERGEs cannot supersede historical binary equations.

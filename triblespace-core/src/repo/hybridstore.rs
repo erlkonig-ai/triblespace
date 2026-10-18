@@ -348,7 +348,7 @@ where
     fn select_record_view_changes(
         &self, previous: &Self,
         selectors: &std::collections::BTreeSet<crate::collection::CollectionRecordSelector>,
-    ) -> Result<(Vec<crate::collection::CollectionRecordView>, Vec<crate::collection::CollectionRecordView>), Self::RecordsError> {
+    ) -> Result<crate::collection::RecordViewChanges, Self::RecordsError> {
         self.records.select_record_view_changes(&previous.records, selectors)
     }
 

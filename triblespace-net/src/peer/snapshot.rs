@@ -402,7 +402,7 @@ where
 
     fn select_record_view_changes(
         &self, previous: &Self, selectors: &BTreeSet<CollectionRecordSelector>,
-    ) -> Result<(Vec<triblespace_core::collection::CollectionRecordView>, Vec<triblespace_core::collection::CollectionRecordView>), Self::RecordsError> {
+    ) -> Result<triblespace_core::collection::RecordViewChanges, Self::RecordsError> {
         self.frozen.select_record_view_changes(&previous.frozen, selectors)
     }
 }

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- In the isolated occurrence-view candidate, advance each shared collection
+  peer set from repeated append evidence, exact semantic deltas, or a full
+  rebuild after physical-source replacement. Retain full-body collision checks
+  and reuse each update's computed fingerprint for batch insertion. Duplicate
+  physical copies do not become distinct peer items or semantic removals.
+
 - Simplify the private ALPN33 cached-RIBLT wire: derive its SipHash key from
   OPEN without repeating it in ROOT, and replace cached DONE/LANDED with gated
   write-half FIN. Actual ROOT/body writes, exact proof and insertion/fetch debt

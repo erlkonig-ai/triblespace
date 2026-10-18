@@ -206,6 +206,22 @@ impl<R: CollectionRead> CollectionRead for CountedSnapshot<R> {
     ) -> Result<(Vec<CollectionRecord>, Vec<CollectionRecord>), Self::RecordsError> {
         self.inner.select_record_changes(&previous.inner, selectors)
     }
+
+    fn select_record_views(
+        &self,
+        selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<Vec<triblespace_core::collection::CollectionRecordView>, Self::RecordsError> {
+        self.enumerations.fetch_add(1, Ordering::Relaxed);
+        self.inner.select_record_views(selectors)
+    }
+
+    fn select_record_view_changes(
+        &self,
+        previous: &Self,
+        selectors: &BTreeSet<CollectionRecordSelector>,
+    ) -> Result<triblespace_core::collection::RecordViewChanges, Self::RecordsError> {
+        self.inner.select_record_view_changes(&previous.inner, selectors)
+    }
 }
 
 impl<R: WantRead> WantRead for CountedSnapshot<R> {
@@ -977,6 +993,38 @@ impl ScopedFixture {
             self.blob_reads.swap(0, Ordering::Relaxed),
         )
     }
+}
+
+#[test]
+fn occurrence_duplicate_append_and_unchanged_observation_reuse_shared_caches() {
+    use std::io::Write;
+    use crate::walk::WalkKind;
+    let mut fixture = ScopedFixture::new();
+    let selected = fixture.active();
+    let before = fixture.observe(&selected, None);
+    assert_eq!(fixture.take_counts().0, 2, "one initial inventory per collection");
+    let path = fixture._directory.path().join("scoped-host-observation.pile");
+    let mut raw = before.0.inner.raw_records();
+    let occurrence = raw.find(|entry| matches!(entry.as_ref().unwrap().content,
+        triblespace_core::repo::pile::PileRecordContent::Collection { record }
+            if record == fixture.records[0])).unwrap().unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::OpenOptions::new().append(true).open(&path).unwrap()
+        .write_all(&bytes[occurrence.offset..occurrence.offset + occurrence.len]).unwrap();
+    let appended = fixture.observe(&selected, Some(&before));
+    assert_eq!(fixture.take_counts().0, 0, "append update does not rebuild an inventory");
+    let c = fixture.collections[0].handle();
+    let old = before.1.collection(c).unwrap();
+    let new = appended.1.collection(c).unwrap();
+    assert_eq!(new.repair.records().len(), old.repair.records().len());
+    assert_same_record_leaves(&old, &new, &[fixture.records[0]]);
+    assert!(Arc::ptr_eq(&old.cache(WalkKind::Commit), &new.cache(WalkKind::Commit)));
+    // Multiple consumers pin the same published collection, not per-peer builds.
+    assert!(Arc::ptr_eq(&new, &appended.1.collection(c).unwrap()));
+    let same = fixture.observe(&selected, Some(&appended));
+    assert_eq!(fixture.take_counts(), (0, 0, 0));
+    assert!(Arc::ptr_eq(&new.cache(WalkKind::Commit),
+        &same.1.collection(c).unwrap().cache(WalkKind::Commit)));
 }
 
 #[test]

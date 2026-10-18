@@ -1,11 +1,9 @@
-//! Typed fixed-record values keyed by collection, member and BLAKE3(body).
+//! Typed fixed-record occurrences keyed by collection, member and frame offset.
 //!
-//! The discriminator is a hash identity assumption, not injective byte identity.
-//! Where bodies meet, unequal bodies under one key refuse insertion. Independent
-//! roots can nevertheless hide a forced collision in key-only PATCH difference;
-//! the counterexample below records that limit instead of adding a catalogue.
+//! Keys identify occurrences only within one append-only source generation.
+//! Snapshot boundaries must check record_origin before key-only PATCH algebra.
 //! The retained value is one typed View owning its actual mmap, not a root cover.
-//! Enumeration is streaming, grouped by kind and ordered by this stable key.
+//! Enumeration is a streaming bag, grouped by kind and ordered within a snapshot.
 
 use super::*;
 use anybytes::View;
@@ -13,14 +11,9 @@ use crate::collection::{CollectionRecordView, EncodedCommit, EncodedDerive, Enco
 use crate::patch::PATCHIntoOrderedIterator;
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
-mod compact {
-    pub const KEY_LEN: usize = 96;
-    pub const TAIL_LEN: usize = 32;
-    crate::key_segmentation!(Segments, 96, [32, 32, 32]);
-    crate::key_schema!(Schema, Segments, 96, [0, 1, 2]);
-}
-use compact::{KEY_LEN, TAIL_LEN};
-type Fixed<T> = PATCH<KEY_LEN, compact::Schema, View<T>, XorSip128>;
+const KEY_LEN: usize = 72;
+const TAIL_LEN: usize = 8;
+type Fixed<T> = PATCH<KEY_LEN, collection_record_key::Schema, View<T>, XorSip128>;
 
 trait Body: Immutable + IntoBytes + KnownLayout + TryFromBytes + Send + Sync + 'static {
     const KIND: FixedKind;
@@ -61,21 +54,6 @@ impl FixedKind {
     }
 }
 
-#[cfg(test)]
-thread_local! { static FORCE_COLLISION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
-
-fn compact_key(body: &[u8]) -> [u8; KEY_LEN] {
-    assert_eq!(body.len(), 224);
-    let mut key = [0; KEY_LEN];
-    key[..64].copy_from_slice(&body[32..96]);
-    // Every physical record pays the body fingerprint. Only a new key pays
-    // PATCH's separate leaf hash, which summarizes this 96-byte key.
-    key[64..].copy_from_slice(blake3::hash(body).as_bytes());
-    #[cfg(test)]
-    if FORCE_COLLISION.get() { key[64..].fill(0); }
-    key
-}
-
 fn member_prefix(collection: CollectionHandle, member: CollectionData) -> [u8; 64] {
     let mut prefix = [0; 64];
     prefix[..32].copy_from_slice(&collection.raw);
@@ -91,9 +69,8 @@ fn shares_selected<T: Body>(a: &Fixed<T>, b: &Fixed<T>, s: &CollectionRecordSele
     }
 }
 
-fn trusted_view<T: Body>(key: &[u8; KEY_LEN], view: &View<T>) -> CollectionRecordView {
+fn trusted_view<T: Body>(view: &View<T>) -> CollectionRecordView {
     CollectionRecordView::from_native_fixed(view.clone().bytes())
-        .with_native_fingerprint(key[64..].try_into().unwrap())
 }
 
 fn selected_keys<T: Body>(root: &Fixed<T>, selectors: &BTreeSet<CollectionRecordSelector>) -> Vec<[u8; KEY_LEN]> {
@@ -123,7 +100,23 @@ fn selected_keys<T: Body>(root: &Fixed<T>, selectors: &BTreeSet<CollectionRecord
 }
 
 fn selected_views<T: Body>(root: &Fixed<T>, selectors: &BTreeSet<CollectionRecordSelector>) -> Vec<CollectionRecordView> {
-    selected_keys(root, selectors).iter().map(|key| trusted_view(key, root.get(key).unwrap())).collect()
+    selected_keys(root, selectors).iter().map(|key| trusted_view(root.get(key).unwrap())).collect()
+}
+
+fn contains<T: Body>(root: &Fixed<T>, body: &[u8]) -> bool {
+    // Explicit semantic membership for idempotent authored insertion only.
+    // Replay never scans the other occurrences of this member.
+    let mut key = [0; KEY_LEN];
+    key[..64].copy_from_slice(&body[32..96]);
+    let prefix: [u8; 64] = key[..64].try_into().unwrap();
+    let mut present = false;
+    root.infixes(&prefix, |offset: &[u8; TAIL_LEN]| {
+        if !present {
+            key[64..].copy_from_slice(offset);
+            present = root.get(&key).is_some_and(|value| value.as_bytes() == body);
+        }
+    });
+    present
 }
 
 fn decode<T: Body>(view: &View<T>) -> CollectionRecord {
@@ -148,7 +141,7 @@ fn checked_insert<T: Body>(root: &mut Fixed<T>, key: &[u8; KEY_LEN], body: &[u8]
             Ok(())
         } else {
             // Not CorruptPile: automatic tail repair MUST NOT truncate evidence.
-            Err(ReadError::IoError(std::io::Error::other("record discriminator collision: unequal canonical bodies")))
+            Err(ReadError::IoError(std::io::Error::other("record occurrence collision: unequal canonical bodies at one offset")))
         }
     })?;
     Ok(())
@@ -179,16 +172,15 @@ impl CollectionRecordIndex {
         } else { false }
     }
     pub(super) fn difference(&self, other: &Self) -> Self {
-        // Hash-identity assumption: this is key-only, NOT a cross-root collision
-        // check. The forced independent-root test demonstrates its limitation.
+        // Caller must establish the same record_origin before comparing keys.
         Self { commits: self.commits.difference(&other.commits), derives: self.derives.difference(&other.derives),
             maps: self.maps.difference(&other.maps), occurrences: self.occurrences.difference(&other.occurrences) }
     }
     pub(super) fn contains_fixed(&self, record: &CollectionRecord) -> bool {
         match record {
-            CollectionRecord::Commit(r) => { let b = r.to_bytes(); self.commits.get(&compact_key(&b)).is_some_and(|v| v.as_bytes() == b) }
-            CollectionRecord::Derive(r) => { let b = r.to_bytes(); self.derives.get(&compact_key(&b)).is_some_and(|v| v.as_bytes() == b) }
-            CollectionRecord::Map(r) => { let b = r.to_bytes(); self.maps.get(&compact_key(&b)).is_some_and(|v| v.as_bytes() == b) }
+            CollectionRecord::Commit(r) => contains(&self.commits, &r.to_bytes()),
+            CollectionRecord::Derive(r) => contains(&self.derives, &r.to_bytes()),
+            CollectionRecord::Map(r) => contains(&self.maps, &r.to_bytes()),
             CollectionRecord::Merge(_) => false,
         }
     }
@@ -218,9 +210,9 @@ impl CollectionRecordIndex {
             maps: self.maps.into_iter_ordered(),
         }
     }
-    pub(super) fn insert_current_fixed(&mut self, record: &CollectionRecord, frame: &[u8], mmap: &Arc<MmapRaw>) -> Result<(), ReadError> {
+    pub(super) fn insert_current_fixed(&mut self, record: &CollectionRecord, offset: usize, frame: &[u8], mmap: &Arc<MmapRaw>) -> Result<(), ReadError> {
         let body = &frame[FRAME_KIND_OFFSET..FRAME_KIND_OFFSET + 224];
-        let key = compact_key(body);
+        let key = collection_record_key(record, offset);
         match record {
             CollectionRecord::Commit(_) => checked_insert(&mut self.commits, &key, body, mmap),
             CollectionRecord::Derive(_) => checked_insert(&mut self.derives, &key, body, mmap),
@@ -231,9 +223,9 @@ impl CollectionRecordIndex {
 }
 
 pub(super) struct FixedRecordIter {
-    commits: PATCHIntoOrderedIterator<KEY_LEN, compact::Schema, View<EncodedCommit>>,
-    derives: PATCHIntoOrderedIterator<KEY_LEN, compact::Schema, View<EncodedDerive>>,
-    maps: PATCHIntoOrderedIterator<KEY_LEN, compact::Schema, View<EncodedMap>>,
+    commits: PATCHIntoOrderedIterator<KEY_LEN, collection_record_key::Schema, View<EncodedCommit>>,
+    derives: PATCHIntoOrderedIterator<KEY_LEN, collection_record_key::Schema, View<EncodedDerive>>,
+    maps: PATCHIntoOrderedIterator<KEY_LEN, collection_record_key::Schema, View<EncodedMap>>,
 }
 impl Iterator for FixedRecordIter {
     type Item = CollectionRecord;

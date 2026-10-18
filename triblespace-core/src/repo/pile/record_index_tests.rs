@@ -127,8 +127,7 @@ fn native_fixed_index_matches_raw_oracle_and_selected_order() {
         append_test_bytes(&path, &collection_record_header(record));
     }
     let after = pile.snapshot().unwrap();
-    // The old occurrence reader's semantic oracle, without retaining its
-    // physical catalogue alongside the candidate.
+    // Independent raw-frame oracle: both the assertion set and multiplicity.
     let oracle: BTreeSet<_> = PileRecords::open(&path)
         .unwrap()
         .filter_map(|r| match r.unwrap().content {
@@ -142,17 +141,17 @@ fn native_fixed_index_matches_raw_oracle_and_selected_order() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(all.iter().copied().collect::<BTreeSet<_>>(), oracle);
-    assert_eq!(all.len(), oracle.len());
+    assert_eq!(all.len(), 2 * records.len());
     assert_eq!(
         before
             .records()
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
-            .unwrap(),
-        all
+            .unwrap().into_iter().collect::<BTreeSet<_>>(),
+        oracle
     );
     assert_eq!(after.collection_records.occurrences.len(), 2);
-    assert_eq!(after.collection_records.len(), oracle.len() as u64 + 1);
+    assert_eq!(after.collection_records.len(), 2 * records.len() as u64);
     assert_eq!(
         after.collection_occurrences().unwrap().len(),
         2 * records.len()
@@ -257,7 +256,7 @@ fn native_fixed_index_preserves_opaque_old_frames_without_promoting_assertions()
 }
 
 #[test]
-fn native_fixed_index_reuses_map_owner_and_duplicate_remap_does_not_adopt_it() {
+fn native_fixed_index_reuses_maps_and_keeps_duplicate_occurrence_owner() {
     let dir = tempfile::tempdir().unwrap();
     let path = fresh_empty_pile_path(&dir, "owner-reuse.pile");
     let mut pile = PileFile::open(&path).unwrap();
@@ -271,7 +270,7 @@ fn native_fixed_index_reuses_map_owner_and_duplicate_remap_does_not_adopt_it() {
     assert_eq!(Arc::as_ptr(&pile.mmap), initial_address);
     let fixed_only = first.collection_records.clone();
     pile.ensure_mapped(pile.mmap.len() + 1).unwrap();
-    let unused_owner = Arc::downgrade(&pile.mmap);
+    let duplicate_owner = Arc::downgrade(&pile.mmap);
     assert!(!std::ptr::eq(Arc::as_ptr(&pile.mmap), initial_address));
     append_test_bytes(&path, &collection_record_header(&record));
     let latest = pile.snapshot().unwrap();
@@ -280,8 +279,8 @@ fn native_fixed_index_reuses_map_owner_and_duplicate_remap_does_not_adopt_it() {
     drop(latest);
     pile.close().unwrap();
     assert!(
-        unused_owner.upgrade().is_none(),
-        "duplicate-only map is not adopted by any root"
+        duplicate_owner.upgrade().is_some(),
+        "the physical duplicate owns its actual new mapping"
     );
     assert!(old_owner.upgrade().is_some());
     assert_eq!(
@@ -291,6 +290,7 @@ fn native_fixed_index_reuses_map_owner_and_duplicate_remap_does_not_adopt_it() {
     drop(fixed_only);
     assert!(old_owner.upgrade().is_some());
     drop(latest_roots);
+    assert!(duplicate_owner.upgrade().is_none());
     assert!(
         old_owner.upgrade().is_none(),
         "last root releases the full mapping"
@@ -597,15 +597,15 @@ fn native_fixed_merge_delta_never_scans_prior_same_output_witnesses() {
     let (added, removed) = after.select_record_changes(&before, &selectors).unwrap();
     assert_eq!(added.len(), 32);
     assert!(removed.is_empty());
-    // Independent mapping/origin: semantic MERGE comparison reads each prior
-    // witness once per member, not once for each new witness.
+    // Independent mapping/origin: replay the current occurrence bag into the
+    // idempotent fold rather than compare unrelated offset coordinates.
     let mut reopened = Pile::open_as(&path, key.verifying_key()).unwrap();
     let independent = reopened.snapshot().unwrap();
     COLLECTION_RECORD_READS.with(|reads| reads.set(0));
     let mut offered = Vec::new();
     independent.for_each_record_since(Some(&before), &mut |record| offered.push(*record));
-    assert_eq!(offered.len(), 32);
-    assert_eq!(COLLECTION_RECORD_READS.with(|reads| reads.get()), 65 + 32);
+    assert_eq!(offered.len(), 128 + 65);
+    assert_eq!(COLLECTION_RECORD_READS.with(|reads| reads.get()), 128 + 65);
     reopened.close().unwrap();
     pile.close().unwrap();
 }

@@ -487,8 +487,8 @@ mod blob_occurrence_key {
 ///
 /// One relation answers every record route: a collection's records are the
 /// 32-byte prefix, the producers of one member are the 64-byte prefix, and
-/// the offset names the frame the record is read from. Nothing about the
-/// record itself is held; the file already holds it.
+/// the offset names one occurrence within a source generation. Fixed kinds
+/// retain typed views; MERGE reads its frame from the snapshot mapping.
 mod collection_record_key {
     crate::key_segmentation!(Segments, 72, [32, 32, 8]);
     crate::key_schema!(Schema, Segments, 72, [0, 1, 2]);
@@ -3393,7 +3393,9 @@ impl super::StoreSnapshot for PileFileSnapshot {
         dependencies: &super::StoreDependencies,
     ) -> super::StoreChanges {
         let mut changes = super::StoreChanges::NONE;
-        let records_changed = if dependencies.all_records {
+        let records_changed = if !Arc::ptr_eq(&self.record_origin, &previous.record_origin) {
+            dependencies.all_records || !dependencies.records.is_empty()
+        } else if dependencies.all_records {
             !self
                 .collection_records
                 .shares_root(&previous.collection_records)
@@ -3981,7 +3983,7 @@ impl PileFile {
                             marker: slice[..16].try_into().expect("decoded frame marker"),
                         });
                     }
-                    self.collection_records.insert_current_fixed(&record, slice, &self.mmap)?;
+                    self.collection_records.insert_current_fixed(&record, start_offset, slice, &self.mmap)?;
                 } else {
                     // MERGE retains the occurrence path. The other kinds
                     // never get an occurrence leaf in this relation.
@@ -4351,15 +4353,15 @@ impl BlobStoreList for PileFileSnapshot {
     }
 }
 
-/// Deterministic owned snapshot of the pile's native collection records:
-/// the index walked in key order, each record read from its frame and handed
-/// out once, however many frames hold it.
+/// Deterministic owned snapshot of the pile's native collection record bag.
+/// Each indexed occurrence is returned, including repeated canonical bodies.
+/// This typed projection excludes blobs, proofs, retired and opaque frames;
+/// use `raw_records` for the complete physical log in file order.
 pub struct PileCollectionRecordIter {
     fixed: record_index::FixedRecordIter,
     keys: crate::patch::PATCHIntoOrderedIterator<72, collection_record_key::Schema, (), XorSip128>,
     mmap: Arc<MmapRaw>,
     covered_len: usize,
-    run: MemberRun,
 }
 
 /// The retired signed equations of one pile snapshot, each once, in index
@@ -4413,15 +4415,9 @@ impl Iterator for PileCollectionRecordIter {
         if let Some(record) = self.fixed.next() {
             return Some(Ok(record));
         }
-        loop {
-            let key = self.keys.next()?;
-            let offset =
-                collection_record_offset(key[64..].try_into().expect("key tail is the offset"));
-            let record = collection_record_at(&self.mmap, self.covered_len, offset);
-            if self.run.first(&key, record) {
-                return Some(Ok(record));
-            }
-        }
+        let key = self.keys.next()?;
+        let offset = collection_record_offset(key[64..].try_into().expect("key tail is the offset"));
+        Some(Ok(collection_record_at(&self.mmap, self.covered_len, offset)))
     }
 }
 
@@ -4648,54 +4644,30 @@ impl PileFile {
 
 impl crate::collection::covered::RecordDelta for PileFileSnapshot {
     fn for_each_record_since(&self, since: Option<&Self>, each: &mut dyn FnMut(&CollectionRecord)) {
-        let mut fresh = match since {
+        // Offsets are comparable only within the same append-only source.
+        // Independent observations offer the current bag to this idempotent
+        // fold, never compare coincident offsets carrying unrelated bodies.
+        let fresh = match since.filter(|old| Arc::ptr_eq(&self.record_origin, &old.record_origin)) {
             Some(since) => self
                 .collection_records
                 .difference(&since.collection_records),
             None => self.collection_records.clone(),
         };
-        let independent = since.filter(|old| !Arc::ptr_eq(&self.record_origin, &old.record_origin));
-        if independent.is_some() {
-            fresh.occurrences = self.collection_records.occurrences.clone();
-        }
         let occurrences = fresh.occurrences.clone();
         for record in fresh.into_fixed() {
             each(&record);
         }
-        // Same-origin MERGE preserves the occurrence feed: repeated physical
-        // evidence is harmless to the idempotent coverage/held consumers. It
-        // must not cause a history scan for every fresh witness.
-        // Only independent origins need semantic comparison. These sets are
-        // scratch for one member within this invocation, never retained state.
-        let mut member: Option<[u8; 64]> = None;
-        let mut prior = BTreeSet::new();
-        let mut seen = BTreeSet::new();
         for key in occurrences.iter_ordered() {
             let record = self.record_at(key[64..].try_into().expect("offset tail"));
-            if let Some(old) = independent {
-                let prefix: [u8; 64] = key[..64].try_into().unwrap();
-                if member != Some(prefix) {
-                    prior.clear();
-                    seen.clear();
-                    old.collection_records.occurrences.infixes(&prefix, |offset: &[u8; 8]| {
-                        prior.insert(old.record_at(offset));
-                    });
-                    member = Some(prefix);
-                }
-                if !prior.contains(&record) && seen.insert(record) {
-                    each(&record);
-                }
-            } else {
-                each(&record);
-            }
+            each(&record);
         }
     }
 }
 
 impl PileFileSnapshot {
-    /// Physical offsets are not fixed-record identity. Rewrites that need
-    /// first-frame positions/census reconstruct this sorted scratch relation
-    /// from their frozen prefix, rather than retaining it on every replay.
+    /// Physical census across all known collection kinds. Rewrites reconstruct
+    /// this sorted scratch relation from their frozen prefix; ordinary reads
+    /// use the per-kind indexes instead.
     fn collection_occurrences(&self) -> Result<Vec<[u8; 72]>, ReadError> {
         // SAFETY: the snapshot owns this immutable applied prefix. The Bytes
         // directly shares its existing MmapRaw owner, with no new mapping.
@@ -4761,19 +4733,14 @@ impl PileFileSnapshot {
                 frames_under(prefix);
             }
         }
-        // Overlapping routes name a frame more than once, and a pile made
-        // by concatenation can hold one record in more than one frame; each
-        // record is read and returned once, in the index's order, the same
-        // order `records` walks.
+        // Deduplicate overlapping routes, not equal bodies at distinct offsets.
         keys.sort_unstable();
         keys.dedup();
-        let mut run = MemberRun::new();
         result.extend(keys
             .iter()
             .filter_map(|key| {
                 let record = self.record_at(key[64..].try_into().expect("key tail is the offset"));
-                (selectors_match_record(selectors, record) && run.first(key, record))
-                    .then_some(record)
+                selectors_match_record(selectors, record).then_some(record)
             })
         );
         Ok(result)
@@ -4801,7 +4768,6 @@ impl CollectionRead for PileFileSnapshot {
             keys: self.collection_records.occurrences.clone().into_iter_ordered(),
             mmap: self.mmap.clone(),
             covered_len: self.covered_len,
-            run: MemberRun::new(),
         })
     }
 
@@ -4835,17 +4801,21 @@ impl CollectionRead for PileFileSnapshot {
         &self,
         previous: &Self,
         selectors: &BTreeSet<CollectionRecordSelector>,
-    ) -> Result<(Vec<crate::collection::CollectionRecordView>, Vec<crate::collection::CollectionRecordView>), Self::RecordsError> {
-        if selectors.is_empty() { return Ok((Vec::new(), Vec::new())); }
-        if selectors.iter().all(|s| matches!(s, CollectionRecordSelector::Foundations(_))) {
-            return Ok((
-                self.collection_records.difference(&previous.collection_records).select_foundation_views(selectors),
-                previous.collection_records.difference(&self.collection_records).select_foundation_views(selectors),
-            ));
+    ) -> Result<crate::collection::RecordViewChanges, Self::RecordsError> {
+        use crate::collection::RecordViewChanges;
+        if selectors.is_empty() { return Ok(RecordViewChanges::Append(Vec::new())); }
+        // This guard precedes every key-only shortcut. Reopening/replacing a
+        // source invalidates occurrence coordinates even at identical offsets.
+        if !Arc::ptr_eq(&self.record_origin, &previous.record_origin)
+            || self.covered_len < previous.covered_len {
+            return Ok(RecordViewChanges::Rebuild);
         }
-        // In particular, keep the prior exact MERGE comparison unchanged.
-        let (added, removed) = self.select_record_changes(previous, selectors)?;
-        Ok((added.into_iter().map(Into::into).collect(), removed.into_iter().map(Into::into).collect()))
+        let added = self.collection_records.difference(&previous.collection_records);
+        if selectors.iter().all(|s| matches!(s, CollectionRecordSelector::Foundations(_))) {
+            return Ok(RecordViewChanges::Append(added.select_foundation_views(selectors)));
+        }
+        Ok(RecordViewChanges::Append(self.select_record_index(&added, selectors)?
+            .into_iter().map(Into::into).collect()))
     }
 
     fn select_record_changes(
@@ -4856,18 +4826,17 @@ impl CollectionRead for PileFileSnapshot {
         if selectors.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
-        let mut added = self
+        // Explicit semantic diagnostics remain valid across physical origins.
+        // Do not let a key-only difference hide changed bodies at equal offsets.
+        if !Arc::ptr_eq(&self.record_origin, &previous.record_origin) {
+            return crate::collection::store::selected_record_changes(self, previous, selectors);
+        }
+        let added = self
             .collection_records
             .difference(&previous.collection_records);
-        let mut removed = previous
+        let removed = previous
             .collection_records
             .difference(&self.collection_records);
-        // Fixed keys use fingerprint identity across owners and offsets. Only
-        // MERGE occurrence keys still need lineage-qualified offsets.
-        if !Arc::ptr_eq(&self.record_origin, &previous.record_origin) {
-            added.occurrences = self.collection_records.occurrences.clone();
-            removed.occurrences = previous.collection_records.occurrences.clone();
-        }
         let added: BTreeSet<_> = self
             .select_record_index(&added, selectors)?
             .into_iter()
@@ -10308,10 +10277,10 @@ mod tests {
         let mut second = PileFile::open(&second_path).unwrap();
         second.insert(replacement).unwrap();
         let replaced = second.snapshot().unwrap();
-        // The physical census remains separate from logical keys. Identical
-        // C/member/offset coordinates may name different canonical records.
+        // Identical C/member/offset coordinates in different origins may name
+        // different canonical records; both copies remain in the first bag.
         assert_eq!(before.collection_occurrences().unwrap().len(), 2);
-        assert_eq!(before.collection_records.len(), 1);
+        assert_eq!(before.collection_records.len(), 2);
         assert!(
             before.collection_occurrences().unwrap()
                 .contains(&replaced.collection_occurrences().unwrap()[0]),
@@ -10420,13 +10389,13 @@ mod tests {
     }
 
     /// `cat a.pile >> a.pile` gives every record a second frame, and replay
-    /// indexes both without comparing them. No read may tell the difference:
-    /// enumeration and selection return each record once, coverage and the
-    /// frontier are those of the single copy, inserting a held record still
+    /// indexes both without comparing them. Enumeration and selection expose
+    /// both occurrences, while coverage and the frontier remain those of the
+    /// single copy. Inserting a held record still
     /// appends nothing, and a compaction, which rewrites through `insert`,
     /// leaves one frame per record.
     #[test]
-    fn a_repeated_frame_changes_no_read() {
+    fn a_repeated_frame_changes_bag_but_not_coverage_or_frontier() {
         let dir = tempfile::tempdir().unwrap();
         let single_path = fresh_empty_pile_path(&dir, "repeat-single.pile");
         let doubled_path = dir.path().join("repeat-doubled.pile");
@@ -10466,30 +10435,24 @@ mod tests {
         let mut repeated = Pile::open_as(&doubled_path, authority.verifying_key()).unwrap();
         let one = single.snapshot().unwrap();
         let two = repeated.snapshot().unwrap();
-        // Control: physical history still holds both copies, independently
-        // of exact fixed-record keys collapsing them during replay.
+        // Both the raw census and typed bag retain both copies.
         assert_eq!(
             two.collection_occurrences().unwrap().len(),
             2 * one.collection_occurrences().unwrap().len()
         );
-        assert_eq!(
-            two.records()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            one.records()
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap()
-        );
+        let one_records = one.records().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        let two_records = two.records().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(two_records.len(), 2 * one_records.len());
+        let mut expected = one_records.clone(); expected.extend_from_slice(&one_records);
+        assert_eq!(sorted_collection_records(two_records), sorted_collection_records(expected));
         let selectors = BTreeSet::from([
             CollectionRecordSelector::Collection(lineage),
             CollectionRecordSelector::ProducedMember(lineage, result),
         ]);
-        assert_eq!(
-            two.select_records(&selectors).unwrap(),
-            one.select_records(&selectors).unwrap()
-        );
+        let one_selected = one.select_records(&selectors).unwrap();
+        let two_selected = two.select_records(&selectors).unwrap();
+        let mut expected = one_selected.clone(); expected.extend_from_slice(&one_selected);
+        assert_eq!(sorted_collection_records(two_selected), sorted_collection_records(expected));
         assert_eq!(
             one.coverage_index()
                 .coverage(lineage, result)
@@ -10828,7 +10791,7 @@ mod tests {
     }
 
     #[test]
-    fn native_collection_records_cat_as_an_order_independent_set_union() {
+    fn native_collection_records_cat_preserves_bag_and_semantic_set_union() {
         let dir = tempfile::tempdir().unwrap();
         let path_a = fresh_empty_pile_path(&dir, "a.pile");
         let path_b = fresh_empty_pile_path(&dir, "b.pile");
@@ -10854,8 +10817,10 @@ mod tests {
         ba.extend_from_slice(&bytes_a);
         std::fs::write(&path_ba, ba).unwrap();
 
-        let expected = sorted_collection_records(records.clone());
-        let source_expected = sorted_collection_records(records[..2].to_vec());
+        let expected_set: BTreeSet<_> = records.iter().copied().collect();
+        let expected = sorted_collection_records(vec![records[0], records[1], records[0], records[2]]);
+        let source_set: BTreeSet<_> = records[..2].iter().copied().collect();
+        let source_expected = sorted_collection_records(vec![records[0], records[1], records[0]]);
         let target_expected = vec![records[2]];
         let source_selector = BTreeSet::from([CollectionRecordSelector::Collection(
             collection_test_collection(1),
@@ -10873,11 +10838,13 @@ mod tests {
                     .collect::<Result<Vec<_>, _>>()
                     .unwrap(),
             );
+            assert_eq!(actual.len(), 4, "concatenation retains the shared assertion's two frames");
+            assert_eq!(actual.iter().copied().collect::<BTreeSet<_>>(), expected_set);
             assert_eq!(actual, expected);
-            assert_eq!(
-                sorted_collection_records(snapshot.select_records(&source_selector).unwrap()),
-                source_expected
-            );
+            let source = snapshot.select_records(&source_selector).unwrap();
+            assert_eq!(source.len(), 3);
+            assert_eq!(source.iter().copied().collect::<BTreeSet<_>>(), source_set);
+            assert_eq!(sorted_collection_records(source), source_expected);
             assert_eq!(
                 snapshot.select_records(&target_selector).unwrap(),
                 target_expected
@@ -10945,19 +10912,17 @@ mod tests {
         ba.extend_from_slice(&bytes_a);
         std::fs::write(&path_ba, ba).unwrap();
 
-        let mut expected = vec![first, conflicting];
+        let semantic_expected = BTreeSet::from([first, conflicting]);
+        let mut expected = vec![first, first, conflicting];
         expected.sort_unstable_by_key(CollectionRecord::fingerprint);
         for path in [&path_ab, &path_ba] {
             let mut pile = Pile::open(path).unwrap();
             let snapshot = pile.snapshot().unwrap();
-            assert_eq!(
-                sorted_collection_records(snapshot.select_records(&exact).unwrap()),
-                expected
-            );
-            assert!(!snapshot
-                .select_records(&exact)
-                .unwrap()
-                .contains(&unrelated));
+            let selected = snapshot.select_records(&exact).unwrap();
+            assert_eq!(selected.len(), 3);
+            assert_eq!(selected.iter().copied().collect::<BTreeSet<_>>(), semantic_expected);
+            assert!(!selected.contains(&unrelated));
+            assert_eq!(sorted_collection_records(selected), expected);
             pile.close().unwrap();
         }
     }

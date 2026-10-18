@@ -7,12 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- In the canonical source candidate, retain fixed collection records as typed
-  PATCH values under stable BLAKE3 keys. Add checked lazy insertion and streaming
-  ordered key/value traversal; preserve first-owner duplicate handling and
-  collision refusal without a get-then-insert pass. Full enumeration no longer
-  materializes and sorts canonical bodies; selector order follows the same
-  per-kind key order. No format, signature, network or live deployment change.
+- In the isolated canonical candidate, retain typed fixed-record occurrences
+  under collection/member/offset PATCH keys, without body hashing during replay.
+  Streaming enumeration and selections expose bags; coverage folds remain
+  idempotent and shared peer overlays own semantic deduplication. Guard source
+  origin before key comparisons and rebuild peer sets on replacement. Listing
+  counts are occurrence counts unless explicitly deduplicated. No format,
+  signature, wire, migration or live deployment change.
 
 - Add `blob::Bundle<S>`, a typed blob root with explicitly carried attachments.
   Existing `entity!` spreading emits its root handle and unions the carried
