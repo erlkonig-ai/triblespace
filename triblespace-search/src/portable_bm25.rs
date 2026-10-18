@@ -673,6 +673,13 @@ fn joined_statistics<D: InlineEncoding, T: InlineEncoding>(
     }
     documents.truncate(write);
     documents.shrink_to_fit();
+    // Union positions are stored as u32 codes below. One carrier is capped at
+    // u32::MAX documents by its layout, but a union of carriers is not.
+    if documents.len() > u32::MAX as usize {
+        return Err(PortableBM25Error::new(
+            "union document domain exceeds u32 document codes",
+        ));
+    }
 
     let length_overflow = || PortableBM25Error::new("derived document length overflows u64");
     let mut lengths = vec![0u64; documents.len()];
@@ -1487,6 +1494,36 @@ mod tests {
             bits(actual.query_multi(&query)),
             bits(expected.query_multi(&query))
         );
+    }
+
+    #[test]
+    fn a_shared_document_joins_by_term_value_not_by_carrier_term_position() {
+        // Document 1 is shared, but its terms sit at different positions in
+        // the two carriers' term tables: 0xa2 is the left carrier's only term,
+        // while the right carrier lists 0xa1 then 0xa2. Its union length is
+        // max(0, 4) + max(3, 1) = 7. Joining by term position would pair
+        // left's 0xa2 with right's 0xa1 and give 5. Document 2 is held by the
+        // left carrier alone and keeps its own length there.
+        let left = TestIndex::from_exact_counts(
+            [value(1), value(2)],
+            [(value(1), value(0xa2), 3), (value(2), value(0xa2), 6)],
+        )
+        .unwrap();
+        let right = TestIndex::from_exact_counts(
+            [value(1)],
+            [(value(1), value(0xa1), 4), (value(1), value(0xa2), 1)],
+        )
+        .unwrap();
+        let canonical = TestIndex::merge([&left, &right]).unwrap();
+        let expected = canonical.query().unwrap();
+        let view = TestView::from_segments([left.clone(), right.clone()]);
+        let actual = view.query().unwrap();
+        assert_eq!(actual.doc_count(), 2);
+        assert_eq!(actual.doc_len(0), Some(7));
+        assert_eq!(actual.doc_len(1), Some(6));
+        for code in 0..expected.doc_count() {
+            assert_eq!(actual.doc_len(code), expected.doc_len(code));
+        }
     }
 
     #[test]
