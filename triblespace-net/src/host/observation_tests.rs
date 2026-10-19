@@ -624,7 +624,8 @@ fn proof_arrival_refreshes_authorization_without_record_enumeration() {
         .unwrap();
     assert_eq!(fixture.enumerations.load(Ordering::Relaxed), 0);
     assert_same_record_leaves(&old, &new, &fixture.records);
-    assert_ne!(old.wake_root(), new.wake_root());
+    // Grants are no part of the wake root.
+    assert_eq!(old.wake_root(), new.wake_root());
     assert_eq!(
         new.repair
             .authorization_evidence()

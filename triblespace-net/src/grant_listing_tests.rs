@@ -738,3 +738,122 @@ fn a_stored_grant_whose_definition_fetch_fails_is_fetched_again_at_the_retry() {
         retried.fetch
     );
 }
+
+// ---- health: grant agreement from the index and the peer's listing ----
+
+/// An empty record frontier: health's view of a collection with no records.
+fn no_records() -> crate::health::RepairFrontier {
+    let empty = PatchSummary::new(None, 0).unwrap();
+    crate::health::RepairFrontier {
+        wake_root: [0; 32],
+        commits: empty,
+        derives: empty,
+    }
+}
+
+/// Health reads grant agreement from the grant index, never from C's
+/// admission evidence. C holds a valid grant, a junk-delegated proof and a
+/// waiting one here: the evidence holds all three, the index only the
+/// first. A peer listing the index's root for C agrees with this side, and
+/// the pair reads current; the listing goes with the connection.
+#[test]
+fn health_reports_the_grant_index_root_and_the_peer_s_listing() {
+    use triblespace_core::collection::{
+        AdmissionPolicy, CollectionPolicy, CollectionStoreExt, read_capability,
+    };
+    use triblespace_core::patch::Entry;
+
+    use crate::health::{CollectionHealth, Health, PairState, PeeringHealth};
+    use crate::walk::WalkKind;
+
+    let [owner, g, z, y] = [0xC1, 0xC2, 0xC3, 0xC4].map(key);
+    let mut host = Node::new(0xC0);
+    let direct = AdmissionPolicy::direct(owner.verifying_key());
+    let c = host
+        .store
+        .collection("agreement", CollectionPolicy::new(direct.clone(), direct))
+        .unwrap()
+        .handle();
+    host.active.insert(&Entry::new(&c.raw));
+    let to_g = grant(c, &owner, read_capability(), &g);
+    let junk = to_g.delegate(&g, read_capability(), z.verifying_key()).unwrap();
+    let absent = handle_of(&{
+        use triblespace_core::metadata;
+        use triblespace_core::prelude::entity;
+        entity! { metadata::name: "never stored" }.facts().clone()
+    });
+    let waiting = grant(c, &owner, absent, &y);
+    for proof in [&to_g, &junk, &waiting] {
+        host.store.insert_proof(proof.clone()).unwrap();
+    }
+    host.observe();
+    let snapshot = host.snapshot();
+    let index = snapshot.grants().summary(c);
+    let evidence = snapshot
+        .collection(c)
+        .unwrap()
+        .repair()
+        .authorization_evidence()
+        .summary();
+    assert_eq!((index.leaf_count(), evidence.leaf_count()), (1, 3));
+
+    let health = Health::new(iroh_base::EndpointId::from_bytes(&id(&host.key)).unwrap());
+    let (linked, _) = open_to(&mut host, id(&owner), 1);
+    hear(&mut host, &linked, vec![(c, index)]);
+    assert!(host.grants.publish(&health));
+    let published = health.snapshot();
+    let entry = published
+        .grants
+        .iter()
+        .find(|entry| entry.resource == c)
+        .expect("C's grant agreement is published");
+    assert_eq!(entry.local, index, "the index's root, not the evidence's");
+    assert_eq!(entry.peers.len(), 1);
+    assert_eq!(entry.peers[0].peer, id(&owner));
+    assert_eq!(entry.peers[0].listed, Some(index));
+
+    let now = crate::clock::mono_now();
+    health.update(|sample| {
+        sample.started_at = Some(now);
+        sample.observed_at = Some(now);
+        sample.store.serving_snapshot = true;
+        sample.store.last_snapshot_observed_at = Some(now);
+        sample.collections.push(CollectionHealth {
+            collection: c,
+            local_frontier: Some(no_records()),
+            last_local_change_at: Some(now),
+            peers: Vec::new(),
+        });
+        sample.peerings.push(PeeringHealth {
+            collection: c,
+            peer: id(&owner),
+            asked: true,
+            peered: true,
+            sends: true,
+            receives: true,
+            refused_by_me: false,
+            refused_by_them: false,
+        });
+    });
+    health.with_peer(c, id(&owner), |pair| {
+        let empty = no_records();
+        pair.pushed(now, WalkKind::Commit, empty.commits, true);
+        pair.pushed(now, WalkKind::Derive, empty.derives, true);
+        pair.received(now, WalkKind::Commit, Some(empty.commits), true);
+        pair.received(now, WalkKind::Derive, Some(empty.derives), true);
+    });
+    let age = std::time::Duration::from_secs(180);
+    assert_eq!(health.snapshot().pair(c, id(&owner), now, age), PairState::Current);
+
+    host.grants.event(&ReconEvent::Closed(linked.link.clone()));
+    assert!(host.grants.publish(&health));
+    let entry = health
+        .snapshot()
+        .grants
+        .iter()
+        .find(|entry| entry.resource == c)
+        .cloned()
+        .expect("an active C stays published");
+    assert!(entry.peers.is_empty(), "a listing goes with its connection");
+    assert_ne!(health.snapshot().pair(c, id(&owner), now, age), PairState::Current);
+}

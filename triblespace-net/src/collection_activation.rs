@@ -4,9 +4,11 @@
 //! sets. The records are the collection's foundations -- COMMITs and DERIVEs;
 //! a MERGE is its signer's own lattice node and never replicates. A newly
 //! arrived proof may activate an old COMMIT or admit a new reader without
-//! changing the record PATCH. A collection's root commits to both, without
-//! disclosing a record or proof; its held-blob set is compared apart, and
-//! only between two neighbours that replicate it in full.
+//! changing the record PATCH. A collection's root commits to its records
+//! only, without disclosing one: grants travel by grant gossip
+//! ([`crate::grants`]), not by the collection's push schedule. Its held-blob
+//! set is compared apart, and only between two neighbours that replicate it
+//! in full.
 //! The authorization projection contains byte-valid proofs for exact C and its
 //! configured roots. Definition residency determines authority, not membership.
 //! It also indexes each proof's prefixes under the keys they name, so a
@@ -40,10 +42,9 @@ use crate::host::ResidentBlobReader;
 use crate::patch_repair::PatchSummary;
 
 const COLLECTION_REPAIR_ROOT_DOMAIN: &[u8] = b"triblespace.collection.repair-overlay\0";
-/// Version 4: records (foundations only, COMMIT and DERIVE) and
-/// authorization evidence, without held blobs. Version 3 also hashed the held
-/// set.
-const COLLECTION_REPAIR_ROOT_VERSION: u32 = 5;
+/// Version 6: records only (foundations, COMMIT and DERIVE). Version 5 also
+/// hashed the authorization evidence, version 3 the held set.
+const COLLECTION_REPAIR_ROOT_VERSION: u32 = 6;
 
 type AuthorizationEvidencePatch = PATCH<64, IdentitySchema, CapabilityProof, Blake3Merkle>;
 /// Subject key | hash of the proof prefix that ends at that subject.
@@ -387,13 +388,9 @@ impl CollectionRepairOverlay {
     }
 
     /// The collection's [`record_root`], which its push schedule follows.
-    /// Held blobs are not part of it.
+    /// Neither held blobs nor grants are part of it.
     pub fn wake_root(&self) -> [u8; 32] {
-        record_root(
-            self.collection,
-            self.records.summaries(),
-            self.authorization_evidence.summary(),
-        )
+        record_root(self.collection, self.records.summaries())
     }
 
     /// Keep fixed components whose raw inputs the store certifies unchanged.
@@ -452,24 +449,20 @@ impl CollectionRepairOverlay {
     }
 }
 
-/// The root of a collection's records and authorization evidence: the
-/// collection's wake root, which its push schedule follows.
+/// The root of a collection's records: the collection's wake root, which
+/// its push schedule follows. Grants are not part of it; they travel by
+/// grant gossip.
 ///
 /// Counts participate alongside roots so the digest commits to the same
-/// authenticated component summaries used by PATCH repair. Neither a proof,
-/// record, count, nor component root is disclosed by this value.
-pub fn record_root(
-    collection: CollectionHandle,
-    records: [PatchSummary; 2],
-    authorization: PatchSummary,
-) -> [u8; 32] {
+/// authenticated component summaries used by PATCH repair. Neither a record,
+/// count, nor component root is disclosed by this value.
+pub fn record_root(collection: CollectionHandle, records: [PatchSummary; 2]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(COLLECTION_REPAIR_ROOT_DOMAIN);
     hasher.update(&COLLECTION_REPAIR_ROOT_VERSION.to_be_bytes());
     hasher.update(&collection.raw);
     update_summary(&mut hasher, records[0]);
     update_summary(&mut hasher, records[1]);
-    update_summary(&mut hasher, authorization);
     *hasher.finalize().as_bytes()
 }
 
@@ -1346,7 +1339,8 @@ mod tests {
             before.authorization_evidence().summary(),
             after.authorization_evidence().summary()
         );
-        assert_ne!(before.wake_root(), after.wake_root());
+        // Grants are no part of the wake root.
+        assert_eq!(before.wake_root(), after.wake_root());
     }
 
     #[test]
@@ -1388,8 +1382,11 @@ mod tests {
         assert_eq!(first.wake_root(), second.wake_root());
     }
 
+    /// A grant is not a record: a new READ proof enters the evidence and
+    /// leaves the wake root, which the push schedule follows, as it was. A
+    /// commit still moves it.
     #[test]
-    fn read_proof_changes_wake_root_without_changing_records() {
+    fn a_read_proof_leaves_the_wake_root_and_a_commit_moves_it() {
         let root = key(29);
         let reader = key(30);
         let mut store = MemoryRepo::default();
@@ -1424,7 +1421,20 @@ mod tests {
         assert_eq!(before.records().summaries(), after.records().summaries());
         assert_eq!(before.authorization_evidence().len(), 0);
         assert_eq!(after.authorization_evidence().len(), 1);
-        assert_ne!(before.wake_root(), after.wake_root());
+        assert_eq!(before.wake_root(), after.wake_root());
+
+        let commit = CollectionCommit::sign(
+            &reader,
+            collection.handle(),
+            data(41),
+            empty_metadata_handle(),
+        );
+        store.insert(CollectionRecord::Commit(commit)).unwrap();
+        let committed_snapshot = store.snapshot().unwrap();
+        let committed =
+            collection_repair_overlay(&committed_snapshot, collection.handle()).unwrap();
+        assert_ne!(after.records().summaries(), committed.records().summaries());
+        assert_ne!(after.wake_root(), committed.wake_root(), "positive control");
     }
 
     /// Only foundations replicate: a DERIVE enters the record PATCH, a MERGE

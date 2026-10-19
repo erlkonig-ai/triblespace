@@ -291,6 +291,15 @@ fn opens_sent(taps: &Taps, from: usize, peer: PeerId, component: u8) -> usize {
         .count()
 }
 
+/// Walk OPENs between the tapped host and `peer`, either way, since the
+/// `from`-th frame, by the component its OPEN names.
+fn opens(taps: &Taps, from: usize, peer: PeerId, component: u8) -> usize {
+    taps.since(from, peer, TAG_WALK)
+        .iter()
+        .filter(|crossed| crossed.kind == FRAME_OPEN && crossed.walk_kind == Some(component))
+        .count()
+}
+
 /// The test's delivery definition, as Secrets binds one: an action and a
 /// name, nothing that makes it a collection's.
 fn delivery_definition() -> Blob<SimpleArchive> {
@@ -471,16 +480,16 @@ fn a_late_write_grant_admits_a_record_the_reader_already_holds() {
 /// A grant is not a record: a new grant over C moves no Commit or Derive
 /// walk. W and S have been quiet long enough for the push timer to reach its
 /// cap; W signs a WRITE grant, and every walk W opens to S until S holds it
-/// is counted. The grant travels by an Authorization walk (positive control
-/// one), and a record appended afterwards does open a Commit walk (positive
-/// control two, so the counter is not blind).
+/// is counted. The grant travels by an Authorization walk, which either side
+/// may open: the one that hears the other list a different root for C
+/// (positive control one). A record appended afterwards does open a Commit
+/// walk (positive control two, so the counter is not blind).
 ///
-/// Base: the authorization summary is part of the collection's wake root
+/// Base: the authorization summary was part of the collection's wake root
 /// (schedule.rs `roots`, collection_activation `record_root`), so a new
-/// grant resets the push timer and the push that carries it opens Commit and
+/// grant reset the push timer and the push that carried it opened Commit and
 /// Derive walks as well.
 #[test]
-#[ignore = "grant gossip redesign"]
 fn a_late_grant_opens_no_record_walk() {
     for seed in 0..SEEDS {
         run(async |clock| {
@@ -521,7 +530,7 @@ fn a_late_grant_opens_no_record_walk() {
                 |hosts| holds_proof(hosts[1], &late),
             )
             .await;
-            let auth = opens_sent(&taps, from, s_id, WALK_AUTHORIZATION);
+            let auth = opens(&taps, from, s_id, WALK_AUTHORIZATION);
             let records = opens_sent(&taps, from, s_id, WALK_COMMIT)
                 + opens_sent(&taps, from, s_id, WALK_DERIVE);
             assert!(

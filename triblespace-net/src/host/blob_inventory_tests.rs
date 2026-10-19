@@ -157,10 +157,6 @@ fn a_blob_only_child_is_held_after_a_report_not_by_its_arrival() {
     let new_manifest = crate::collection_wire::manifest(&new_collection.repair);
     assert_eq!(old_manifest.commits, new_manifest.commits);
     assert_eq!(old_manifest.derives, new_manifest.derives);
-    assert_eq!(
-        old_manifest.authorization_evidence,
-        new_manifest.authorization_evidence
-    );
     assert_eq!(old_manifest.wake_root, new_manifest.wake_root);
     assert_ne!(
         digest(&old, fixture.collection),

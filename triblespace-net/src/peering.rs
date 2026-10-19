@@ -1180,6 +1180,7 @@ pub(crate) async fn run<T: Transport, S: Service>(
             schedules.neighbours(peerings.neighbours(), crate::clock::mono_now());
             sink.apply(grants.peered(peerings.peered()));
         }
+        grants.publish(&health);
     }
 }
 

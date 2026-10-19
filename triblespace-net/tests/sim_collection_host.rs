@@ -334,7 +334,6 @@ fn issuer_held_read_proof_reaches_a_handle_only_recipient_by_grant_exchange() {
                 .reader_is_admitted(&before_selection, recipient_key.verifying_key())
                 .unwrap()
         );
-        assert!(recipient.health().available.is_empty());
         // Selecting C makes the recipient ask the issuer, a key of C's grant
         // chain, to peer for it.
         select(&mut recipient.store(), &recipient_key, collection.handle());

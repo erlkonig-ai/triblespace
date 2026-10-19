@@ -51,12 +51,12 @@ pub mod attrs {
         "8593367EF64B9466AA37ABAD8CEE1BD0" as resident_blobs: inlineencodings::U256BE;
         /// Locally observed collection-record leaves.
         "1B8BAA2BC79AF3981143A3B505C11080" as local_records: inlineencodings::U256BE;
-        /// Locally observed authorization-evidence leaves.
+        /// Grants over the collection in the local grant index.
         "E30053A332B8DE94643A05F9F6FC5455" as local_authorizations: inlineencodings::U256BE;
         /// Collection-record leaves of the peer's tree, as its last push that
         /// landed whole here carried them.
         "EBB986FACE961CB32B1276CCAF39A74D" as remote_records: inlineencodings::U256BE;
-        /// Authorization-evidence leaves of the peer's tree, the same way.
+        /// Grants over the collection in the peer's standing listing.
         "CA19BB7964D2F6DD562416CC39CA13AA" as remote_authorizations: inlineencodings::U256BE;
         /// Opaque provider keys considered resident by the publication worker.
         "7ECCF364F3C49A7F14341786D9D4C601" as publication_keys: inlineencodings::U256BE;
@@ -313,15 +313,21 @@ pub fn measurements(
                         let entry = collection?.peers.iter().find(|entry| entry.peer == peer)?;
                         Some(entry.received)
                     });
+                    // Grant counts are the grant index's here and the peer's
+                    // standing listing of C's grants.
+                    let grants = condition.collection.and_then(|handle| {
+                        health.grants.iter().find(|grants| grants.resource == handle)
+                    });
+                    let listed = condition.peer.as_ref().and_then(|peer| {
+                        let peer = peer.to_bytes();
+                        grants?.peers.iter().find(|listing| listing.peer == peer)?.listed
+                    });
                     Evidence {
                         local_records: local.map(|frontier| frontier.commits.leaf_count() + frontier.derives.leaf_count()),
-                        local_authorizations: local
-                            .map(|frontier| frontier.authorization_evidence.leaf_count()),
+                        local_authorizations: grants.map(|grants| grants.local.leaf_count()),
                         remote_records: remote
                             .and_then(|roots| Some(roots.commits?.leaf_count() + roots.derives?.leaf_count())),
-                        remote_authorizations: remote
-                            .and_then(|roots| roots.authorization_evidence)
-                            .map(|root| root.leaf_count()),
+                        remote_authorizations: listed.map(|listed| listed.leaf_count()),
                         ..Evidence::default()
                     }
                 }
@@ -548,7 +554,7 @@ mod tests {
             publication: crate::health::PublicationHealth::default(),
             blob_serving: crate::health::BlobServeHealth::default(),
             peerings: Vec::new(),
-            available: Vec::new(),
+            grants: Vec::new(),
         }
     }
 
@@ -601,7 +607,6 @@ mod tests {
             wake_root: [5; 32],
             commits: PatchSummary::new(Some([5; 32]), 10).unwrap(),
             derives: PatchSummary::new(None, 0).unwrap(),
-            authorization_evidence: PatchSummary::new(None, 0).unwrap(),
         };
         sample.collections.push(CollectionHealth {
             collection,
@@ -619,12 +624,23 @@ mod tests {
             refused_by_me: false,
             refused_by_them: false,
         });
+        // Both sides hold the same two grants over C.
+        let agreed = PatchSummary::new(Some([6; 32]), 2).unwrap();
+        sample.grants.push(crate::health::GrantHealth {
+            resource: collection,
+            local: agreed,
+            peers: vec![crate::health::GrantPeerHealth {
+                peer: remote_key,
+                listed: Some(agreed),
+                ..Default::default()
+            }],
+        });
         let health = Health::new(sample.node);
         health.update(|value| *value = sample);
         (health, collection, remote_key, frontier)
     }
 
-    /// Confirm both trees of `frontier` and land a receive at `at`.
+    /// Confirm both record trees of `frontier` and land receives at `at`.
     fn settle(
         health: &crate::health::Health,
         collection: CollectionHandle,
@@ -637,15 +653,8 @@ mod tests {
         health.with_peer(collection, peer, |pair| {
             pair.pushed(at, WalkKind::Commit, frontier.commits, true);
             pair.pushed(at, WalkKind::Derive, frontier.derives, true);
-            pair.pushed(
-                at,
-                WalkKind::Authorization,
-                frontier.authorization_evidence,
-                true,
-            );
             pair.received(at, WalkKind::Commit, Some(frontier.commits), true);
             pair.received(at, WalkKind::Derive, Some(frontier.derives), true);
-            pair.received(at, WalkKind::Authorization, Some(frontier.authorization_evidence), true);
         });
     }
 
@@ -729,7 +738,6 @@ mod tests {
                 pair.pushed(now, WalkKind::Commit, frontier.commits, true);
                 pair.received(now, WalkKind::Commit, Some(frontier.commits), true);
                 pair.received(now, WalkKind::Derive, Some(frontier.derives), true);
-                pair.received(now, WalkKind::Authorization, Some(frontier.authorization_evidence), true);
             });
             let condition = collection_condition(&health, now);
             assert_eq!(condition.state, State::Progressing);
@@ -749,7 +757,7 @@ mod tests {
                 .unwrap()
                 .evidence;
             assert_eq!(evidence.remote_records, Some(10 + u64::from(multiplier)));
-            assert_eq!(evidence.remote_authorizations, Some(frontier.authorization_evidence.leaf_count()));
+            assert_eq!(evidence.remote_authorizations, Some(2));
         }
     }
 
@@ -765,17 +773,10 @@ mod tests {
         health.with_peer(collection, remote_key, |pair| {
             pair.pushed(at, WalkKind::Commit, frontier.commits, true);
             pair.pushed(at, WalkKind::Derive, frontier.derives, true);
-            pair.pushed(
-                at,
-                WalkKind::Authorization,
-                frontier.authorization_evidence,
-                true,
-            );
             pair.received(at, WalkKind::Commit, None, false);
             pair.pushed(failed_at, WalkKind::Commit, frontier.commits, true);
             pair.received(failed_at, WalkKind::Commit, None, false);
             pair.received(at, WalkKind::Derive, Some(frontier.derives), true);
-            pair.received(at, WalkKind::Authorization, Some(frontier.authorization_evidence), true);
         });
         let condition = collection_condition(&health, failed_at);
         assert_eq!(condition.state, State::Stalled);
@@ -794,11 +795,59 @@ mod tests {
                 true,
             );
             pair.received(recovered_at, WalkKind::Derive, Some(frontier.derives), true);
-            pair.received(recovered_at, WalkKind::Authorization, Some(frontier.authorization_evidence), true);
         });
         let condition = collection_condition(&health, recovered_at);
         assert_eq!(condition.state, State::Current);
         assert!(!condition.alert);
+    }
+
+    /// Authorization counts are the grant index's and the peer's listing
+    /// for C. A pair agreeing on C's grants stays current past the default
+    /// age with only its record trees exchanged since.
+    #[test]
+    fn authorization_counts_come_from_grant_agreement_which_needs_no_fresh_walk() {
+        use crate::health::{GrantHealth, GrantPeerHealth};
+        use crate::patch_repair::PatchSummary;
+        use crate::walk::WalkKind;
+
+        let at = crate::clock::mono_now();
+        let later = at + Duration::from_secs(600);
+        let (health, collection, remote_key, frontier) = pair(at, at);
+        let local = PatchSummary::new(Some([6; 32]), 3).unwrap();
+        let listed = PatchSummary::new(Some([6; 32]), 3).unwrap();
+        health.update(|sample| {
+            sample.grants = vec![GrantHealth {
+                resource: collection,
+                local,
+                peers: vec![GrantPeerHealth {
+                    peer: remote_key,
+                    listed: Some(listed),
+                    ..Default::default()
+                }],
+            }];
+        });
+        for when in [at, later] {
+            health.update(|sample| {
+                sample.observed_at = Some(when);
+                sample.store.last_snapshot_observed_at = Some(when);
+            });
+            health.with_peer(collection, remote_key, |pair| {
+                pair.pushed(when, WalkKind::Commit, frontier.commits, true);
+                pair.pushed(when, WalkKind::Derive, frontier.derives, true);
+                pair.received(when, WalkKind::Commit, Some(frontier.commits), true);
+                pair.received(when, WalkKind::Derive, Some(frontier.derives), true);
+            });
+            let condition = collection_condition(&health, when);
+            assert_eq!(condition.state, State::Current, "{when:?}");
+            let measured = super::measurements(&health.snapshot(), when);
+            let evidence = &measured
+                .iter()
+                .find(|measurement| measurement.condition.component == Component::Collection)
+                .unwrap()
+                .evidence;
+            assert_eq!(evidence.local_authorizations, Some(3));
+            assert_eq!(evidence.remote_authorizations, Some(3));
+        }
     }
 
     #[test]

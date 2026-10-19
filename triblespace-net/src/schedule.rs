@@ -2,21 +2,24 @@
 //! exchanged (design: walk streams).
 //!
 //! Each selected collection has one [`WakeSchedule`]. When it fires, this
-//! side opens an exchange of C's records tree and its authorization tree
-//! with each neighbour it sends C to or receives C from, and of its
-//! references tree with each of those with which it replicates C in full;
+//! side opens an exchange of C's two records trees with each neighbour it
+//! sends C to or receives C from, and of its references tree with each of
+//! those with which it replicates C in full;
 //! an exchange already running with a neighbour for a tree is skipped, not
 //! queued, and one the neighbour opened at the same time takes its place
 //! ([`crate::walk`]). A local append resets the timer to its shortest
-//! interval. A root that changes while the peer's delta of C's records or
-//! evidence is being received here is that delta landing and resets
-//! nothing; the receive resets the timer once when it lands, so the merged
+//! interval. A root that changes while the peer's delta of C's records is
+//! being received here is that delta landing and resets nothing; the receive resets the timer once when it lands, so the merged
 //! root goes out once (D4). A receive that lands without changing the root,
 //! the common case of an unchanged tree exchanged again, resets nothing:
 //! otherwise two neighbours would exchange every shortest interval forever.
 //! A changed held set resets nothing: the next exchange carries it. A
 //! neighbour this side starts sending to or receiving from is exchanged
 //! with within two minimum intervals.
+//!
+//! Grants are not the schedule's. They are no part of C's root, and grant
+//! walks are opened by grant gossip ([`crate::grants`]) where two hosts'
+//! listed roots differ; one received here defers nothing.
 //!
 //! When an exchange is confirmed, the walks task compares the tree with the
 //! one agreed and exchanges again at once if they differ
@@ -64,7 +67,7 @@ struct Scheduled {
     root: RawHash,
     schedule: WakeSchedule,
     neighbours: HashMap<PeerId, Neighbour>,
-    /// Deltas of the records or authorization tree being received.
+    /// Deltas of the records trees being received.
     receiving: usize,
     /// The root changed while one was: the merged root goes out once they
     /// end.
@@ -80,15 +83,10 @@ pub(crate) struct Schedules {
 /// The selected collections of `snapshot` and their record roots.
 pub(crate) fn roots(snapshot: &StoreSnapshot) -> impl Iterator<Item = (CollectionHandle, RawHash)> {
     snapshot.active().filter_map(|collection| {
-        let repair = snapshot.selected(collection)?;
-        let repair = repair.repair();
+        let selected = snapshot.selected(collection)?;
         Some((
             collection,
-            record_root(
-                collection,
-                repair.records().summaries(),
-                repair.authorization_evidence().summary(),
-            ),
+            record_root(collection, selected.repair().records().summaries()),
         ))
     })
 }
@@ -181,9 +179,9 @@ impl Schedules {
     }
 
     /// A delta of a tree is being received here, or its exchange ended. A
-    /// root that changes while one of C's records or evidence is received
-    /// resets nothing; once the last of them ends, having landed, the change
-    /// resets C's timer once.
+    /// root that changes while one of C's records trees is received resets
+    /// nothing; once the last of them ends, having landed, the change resets
+    /// C's timer once. Held blobs and grants count for nothing.
     pub(crate) fn event(&mut self, event: Event, now: Mono) {
         let (collection, kind, landed) = match event {
             Event::Receiving { collection, kind } => (collection, kind, None),
@@ -193,7 +191,7 @@ impl Schedules {
                 landed,
             } => (collection, kind, Some(landed)),
         };
-        if kind == WalkKind::References {
+        if !matches!(kind, WalkKind::Commit | WalkKind::Derive) {
             return;
         }
         let Some(scheduled) = self.collections.get_mut(&collection.raw) else {
@@ -219,9 +217,8 @@ impl Schedules {
     }
 
     /// The exchanges to open: of each collection whose opportunity is due,
-    /// its records and authorization trees with every neighbour this side
-    /// sends to or receives from, and its references tree with those it
-    /// replicates in full with.
+    /// its records trees with every neighbour this side sends to or receives
+    /// from, and its references tree with those it replicates in full with.
     pub(crate) fn poll(&mut self, now: Mono) -> Vec<Start> {
         let mut starts = Vec::new();
         for (raw, scheduled) in &mut self.collections {
@@ -236,7 +233,6 @@ impl Schedules {
                 }
                 starts.push((*peer, collection, WalkKind::Commit));
                 starts.push((*peer, collection, WalkKind::Derive));
-                starts.push((*peer, collection, WalkKind::Authorization));
                 if neighbour.full {
                     starts.push((*peer, collection, WalkKind::References));
                 }
@@ -289,13 +285,13 @@ mod tests {
             .collect()
     }
 
-    /// A timer's opportunity exchanges the records and authorization trees
-    /// with every neighbour this side sends to or receives from, and the
-    /// references tree only with one it replicates the collection in full
-    /// with. A neighbour the collection flows neither way with gets
-    /// nothing.
+    /// A timer's opportunity exchanges the two record trees with every
+    /// neighbour this side sends to or receives from, and the references
+    /// tree only with one it replicates the collection in full with. Grants
+    /// are not the schedule's: no authorization tree is exchanged. A
+    /// neighbour the collection flows neither way with gets nothing.
     #[test]
-    fn an_opportunity_exchanges_three_trees_with_each_neighbour_and_four_with_a_full_one() {
+    fn an_opportunity_exchanges_the_record_trees_with_each_neighbour_and_held_blobs_with_a_full_one() {
         let c = collection(1);
         let mut now = crate::clock::mono_now();
         let mut node = Schedules::default();
@@ -311,25 +307,24 @@ mod tests {
             [
                 (c, WalkKind::Commit),
                 (c, WalkKind::Derive),
-                (c, WalkKind::Authorization),
                 (c, WalkKind::References)
             ]
         );
         assert!(to(&starts, B).is_empty());
 
-        // B starts receiving on demand: records and evidence only, within
-        // two minimum intervals, at one or both of their opportunities.
+        // B starts receiving on demand: records only, within two minimum
+        // intervals, at one or both of their opportunities.
         node.neighbours(
             [(c, &a, true, true, true), (c, &b, false, true, false)],
             now,
         );
         let starts = advance(&mut node, &mut now, Duration::from_secs(4));
         let to_b = to(&starts, B);
-        assert!(!to_b.is_empty() && to_b.len() <= 6, "{to_b:?}");
-        for pair in to_b.chunks(3) {
-            assert_eq!(pair, [(c, WalkKind::Commit), (c, WalkKind::Derive), (c, WalkKind::Authorization)]);
+        assert!(!to_b.is_empty() && to_b.len() <= 4, "{to_b:?}");
+        for pair in to_b.chunks(2) {
+            assert_eq!(pair, [(c, WalkKind::Commit), (c, WalkKind::Derive)]);
         }
-        assert_eq!(to(&starts, A).len() / 4, to_b.len() / 3);
+        assert_eq!(to(&starts, A).len() / 3, to_b.len() / 2);
     }
 
     #[test]
@@ -425,10 +420,7 @@ mod tests {
             now,
         );
         let starts = advance(&mut node, &mut now, Duration::from_secs(2));
-        assert_eq!(
-            to(&starts, B),
-            [(c, WalkKind::Commit), (c, WalkKind::Derive), (c, WalkKind::Authorization)]
-        );
+        assert_eq!(to(&starts, B), [(c, WalkKind::Commit), (c, WalkKind::Derive)]);
         // Twelve seconds on, the interval has doubled past the minimum, so
         // a reset would move the deadline. A receive during which the root
         // did not change resets nothing, landed or not, a references receive
@@ -465,7 +457,7 @@ mod tests {
         // A change during a receive that lands resets once it ends, even
         // when another receive is still running.
         let deadline = node.deadline();
-        for kind in [WalkKind::Commit, WalkKind::Authorization] {
+        for kind in [WalkKind::Commit, WalkKind::Derive] {
             node.event(
                 Event::Receiving {
                     collection: c,
@@ -478,7 +470,7 @@ mod tests {
         node.event(
             Event::Received {
                 collection: c,
-                kind: WalkKind::Authorization,
+                kind: WalkKind::Derive,
                 landed: true,
             },
             now,
@@ -493,6 +485,32 @@ mod tests {
             now,
         );
         assert!(node.deadline() <= Some(now + Duration::from_secs(2)));
+    }
+
+    /// Grants are not the schedule's: a grant walk received here defers no
+    /// change of the record root, which resets the timer at once.
+    #[test]
+    fn a_grant_walk_received_here_defers_no_record_change() {
+        let c = collection(8);
+        let mut now = crate::clock::mono_now();
+        let mut node = Schedules::default();
+        node.observe([(c, root(0))], now);
+        let b = link(2, B);
+        node.neighbours([(c, &b, true, false, false)], now);
+        // Quiet long enough to reach sixty-second intervals.
+        advance(&mut node, &mut now, Duration::from_secs(200));
+        node.event(
+            Event::Receiving {
+                collection: c,
+                kind: WalkKind::Authorization,
+            },
+            now,
+        );
+        node.observe([(c, root(1))], now);
+        assert!(
+            node.deadline() <= Some(now + Duration::from_secs(2)),
+            "a record change during a grant walk resets the timer"
+        );
     }
 
     /// An unselected collection is scheduled no more, and a selected one
@@ -510,7 +528,7 @@ mod tests {
         );
         assert!(node.deadline().is_some());
         let starts = advance(&mut node, &mut now, Duration::from_secs(2));
-        assert_eq!(to(&starts, A).len(), 3);
+        assert_eq!(to(&starts, A).len(), 2);
         assert!(starts.iter().all(|(_, collection, _)| *collection == c));
 
         node.observe([(d, root(0))], now);

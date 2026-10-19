@@ -73,7 +73,7 @@ mod tests {
             publication: Default::default(),
             blob_serving: Default::default(),
             peerings: Vec::new(),
-            available: Vec::new(),
+            grants: Vec::new(),
         }
     }
 

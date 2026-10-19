@@ -174,6 +174,8 @@ async fn until(clock: &VirtualClock, seconds: u64, mut ready: impl FnMut() -> bo
     panic!("two actual hosts did not converge within {seconds} virtual seconds");
 }
 
+/// The peer confirmed `record_count` records of C, and listed this side's
+/// root of C's grants, holding `proof_count` of them.
 fn confirmed(
     peer: &Peer<MemoryRepo>,
     other: [u8; 32],
@@ -181,25 +183,34 @@ fn confirmed(
     record_count: u64,
     proof_count: u64,
 ) -> bool {
-    peer.health()
-        .collections
+    let health = peer.health();
+    let grants_agree = health
+        .grants
         .iter()
-        .find(|item| item.collection == collection)
-        .and_then(|item| item.peers.iter().find(|item| item.peer == other))
+        .find(|item| item.resource == collection)
         .is_some_and(|item| {
-            item.confirmed
-                .commits
-                .zip(item.confirmed.derives)
-                .is_some_and(|(commits, derives)| {
-                    commits.leaf_count() + derives.leaf_count() == record_count
-                })
+            item.local.leaf_count() == proof_count
                 && item
-                    .confirmed
-                    .authorization_evidence
-                    .is_some_and(|root| root.leaf_count() == proof_count)
-                && item.pushes.last_ok
-                && item.receives.last_ok
-        })
+                    .peers
+                    .iter()
+                    .any(|listing| listing.peer == other && listing.listed == Some(item.local))
+        });
+    grants_agree
+        && health
+            .collections
+            .iter()
+            .find(|item| item.collection == collection)
+            .and_then(|item| item.peers.iter().find(|item| item.peer == other))
+            .is_some_and(|item| {
+                item.confirmed
+                    .commits
+                    .zip(item.confirmed.derives)
+                    .is_some_and(|(commits, derives)| {
+                        commits.leaf_count() + derives.leaf_count() == record_count
+                    })
+                    && item.pushes.last_ok
+                    && item.receives.last_ok
+            })
 }
 
 /// Walk frames outside grant walks: those are Prefix only, whatever the

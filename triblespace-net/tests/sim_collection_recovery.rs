@@ -175,9 +175,7 @@ fn periodic_pushes_recover_a_healed_partition_beside_a_healthy_replica() {
                 && [&b, &c].into_iter().all(|peer| {
                     frontier(peer, collection).is_some_and(|other| {
                         let root = root.unwrap();
-                        other.commits == root.commits
-                            && other.derives == root.derives
-                            && other.authorization_evidence == root.authorization_evidence
+                        other.commits == root.commits && other.derives == root.derives
                     })
                 })
                 && contains(&mut c, original)

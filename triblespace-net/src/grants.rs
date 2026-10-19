@@ -31,6 +31,10 @@
 //!   opens its walk again the same way, and a definition found nowhere is
 //!   asked for again when the retry falls due, so recovery never waits for a
 //!   listing that may not change.
+//! - What this side holds of R's grants, and each connected peer's standing
+//!   listing of R, is published into health as grant agreement
+//!   ([`crate::health::GrantHealth`]); a collection's pair reads its grant
+//!   part from there, with no age.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -909,6 +913,8 @@ pub(crate) struct Grants {
     /// Stored grants waiting in the index whose missing handles were asked
     /// for, by proof id.
     asked: PATCH<32, IdentitySchema, ()>,
+    /// Grant agreement changed since it was last published.
+    changed: bool,
 }
 
 impl Grants {
@@ -919,6 +925,7 @@ impl Grants {
             listings: HashMap::new(),
             waiting: Pending::default(),
             asked: PATCH::new(),
+            changed: false,
         }
     }
 
@@ -928,11 +935,72 @@ impl Grants {
         &self.waiting
     }
 
+    /// Publish grant agreement into `health`, if anything changed since the
+    /// last call: for every active collection and every resource listed to or
+    /// by a connected peer, the root and count of its grants in the index
+    /// here and each such peer's standing listing of it, from the peer's
+    /// newest connection. Returns whether it did.
+    pub(crate) fn publish(&mut self, health: &crate::health::Health) -> bool {
+        if !std::mem::take(&mut self.changed) {
+            return false;
+        }
+        let grants = self.health();
+        health.update(|health| health.grants = grants);
+        true
+    }
+
+    fn health(&self) -> Vec<crate::health::GrantHealth> {
+        use crate::health::{GrantHealth, GrantPeerHealth};
+        let Some(snapshot) = &self.snapshot else {
+            return Vec::new();
+        };
+        let index = snapshot.grants();
+        // Scratch for this publication only: each peer's newest connection
+        // and the resources to report.
+        let mut newest: BTreeMap<PeerId, &Listing> = BTreeMap::new();
+        for listing in self.listings.values() {
+            let peer = listing.link.peer();
+            if newest
+                .get(&peer)
+                .is_none_or(|kept| kept.link.id() < listing.link.id())
+            {
+                newest.insert(peer, listing);
+            }
+        }
+        let mut resources: BTreeSet<RawHash> = snapshot.active().map(|c| c.raw).collect();
+        for listing in newest.values() {
+            resources.extend(listing.listed.iter_ordered().copied());
+            resources.extend(listing.sent.iter_ordered().copied());
+        }
+        resources
+            .into_iter()
+            .map(|raw| {
+                let resource = CollectionHandle::new(raw);
+                let peers = newest
+                    .iter()
+                    .filter(|(_, listing)| {
+                        listing.listed.get(&raw).is_some() || listing.sent.get(&raw).is_some()
+                    })
+                    .map(|(peer, listing)| GrantPeerHealth {
+                        peer: *peer,
+                        listed: listing.listed.get(&raw).copied(),
+                    })
+                    .collect();
+                GrantHealth {
+                    resource,
+                    local: index.summary(resource),
+                    peers,
+                }
+            })
+            .collect()
+    }
+
     /// Hear one connection event: list on opening, forget on closing, and
     /// hear the peer's GRANT_ROOTS.
     pub(crate) fn event(&mut self, event: &ReconEvent) -> Effects {
         match event {
             ReconEvent::Opened(link) => {
+                self.changed = true;
                 if !link.closed() {
                     self.listings.insert(link.id(), Listing::new(link.clone()));
                     self.list(link.id());
@@ -942,6 +1010,7 @@ impl Grants {
             // Keys are free, so a grant waits in memory only while its
             // sender stays connected.
             ReconEvent::Closed(link) => {
+                self.changed = true;
                 self.listings.remove(&link.id());
                 let sender = link.peer();
                 if !self
@@ -976,6 +1045,7 @@ impl Grants {
     /// grants over a listed R waiting here need from this peer first.
     fn hear(&mut self, id: u64, roots: &[(CollectionHandle, PatchSummary)]) -> Effects {
         let mut effects = Effects::default();
+        self.changed = true;
         let mut heard = Vec::new();
         for (resource, theirs) in roots {
             let (resource, theirs) = (*resource, *theirs);
@@ -1149,6 +1219,7 @@ impl Grants {
         &mut self,
         peered: impl IntoIterator<Item = (u64, CollectionHandle)>,
     ) -> Effects {
+        self.changed = true;
         let mut now: HashMap<u64, PATCH<32, IdentitySchema, (), Blake3Merkle>> = HashMap::new();
         for (id, resource) in peered {
             now.entry(id)
@@ -1347,6 +1418,7 @@ impl Grants {
     pub(crate) fn observe(&mut self, snapshot: Arc<StoreSnapshot>) -> Effects {
         let mut effects = Effects::default();
         self.snapshot = Some(snapshot.clone());
+        self.changed = true;
         let mut policies = HashMap::new();
         for (proof, senders) in self
             .waiting

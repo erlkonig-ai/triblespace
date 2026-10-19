@@ -392,32 +392,27 @@ impl Walks {
             .agreed
             .as_ref()
             .map_or(ended.root, |agreed| agreed.summary());
-        self.health.with_peer(collection, peer, |health| {
-            // A grant walk is no push or receive of the collection (D5): it
-            // moves no counter. Until health reads grant agreement from the
-            // listings, it still keeps the AUTH roots and receive completion.
-            if kind == WalkKind::Authorization {
-                if ended.receives {
-                    health.grants_received(now, ended.peer_root, ended.landed);
-                }
-            } else {
+        // A grant walk is no push or receive of the collection: its end
+        // reaches the grant exchange, which reports grant agreement.
+        if kind != WalkKind::Authorization {
+            self.health.with_peer(collection, peer, |health| {
                 if ended.sends {
                     health.pushed(now, kind, confirmed, ended.confirmed)
                 }
                 if ended.receives {
                     health.received(now, kind, ended.peer_root, ended.landed)
                 }
-            }
-            // Directional end counters are LANDED/gated-FIN receipts. This diagnostic
-            // root, unlike those counters, exists only with shared agreement.
-            let agreed_root = ended.agreed.as_ref().map(|tree| tree.summary());
-            match kind {
-                WalkKind::Commit => health.confirmed.commits = agreed_root,
-                WalkKind::Derive => health.confirmed.derives = agreed_root,
-                WalkKind::Authorization => health.confirmed.authorization_evidence = agreed_root,
-                WalkKind::References => {}
-            }
-        });
+                // Directional end counters are LANDED/gated-FIN receipts. This
+                // diagnostic root, unlike those counters, exists only with
+                // shared agreement.
+                let agreed_root = ended.agreed.as_ref().map(|tree| tree.summary());
+                match kind {
+                    WalkKind::Commit => health.confirmed.commits = agreed_root,
+                    WalkKind::Derive => health.confirmed.derives = agreed_root,
+                    WalkKind::Authorization | WalkKind::References => {}
+                }
+            });
+        }
         let Some(agreed) = ended.agreed else {
             self.agreed.remove(&key);
             return false;

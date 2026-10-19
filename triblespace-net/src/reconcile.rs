@@ -1568,10 +1568,6 @@ mod tests {
         let initial_frontier = frontier().unwrap();
         assert_eq!(initial_frontier.commits, manifest(&initial_overlay).commits);
         assert_eq!(initial_frontier.derives, manifest(&initial_overlay).derives);
-        assert_eq!(
-            initial_frontier.authorization_evidence,
-            manifest(&initial_overlay).authorization_evidence
-        );
         let blob = Blob::<UnknownBlob>::new(Bytes::from_source(b"network batch".to_vec()));
         let handle = blob.get_handle();
         let record = CollectionRecord::Commit(CollectionCommit::sign(
@@ -1645,14 +1641,10 @@ mod tests {
                 .reader_is_admitted_by(reader, std::slice::from_ref(&proof)),
             QuorumOutcome::Met
         );
-        // Health commits to the complete semantic record and AUTH PATCHes.
+        // Health commits to the complete record PATCHes.
         let published = frontier_after_refresh.unwrap();
         assert_eq!(published.commits, manifest(&expected).commits);
         assert_eq!(published.derives, manifest(&expected).derives);
-        assert_eq!(
-            published.authorization_evidence,
-            manifest(&expected).authorization_evidence
-        );
         // The root leaves held blobs out, so a bare semantic overlay and the
         // serving one share it.
         assert_eq!(published.wake_root, manifest(&expected).wake_root);
