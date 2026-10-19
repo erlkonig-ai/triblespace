@@ -449,6 +449,8 @@ pub(crate) struct Ended {
     pub(crate) failure: Option<Failure>,
     /// The peer reset the stream as refused.
     pub(crate) refused: bool,
+    /// Received values a grant walk skipped.
+    pub(crate) skipped: u64,
 }
 
 pub(crate) struct Exchange {
@@ -462,6 +464,8 @@ pub(crate) struct Exchange {
     /// Peer keys accounted for but not kept here: skipped, or pending. They
     /// are never part of the agreement.
     excluded: PATCH<KEY_BYTES, IdentitySchema, ()>,
+    /// Received values skipped, for grant health.
+    skipped: u64,
     sends: bool,
     receives: bool,
     agreed: Option<Arc<Tree>>,
@@ -536,6 +540,7 @@ impl Exchange {
             pinned,
             gate,
             excluded: PATCH::new(),
+            skipped: 0,
             sends,
             receives,
             agreed,
@@ -938,6 +943,7 @@ impl Exchange {
                 _ => None,
             },
             refused: false,
+            skipped: self.skipped,
         }
     }
 
@@ -1432,6 +1438,7 @@ impl Exchange {
             // Accounted for in the peer's delta, so the walk confirms, but
             // never agreed: a skipped key is offered again by the next walk.
             Admit::Skip(key) => {
+                self.skipped += 1;
                 self.excluded.insert(&Entry::new(&key));
                 self.have_leaf(key, outs);
             }

@@ -324,6 +324,38 @@ fn a_wrong_root_proof_over_an_unknown_r_is_skipped_and_the_agreement_is_the_rece
     assert_ne!(agreed.leaf_count(), 1, "never the sender's root");
 }
 
+/// A walk counts the proofs it skipped, and only those: a foreign proof is
+/// counted, the valid grant landing beside it is not, and the agreement is
+/// what the receiver holds.
+#[test]
+fn a_walk_counts_what_it_skipped_and_not_what_it_landed() {
+    let [alice, stranger] = [0x64, 0x6E].map(key);
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::Open,
+        AdmissionPolicy::direct(alice.verifying_key()),
+    );
+    let mut bob = Node::new(0x65);
+    let bob_key = key(0x65);
+    let c = bob.hold("counts skips", policy);
+    let foreign = grant(CollectionHandle::new([0x78; 32]), &alice, write_capability(), &bob_key);
+    let valid = grant(c, &alice, write_capability(), &bob_key);
+    let joined = bob
+        .walks
+        .start_incoming(id(&stranger), c, AUTH, Algorithm::Prefix, None)
+        .unwrap();
+    let mut side = Side::with(bob, joined);
+    scripted(&mut side, c, &[value(&foreign), value(&valid)]);
+    assert_eq!(side.outcome(), Some(Outcome::Confirmed));
+    assert!(stored(&mut side.node, &valid).is_some(), "positive control: it landed");
+    side.node.observe();
+    let local = side.node.serving().grants().summary(c);
+    assert_eq!(local.leaf_count(), 1);
+    let Side { exchange, .. } = side;
+    let ended = exchange.end();
+    assert_eq!(ended.skipped, 1, "the foreign proof, not the landed one");
+    assert_eq!(ended.agreed.expect("confirmed").summary(), local);
+}
+
 #[test]
 fn an_incoming_walk_over_an_absent_r_starts_empty_and_receives() {
     let mut bob = Node::new(0x81);

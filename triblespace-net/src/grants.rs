@@ -518,6 +518,8 @@ pub(crate) struct GrantWalkEnd {
     pub(crate) peer: PeerId,
     pub(crate) resource: CollectionHandle,
     pub(crate) outcome: GrantOutcome,
+    /// Proofs the walk received here and skipped.
+    pub(crate) skipped: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -753,6 +755,22 @@ fn settles(
     Some(validate_proof_for_policies(resource, policies, proof).is_ok())
 }
 
+/// Whether a resident descriptor describes a collection: an entity tagged as
+/// a collection descriptor. None larger than any descriptor this node
+/// fetches, or not readable as an archive, does.
+fn is_collection_descriptor(bytes: anybytes::Bytes, resource: CollectionHandle) -> bool {
+    use triblespace_core::collection::KIND_COLLECTION_DESCRIPTOR;
+    use triblespace_core::metadata;
+    if bytes.len() as u64 > METADATA_BLOB_BYTES {
+        return false;
+    }
+    Blob::<SimpleArchive>::with_handle(bytes, Inline::new(resource.raw))
+        .try_from_blob::<TribleSet>()
+        .is_ok_and(|facts| {
+            exists!(pattern!(&facts, [{ _?entity @ metadata::tag: KIND_COLLECTION_DESCRIPTOR }]))
+        })
+}
+
 /// The name a resident descriptor gives its resource, if it reads as one.
 fn descriptor_name(bytes: anybytes::Bytes, resource: CollectionHandle) -> Option<RawHash> {
     if bytes.len() as u64 > METADATA_BLOB_BYTES {
@@ -825,6 +843,20 @@ struct Listing {
     peered: PATCH<32, IdentitySchema, (), Blake3Merkle>,
     /// Walks over R to open again after a failure, with their backoff.
     retries: PATCH<32, IdentitySchema, Retry>,
+    /// What this side held of R's grants when the last walk over R
+    /// confirmed.
+    agreed: PATCH<32, IdentitySchema, PatchSummary>,
+    /// Grant health counters per R.
+    counters: PATCH<32, IdentitySchema, Counters>,
+}
+
+/// Grant health counters for one connection and resource.
+#[derive(Clone, Copy, Debug, Default)]
+struct Counters {
+    ends: crate::health::Ends,
+    skipped: u64,
+    pending: u64,
+    retries: u64,
 }
 
 /// A backoff for one connection and resource.
@@ -849,7 +881,17 @@ impl Listing {
             unknown: PATCH::new(),
             peered: PATCH::new(),
             retries: PATCH::new(),
+            agreed: PATCH::new(),
+            counters: PATCH::new(),
         }
+    }
+
+    /// Change R's counters.
+    fn count(&mut self, resource: CollectionHandle, change: impl FnOnce(&mut Counters)) {
+        let mut counters = self.counters.get(&resource.raw).copied().unwrap_or_default();
+        change(&mut counters);
+        self.counters
+            .replace(&PatchEntry::with_value(&resource.raw, counters));
     }
 
     /// Open the walk over R again after a backoff: 1 s after the first
@@ -945,8 +987,44 @@ impl Grants {
             return false;
         }
         let grants = self.health();
-        health.update(|health| health.grants = grants);
+        let named_unselected = self.named_unselected();
+        health.update(|health| {
+            health.grants = grants;
+            health.named_unselected = named_unselected;
+        });
         true
+    }
+
+    /// Collections an indexed grant names this node on that it has not
+    /// selected, in handle order.
+    fn named_unselected(&self) -> Vec<CollectionHandle> {
+        let Some(snapshot) = &self.snapshot else {
+            return Vec::new();
+        };
+        let index = snapshot.grants();
+        index
+            .resources()
+            .filter(|resource| {
+                index.participates(*resource, self.local) && snapshot.selected(*resource).is_none()
+            })
+            .filter(|resource| {
+                index.grants(*resource).is_some_and(|grants| {
+                    grants.proofs.iter_ordered().any(|key| {
+                        grants
+                            .proofs
+                            .get(key)
+                            .expect("an ordered grant key holds its proof")
+                            .prefixes()
+                            .any(|prefix| prefix.subject().to_bytes() == self.local)
+                    })
+                })
+            })
+            .filter(|resource| {
+                snapshot
+                    .get_blob(&resource.raw)
+                    .is_some_and(|bytes| is_collection_descriptor(bytes, *resource))
+            })
+            .collect()
     }
 
     fn health(&self) -> Vec<crate::health::GrantHealth> {
@@ -971,6 +1049,7 @@ impl Grants {
         for listing in newest.values() {
             resources.extend(listing.listed.iter_ordered().copied());
             resources.extend(listing.sent.iter_ordered().copied());
+            resources.extend(listing.counters.iter_ordered().copied());
         }
         resources
             .into_iter()
@@ -979,11 +1058,21 @@ impl Grants {
                 let peers = newest
                     .iter()
                     .filter(|(_, listing)| {
-                        listing.listed.get(&raw).is_some() || listing.sent.get(&raw).is_some()
+                        listing.listed.get(&raw).is_some()
+                            || listing.sent.get(&raw).is_some()
+                            || listing.counters.get(&raw).is_some()
                     })
-                    .map(|(peer, listing)| GrantPeerHealth {
-                        peer: *peer,
-                        listed: listing.listed.get(&raw).copied(),
+                    .map(|(peer, listing)| {
+                        let counters = listing.counters.get(&raw).copied().unwrap_or_default();
+                        GrantPeerHealth {
+                            peer: *peer,
+                            listed: listing.listed.get(&raw).copied(),
+                            agreed: listing.agreed.get(&raw).copied(),
+                            ends: counters.ends,
+                            skipped: counters.skipped,
+                            pending: counters.pending,
+                            retries: counters.retries,
+                        }
                     })
                     .collect();
                 GrantHealth {
@@ -1303,6 +1392,8 @@ impl Grants {
                     listing
                         .retries
                         .replace(&PatchEntry::with_value(&resource.raw, retry));
+                    listing.count(resource, |counters| counters.retries += 1);
+                    self.changed = true;
                     effects.walks.push((peer, resource));
                 } else {
                     listing.retries.remove(&resource.raw);
@@ -1350,13 +1441,27 @@ impl Grants {
     /// replaced, running or queued one changes nothing.
     fn ended(&mut self, end: GrantWalkEnd, now: Mono) {
         let local = self.summary(end.resource);
+        self.changed = true;
         for listing in self.listings.values_mut() {
             if listing.link.peer() != end.peer {
                 continue;
             }
+            listing.count(end.resource, |counters| {
+                counters.skipped += end.skipped;
+                match end.outcome {
+                    GrantOutcome::Confirmed { .. } => counters.ends.ended(now, true),
+                    GrantOutcome::Unconfirmed(_) | GrantOutcome::Refused => {
+                        counters.ends.ended(now, false)
+                    }
+                    GrantOutcome::Replaced | GrantOutcome::NotStarted(_) => {}
+                }
+            });
             match end.outcome {
-                GrantOutcome::Confirmed { .. } => {
+                GrantOutcome::Confirmed { agreed } => {
                     listing.retries.remove(&end.resource.raw);
+                    listing
+                        .agreed
+                        .replace(&PatchEntry::with_value(&end.resource.raw, agreed));
                 }
                 GrantOutcome::Unconfirmed(_)
                 | GrantOutcome::Refused
@@ -1402,6 +1507,14 @@ impl Grants {
                     }
                 }
                 let resource = proof.resource().into_bytes();
+                self.changed = true;
+                for listing in self.listings.values_mut() {
+                    if listing.link.peer() == peer {
+                        listing.count(CollectionHandle::new(resource), |counters| {
+                            counters.pending += 1
+                        });
+                    }
+                }
                 effects.fetch.extend(self.fetch(&proof, [resource], &[peer]));
                 for (sender, resource) in self.waiting.insert(peer, proof) {
                     self.give_up(sender, resource, now);

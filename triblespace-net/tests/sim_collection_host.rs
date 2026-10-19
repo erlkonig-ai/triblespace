@@ -334,6 +334,8 @@ fn issuer_held_read_proof_reaches_a_handle_only_recipient_by_grant_exchange() {
                 .reader_is_admitted(&before_selection, recipient_key.verifying_key())
                 .unwrap()
         );
+        // The recipient sees it was granted C, which it does not sync yet.
+        assert_eq!(recipient.health().named_unselected, [collection.handle()]);
         // Selecting C makes the recipient ask the issuer, a key of C's grant
         // chain, to peer for it.
         select(&mut recipient.store(), &recipient_key, collection.handle());
@@ -346,6 +348,7 @@ fn issuer_held_read_proof_reaches_a_handle_only_recipient_by_grant_exchange() {
         advance(&clock, &mut [&mut issuer, &mut recipient], 32).await;
         let dangling = recipient.snapshot().unwrap();
         assert_eq!(records_of(&dangling, collection.handle()), 1);
+        assert!(recipient.health().named_unselected.is_empty(), "selected now");
         let received = dangling
             .proofs()
             .unwrap()

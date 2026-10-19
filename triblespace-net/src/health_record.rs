@@ -285,6 +285,9 @@ pub fn conditions(
 
 /// Interpret qualitative conditions and retain their independently observed
 /// counters. This does not turn pairwise roots into blob availability claims.
+/// Of grant agreement only a collection's grant counts are recorded; the
+/// per-resource agreement in [`crate::health::HealthSnapshot::grants`] and
+/// its walk counters are runtime evidence, not persisted.
 pub fn measurements(
     health: &crate::health::HealthSnapshot,
     now: crate::clock::Mono,
@@ -555,6 +558,7 @@ mod tests {
             blob_serving: crate::health::BlobServeHealth::default(),
             peerings: Vec::new(),
             grants: Vec::new(),
+            named_unselected: Vec::new(),
         }
     }
 

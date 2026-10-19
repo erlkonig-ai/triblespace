@@ -1103,7 +1103,7 @@ impl<T: Transport, S: Service> Task<T, S> {
                     } else {
                         GrantOutcome::Unconfirmed(ended.failure)
                     };
-                    self.grant_end(peer, collection, outcome);
+                    self.grant_end(peer, collection, outcome, ended.skipped);
                     self.start_queued(peer);
                 }
                 if ended.receives {
@@ -1136,7 +1136,7 @@ impl<T: Transport, S: Service> Task<T, S> {
         let grant = kind == WalkKind::Authorization;
         let not_started = |task: &Self, why| {
             if grant {
-                task.grant_end(peer, collection, GrantOutcome::NotStarted(why));
+                task.grant_end(peer, collection, GrantOutcome::NotStarted(why), 0);
             }
         };
         if self.running.contains_key(&key) {
@@ -1185,11 +1185,18 @@ impl<T: Transport, S: Service> Task<T, S> {
     }
 
     /// Tell the grant exchange how a grant walk with `peer` over R ended.
-    fn grant_end(&self, peer: PeerId, resource: CollectionHandle, outcome: GrantOutcome) {
+    fn grant_end(
+        &self,
+        peer: PeerId,
+        resource: CollectionHandle,
+        outcome: GrantOutcome,
+        skipped: u64,
+    ) {
         let _ = self.grants.send(GrantEvent::Ended(GrantWalkEnd {
             peer,
             resource,
             outcome,
+            skipped,
         }));
     }
 
@@ -2058,6 +2065,7 @@ pub(crate) mod tests {
                     agreed: Some(Arc::new(Tree::pinned(kind, pinned.repair()))),
                     failure: None,
                     refused: false,
+                    skipped: 0,
                 };
                 assert!(!node.walks.ended(peer, collection, kind, ended, now));
             }
@@ -2166,6 +2174,7 @@ pub(crate) mod tests {
                 agreed: Some(Arc::new(Tree::pinned(kind, pinned.repair()))),
                 failure: None,
                 refused: false,
+                skipped: 0,
             },
             crate::clock::mono_now(),
         );
@@ -3224,6 +3233,7 @@ pub(crate) mod tests {
                     agreed: Some(Arc::new(Tree::pinned(kind, pinned.repair()))),
                     failure: None,
                     refused: false,
+                    skipped: 0,
                 },
             });
             assert!(
@@ -4406,6 +4416,7 @@ pub(crate) mod tests {
                     }),
                     failure,
                     refused,
+                    skipped: 0,
                 }
             };
             let cases = [

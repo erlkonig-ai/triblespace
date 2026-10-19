@@ -70,7 +70,7 @@ pub struct Ends {
 }
 
 impl Ends {
-    fn ended(&mut self, at: Mono, ok: bool) {
+    pub(crate) fn ended(&mut self, at: Mono, ok: bool) {
         self.last_at = Some(at);
         self.last_ok = ok;
         if ok {
@@ -339,6 +339,10 @@ pub struct HealthSnapshot {
     /// and what each connected peer listed for R. Written only by the
     /// peering task.
     pub grants: Vec<GrantHealth>,
+    /// Collections an indexed grant names this node on that it has not
+    /// selected: what it was granted and does not sync yet. Written only by
+    /// the peering task.
+    pub named_unselected: Vec<CollectionHandle>,
 }
 
 /// What this side holds of the grants over one resource R, and what each
@@ -358,6 +362,18 @@ pub struct GrantPeerHealth {
     pub peer: PeerId,
     /// The peer's last GRANT_ROOTS entry for R on the current connection.
     pub listed: Option<PatchSummary>,
+    /// What this side held of R's grants when the last grant walk with the
+    /// peer over R confirmed.
+    pub agreed: Option<PatchSummary>,
+    /// Grant walks with the peer over R that ran to an end: confirmed ones
+    /// end well; failed and refused ones do not.
+    pub ends: Ends,
+    /// Proofs those walks received here and skipped.
+    pub skipped: u64,
+    /// Proofs the peer delivered over R that waited for R's descriptor.
+    pub pending: u64,
+    /// Grant walks over R opened again after a failure or a give-up.
+    pub retries: u64,
 }
 
 fn fresh(at: Option<Mono>, now: Mono, max_age: Duration) -> bool {
@@ -451,6 +467,7 @@ impl Health {
             blob_serving: BlobServeHealth::default(),
             peerings: Vec::new(),
             grants: Vec::new(),
+            named_unselected: Vec::new(),
         })))
     }
 

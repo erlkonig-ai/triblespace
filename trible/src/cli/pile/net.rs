@@ -21,6 +21,7 @@ use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::SnapshotSource;
 use triblespace_net::health_record::{self, Recorder, DEFAULT_MAX_AGE, REPORT_EVERY};
 use triblespace_net::peer::{Peer, PeerConfig};
+use triblespace_net::patch_repair::PatchSummary;
 use triblespace_net::reconcile::ReplicationMode;
 
 /// Open the pile, as `host` when the command publishes or reads MERGEs or MAPs
@@ -621,6 +622,7 @@ fn run_sync(
     eprintln!("live collection repair active. (Ctrl-C to stop; also SIGTERM on Unix)\n");
     let node = *peer.id().as_bytes();
     let mut rounds_seen = RoundsSeen::new();
+    let mut grants_seen = GrantsSeen::new();
     let mut recorded = None;
 
     let started = std::time::Instant::now();
@@ -742,6 +744,9 @@ fn run_sync(
             for (remote, count) in completed_rounds(rounds, &mut rounds_seen) {
                 eprintln!("{}", reconciled_line(&remote, count));
             }
+            for line in grant_changes(&health, &mut grants_seen) {
+                eprintln!("{line}");
+            }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         Ok::<(), anyhow::Error>(())
@@ -775,6 +780,65 @@ fn reconciled_line(peer: &[u8; 32], collections: usize) -> String {
         "reconciled with peer {}: {collections} collections",
         hex::encode(peer)
     )
+}
+
+/// Grant agreement per `peer || resource` that was last printed disagreeing,
+/// kept across the daemon's passes: what this side holds, what the peer
+/// listed and what the last confirmed walk agreed.
+type GrantsSeen = triblespace_core::patch::PATCH<
+    64,
+    triblespace_core::patch::IdentitySchema,
+    (
+        PatchSummary,
+        Option<PatchSummary>,
+        Option<PatchSummary>,
+    ),
+>;
+
+/// One line per peer and resource whose grant agreement changed while the
+/// peer's listing differs from this side's grant index, and one when it
+/// agrees again: `grants <resource hex> with peer <endpoint id hex>: local
+/// <n>, listed <n|->, agreed <n|->`, counts of grants. A pair that agrees
+/// from the start prints nothing, so a daemon holding many resources stays
+/// quiet. The prefix and shape are stable for scripts.
+fn grant_changes(
+    health: &triblespace_net::health::HealthSnapshot,
+    seen: &mut GrantsSeen,
+) -> Vec<String> {
+    use triblespace_core::patch::Entry;
+    let count = |summary: Option<PatchSummary>| {
+        summary.map_or_else(|| "-".to_owned(), |summary| summary.leaf_count().to_string())
+    };
+    let mut lines = Vec::new();
+    for entry in &health.grants {
+        for listing in &entry.peers {
+            let Some(listed) = listing.listed else {
+                continue;
+            };
+            let mut key = [0; 64];
+            key[..32].copy_from_slice(&listing.peer);
+            key[32..].copy_from_slice(&entry.resource.raw);
+            let state = (entry.local, Some(listed), listing.agreed);
+            let disagrees = listed != entry.local;
+            let printed = seen.get(&key).copied();
+            if (disagrees && printed != Some(state)) || (!disagrees && printed.is_some()) {
+                lines.push(format!(
+                    "grants {} with peer {}: local {}, listed {}, agreed {}",
+                    hex::encode(entry.resource.raw),
+                    hex::encode(listing.peer),
+                    entry.local.leaf_count(),
+                    count(Some(listed)),
+                    count(listing.agreed),
+                ));
+                if disagrees {
+                    seen.replace(&Entry::with_value(&key, state));
+                } else {
+                    seen.remove(&key);
+                }
+            }
+        }
+    }
+    lines
 }
 
 /// The last completed repair round per `peer || collection`, kept across the
@@ -959,6 +1023,58 @@ fn run_health(
 
 #[cfg(test)]
 mod tests {
+    /// A pair whose listing differs prints a line, again only when its state
+    /// changes, and once more when it agrees; a pair agreeing from the start
+    /// prints nothing.
+    #[test]
+    fn grant_lines_follow_disagreement_and_its_end() {
+        use triblespace_core::collection::CollectionHandle;
+        use triblespace_net::health::{GrantHealth, GrantPeerHealth};
+        use triblespace_net::patch_repair::PatchSummary;
+
+        let summary = |byte: u8, count| PatchSummary::new(Some([byte; 32]), count).unwrap();
+        let mut health = triblespace_net::health::HealthSnapshot {
+            node: iroh_base::SecretKey::from_bytes(&[5; 32]).public().into(),
+            started_at: None,
+            observed_at: None,
+            store: Default::default(),
+            collections: Vec::new(),
+            publication: Default::default(),
+            blob_serving: Default::default(),
+            peerings: Vec::new(),
+            grants: Vec::new(),
+            named_unselected: Vec::new(),
+        };
+        let resource = CollectionHandle::new([1; 32]);
+        let quiet = CollectionHandle::new([2; 32]);
+        let listing = |listed, agreed| GrantPeerHealth {
+            peer: [7; 32],
+            listed,
+            agreed,
+            ..Default::default()
+        };
+        let mut seen = super::GrantsSeen::new();
+        health.grants = vec![
+            GrantHealth { resource, local: summary(3, 3), peers: vec![listing(Some(summary(2, 2)), None)] },
+            GrantHealth { resource: quiet, local: summary(4, 1), peers: vec![listing(Some(summary(4, 1)), None)] },
+        ];
+        let lines = super::grant_changes(&health, &mut seen);
+        assert_eq!(
+            lines,
+            [format!(
+                "grants {} with peer {}: local 3, listed 2, agreed -",
+                hex::encode([1; 32]),
+                hex::encode([7; 32])
+            )]
+        );
+        assert!(super::grant_changes(&health, &mut seen).is_empty(), "unchanged");
+        health.grants[0].peers[0] = listing(Some(summary(3, 3)), Some(summary(3, 3)));
+        let lines = super::grant_changes(&health, &mut seen);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].ends_with("local 3, listed 3, agreed 3"), "{lines:?}");
+        assert!(super::grant_changes(&health, &mut seen).is_empty(), "agreement is quiet");
+    }
+
     #[test]
     fn the_bound_line_names_every_bound_socket() {
         let addr: std::net::SocketAddr = "127.0.0.1:7001".parse().unwrap();

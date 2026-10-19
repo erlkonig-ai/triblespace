@@ -555,6 +555,7 @@ fn ended(peer: &SigningKey, resource: CollectionHandle, outcome: GrantOutcome) -
         peer: id(peer),
         resource,
         outcome,
+        skipped: 0,
     })
 }
 
@@ -856,4 +857,162 @@ fn health_reports_the_grant_index_root_and_the_peer_s_listing() {
         .expect("an active C stays published");
     assert!(entry.peers.is_empty(), "a listing goes with its connection");
     assert_ne!(health.snapshot().pair(c, id(&owner), now, age), PairState::Current);
+}
+
+/// One peer's published agreement on R.
+fn agreement(health: &crate::health::Health, resource: CollectionHandle, peer: PeerId) -> (PatchSummary, crate::health::GrantPeerHealth) {
+    let published = health.snapshot();
+    let entry = published
+        .grants
+        .iter()
+        .find(|entry| entry.resource == resource)
+        .expect("R's agreement is published");
+    let peer = entry
+        .peers
+        .iter()
+        .find(|listing| listing.peer == peer)
+        .cloned()
+        .expect("the peer's listing is published");
+    (entry.local, peer)
+}
+
+fn health_of(node: &Node) -> crate::health::Health {
+    crate::health::Health::new(iroh_base::EndpointId::from_bytes(&id(&node.key)).unwrap())
+}
+
+/// While the peer's grants over R differ, its listing and the agreement
+/// differ from this side's root (the fields move); after a confirmed walk
+/// and the peer's new listing, local, listed and agreed are equal. The walk
+/// end is counted, and so are the proofs it skipped.
+#[test]
+fn grant_health_reports_local_listed_agreed_and_walk_ends() {
+    let [alice, bob] = [0x50, 0x51].map(key);
+    let mut host = Node::new(0x5B);
+    let (r, _) = holding(&mut host, &alice, &bob);
+    host.observe();
+    let local = host.snapshot().grants().summary(r);
+    let health = health_of(&host);
+    let (linked, _) = open_to(&mut host, id(&bob), 1);
+    assert_eq!(hear(&mut host, &linked, vec![(r, summary(1))]).walks, [(id(&bob), r)]);
+    host.grants.publish(&health);
+    let (published, in_flight) = agreement(&health, r, id(&bob));
+    assert_eq!(published, local);
+    assert_eq!(in_flight.listed, Some(summary(1)));
+    assert_eq!(in_flight.agreed, None, "positive control: nothing agreed yet");
+    assert_eq!(in_flight.ends.ok + in_flight.ends.failed, 0);
+
+    host.grants.walked(
+        GrantEvent::Ended(GrantWalkEnd {
+            peer: id(&bob),
+            resource: r,
+            outcome: GrantOutcome::Confirmed { agreed: local },
+            skipped: 1,
+        }),
+        now(),
+    );
+    hear(&mut host, &linked, vec![(r, local)]);
+    host.grants.publish(&health);
+    let (published, settled) = agreement(&health, r, id(&bob));
+    assert_eq!((settled.listed, settled.agreed), (Some(published), Some(published)));
+    assert_eq!(published, local);
+    assert_eq!((settled.ends.ok, settled.ends.failed), (1, 0));
+    assert!(settled.ends.last_ok);
+    assert_eq!(settled.skipped, 1, "a skipped junk proof leaves agreed == local");
+
+    host.grants.walked(
+        GrantEvent::Ended(GrantWalkEnd {
+            peer: id(&bob),
+            resource: r,
+            outcome: GrantOutcome::Unconfirmed(None),
+            skipped: 0,
+        }),
+        now(),
+    );
+    host.grants.publish(&health);
+    let (_, failed) = agreement(&health, r, id(&bob));
+    assert_eq!((failed.ends.ok, failed.ends.failed), (1, 1));
+    assert_eq!(failed.agreed, Some(local), "the last confirmed agreement stays");
+}
+
+/// A grant the peer delivered that waits for its descriptor counts as
+/// pending; once evicted, the walk that opens again counts as a retry.
+#[test]
+fn an_evicted_pending_grant_counts_as_pending_then_as_a_retry() {
+    let [alice, peer] = [0xF0, 0xFF].map(key);
+    let (_, _, r, handle) = unheld(&alice, "counted");
+    let (mut host, _linked) = listed_to(&peer, r, summary(12));
+    let health = health_of(&host);
+    let base = now();
+    let first = grant(r, &alice, handle, &key(0xF1));
+    host.grants.walked(pending(id(&peer), &first), base);
+    host.grants.walked(ended(&peer, r, confirmed()), base);
+    host.grants.publish(&health);
+    let (_, counted) = agreement(&health, r, id(&peer));
+    assert_eq!((counted.pending, counted.retries), (1, 0));
+    for index in 0..MAX_PENDING_PER_SENDER {
+        let mut seed = [0xF2; 32];
+        seed[..8].copy_from_slice(&(index as u64).to_be_bytes());
+        let other = grant(r, &alice, handle, &SigningKey::from_bytes(&seed));
+        host.grants.walked(pending(id(&peer), &other), base);
+    }
+    assert!(!host.grants.waiting().contains(id(&peer), &first), "evicted");
+    let due = host.grants.deadline().expect("a retry is scheduled");
+    assert_eq!(host.grants.retry(due).walks, [(id(&peer), r)]);
+    host.grants.publish(&health);
+    let (_, retried) = agreement(&health, r, id(&peer));
+    assert_eq!(retried.pending, 1 + MAX_PENDING_PER_SENDER as u64);
+    assert_eq!(retried.retries, 1);
+}
+
+/// A collection an indexed grant names this node on, that it holds but has
+/// not selected, is published as granted and unselected; selecting it
+/// removes it. A non-collection resource granted to it never is, nor a
+/// collection granted only to someone else.
+#[test]
+fn a_granted_unselected_collection_is_published_until_selected() {
+    use triblespace_core::collection::{
+        AdmissionPolicy, CollectionPolicy, CollectionStoreExt, read_capability,
+    };
+    use triblespace_core::collection::selection::{CONFIG_COLLECTION_NAME, write_sync_selection};
+    use triblespace_core::collection::private_policy;
+    use triblespace_core::patch::Entry;
+
+    let [owner, other] = [0x21, 0x22].map(key);
+    let mut host = Node::new(0x20);
+    let me = host.key.clone();
+    let direct = AdmissionPolicy::direct(owner.verifying_key());
+    let granted = host
+        .store
+        .collection("granted", CollectionPolicy::new(direct.clone(), direct.clone()))
+        .unwrap()
+        .handle();
+    let elsewhere = host
+        .store
+        .collection("not mine", CollectionPolicy::new(direct.clone(), direct))
+        .unwrap()
+        .handle();
+    host.store
+        .insert_proof(grant(granted, &owner, read_capability(), &me))
+        .unwrap();
+    host.store
+        .insert_proof(grant(elsewhere, &owner, read_capability(), &other))
+        .unwrap();
+    let (r, _) = holding(&mut host, &owner, &me);
+    let config = host
+        .store
+        .collection(CONFIG_COLLECTION_NAME, private_policy(me.verifying_key()))
+        .unwrap();
+    for collection in [granted, elsewhere] {
+        host.active.insert(&Entry::new(&collection.raw));
+    }
+    let health = health_of(&host);
+    host.observe();
+    host.grants.publish(&health);
+    assert_eq!(health.snapshot().named_unselected, [granted]);
+    assert!(host.snapshot().grants().participates(r, id(&me)), "R names me too");
+
+    write_sync_selection(&mut host.store, config, &me, granted, true).unwrap();
+    host.observe();
+    host.grants.publish(&health);
+    assert!(health.snapshot().named_unselected.is_empty(), "selected now");
 }

@@ -74,6 +74,7 @@ mod tests {
             blob_serving: Default::default(),
             peerings: Vec::new(),
             grants: Vec::new(),
+            named_unselected: Vec::new(),
         }
     }
 
