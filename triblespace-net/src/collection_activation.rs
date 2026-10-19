@@ -155,8 +155,6 @@ impl CollectionAuthorizationEvidencePatch {
     /// delegate of each retained proof, including intermediate issuers. This
     /// uses only recognized policy geometry and signature-valid evidence;
     /// missing capability definitions or READ admission do not hide candidates.
-    /// Subordinate-resource proofs contribute only after their immutable
-    /// same-entity route and own policy roots selected them into this PATCH.
     ///
     /// These are routing hints, not authorization or evidence that an endpoint
     /// is online, serves this collection, or has any payloads. Duplicates and
@@ -178,13 +176,13 @@ impl CollectionAuthorizationEvidencePatch {
 
     /// Validate exact resource, configured root, and the signed byte chain
     /// ([`descriptor::validate_proof_evidence`], the predicate the held-blob
-    /// index also applies to proof seeds). Capability definitions need not be
-    /// resident for evidence to be repaired.
+    /// index also applies to proof seeds). Reads no blob: capability
+    /// definitions need not be resident for evidence to be repaired.
     pub fn validate_proof(
         &self,
         proof: &CapabilityProof,
     ) -> Result<(), CollectionAuthorizationEvidenceError> {
-        descriptor::validate_proof_evidence(&self.reader, self.collection, &self.descriptor, proof)
+        descriptor::validate_proof_evidence(self.collection, &self.descriptor, proof)
             .map_err(Into::into)
     }
 
@@ -501,8 +499,6 @@ pub enum CollectionAuthorizationEvidenceError {
     OpenPolicies,
     /// The proof names a different opaque resource.
     WrongResource,
-    /// The subordinate resource's immutable routing descriptor is not resident.
-    ResourceDescriptorUnavailable(CollectionHandle),
     /// The proof starts outside all descriptor-local roots.
     WrongRoot,
     /// A signature in the prefix chain is invalid.
@@ -515,9 +511,6 @@ impl From<descriptor::ProofEvidenceError> for CollectionAuthorizationEvidenceErr
     fn from(error: descriptor::ProofEvidenceError) -> Self {
         match error {
             descriptor::ProofEvidenceError::WrongResource => Self::WrongResource,
-            descriptor::ProofEvidenceError::ResourceDescriptorUnavailable(resource) => {
-                Self::ResourceDescriptorUnavailable(resource)
-            }
             descriptor::ProofEvidenceError::WrongRoot => Self::WrongRoot,
             descriptor::ProofEvidenceError::Invalid(source) => Self::Invalid(source),
         }
@@ -536,11 +529,6 @@ impl fmt::Display for CollectionAuthorizationEvidenceError {
             Self::WrongResource => {
                 formatter.write_str("capability proof names a different resource")
             }
-            Self::ResourceDescriptorUnavailable(resource) => write!(
-                formatter,
-                "capability resource descriptor is unavailable: blake3:{}",
-                hex::encode(resource.raw)
-            ),
             Self::Invalid(source) => {
                 write!(
                     formatter,
@@ -813,9 +801,7 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use ed25519_dalek::SigningKey;
-    use triblespace_core::capability::policy::{
-        capability_handle, resource_collection, resource_policy,
-    };
+    use triblespace_core::capability::policy::{capability_handle, resource_policy};
     use triblespace_core::capability::{
         CapabilityRequest, CapabilityResource, capability_action, capability_delegate_action,
         capability_quorum_authorizes,
@@ -1726,127 +1712,6 @@ mod tests {
         assert_eq!(
             without_write.writer_is_admitted_by(subject, &proofs),
             QuorumOutcome::Undefined(vec![write_capability()])
-        );
-    }
-
-    #[test]
-    fn subordinate_resources_use_immutable_same_entity_routes_and_their_own_roots() {
-        use triblespace_core::capability::policy::resource_handle;
-
-        let collection_root = key(92);
-        let resource_root = key(93);
-        let reader = key(94);
-        let unrelated_readers = [key(97), key(98), key(99), key(100)];
-        let mut store = MemoryRepo::default();
-        let collection = store
-            .collection(
-                "resource-audience",
-                CollectionPolicy::new(
-                    AdmissionPolicy::direct(collection_root.verifying_key()),
-                    AdmissionPolicy::direct(collection_root.verifying_key()),
-                ),
-            )
-            .unwrap();
-        let other = store
-            .collection(
-                "other-audience",
-                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
-            )
-            .unwrap();
-        let unknown_definition = Inline::new([95; 32]);
-        let resource = store.put::<SimpleArchive, _>(entity! {
-            resource_collection: collection.handle(),
-            resource_policy*: AdmissionPolicy::direct(resource_root.verifying_key()).binding(unknown_definition),
-        }.facts().clone()).unwrap();
-        let same_root_resource = store.put::<SimpleArchive, _>(entity! {
-            resource_collection: collection.handle(),
-            resource_policy*: AdmissionPolicy::direct(collection_root.verifying_key()).binding(read_capability()),
-        }.facts().clone()).unwrap();
-        let wrong_audience = store.put::<SimpleArchive, _>(entity! {
-            resource_collection: other.handle(),
-            resource_policy*: AdmissionPolicy::direct(resource_root.verifying_key()).binding(read_capability()),
-        }.facts().clone()).unwrap();
-        let split_entities = entity! { resource_collection: collection.handle() }
-            + entity! { resource_policy*: AdmissionPolicy::direct(resource_root.verifying_key()).binding(read_capability()) };
-        let split_resource = store
-            .put::<SimpleArchive, _>(split_entities.facts().clone())
-            .unwrap();
-        // A later ordinary C fact cannot reroute the hash-named R descriptor.
-        store
-            .commit(
-                collection,
-                &collection_root,
-                entity! {
-                    resource_handle: wrong_audience,
-                    resource_collection: collection.handle(),
-                },
-            )
-            .unwrap();
-        let accepted = [
-            root_proof(&resource_root, &reader, scope(unknown_definition, resource)),
-            root_proof(
-                &collection_root,
-                &reader,
-                scope(read_capability(), same_root_resource),
-            ),
-        ];
-        let rejected = [
-            root_proof(
-                &collection_root,
-                &unrelated_readers[0],
-                scope(unknown_definition, resource),
-            ),
-            root_proof(
-                &resource_root,
-                &unrelated_readers[1],
-                scope(read_capability(), wrong_audience),
-            ),
-            root_proof(
-                &resource_root,
-                &unrelated_readers[2],
-                scope(read_capability(), split_resource),
-            ),
-            root_proof(
-                &resource_root,
-                &unrelated_readers[3],
-                scope(read_capability(), Inline::new([96; 32])),
-            ),
-        ];
-        for proof in accepted.iter().chain(&rejected) {
-            store.insert_proof(proof.clone()).unwrap();
-        }
-        let snapshot = store.snapshot().unwrap();
-        let overlay = collection_repair_overlay(&snapshot, collection.handle()).unwrap();
-        let evidence = overlay.authorization_evidence();
-        assert_eq!(evidence.len(), 2);
-        for proof in &accepted {
-            evidence.validate_proof(proof).unwrap();
-            assert_eq!(evidence.get(proof.id()), Some(proof));
-        }
-        for proof in rejected {
-            assert!(evidence.validate_proof(&proof).is_err());
-            assert!(evidence.get(proof.id()).is_none());
-        }
-        assert_eq!(
-            evidence.reader_is_admitted_by(reader.verifying_key(), &accepted),
-            QuorumOutcome::Unmet
-        );
-        let mut candidates = overlay
-            .discovery_candidates()
-            .map(|key| key.to_bytes())
-            .collect::<Vec<_>>();
-        candidates.sort();
-        candidates.dedup();
-        let mut expected = [
-            collection_root.verifying_key(),
-            resource_root.verifying_key(),
-            reader.verifying_key(),
-        ]
-        .map(|key| key.to_bytes());
-        expected.sort();
-        assert_eq!(
-            candidates, expected,
-            "only routed R evidence contributes; wrong roots, other audiences, split routes and missing R descriptors do not"
         );
     }
 

@@ -15,9 +15,8 @@
 //! evidence (keyed by proof id under the collection) and the blobs it holds,
 //! as handles without values: a held reference a side lacks is noted held
 //! when the blob is resident, and fetched by hash from the peer first
-//! otherwise. A record lands as it is; a proof lands once its evidence
-//! validates, fetches the descriptor of a resource it is routed through, or
-//! stays deferred, which fails the exchange.
+//! otherwise. A record lands as it is; a proof lands once it validates as
+//! the collection's evidence, and fails the exchange otherwise.
 //!
 //! The walks task runs one node's exchanges. Either side opens the stream
 //! when its timer fires ([`crate::schedule`]), on the current connection to
@@ -53,23 +52,18 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::debug;
 use triblespace_core::blob::encodings::UnknownBlob;
-use triblespace_core::blob::{Blob, MemoryBlobStore};
+use triblespace_core::blob::Blob;
 use triblespace_core::capability::{CapabilityProof, CapabilityProofId, QuorumOutcome};
 use triblespace_core::collection::{
-    CollectionHandle, CollectionRecordView, EncodedCommit, EncodedDerive, descriptor,
+    CollectionHandle, CollectionRecordView, EncodedCommit, EncodedDerive,
 };
 #[cfg(test)]
 use triblespace_core::collection::CollectionRecord;
 use triblespace_core::patch::{Blake3Merkle, Entry, IdentitySchema, PATCH};
-use triblespace_core::repo::SnapshotSource;
-use triblespace_core::trible::TribleSet;
 
 use crate::channel::NetEvent;
 use crate::clock::Mono;
-use crate::collection_activation::{
-    CollectionAuthorizationEvidenceError, CollectionAuthorizationEvidencePatch,
-    CollectionRepairOverlay,
-};
+use crate::collection_activation::{CollectionAuthorizationEvidencePatch, CollectionRepairOverlay};
 use crate::collection_delta::decode_record;
 #[cfg(test)]
 use crate::collection_delta::encode_record;
@@ -79,7 +73,7 @@ use crate::connection::{
 };
 use crate::exchange::{Ended, Exchange, Out, Outcome, Tree};
 use crate::health::Health;
-use crate::host::{CollectionSnapshot, METADATA_BLOB_BYTES, StoreSnapshot};
+use crate::host::{CollectionSnapshot, StoreSnapshot};
 use crate::landing::{LandSlot, Landed};
 use crate::patch_repair::PatchSummary;
 #[cfg(test)]
@@ -507,15 +501,8 @@ impl Walks {
 pub(crate) enum Admit {
     /// Events for the landing task.
     Land(Vec<NetEvent>),
-    /// Fetch a blob by hash from the peer: a held reference, or the routing
-    /// descriptor a deferred `proof` names.
-    Fetch {
-        handle: RawHash,
-        proof: Option<CapabilityProof>,
-    },
-    /// A proof over a resource routed to C that the evidence here cannot
-    /// place yet stays deferred: the exchange does not confirm.
-    Defer,
+    /// Fetch a held reference by hash from the peer.
+    Fetch(RawHash),
     /// A held reference that could not be fetched: the exchange does not
     /// confirm, and the blob stays in the next delta.
     Fail,
@@ -554,9 +541,8 @@ impl Value {
 
 /// Check the value under `key` of a `kind` exchange of C against `evidence`
 /// (design 2.5): the value, and what to do with it. A record lands; a proof
-/// lands once its evidence validates, fetches the descriptor of the
-/// resource it is routed through, or stays deferred. Held references carry
-/// no values.
+/// lands once it validates as C's evidence. Held references carry no
+/// values.
 pub(crate) fn admit_value(
     kind: WalkKind,
     collection: CollectionHandle,
@@ -586,21 +572,11 @@ pub(crate) fn admit_value(
                 bail!("a proof under another proof's key");
             }
             proof.verify_signatures()?;
-            let routed = proof.resource().into_bytes() != collection.raw;
-            let admit = match evidence.validate_proof(&proof) {
-                Ok(()) => Admit::Land(vec![NetEvent::CapabilityProof(proof.clone())]),
-                // A proof over a resource routed to C needs that resource's
-                // descriptor, which the peer holds.
-                Err(CollectionAuthorizationEvidenceError::ResourceDescriptorUnavailable(
-                    descriptor,
-                )) if routed => Admit::Fetch {
-                    handle: descriptor.raw,
-                    proof: Some(proof.clone()),
-                },
-                Err(CollectionAuthorizationEvidenceError::WrongRoot) if routed => Admit::Defer,
-                Err(error) => return Err(error.into()),
-            };
-            Ok((Value::Proof(proof), admit))
+            evidence.validate_proof(&proof)?;
+            Ok((
+                Value::Proof(proof.clone()),
+                Admit::Land(vec![NetEvent::CapabilityProof(proof)]),
+            ))
         }
         WalkKind::References => bail!("held references carry no values"),
     }
@@ -626,39 +602,24 @@ pub(crate) fn admit_missing(
         if snapshot.is_some_and(|snapshot| snapshot.get_blob(&key).is_some()) {
             Admit::Land(vec![held])
         } else {
-            Admit::Fetch {
-                handle: key,
-                proof: None,
-            }
+            Admit::Fetch(key)
         },
     )
 }
 
 /// What a blob fetch of an exchange of C brought back. A fetched held
-/// reference lands, noted held in C; one that could not be fetched fails. A
-/// deferred `proof`'s descriptor that routes it to C lands with it;
-/// otherwise the proof stays deferred.
+/// reference lands, noted held in C; one that could not be fetched fails.
 pub(crate) fn admit_fetched(
     collection: CollectionHandle,
     handle: RawHash,
-    proof: Option<CapabilityProof>,
     blob: Option<Blob<UnknownBlob>>,
 ) -> Admit {
-    match (proof, blob) {
-        (None, Some(blob)) => Admit::Land(vec![
+    match blob {
+        Some(blob) => Admit::Land(vec![
             NetEvent::Blob(blob),
             NetEvent::Held { collection, handle },
         ]),
-        (None, None) => Admit::Fail,
-        (Some(proof), descriptor) => {
-            match descriptor.filter(|descriptor| routes(collection, &proof, descriptor)) {
-                Some(descriptor) => Admit::Land(vec![
-                    NetEvent::Blob(descriptor),
-                    NetEvent::CapabilityProof(proof),
-                ]),
-                None => Admit::Defer,
-            }
-        }
+        None => Admit::Fail,
     }
 }
 
@@ -755,20 +716,6 @@ pub(crate) fn value(
             .is_some()
             .then_some(Value::Handle),
     }
-}
-
-/// Whether `proof` is evidence for C through the resource `descriptor`
-/// describes.
-fn routes(
-    collection: CollectionHandle,
-    proof: &CapabilityProof,
-    descriptor: &Blob<UnknownBlob>,
-) -> bool {
-    let mut blobs = MemoryBlobStore::new();
-    blobs.insert(descriptor.clone());
-    let Ok(reader) = blobs.snapshot();
-    // C's own descriptor is read only for a proof over C itself.
-    descriptor::validate_proof_evidence(&reader, collection, &TribleSet::new(), proof).is_ok()
 }
 
 /// Starts exchanges through the walks task, and hands it the `walk/1`
@@ -1147,29 +1094,29 @@ impl<T: Transport, S: Service> Task<T, S> {
     }
 }
 
-/// Fetch `handle` from `peer`: a `descriptor` is metadata, a held reference
-/// may be any blob. The fetch ends after [`WALK_DEADLINE`] without
-/// progress, between any two chunks, never for its size, so a blob of any
-/// size lands at a steady rate; the wait for an opener permit before it is
-/// not timed.
+/// Fetch the held reference `handle` from `peer`, which may be any blob. The
+/// fetch ends after [`WALK_DEADLINE`] without progress, between any two
+/// chunks, never for its size, so a blob of any size lands at a steady rate;
+/// the wait for an opener permit before it is not timed.
 async fn fetch_blob<T: Transport, S: Service>(
     connections: ConnectionTable<T, S>,
     peer: PeerId,
     handle: RawHash,
-    descriptor: bool,
 ) -> Option<Blob<UnknownBlob>> {
-    let limit = if descriptor {
-        METADATA_BLOB_BYTES
-    } else {
-        MAX_EXACT_BLOB_BYTES
-    };
     let connection = connections.current(peer)?;
     let local = connections.transport().local_id();
     let provider = connection.remote_id();
     let (mut send, recv) = connection.open_bi().await.ok()?;
     send_u8(&mut send, TAG_BLOB).await.ok()?;
     let mut recv = Progress::new(recv, WALK_DEADLINE);
-    fetch_get_blob_stream_with_limit(&mut send, &mut recv, local, provider, &handle, limit)
+    fetch_get_blob_stream_with_limit(
+        &mut send,
+        &mut recv,
+        local,
+        provider,
+        &handle,
+        MAX_EXACT_BLOB_BYTES,
+    )
         .await
         .ok()
         .flatten()
@@ -1279,7 +1226,7 @@ impl<T: Transport, S> Driver<T, S> {
 }
 
 /// A blob fetch's result, as a driver hears it.
-type Fetched = (RawHash, Option<CapabilityProof>, Option<Blob<UnknownBlob>>);
+type Fetched = (RawHash, Option<Blob<UnknownBlob>>);
 
 /// Drive one exchange on its stream, after the tag and Open: write the
 /// frames of this side's delta as the stream takes them, interleaved with
@@ -1381,7 +1328,7 @@ async fn drive<T: Transport, S: Service>(
                 None => break 'drive true,
             },
             Some((landed, failed)) = acked.recv() => exchange.on_landed_ack(landed, failed),
-            Some((handle, proof, blob)) = fetched.recv() => exchange.on_fetched(handle, proof, blob),
+            Some((handle, blob)) = fetched.recv() => exchange.on_fetched(handle, blob),
             changed = progressed.changed() => {
                 if changed.is_err() { break 'drive true; }
                 let written = *progressed.borrow_and_update();
@@ -1398,13 +1345,13 @@ async fn drive<T: Transport, S: Service>(
                 Out::Land(events) => {
                     let _ = driver.landing.send((driver.id, events));
                 }
-                Out::Fetch { handle, proof } => {
+                Out::Fetch(handle) => {
                     let connections = driver.connections.clone();
                     let fetches = fetches.clone();
                     let peer = driver.peer;
                     tokio::spawn(async move {
-                        let blob = fetch_blob(connections, peer, handle, proof.is_some()).await;
-                        let _ = fetches.send((handle, proof, blob));
+                        let blob = fetch_blob(connections, peer, handle).await;
+                        let _ = fetches.send((handle, blob));
                     });
                 }
             }
@@ -1655,7 +1602,9 @@ pub(crate) mod tests {
         };
         use triblespace_core::patch::Entry as PatchEntry;
         use triblespace_core::repo::memoryrepo::MemoryRepo;
-        use triblespace_core::repo::{BlobStorePut, CapabilityProofStore, StoreChanges};
+        use triblespace_core::repo::{
+            BlobStorePut, CapabilityProofStore, SnapshotSource, StoreChanges,
+        };
 
         use crate::health::CollectionHealth;
         use crate::host::ActiveCollections;

@@ -411,16 +411,15 @@ mod reference_exchange {
         let mut fetched = Vec::new();
         loop {
             carry(&mut sending, &mut receiving);
-            let Some((handle, proof)) = receiving.fetches.pop() else {
+            let Some(handle) = receiving.fetches.pop() else {
                 break;
             };
-            assert!(proof.is_none());
             fetched.push(handle);
             let blob = (!fail.contains(&handle)).then(|| {
                 BlobStoreGet::get::<Blob<UnknownBlob>, UnknownBlob>(&store, Inline::new(handle))
                     .unwrap()
             });
-            let outs = receiving.exchange.on_fetched(handle, None, blob);
+            let outs = receiving.exchange.on_fetched(handle, blob);
             receiving.outputs(outs);
         }
         fetched.sort_unstable();

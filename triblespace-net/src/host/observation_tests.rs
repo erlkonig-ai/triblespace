@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
-use triblespace_core::capability::policy::{resource_collection, resource_policy};
+use triblespace_core::capability::policy::resource_policy;
 use triblespace_core::capability::{
     CapabilityProof, CapabilityProofId, CapabilityResource, QuorumOutcome, capability_action,
 };
@@ -1317,24 +1317,11 @@ fn scoped_missing_definition_landing_changes_admission_without_rebuilding_record
 }
 
 #[test]
-fn scoped_reuse_rebinds_novel_request_resource_and_definition_reads() {
-    use crate::collection_activation::CollectionAuthorizationEvidenceError;
-
+fn scoped_reuse_rebinds_novel_request_definition_reads() {
     let mut fixture = ScopedFixture::new();
     let collection = fixture.collections[0].handle();
     let selected = active(collection);
-    let resource_root = SigningKey::from_bytes(&[114; 32]);
     let recipient = SigningKey::from_bytes(&[115; 32]).verifying_key();
-    let resource: Blob<SimpleArchive> = entity! {
-        resource_collection: collection,
-        resource_policy*: AdmissionPolicy::direct(resource_root.verifying_key()).binding(read_capability()),
-    }.facts().clone().to_blob();
-    let incoming_resource = CapabilityProof::new(
-        CapabilityResource::from(resource.get_handle()),
-        &resource_root,
-        read_capability(),
-        recipient,
-    );
     let definition: Blob<SimpleArchive> = entity! {
         capability_action: ACTION_READ,
         metadata::name: "first referenced by a future request",
@@ -1350,9 +1337,8 @@ fn scoped_reuse_rebinds_novel_request_resource_and_definition_reads() {
     );
     let before = fixture.observe(&selected, None);
     fixture.take_counts();
-    // Neither proof exists in the local proof set at construction time, so
-    // these two handles are not construction dependencies of the fixed result.
-    fixture.store.put::<SimpleArchive, _>(resource).unwrap();
+    // The proof is not in the local proof set at construction time, so its
+    // definition is not a construction dependency of the fixed result.
     fixture.store.put::<SimpleArchive, _>(definition).unwrap();
     let after = fixture.observe(&selected, Some(&before));
     let (records, proofs, reads) = fixture.take_counts();
@@ -1361,16 +1347,6 @@ fn scoped_reuse_rebinds_novel_request_resource_and_definition_reads() {
     let old = before.1.collection(collection).unwrap();
     let new = after.1.collection(collection).unwrap();
     assert_eq!(old.wake_root(), new.wake_root());
-    assert!(matches!(
-        old.repair
-            .authorization_evidence()
-            .validate_proof(&incoming_resource),
-        Err(CollectionAuthorizationEvidenceError::ResourceDescriptorUnavailable(_))
-    ));
-    new.repair
-        .authorization_evidence()
-        .validate_proof(&incoming_resource)
-        .unwrap();
     assert_eq!(
         old.repair
             .authorization_evidence()
@@ -1380,14 +1356,14 @@ fn scoped_reuse_rebinds_novel_request_resource_and_definition_reads() {
     assert_eq!(
         new.repair
             .authorization_evidence()
-            .reader_is_admitted_by(recipient, &[incoming_read]),
+            .reader_is_admitted_by(recipient, &[incoming_read.clone()]),
         QuorumOutcome::Met
     );
-    // Reader freshness does not silently publish either newly received proof.
+    // Reader freshness does not silently publish the newly received proof.
     assert!(
         new.repair
             .authorization_evidence()
-            .get(incoming_resource.id())
+            .get(incoming_read.id())
             .is_none()
     );
 }

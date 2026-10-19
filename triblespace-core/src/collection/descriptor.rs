@@ -31,9 +31,7 @@ use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::utf8string::UTF8String;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
-use crate::capability::policy::{
-    capability_handle, resource_collection, resource_policies, resource_policy,
-};
+use crate::capability::policy::{capability_handle, resource_policies, resource_policy};
 use crate::capability::{
     CapabilityHandle, CapabilityProof, CapabilityProofError, CapabilityResource,
 };
@@ -427,13 +425,28 @@ pub fn capability_policies<'a>(
         .flat_map(move |descriptor| resource_policies(facts, descriptor, None))
 }
 
+/// The policies of every entity in `facts` that carries [`resource_policy`],
+/// whatever its kind: the roots a grant over the resource these facts
+/// describe may start at.
+///
+/// No kind tag is required, so a collection descriptor and any other
+/// resource descriptor are read alike. Unrelated facts on those entities,
+/// such as a retired routing field, are ignored. Unknown or unsupported
+/// policy rows contribute nothing, as in [`resource_policies`].
+pub fn resource_grant_policies(facts: &TribleSet) -> impl Iterator<Item = AdmissionPolicy> + '_ {
+    find!(
+        resource: Id,
+        pattern!(facts, [{ ?resource @ resource_policy: _?binding }])
+    )
+    .unique()
+    .flat_map(move |resource| resource_policies(facts, resource, None).map(|(_, policy)| policy))
+}
+
 /// Why a capability proof is not authorization evidence for a collection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProofEvidenceError {
     /// The proof names a different resource.
     WrongResource,
-    /// The subordinate resource's immutable routing descriptor is not resident.
-    ResourceDescriptorUnavailable(CollectionHandle),
     /// The proof starts outside every root the resource's policies declare.
     WrongRoot,
     /// A signature in the proof's prefix chain is invalid.
@@ -443,38 +456,23 @@ pub enum ProofEvidenceError {
 /// Whether `proof` is authorization evidence for `collection`, whose
 /// descriptor facts are `descriptor`.
 ///
-/// A proof over the collection itself must start at a root of one of its
-/// capability policies. A proof over another resource R counts only when R's
-/// immutable descriptor has an entity that both routes to the collection
-/// ([`resource_collection`]) and binds a policy the proof starts at: backlink
-/// and binding belong to the same entity, so a mutable collection fact can
-/// neither create nor change the route. Every signature must verify.
-/// Definitions need not be resident: this decides which proofs belong to the
-/// collection, not what they authorize. Every reader that asks which proofs
-/// are a collection's evidence asks this one predicate.
-pub fn validate_proof_evidence<R: BlobStoreGet>(
-    reader: &R,
+/// The proof must be over the collection itself, start at a root of one of
+/// its capability policies, and carry valid signatures. A proof over any
+/// other resource is never a collection's evidence, whatever that resource's
+/// descriptor says. Definitions need not be resident: this decides which
+/// proofs belong to the collection, not what they authorize. Every reader
+/// that asks which proofs are a collection's evidence asks this one
+/// predicate.
+pub fn validate_proof_evidence(
     collection: CollectionHandle,
     descriptor: &TribleSet,
     proof: &CapabilityProof,
 ) -> Result<(), ProofEvidenceError> {
-    let resource = CollectionHandle::new(proof.resource().into_bytes());
-    if resource == collection {
-        return validate_proof_for_policies(
-            collection,
-            capability_policies(descriptor, None).map(|(_, policy)| policy),
-            proof,
-        );
-    }
-    let facts: TribleSet = reader
-        .get(resource)
-        .map_err(|_| ProofEvidenceError::ResourceDescriptorUnavailable(resource))?;
-    let policies = find!(
-        route: Id,
-        pattern!(&facts, [{ ?route @ resource_collection: collection }])
+    validate_proof_for_policies(
+        collection,
+        capability_policies(descriptor, None).map(|(_, policy)| policy),
+        proof,
     )
-    .flat_map(|route| resource_policies(&facts, route, None).map(|(_, policy)| policy));
-    validate_proof_for_policies(resource, policies, proof)
 }
 
 /// Whether `proof` is over exact `resource`, starts at a root of one of
@@ -1114,18 +1112,13 @@ mod grant_gossip_tests {
     }
 
     /// The derived id of the published `resource_collection` attribute,
-    /// recorded on the base f2a2b5a1 where core still exported it.
+    /// recorded on the base f2a2b5a1 where core still exported it (the
+    /// equality was asserted there against the export).
     const RETIRED_RESOURCE_COLLECTION_ID: Id =
         crate::macros::id_hex!("926F34A0A81715F0C44F77C691A42468");
 
     #[test]
     fn the_local_retired_backlink_has_the_published_identity() {
-        assert_eq!(
-            retired::resource_collection.id(),
-            crate::capability::policy::resource_collection.id(),
-            "{:X}",
-            crate::capability::policy::resource_collection.id()
-        );
         assert_eq!(
             retired::resource_collection.id(),
             RETIRED_RESOURCE_COLLECTION_ID,
@@ -1136,9 +1129,8 @@ mod grant_gossip_tests {
 
     /// A proof over a resource R other than C is never C's evidence, even
     /// when R's descriptor still names C through the retired backlink and the
-    /// proof starts at R's own root. Base: the subordinate branch accepts it.
+    /// proof starts at R's own root. Base: the subordinate branch accepted it.
     #[test]
-    #[ignore = "grant gossip redesign"]
     fn a_proof_over_another_resource_is_never_a_collections_evidence() {
         let collection_root = SigningKey::from_bytes(&[0x71; 32]);
         let resource_root = SigningKey::from_bytes(&[0x72; 32]);
@@ -1161,8 +1153,7 @@ mod grant_gossip_tests {
         }
         .facts()
         .clone();
-        let resource = blobs.put::<SimpleArchive, _>(resource_facts);
-        let reader = SnapshotSource::snapshot(&mut blobs.blobs().clone()).unwrap();
+        let resource = blobs.put::<SimpleArchive, _>(resource_facts.clone());
 
         // Positive controls: the predicate admits a proof over C from C's
         // root, and the proof over R is valid under R's own policies.
@@ -1173,7 +1164,7 @@ mod grant_gossip_tests {
             subject,
         );
         assert_eq!(
-            validate_proof_evidence(&reader, collection, descriptor.facts(), &over_collection),
+            validate_proof_evidence(collection, descriptor.facts(), &over_collection),
             Ok(())
         );
         let over_resource = CapabilityProof::new(
@@ -1190,11 +1181,165 @@ mod grant_gossip_tests {
             ),
             Ok(())
         );
+        // R's own generic policy fields still root its grants: the backlink
+        // is ignored, not rejected.
+        assert_eq!(
+            validate_proof_for_policies(
+                resource,
+                resource_grant_policies(&resource_facts),
+                &over_resource,
+            ),
+            Ok(())
+        );
 
         assert_eq!(
-            validate_proof_evidence(&reader, collection, descriptor.facts(), &over_resource),
+            validate_proof_evidence(collection, descriptor.facts(), &over_resource),
             Err(ProofEvidenceError::WrongResource),
             "R's backlink made its proof C's evidence"
+        );
+    }
+
+    /// Flip one signature byte of step `step`, keeping the proof decodable.
+    fn tamper(proof: &CapabilityProof, step: usize) -> CapabilityProof {
+        let mut bytes = proof.as_bytes().to_vec();
+        let signature = crate::capability::CAPABILITY_PROOF_HEADER_LEN
+            + step * crate::capability::CAPABILITY_PROOF_EDGE_LEN
+            + 64;
+        bytes[signature] ^= 0x01;
+        CapabilityProof::from_bytes(&bytes).expect("a flipped signature byte still decodes")
+    }
+
+    /// C's root, its descriptor facts and its handle.
+    fn governed() -> (SigningKey, Fragment, CollectionHandle) {
+        let root = SigningKey::from_bytes(&[0x74; 32]);
+        let direct = AdmissionPolicy::direct(root.verifying_key());
+        let descriptor = naming::<SimpleArchive>("audited", CollectionPolicy::new(direct.clone(), direct));
+        let mut blobs = Fragment::empty();
+        let collection = blobs.put::<SimpleArchive, _>(descriptor.facts().clone());
+        (root, descriptor, collection)
+    }
+
+    /// Migration regression (core owner): a proof over another resource is
+    /// rejected against C's descriptor however it is rooted, and the proof
+    /// over C from the same root is accepted (control).
+    #[test]
+    fn a_wrong_resource_proof_is_never_evidence_for_c() {
+        let (root, descriptor, collection) = governed();
+        let subject = SigningKey::from_bytes(&[0x75; 32]).verifying_key();
+        let elsewhere: CollectionHandle = Inline::new([0x76; 32]);
+        let over_c = CapabilityProof::new(
+            CapabilityResource::from(collection),
+            &root,
+            read_capability(),
+            subject,
+        );
+        let over_other = CapabilityProof::new(
+            CapabilityResource::from(elsewhere),
+            &root,
+            read_capability(),
+            subject,
+        );
+        assert_eq!(
+            validate_proof_evidence(collection, descriptor.facts(), &over_c),
+            Ok(())
+        );
+        assert_eq!(
+            validate_proof_for_policies(
+                collection,
+                capability_policies(descriptor.facts(), None).map(|(_, policy)| policy),
+                &over_other,
+            ),
+            Err(ProofEvidenceError::WrongResource)
+        );
+        assert_eq!(
+            validate_proof_evidence(collection, descriptor.facts(), &over_other),
+            Err(ProofEvidenceError::WrongResource),
+            "a proof over another resource was C's evidence"
+        );
+    }
+
+    /// Migration regression (core owner): an invalid prefix fails, a valid
+    /// delegation prefix is accepted, and tampering with a later step of an
+    /// otherwise valid chain is rejected at that step.
+    #[test]
+    fn delegation_prefixes_are_judged_by_their_signatures() {
+        let (root, descriptor, collection) = governed();
+        let grantee = SigningKey::from_bytes(&[0x77; 32]);
+        let subject = SigningKey::from_bytes(&[0x78; 32]).verifying_key();
+        let first = CapabilityProof::new(
+            CapabilityResource::from(collection),
+            &root,
+            read_capability(),
+            grantee.verifying_key(),
+        );
+        let chain = first
+            .delegate(&grantee, read_capability(), subject)
+            .expect("the grantee signs the extension");
+        let evidence = |proof: &CapabilityProof| {
+            validate_proof_evidence(collection, descriptor.facts(), proof)
+        };
+        // Positive controls: the chain and its first prefix.
+        assert_eq!(evidence(&chain), Ok(()));
+        let prefix = chain.prefixes().next().unwrap().to_proof();
+        assert_eq!(prefix, first);
+        assert_eq!(evidence(&prefix), Ok(()));
+        assert_eq!(
+            evidence(&tamper(&first, 0)),
+            Err(ProofEvidenceError::Invalid(
+                crate::capability::CapabilityProofError::InvalidSignature { step: 0 }
+            )),
+            "an invalid prefix"
+        );
+        assert_eq!(
+            evidence(&tamper(&chain, 0)),
+            Err(ProofEvidenceError::Invalid(
+                crate::capability::CapabilityProofError::InvalidSignature { step: 0 }
+            )),
+            "a chain over an invalid prefix"
+        );
+        assert_eq!(
+            evidence(&tamper(&chain, 1)),
+            Err(ProofEvidenceError::Invalid(
+                crate::capability::CapabilityProofError::InvalidSignature { step: 1 }
+            )),
+            "a tampered later step"
+        );
+    }
+
+    /// The generic root source reads any entity carrying `resource_policy`,
+    /// tagged or not, and nothing else.
+    #[test]
+    fn resource_grant_policies_read_every_policy_entity_whatever_its_kind() {
+        let resource_root = SigningKey::from_bytes(&[0x79; 32]).verifying_key();
+        let definition: CapabilityHandle = Inline::new([0x7A; 32]);
+        // A Secrets-shaped resource: no kind tag, one direct binding.
+        let untagged = entity! {
+            resource_policy*: AdmissionPolicy::direct(resource_root).binding(definition),
+        };
+        assert_eq!(
+            resource_grant_policies(untagged.facts()).collect::<Vec<_>>(),
+            vec![AdmissionPolicy::direct(resource_root)]
+        );
+        // A collection descriptor answers its own policies, as the
+        // collection-typed reader does.
+        let (root, descriptor, _) = governed();
+        let generic: Vec<_> = resource_grant_policies(descriptor.facts()).collect();
+        let typed: Vec<_> = capability_policies(descriptor.facts(), None)
+            .map(|(_, policy)| policy)
+            .collect();
+        assert_eq!(generic, typed);
+        assert!(generic.contains(&AdmissionPolicy::direct(root.verifying_key())));
+        // Facts with no policy entity answer nothing, and an Open binding
+        // answers Open, which names no root.
+        assert_eq!(
+            resource_grant_policies(&entity! { metadata::name: "no policy" }.facts().clone())
+                .count(),
+            0
+        );
+        let open = entity! { resource_policy*: AdmissionPolicy::Open.binding(definition) };
+        assert_eq!(
+            resource_grant_policies(open.facts()).collect::<Vec<_>>(),
+            vec![AdmissionPolicy::Open]
         );
     }
 }

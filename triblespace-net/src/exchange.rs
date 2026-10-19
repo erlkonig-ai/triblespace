@@ -353,10 +353,8 @@ fn empty() -> PatchSummary {
 pub(crate) enum Out {
     Send(Frame),
     Land(Vec<NetEvent>),
-    Fetch {
-        handle: RawHash,
-        proof: Option<CapabilityProof>,
-    },
+    /// Fetch a held reference by hash from the peer.
+    Fetch(RawHash),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -376,7 +374,6 @@ pub(crate) enum Failure {
     /// The reconstructed peer delta is not its advertised complete tree.
     CountMismatch,
     InsertFailed,
-    DeferredProof,
     /// A local configured cell/proof limit, not malformed peer data or success.
     ResourceLimit,
     /// A poisoned cache or local count invariant failure.
@@ -446,7 +443,6 @@ pub(crate) struct Exchange {
     fetching: usize,
     unlanded: usize,
     failed: u64,
-    deferred: bool,
     peer_done: bool,
     /// Prefix LANDED eligibility; in cached mode, current semantic readiness
     /// only. The driver's `local_finished` records actual successful FIN.
@@ -512,7 +508,6 @@ impl Exchange {
             fetching: 0,
             unlanded: 0,
             failed: 0,
-            deferred: false,
             peer_done: false,
             landed_sent: false,
             landed_received: false,
@@ -819,7 +814,6 @@ impl Exchange {
     pub(crate) fn on_fetched(
         &mut self,
         handle: RawHash,
-        proof: Option<CapabilityProof>,
         blob: Option<Blob<UnknownBlob>>,
     ) -> Vec<Out> {
         let mut outs = Vec::new();
@@ -827,7 +821,7 @@ impl Exchange {
             return outs;
         }
         self.fetching = self.fetching.saturating_sub(1);
-        let admit = admit_fetched(self.collection, handle, proof, blob);
+        let admit = admit_fetched(self.collection, handle, blob);
         self.admit(admit, &mut outs);
         self.settle(&mut outs);
         outs
@@ -1330,15 +1324,9 @@ impl Exchange {
                 self.unlanded += events.len();
                 outs.push(Out::Land(events));
             }
-            Admit::Fetch { handle, proof } => {
+            Admit::Fetch(handle) => {
                 self.fetching += 1;
-                outs.push(Out::Fetch { handle, proof });
-            }
-            Admit::Defer => {
-                self.deferred = true;
-                if self.offers.is_some() {
-                    self.fail(Failure::DeferredProof);
-                }
+                outs.push(Out::Fetch(handle));
             }
             Admit::Fail => {
                 self.failed += 1;
@@ -1427,9 +1415,6 @@ impl Exchange {
         {
             if self.failed > 0 {
                 return self.fail(Failure::InsertFailed);
-            }
-            if self.deferred {
-                return self.fail(Failure::DeferredProof);
             }
             if self.receives
                 && let Err(failure) = self.verify_delta()
@@ -1544,7 +1529,7 @@ pub(crate) mod tests {
         /// individual landing. Physical insertion/ack is still immediate.
         observe_landings: bool,
         pub(crate) held: Vec<Vec<NetEvent>>,
-        pub(crate) fetches: Vec<(RawHash, Option<CapabilityProof>)>,
+        pub(crate) fetches: Vec<RawHash>,
     }
 
     impl Side {
@@ -1613,7 +1598,7 @@ pub(crate) mod tests {
                     Out::Send(frame) => self.outbox.push_back(frame),
                     Out::Land(events) if self.hold => self.held.push(events),
                     Out::Land(events) => self.land(events),
-                    Out::Fetch { handle, proof } => self.fetches.push((handle, proof)),
+                    Out::Fetch(handle) => self.fetches.push(handle),
                 }
             }
         }
@@ -2504,154 +2489,6 @@ pub(crate) mod tests {
         assert!(ended.confirmed);
         assert!(!ended.landed);
         assert!(ended.agreed.is_none());
-    }
-
-    #[test]
-    fn a_deferred_proof_fails_the_exchange_until_its_descriptor_arrives() {
-        deferred_proof(false);
-    }
-
-    #[test]
-    fn prefix_offer_auth_receipt_waits_for_descriptor_and_canonical_landing() {
-        deferred_proof(true);
-    }
-
-    fn deferred_proof(offers: bool) {
-        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-        use triblespace_core::capability::policy::{resource_collection, resource_policy};
-        use triblespace_core::capability::{CapabilityProof, CapabilityResource};
-        use triblespace_core::collection::AdmissionPolicy;
-        use triblespace_core::macros::entity;
-        use triblespace_core::repo::{
-            BlobStoreGet, BlobStorePut, CapabilityProofStore, SnapshotSource,
-        };
-
-        use crate::walk::tests::walking::key;
-
-        let mut sender = Node::new(65);
-        let mut receiver = Node::new(66);
-        let collection = sender.hold("deferred", open());
-        receiver.hold("deferred", open());
-        let resource_root = key(67);
-        let capability = triblespace_core::inline::Inline::new([10; 32]);
-        let resource = sender
-            .store
-            .put::<SimpleArchive, _>(
-                entity! {
-                    resource_collection: collection,
-                    resource_policy*: AdmissionPolicy::direct(resource_root.verifying_key())
-                        .binding(capability),
-                }
-                .facts()
-                .clone(),
-            )
-            .unwrap();
-        let proof = CapabilityProof::new(
-            CapabilityResource::from(resource),
-            &resource_root,
-            capability,
-            receiver.key.verifying_key(),
-        );
-        sender.store.insert_proof(proof.clone()).unwrap();
-        sender.observe();
-        receiver.observe();
-        let evidence = |node: &Node| {
-            node.pinned(collection)
-                .repair()
-                .authorization_evidence()
-                .get(proof.id())
-                .cloned()
-        };
-        assert_eq!(evidence(&sender), Some(proof.clone()));
-        let kind = WalkKind::Authorization;
-
-        for attempt in 0..2 {
-            let mut side = Side::both(receiver, collection, kind);
-            if offers {
-                side.exchange = Exchange::start_one_way(
-                    collection,
-                    kind,
-                    side.node.pinned(collection),
-                    None,
-                    false,
-                    true,
-                );
-                side.hold = true;
-                for frame in tree(&sender, collection, kind, &BTreeSet::new()) {
-                    let key = match &frame {
-                        Frame::Subtree { prefix, .. } if prefix.len() == KEY_BYTES => {
-                            Some(prefix.as_slice().try_into().unwrap())
-                        }
-                        _ => None,
-                    };
-                    side.feed(frame);
-                    if let Some(key) = key {
-                        side.feed(Frame::Value {
-                            key,
-                            bytes: value_of(&sender, collection, kind, key),
-                        });
-                    }
-                }
-                while side.next().is_some() {}
-                assert!(!side.sent.iter().any(|frame| matches!(
-                    frame,
-                    Frame::Have { .. } | Frame::ValueRequest { .. } | Frame::Landed
-                )));
-            } else {
-                stream(&mut side, &sender, collection, kind, &BTreeSet::new());
-            }
-            assert_eq!(side.outcome(), None, "a fetch is owed");
-            let (descriptor, fetched) = side.fetches.pop().unwrap();
-            assert_eq!((fetched, descriptor), (Some(proof.clone()), resource.raw));
-            // The first fetch fails; the second gets the descriptor.
-            let blob = (attempt == 1).then(|| {
-                BlobStoreGet::get::<Blob<UnknownBlob>, UnknownBlob>(
-                    &sender.store.snapshot().unwrap(),
-                    triblespace_core::inline::Inline::new(resource.raw),
-                )
-                .unwrap()
-            });
-            let outs = side
-                .exchange
-                .on_fetched(resource.raw, Some(proof.clone()), blob);
-            side.outputs(outs);
-            if offers {
-                assert!(
-                    !side
-                        .sent
-                        .iter()
-                        .chain(&side.outbox)
-                        .any(|frame| matches!(frame, Frame::Have { .. } | Frame::Landed))
-                );
-                if attempt == 1 {
-                    assert_eq!(
-                        side.held.iter().map(Vec::len).sum::<usize>(),
-                        2,
-                        "descriptor plus proof await ordered landing"
-                    );
-                    side.release();
-                    assert_eq!(
-                        side.outbox
-                            .iter()
-                            .filter(|frame| matches!(frame, Frame::Have { .. }))
-                            .count(),
-                        1
-                    );
-                }
-            }
-            if attempt == 0 {
-                assert_eq!(
-                    side.outcome(),
-                    Some(Outcome::Failed(Failure::DeferredProof))
-                );
-            } else {
-                assert!(side.replies().contains(&Frame::Landed));
-                side.feed(Frame::Landed);
-                assert_eq!(side.outcome(), Some(Outcome::Confirmed));
-            }
-            assert_eq!(evidence(&side.node).is_some(), attempt == 1);
-            receiver = side.node;
-        }
     }
 
     #[test]

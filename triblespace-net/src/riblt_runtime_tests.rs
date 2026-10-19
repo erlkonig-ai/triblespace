@@ -997,7 +997,7 @@ fn riblt_runtime_peer_fin_leaves_more_than_one_reference_fetch_window_alive() {
             index: index as u32, symbol: item.symbol.0, hash: item.hash, count: item.count,
         }, Some(local.snapshot())) {
             match out {
-                Out::Fetch { handle, proof: None } => pending.push_back(handle),
+                Out::Fetch(handle) => pending.push_back(handle),
                 other => panic!("unexpected reference discovery work: {other:?}"),
             }
         }
@@ -1014,9 +1014,9 @@ fn riblt_runtime_peer_fin_leaves_more_than_one_reference_fetch_window_alive() {
         fetched.push(handle);
         let blob = blobs.iter().find(|(key, _)| *key == handle).unwrap().1.clone();
         let mut landed = 0;
-        for out in exchange.on_fetched(handle, None, Some(blob)) {
+        for out in exchange.on_fetched(handle, Some(blob)) {
             match out {
-                Out::Fetch { handle, proof: None } => pending.push_back(handle),
+                Out::Fetch(handle) => pending.push_back(handle),
                 Out::Land(events) => {
                     assert!(matches!(&events[..], [NetEvent::Blob(_), NetEvent::Held { .. }]));
                     let (ok, failed) = local.insert(events);
@@ -1037,120 +1037,6 @@ fn riblt_runtime_peer_fin_leaves_more_than_one_reference_fetch_window_alive() {
     assert!(exchange.ready_to_finish());
     assert_eq!(exchange.outcome(), Some(Outcome::Confirmed));
     assert_eq!(exchange.end().agreed.unwrap().summary(), cache.summary());
-}
-
-#[test]
-fn riblt_runtime_auth_fin_waits_for_descriptor_and_both_landing_acks() {
-    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-    use triblespace_core::capability::policy::{resource_collection, resource_policy};
-    use triblespace_core::capability::{CapabilityProof, CapabilityResource};
-    use triblespace_core::inline::Inline;
-    use triblespace_core::macros::entity;
-    use triblespace_core::repo::{BlobStoreGet, BlobStorePut, CapabilityProofStore, SnapshotSource};
-    use crate::walk::tests::walking::key;
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum Case { Success, Missing, Wrong, FirstAckFails, SecondAckFails }
-    for case in [Case::Success, Case::Missing, Case::Wrong,
-        Case::FirstAckFails, Case::SecondAckFails] {
-        // Same routed-resource fixture as the Prefix descriptor regression:
-        // the proof is signed correctly, but cannot land before its descriptor.
-        let mut peer = Node::new(211);
-        let mut local = Node::new(212);
-        let collection = peer.hold("cached-auth-fin-descriptor", open());
-        assert_eq!(local.hold("cached-auth-fin-descriptor", open()), collection);
-        let resource_root = key(213);
-        let capability = Inline::new([10; 32]);
-        let resource = peer.store.put::<SimpleArchive, _>(entity! {
-            resource_collection: collection,
-            resource_policy*: AdmissionPolicy::direct(resource_root.verifying_key())
-                .binding(capability),
-        }.facts().clone()).unwrap();
-        let proof = CapabilityProof::new(CapabilityResource::from(resource),
-            &resource_root, capability, local.key.verifying_key());
-        proof.verify_signatures().unwrap();
-        peer.store.insert_proof(proof.clone()).unwrap();
-        peer.observe();
-        local.observe();
-        assert!(peer.pinned(collection).repair().authorization_evidence()
-            .get(proof.id()).is_some());
-        assert!(local.pinned(collection).repair().authorization_evidence()
-            .get(proof.id()).is_none());
-
-        let kind = WalkKind::Authorization;
-        let cache = peer.pinned(collection).cache(kind);
-        let mut exchange = Exchange::start_riblt(collection, kind, local.pinned(collection));
-        assert!(matches!(exchange.next_delta(), Some(Frame::RibltRoot { .. })));
-        assert!(exchange.on_root_written().is_empty());
-        assert!(exchange.on_frame(Frame::RibltRoot { summary: cache.summary() },
-            Some(local.snapshot())).is_empty());
-        for index in 0..16 {
-            assert!(matches!(exchange.next_delta(), Some(Frame::RibltCell { .. })));
-            assert!(exchange.on_written(index + 1).is_empty());
-            let item = cache.cell(index).unwrap();
-            assert!(exchange.on_frame(Frame::RibltCell {
-                index: index as u32, symbol: item.symbol.0, hash: item.hash, count: item.count,
-            }, Some(local.snapshot())).is_empty());
-            if exchange.discovery_stopped() { break; }
-        }
-        assert!(exchange.discovery_stopped());
-        let fetched = exchange.on_frame(Frame::Value {
-            key: proof.id().raw, bytes: proof.as_bytes().to_vec(),
-        }, Some(local.snapshot()));
-        assert!(matches!(&fetched[..], [Out::Fetch { handle, proof: Some(value) }]
-            if *handle == resource.raw && *value == proof));
-        assert!(exchange.on_fin().is_empty());
-        assert_eq!(exchange.outcome(), None, "{case:?}: FIN cannot discharge the fetch");
-        assert!(!exchange.ready_to_finish());
-        assert!(!exchange.awaits(), "only local descriptor/landing work remains");
-
-        let descriptor = match case {
-            Case::Missing => None,
-            Case::Wrong => Some(Blob::<UnknownBlob>::new(Bytes::from_source(
-                b"not the signed resource descriptor".to_vec()))),
-            _ => Some(BlobStoreGet::get::<Blob<UnknownBlob>, UnknownBlob>(
-                &peer.store.snapshot().unwrap(), Inline::new(resource.raw)).unwrap()),
-        };
-        let mut work = exchange.on_fetched(resource.raw, Some(proof.clone()), descriptor);
-        if matches!(case, Case::Missing | Case::Wrong) {
-            assert!(work.is_empty());
-            assert_eq!(exchange.outcome(), Some(Outcome::Failed(Failure::DeferredProof)));
-            let ended = exchange.end();
-            assert!(ended.confirmed && !ended.landed && ended.agreed.is_none());
-            continue;
-        }
-        assert_eq!(work.len(), 1);
-        let Out::Land(events) = work.pop().unwrap() else { panic!("descriptor and proof land") };
-        assert!(matches!(&events[..], [NetEvent::Blob(blob), NetEvent::CapabilityProof(value)]
-            if blob.get_handle().raw == resource.raw && *value == proof));
-        assert_eq!(exchange.outcome(), None);
-        assert!(!exchange.ready_to_finish());
-        for (index, event) in events.into_iter().enumerate() {
-            // Successful ACKs come from actual synthetic store insertions;
-            // the two negative cases inject a store failure at either position.
-            let failed = (case == Case::FirstAckFails && index == 0)
-                || (case == Case::SecondAckFails && index == 1);
-            let (landed, failures) = if failed { (0, 1) } else { local.insert(vec![event]) };
-            assert_eq!((landed, failures), if failed { (0, 1) } else { (1, 0) });
-            assert!(exchange.on_landed_ack(landed, failures).is_empty());
-            if index == 0 {
-                assert_eq!(exchange.outcome(), None, "one event still owes its actual ACK");
-                assert!(!exchange.ready_to_finish());
-            }
-        }
-        if case == Case::Success {
-            assert!(exchange.ready_to_finish());
-            assert_eq!(exchange.outcome(), Some(Outcome::Confirmed));
-            local.observe();
-            assert!(local.pinned(collection).repair().authorization_evidence()
-                .get(proof.id()).is_some());
-            assert_eq!(exchange.end().agreed.unwrap().summary(), cache.summary());
-        } else {
-            assert_eq!(exchange.outcome(), Some(Outcome::Failed(Failure::InsertFailed)));
-            let ended = exchange.end();
-            assert!(ended.confirmed && !ended.landed && ended.agreed.is_none());
-        }
-    }
 }
 
 #[tokio::test(start_paused = true)]

@@ -44,7 +44,7 @@ impl Side {
                 Out::Send(frame) => self.replies.push_back(frame),
                 Out::Land(events) if self.hold => self.held.push(events),
                 Out::Land(events) => self.land(events),
-                Out::Fetch { .. } => panic!("records need no fetch"),
+                Out::Fetch(_) => panic!("records need no fetch"),
             }
         }
     }

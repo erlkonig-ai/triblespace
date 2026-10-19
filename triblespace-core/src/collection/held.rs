@@ -13,11 +13,10 @@
 //! records name: the descriptor, each COMMIT's data and metadata archive, each
 //! DERIVE's output, and the capability definitions named by the proofs C's
 //! authorization evidence keeps ([`validate_proof_evidence`], the predicate
-//! the sync host applies: over C from one of C's policy roots, or over a
-//! resource whose descriptor entity routes to C and declares the root,
-//! whether or not that resource is tracked too; a proof whose descriptors
-//! arrive later is judged on their arrival). A valid proof irrelevant to C
-//! seeds nothing. A MERGE never replicates, so its result is never a seed,
+//! the sync host applies: over C from one of C's policy roots; a proof whose
+//! collection descriptor arrives later is judged on its arrival). A proof
+//! over any other resource, and a valid proof irrelevant to C, seeds
+//! nothing. A MERGE never replicates, so its result is never a seed,
 //! and a blob no record names (an attachment, a scratch archive) is never
 //! one either.
 //!
@@ -81,11 +80,9 @@ use anybytes::Bytes;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::UnknownBlob;
-use crate::capability::policy::resource_collection;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::patch::{Blake3Merkle, Entry, IdentitySchema, PATCH};
-use crate::prelude::{find, pattern};
 use crate::repo::{BlobStoreGet, BlobStoreList, CapabilityProofRead, StoreChanges, StoreSnapshot};
 use crate::trible::TribleSet;
 
@@ -360,10 +357,9 @@ fn seeds_of(record: &CollectionRecord) -> Option<Vec<Raw>> {
 /// Seeds contributed by proofs, and descriptors not resident yet.
 struct ProofSeeds {
     seeds: Vec<(CollectionHandle, Raw)>,
-    /// Collection and resource descriptors that are not resident: their
-    /// arrival may let a proof be judged for one of the collections. One
-    /// that is resident and cannot be read judges nothing, and nothing
-    /// arrives to judge it again.
+    /// Collection descriptors that are not resident: their arrival lets a
+    /// proof over that collection be judged. One that is resident and cannot
+    /// be read judges nothing, and nothing arrives to judge it again.
     unrouted: Vec<Raw>,
 }
 
@@ -387,41 +383,25 @@ fn proof_seeds<T: HeldSource>(
     let mut descriptors: BTreeMap<CollectionHandle, Option<TribleSet>> = BTreeMap::new();
     for proof in snapshot.proofs()? {
         let proof = proof?;
-        let resource: CollectionHandle = Inline::new(proof.resource().into_bytes());
-        // Only the proof's own resource, and the collections its resource
-        // descriptor names (whether or not the resource is itself tracked),
-        // can keep it; the predicate decides.
-        let mut candidates = BTreeSet::new();
-        if collections.contains(&resource) {
-            candidates.insert(resource);
+        // Only the proof's own resource can keep it, when that resource is a
+        // tracked collection; the predicate decides.
+        let collection: CollectionHandle = Inline::new(proof.resource().into_bytes());
+        if !collections.contains(&collection) {
+            continue;
         }
-        if let Ok(facts) = snapshot.get::<TribleSet, SimpleArchive>(resource) {
-            for (collection,) in find!(
-                (collection: Inline<Handle<SimpleArchive>>),
-                pattern!(&facts, [{ _?resource @ resource_collection: ?collection }])
-            ) {
-                if collections.contains(&collection) {
-                    candidates.insert(collection);
-                }
+        let descriptor = descriptors.entry(collection).or_insert_with(|| {
+            let facts = snapshot.get::<TribleSet, SimpleArchive>(collection).ok();
+            if facts.is_none() && !snapshot.contains_blob(collection).unwrap_or(false) {
+                found.unrouted.push(collection.raw);
             }
-        } else if !snapshot.contains_blob(resource).unwrap_or(false) {
-            found.unrouted.push(resource.raw);
-        }
-        for collection in candidates {
-            let descriptor = descriptors.entry(collection).or_insert_with(|| {
-                let facts = snapshot.get::<TribleSet, SimpleArchive>(collection).ok();
-                if facts.is_none() && !snapshot.contains_blob(collection).unwrap_or(false) {
-                    found.unrouted.push(collection.raw);
-                }
-                facts
-            });
-            let Some(descriptor) = descriptor else {
-                continue;
-            };
-            if validate_proof_evidence(snapshot, collection, descriptor, &proof).is_ok() {
-                for handle in proof.blob_references() {
-                    found.seeds.push((collection, handle.raw));
-                }
+            facts
+        });
+        let Some(descriptor) = descriptor else {
+            continue;
+        };
+        if validate_proof_evidence(collection, descriptor, &proof).is_ok() {
+            for handle in proof.blob_references() {
+                found.seeds.push((collection, handle.raw));
             }
         }
     }
@@ -761,7 +741,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
 
     use super::*;
-    use crate::blob::{Blob, BlobEncoding, IntoBlob, TryFromBlob};
+    use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
     use crate::capability::{CapabilityProof, CapabilityProofId, CapabilityResource};
     use crate::collection::covered::Covered;
     use crate::collection::{
@@ -1459,65 +1439,6 @@ mod tests {
         pile.close().unwrap();
     }
 
-    /// A proof over a resource whose descriptor routes to C seeds C only
-    /// once that descriptor is resident; its arrival alone re-routes it.
-    #[test]
-    fn a_proof_routed_by_a_later_resource_descriptor_is_seeded_on_its_arrival() {
-        use crate::capability::policy::resource_policy;
-        use crate::collection::AdmissionPolicy;
-
-        let mut store = Store::default();
-        let root = SigningKey::from_bytes(&[44; 32]);
-        let c = governed(&mut store, "routed", &root);
-        let other = governed(&mut store, "routed elsewhere", &root);
-        let delegate = SigningKey::from_bytes(&[45; 32]).verifying_key();
-        let definition: Inline<Handle<SimpleArchive>> =
-            Inline::new(blob(&mut store, b"routed definition"));
-        let elsewhere: Inline<Handle<SimpleArchive>> =
-            Inline::new(blob(&mut store, b"definition routed elsewhere"));
-        let direct = AdmissionPolicy::direct(root.verifying_key());
-        let resource_facts = entity! {
-            resource_collection: c,
-            resource_policy*: direct.binding(definition),
-        }
-        .facts()
-        .clone();
-        let resource: Blob<SimpleArchive> = resource_facts.clone().to_blob();
-        let other_facts = entity! {
-            resource_collection: other,
-            resource_policy*: direct.binding(elsewhere),
-        }
-        .facts()
-        .clone();
-        let other_resource: Blob<SimpleArchive> = other_facts.clone().to_blob();
-        store.track_held([c]);
-        store.snapshot().unwrap();
-        for (resource, definition) in [
-            (resource.get_handle(), definition),
-            (other_resource.get_handle(), elsewhere),
-        ] {
-            store
-                .insert_proof(CapabilityProof::new(
-                    CapabilityResource::from(resource),
-                    &root,
-                    definition,
-                    delegate,
-                ))
-                .unwrap();
-        }
-        let unrouted = store.snapshot().unwrap();
-        assert!(!held_set(&unrouted, c).contains(&definition.raw));
-        store.put::<SimpleArchive, _>(resource_facts).unwrap();
-        store.put::<SimpleArchive, _>(other_facts).unwrap();
-        let routed = store.snapshot().unwrap();
-        let held = held_set(&routed, c);
-        assert!(held.contains(&definition.raw));
-        assert!(
-            !held.contains(&elsewhere.raw),
-            "that resource routes to another collection"
-        );
-    }
-
     /// A collection is settled only from a complete selection of its
     /// records: when the store cannot answer, it stays unsettled (absent
     /// from the view, never short in it) and is selected again.
@@ -1595,7 +1516,7 @@ mod tests {
     /// A valid proof irrelevant to C seeds nothing.
     ///
     /// Whether the resource R is itself tracked changes nothing: a proof over
-    /// R still counts for C when R's descriptor routes to C.
+    /// R never counts for C.
     #[test]
     fn only_proofs_the_collections_authorization_keeps_are_seeds() {
         for track_resource in [false, true] {
@@ -1622,25 +1543,14 @@ mod tests {
         };
         let exact = definition("definition over C");
         let wrong_root = definition("definition from a stranger");
-        let routed = definition("definition over a routed resource");
-        let split = definition("definition over a split route");
+        let over_resource = definition("definition over R from R's root");
         let foreign_root = definition("definition from C's root over R");
-        let resource_policy_of =
-            |definition| AdmissionPolicy::direct(resource_root.verifying_key()).binding(definition);
         let resource = store
             .put::<SimpleArchive, _>(
                 entity! {
-                    resource_collection: c,
-                    resource_policy*: resource_policy_of(routed),
+                    resource_policy*: AdmissionPolicy::direct(resource_root.verifying_key())
+                        .binding(over_resource),
                 }
-                .facts()
-                .clone(),
-            )
-            .unwrap();
-        let split_resource = store
-            .put::<SimpleArchive, _>(
-                (entity! { resource_collection: c }
-                    + entity! { resource_policy*: resource_policy_of(split) })
                 .facts()
                 .clone(),
             )
@@ -1648,8 +1558,7 @@ mod tests {
         for (resource, root, definition) in [
             (c, &collection_root, exact),
             (c, &stranger, wrong_root),
-            (resource, &resource_root, routed),
-            (split_resource, &resource_root, split),
+            (resource, &resource_root, over_resource),
             (resource, &collection_root, foreign_root),
         ] {
             store
@@ -1667,15 +1576,14 @@ mod tests {
             store.track_held([c]);
         }
         let held = held_set(&store.snapshot().unwrap(), c);
-        assert!(held.contains(&exact.raw));
         assert!(
-            held.contains(&routed.raw),
-            "a routed proof seeds C (resource tracked: {track_resource})"
+            held.contains(&exact.raw),
+            "a proof over C from C's root seeds C (resource tracked: {track_resource})"
         );
-        for irrelevant in [wrong_root, split, foreign_root] {
+        for irrelevant in [wrong_root, over_resource, foreign_root] {
             assert!(
                 !held.contains(&irrelevant.raw),
-                "a proof C's authorization rejects seeded C"
+                "a proof C's authorization rejects seeded C (resource tracked: {track_resource})"
             );
         }
     }
@@ -1781,9 +1689,8 @@ mod tests {
     /// Grant gossip redesign: a proof over a resource R whose descriptor
     /// names C through the retired backlink, from R's own root, seeds nothing
     /// in held(C). Its definitions travel with R's grants, by participation,
-    /// not as C's blobs. Base: proof_seeds follows the backlink and seeds it.
+    /// not as C's blobs. Base: proof_seeds followed the backlink and seeded it.
     #[test]
-    #[ignore = "grant gossip redesign"]
     fn a_proof_over_a_resource_naming_c_seeds_nothing_in_c() {
         use crate::capability::policy::resource_policy;
         use crate::collection::AdmissionPolicy;

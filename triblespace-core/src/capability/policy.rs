@@ -38,12 +38,6 @@ attributes! {
     /// Anchor minted with `trible genid` on 2026-09-14:
     /// `5059416BAF824B364FF52F56A0D1CF9F`.
     "5059416BAF824B364FF52F56A0D1CF9F" as pub resource_handle: Handle<SimpleArchive>;
-    /// Immutable declaration of the collection whose READ audience may repair
-    /// this resource's proofs. It does not inherit any collection authority or
-    /// require mutable collection facts naming the resource.
-    /// Anchor minted with `trible genid` on 2026-09-14:
-    /// `62E951EC3ABB7F9B7F123BB7DE2F9F99`.
-    "62E951EC3ABB7F9B7F123BB7DE2F9F99" as pub resource_collection: Handle<SimpleArchive>;
     /// One distinct canonical Ed25519 trust root of this binding.
     /// Anchor minted on 2026-08-30; unchanged encoding and identity.
     "E9AC4E4749FD219705E9533B02AAA405" as pub admission_policy_root: ED25519PublicKey;

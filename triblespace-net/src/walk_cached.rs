@@ -109,7 +109,7 @@ pub(super) async fn drive<T: Transport, S: Service>(
                 None => break 'drive true,
             },
             Some((landed, failed)) = acked.recv() => exchange.on_landed_ack(landed, failed),
-            Some((handle, proof, blob)) = fetched.recv() => exchange.on_fetched(handle, proof, blob),
+            Some((handle, blob)) = fetched.recv() => exchange.on_fetched(handle, blob),
             changed = progressed.changed(), if progress_open => {
                 if changed.is_err() {
                     // Normal writer completion closes this channel too.
@@ -144,13 +144,13 @@ pub(super) async fn drive<T: Transport, S: Service>(
                 Out::Land(events) => {
                     let _ = driver.landing.send((driver.id, events));
                 }
-                Out::Fetch { handle, proof } => {
+                Out::Fetch(handle) => {
                     let connections = driver.connections.clone();
                     let fetches = fetches.clone();
                     let peer = driver.peer;
                     tokio::spawn(async move {
-                        let blob = fetch_blob(connections, peer, handle, proof.is_some()).await;
-                        let _ = fetches.send((handle, proof, blob));
+                        let blob = fetch_blob(connections, peer, handle).await;
+                        let _ = fetches.send((handle, blob));
                     });
                 }
             }

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Remove the `resource_collection` backlink and its routing. A proof is a
+  collection's authorization evidence only when it is over that exact
+  collection and starts at one of its descriptor's policy roots;
+  `validate_proof_evidence(collection, descriptor, proof)` reads no blob, and
+  `ProofEvidenceError::ResourceDescriptorUnavailable` is gone. Held-blob
+  seeding no longer follows the backlink. Old resource descriptors keep the
+  fact and every reader ignores it. The retired attribute anchor
+  `62E951EC3ABB7F9B7F123BB7DE2F9F99` (published derived id
+  `926F34A0A81715F0C44F77C691A42468`) is never to be reused.
+- Add `descriptor::resource_grant_policies(facts)`: the policies of every
+  entity carrying `resource_policy`, whatever its kind, as the root source for
+  grants over any resource.
+
 - Isolated occurrence-view candidate: fixed records use 72-byte
   collection/member/offset PATCH keys and typed mmap-owning values. Typed record
   enumeration/selection preserves physical duplicates; overlapping routes do
