@@ -19,7 +19,7 @@ use triblespace_core::capability::{CapabilityProof, CapabilityResource};
 use triblespace_core::collection::{
     simplearchive_union, write_capability, AdmissionPolicy, CollectionData, CollectionMerge,
     CollectionPolicy, CollectionRecord, CollectionSnapshotExt, CollectionStore, CollectionStoreExt,
-    CoverageRead,
+    CoverageRead, MERGE_INPUTS,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
@@ -40,17 +40,37 @@ fn only_believed_alternative_equations_change_a_results_support() {
     // The owner is this store's host: its merges are the ones believed.
     let mut store = MemoryRepo::for_host(owner.verifying_key());
     let source = store.collection("support-audit", policy).unwrap();
+    // A MERGE joins exactly eight distinct inputs: `a` and `b`, and six more
+    // commits that make up the arity and are joined into `c` beside them.
     let a = entity! { metadata::name: "a" };
     let b = entity! { metadata::name: "b" };
+    let rest = ["d", "e", "f", "g", "h", "i"].map(|name| entity! { metadata::name: name });
+    assert_eq!(2 + rest.len(), MERGE_INPUTS);
     let z = entity! { metadata::name: "unrelated-z" };
-    let c = simplearchive_union::join(&a.facts().clone().to_blob(), &b.facts().clone().to_blob())
-        .unwrap();
+    let c = simplearchive_union::join_all(
+        &[&a, &b]
+            .into_iter()
+            .chain(&rest)
+            .map(|fragment| fragment.facts().clone().to_blob())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
     let ca = store.commit(source, &owner, a).unwrap();
     let cb = store.commit(source, &owner, b).unwrap();
+    let crest: Vec<CollectionData> = rest
+        .into_iter()
+        .map(|fragment| store.commit(source, &owner, fragment).unwrap().data())
+        .collect();
     let cz = store.commit(source, &owner, z).unwrap();
     let c = Handle::<SimpleArchive>::to_hash(store.put::<SimpleArchive, _>(c).unwrap());
     let merged = CollectionRecord::Merge(
-        CollectionMerge::sign(&owner, source.handle(), [ca.data(), cb.data()], c).unwrap(),
+        CollectionMerge::sign(
+            &owner,
+            source.handle(),
+            [ca.data(), cb.data()].into_iter().chain(crest.iter().copied()),
+            c,
+        )
+        .unwrap(),
     );
     store.insert(merged).unwrap();
 
@@ -76,19 +96,30 @@ fn only_believed_alternative_equations_change_a_results_support() {
         (row, cover)
     };
 
-    let original = BTreeSet::from([ca.data(), cb.data()]);
+    let original: BTreeSet<CollectionData> = [ca.data(), cb.data()]
+        .into_iter()
+        .chain(crest.iter().copied())
+        .collect();
     assert_eq!(
         observe(&mut store),
         (original.clone(), BTreeSet::from([c, cz.data()]))
     );
 
     // Different operation inputs mean no functional-output conflict. This
-    // absorption claims `c` already contains `z`. Signed by a key that is
-    // not the host it is not believed, so nothing moves -- whether that key
-    // has no rights at all or holds WRITE on the collection.
+    // absorption claims `c` already contains `z`. Its other six inputs are
+    // commits `c` already stands for, so `z` is the only foundation it could
+    // add. Signed by a key that is not the host it is not believed, so
+    // nothing moves -- whether that key has no rights at all or holds WRITE
+    // on the collection.
     let absorb = |signer: &SigningKey| {
         CollectionRecord::Merge(
-            CollectionMerge::sign(signer, source.handle(), [c, cz.data()], c).unwrap(),
+            CollectionMerge::sign(
+                signer,
+                source.handle(),
+                [c, cz.data()].into_iter().chain(crest.iter().copied()),
+                c,
+            )
+            .unwrap(),
         )
     };
     store.insert(absorb(&unrelated)).unwrap();

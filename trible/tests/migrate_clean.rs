@@ -39,7 +39,7 @@ use triblespace_core::collection::succinctarchive_union::{
 use triblespace_core::collection::{
     grant_collection_write, AdmissionPolicy, CollectionCommit, CollectionMerge,
     CollectionOperationError, CollectionPolicy, CollectionRead, CollectionRecord, CollectionStore,
-    CollectionStoreExt, DeriveMapping, RetiredCollectionEquation, SourceLocator,
+    CollectionStoreExt, DeriveMapping, RetiredCollectionEquation, SourceLocator, MERGE_INPUTS,
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -416,10 +416,22 @@ impl Fixture {
             .commit(other, &a, entity! { metadata::description: "unrelated" })
             .unwrap();
 
-        // A current n-ary MERGE, dropped like every other MERGE.
+        // A current n-ary MERGE, dropped like every other MERGE. It joins
+        // exactly eight distinct inputs: P1, P2, P5 and five resident blobs
+        // only it names, so every input is here and its result is no sole
+        // copy.
+        let merge_only: Vec<CollectionData> = (4..=MERGE_INPUTS)
+            .map(|input| put_raw(&mut pile, format!("merge input {input}").as_bytes()))
+            .collect();
         let r125 = put_raw(&mut pile, b"union of p1 p2 p5");
         pile.insert(CollectionRecord::Merge(
-            CollectionMerge::sign(&a, root.handle(), [p1, p2, p5], r125).unwrap(),
+            CollectionMerge::sign(
+                &a,
+                root.handle(),
+                [p1, p2, p5].into_iter().chain(merge_only),
+                r125,
+            )
+            .unwrap(),
         ))
         .unwrap();
         pile.want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(

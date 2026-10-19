@@ -146,7 +146,8 @@ fn compact_uses_valid_blob_occurrence_without_collecting_blobs_or_equations() {
         CollectionMerge::sign(
             &SigningKey::from_bytes(&[1; 32]),
             Inline::new([1; 32]),
-            [Inline::new([2; 32]), Inline::new([3; 32])],
+            // Exactly eight distinct inputs, none of them resident.
+            [2, 3, 5, 6, 7, 8, 9, 10].map(|input| Inline::new([input; 32])),
             Inline::new([4; 32]),
         )
         .unwrap(),

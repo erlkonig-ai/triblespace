@@ -42,7 +42,7 @@ use triblespace_core::collection::records::{
 use triblespace_core::collection::{
     empty_metadata_handle, AdmissionPolicy, CollectionCommit, CollectionDerive, CollectionMerge,
     CollectionPolicy, CollectionRead, CollectionRecord, CollectionStore, CollectionStoreExt,
-    RetiredCollectionEquation, SourceLocator,
+    RetiredCollectionEquation, SourceLocator, MERGE_INPUTS,
 };
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -276,6 +276,9 @@ struct Fixture {
     merges: Vec<CollectionRecord>,
     /// The result both MERGEs and the retired v8 MERGE name, and nothing else.
     joined: CollectionData,
+    /// The six inputs both MERGEs name beside the two commit payloads, so
+    /// that each joins exactly eight; nothing else names them.
+    merge_only: Vec<CollectionData>,
     /// Collections the CLI registered, by kind.
     succinct: CollectionHandle,
     nvfp4: CollectionHandle,
@@ -405,10 +408,18 @@ impl Fixture {
             )));
         }
         let joined = put_raw(&mut pile, b"joined");
+        // A MERGE joins exactly eight distinct inputs: the two commit
+        // payloads, and six resident blobs only the MERGEs name.
+        let merge_only: Vec<CollectionData> = (3..=MERGE_INPUTS)
+            .map(|input| put_raw(&mut pile, format!("merge input {input}").as_bytes()))
+            .collect();
+        let merge_inputs = || [p1, p2].into_iter().chain(merge_only.iter().copied());
         let merges = vec![
-            CollectionRecord::Merge(CollectionMerge::sign(&key, root, [p1, p2], joined).unwrap()),
             CollectionRecord::Merge(
-                CollectionMerge::sign(&foreign, root, [p1, p2], joined).unwrap(),
+                CollectionMerge::sign(&key, root, merge_inputs(), joined).unwrap(),
+            ),
+            CollectionRecord::Merge(
+                CollectionMerge::sign(&foreign, root, merge_inputs(), joined).unwrap(),
             ),
         ];
         let leaf = |pile: &mut Pile, target: CollectionHandle, tag: &str| {
@@ -565,6 +576,7 @@ impl Fixture {
             commits,
             merges,
             joined,
+            merge_only,
             succinct,
             nvfp4,
             reference_summary,
@@ -707,6 +719,9 @@ fn the_filter_keeps_commits_and_derived_mappings_and_leaves_merges_and_attached_
         assert!(!resident(derive.output().raw));
     }
     assert!(!resident(fixture.joined.raw));
+    for input in &fixture.merge_only {
+        assert!(!resident(input.raw));
+    }
     assert!(resident(fixture.root.raw));
     assert!(resident(fixture.nvfp4.raw));
     assert!(!resident(fixture.succinct.raw));
@@ -1370,10 +1385,16 @@ fn a_corrupt_descriptor_only_dropped_frames_name_refuses_nothing_and_says_why() 
         .handle();
     let a = put_raw(&mut pile, b"merge input a");
     let b = put_raw(&mut pile, b"merge input b");
+    // A MERGE joins exactly eight distinct inputs: `a`, `b` and six more.
+    let more: Vec<CollectionData> = ["c", "d", "e", "f", "g", "h"]
+        .into_iter()
+        .map(|name| put_raw(&mut pile, format!("merge input {name}").as_bytes()))
+        .collect();
+    assert_eq!(2 + more.len(), MERGE_INPUTS);
     let result = put_raw(&mut pile, b"merge result");
     let attachment = put_raw(&mut pile, b"attachment");
     pile.insert(CollectionRecord::Merge(
-        CollectionMerge::sign(&key, merged_only, [a, b], result).unwrap(),
+        CollectionMerge::sign(&key, merged_only, [a, b].into_iter().chain(more), result).unwrap(),
     ))
     .unwrap();
     let map = CollectionRecord::Map(CollectionMap::sign(
