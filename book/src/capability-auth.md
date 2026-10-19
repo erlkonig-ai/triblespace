@@ -256,7 +256,8 @@ index holds each grant over R whose descriptor and definitions are resident,
 that starts at one of R's roots (every `resource_policy` binding in R's
 descriptor, with no test of R's kind), and whose delegation is valid with an
 action at every step. R's roots and the keys on its indexed grants take part in
-R, and so does a node peered for R. Each connection lists the root of R's
+R, and so does a node peered for R that is sent R (a peer that may only write
+R is not). Each connection lists the root of R's
 grants for every R the peer takes part in, and the two walk R's grants where
 the roots differ: every node that takes part in R sees every grant over R, and
 a node that takes no part in R sees nothing about it. A receiver skips what it

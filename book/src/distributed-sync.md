@@ -58,12 +58,14 @@ proof path, not a second descriptor threshold.
 
 A node takes part in a resource R when one of its keys is a root of R (from
 any `resource_policy` binding in R's descriptor), when its key is named on a
-delegation-valid grant over R, or when it is peered for R; merely asking does
-not count. Every node that takes part in R is shown every grant over R, which
-is how grants spread from participant to participant, and a node that takes
-no part in R is shown nothing about R, whatever else the pile it shares
-holds. A peer admitted to READ(C) and peered for C therefore sees C's grants,
-and so does a WRITE grantee of C: its key is named on one.
+delegation-valid grant over R, or when it is peered for R with R flowing to
+it; merely asking does not count, and neither does a peering on which it only
+sends R, as a peer admitted to WRITE(C) but not READ(C) does. Every node that
+takes part in R is shown every grant over R, which is how grants spread from
+participant to participant, and a node that takes no part in R is shown
+nothing about R, whatever else the pile it shares holds. A peer admitted to
+READ(C) and peered for C therefore sees C's grants, and so does a WRITE
+grantee of C: its key is named on one.
 
 Local stores remain permissive grow-only ledgers. They may contain a COMMIT
 whose signer does not currently satisfy WRITE(C), or a proof irrelevant to any
@@ -822,7 +824,8 @@ at the next `Peer::refresh`, which also reobserves the store at once.
 Grants gossip by participation, with one passive mechanism for every
 resource. A grant over a resource R is shown to every node that takes part in
 R (*Four independent capabilities* above: R's roots, the keys named on its
-delegation-valid grants, and the nodes peered for R), and to no other.
+delegation-valid grants, and the nodes peered for R that are sent R), and to
+no other.
 
 Each host keeps one grow-only grant index of every grant it holds, keyed by R
 and proof id, with R's participants. A grant is indexed once R's descriptor
@@ -849,34 +852,48 @@ that syncs nothing still learns its grants, and a stranger cannot make it walk
 more. At most eight grant walks with one peer run at once, and the rest wait
 in order.
 
-The sender of a walk is a participant of R, and the receiver always receives.
-Each received grant goes through the walk's gate: a grant over another
-resource or with a bad signature is skipped, and so is one that does not name
-this node when this node takes no part in R and the link is not peered for R.
-A kept grant lands only once R's descriptor is resident and the grant starts at
-one of R's roots; until the descriptor arrives it waits in bounded memory
-(256 grants per sender, 1,024 and 1 MiB in all, oldest first out), and one
-whose descriptor turns out not to validate it is dropped. Skipped and pending
-grants neither fail the walk nor enter its agreement, so the next walk offers
-them again; nothing negative is recorded, and absence of a grant revokes
-nothing. A waiting grant is forgotten when the last connection of its sender
-closes.
+The sender of a walk is a participant of R, and the receiver receives. A side
+joins at most sixteen grant walks one peer opened at once, and charges a walk
+a peer opens over an R it takes no part in, on a link not peered for R, to
+that peer's budget of 256 such resources, the same bound its listings meet,
+until the connection closes; past either it refuses the stream. Each received
+grant goes through the walk's gate: a grant over another resource is skipped,
+and so is one that does not name this node when this node takes no part in R
+and the link is not peered for R, before any signature is checked. A kept
+grant lands only once R's descriptor is resident and the grant starts at one
+of R's roots; until the descriptor arrives it waits, its signatures checked,
+in bounded memory (256 grants per sender, 1,024 and 1 MiB in all; a sender
+over its share loses its oldest, and when all are over, the sender holding
+the most does), and one whose descriptor turns out not to validate it is
+dropped. Skipped and pending grants neither fail the walk nor enter its
+agreement, so the next walk offers them again, and the walk keeps each as a
+leaf of its membership proof without its bytes; nothing negative is recorded,
+and absence of a grant revokes nothing. A waiting grant is forgotten when the
+last connection of its sender closes.
 
-What a waiting grant needs, R's descriptor (with R's name, once the
-descriptor is resident) and every definition it names, is fetched over
-`blob/1` in one request, from its sender or the peers that listed R first,
-then from the grant's root and delegated keys among connected peers; a
-refused peering request's definitions are fetched the same way. Definitions
-and descriptors are policy metadata, fetched under the same 1 MiB bound, so a
-key cannot make a node store a blob of its choosing by signing a grant whose
+A pending grant has only R's descriptor fetched, over `blob/1` from its
+sender first. What a grant stored here still needs, R's descriptor (with R's
+name, once the descriptor is resident) and every definition it names, is
+fetched in one request, from the peers that listed R first, then from the
+grant's root and delegated keys among connected peers; a refused peering
+request's definitions are fetched the same way. So nothing a grant's steps
+name is fetched before it starts at one of R's roots. Definitions and
+descriptors are policy metadata, fetched under the same 1 MiB bound, so a key
+cannot make a node store a blob of its choosing by signing a grant whose
 capability handle names it.
 
 Every grant walk's end reaches the grant exchange, including one that never
-started. A walk that failed, was refused or could not start opens again on
-the same connection after a backoff of one second, doubling to sixty, while
-the peer's listed root still differs; a confirmed walk or a root change resets
-the backoff, and a pending grant given up (evicted, or its descriptor found
-nowhere) reopens its walk the same way. Nobody dials on a grant's behalf: a
+started. A walk that failed, was refused or could not start, because one over
+R with the peer was running among other reasons, opens again on the same
+connection after a backoff of one second, doubling to sixty, while the peer's
+listed root still differs; a confirmed walk or a root change resets the
+backoff, except that a confirmed walk keeps a retry already due and the
+backoff of a walk whose pending grant may still be given up. A pending grant
+given up (evicted, or its descriptor found nowhere) reopens its walk the same
+way, and a definition found nowhere is asked for again on the same backoff,
+so neither repeats faster than it. A node that becomes a participant of R
+walks R again with every peer whose listed root differs, so the grants it
+skipped while it took no part arrive. Nobody dials on a grant's behalf: a
 grantee no connection reaches is reached by discovery (*Neighbours*).
 
 Credentials remain the peering request's: each is a prefix of the asker's

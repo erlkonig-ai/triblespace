@@ -88,7 +88,7 @@ are not fetched by repair.
 Grants travel by grant gossip, one passive mechanism for every resource R, a
 collection or not. A grant over R is shown to every node that takes part in R:
 R's roots, the keys named on its delegation-valid grants, and the nodes peered
-for R. Each host keeps one incremental grant index, keyed R | proof hash, of
+for R that are sent R. Each host keeps one incremental grant index, keyed R | proof hash, of
 the grants whose descriptor and definitions are resident and that start at one
 of R's roots; each connection lists the root of R's grants on `recon/1`
 (GRANT_ROOTS) for every R the peer takes part in, and the two walk R's grants

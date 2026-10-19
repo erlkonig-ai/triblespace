@@ -49,7 +49,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     names and the entries of every GRANT_ROOTS frame, and can silence the walk
     streams of one kind while the connection stays up.
   - Disclosure widens: a participant of R, a WRITE grantee among them, sees
-    every grant over R. A non-participant still sees nothing about R.
+    every grant over R. A non-participant still sees nothing about R, and a
+    peering counts only where this side sends R: a peer that may write C but
+    not read it is listed and sent none of C's grants.
+  - Bounds on what a peer can make a node do: at most 16 grant walks a peer
+    opened run at once, and those over resources this side takes no part in
+    are charged to the same 256-resource budget per connection as listings.
+    A walk keeps a skipped or pending grant as a leaf without its bytes. A
+    pending grant has only its descriptor fetched, its signatures checked
+    once, after the cheap relevance checks; when all senders together fill
+    the pending bounds the one holding the most loses its oldest.
+  - Recovery: a confirmed walk keeps a retry already due and the backoff of a
+    walk whose pending grant may still be given up; a definition found
+    nowhere is asked for again on the backoff, not every second; a walk asked
+    for while one over R runs opens again after the backoff; becoming a
+    participant of R walks R again with every peer whose root differs. The
+    grant index keeps its waiting state in PATCHes.
   No live activation; pre-redesign ALPN33 builds are a different candidate
   and are never mixed with this one.
 
