@@ -99,7 +99,8 @@ fn golden_v8_v9_copy_exact_occurrences_without_reseal_or_current_membership() {
     )).count(), 4);
     assert!(ids(&into).records.is_empty());
     let report = events(&report);
-    assert_eq!(report.iter().filter(|e| e["retained_inert_evidence"] == true).count(), 4);
+    assert_eq!(report.iter().filter(|e| e["event"] == "raw-copy").count(), 4);
+    assert!(report.iter().all(|e| e.get("retained_inert_evidence").is_none()));
     let end = report.last().unwrap();
     assert_eq!(end["event"], "published");
     assert_eq!(end["retained_inert_occurrences"], 4);
@@ -126,6 +127,7 @@ fn mixed_current_old32_and_retired_preserve_the_exact_filtered_prefix() {
     let key = key(dir.path(), 7);
     let a = args(&source, dir.path(), "mixed-out.pile", &key);
     let into = a.into.clone();
+    let report = a.report.clone().unwrap();
     run(source.clone(), a).unwrap();
     assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
     assert_eq!(&std::fs::read(&into).unwrap()[..prefix.len()], &prefix);
@@ -136,6 +138,8 @@ fn mixed_current_old32_and_retired_preserve_the_exact_filtered_prefix() {
     add(&mut expected, converted.fingerprint().raw());
     assert_eq!(expected.len(), 4);
     assert_inert_projection(&into, &expected);
+    // Ordinary BLOB/current records keep the original per-frame report shape.
+    assert!(events(&report).iter().all(|e| e.get("retained_inert_evidence").is_none()));
     assert!(PileRecords::open(&into).unwrap().all(|f| !matches!(
         f.unwrap().content,
         PileRecordContent::Collection { record: CollectionRecord::Derive(_) }

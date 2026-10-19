@@ -368,7 +368,6 @@ fn rewrite(
             }
             report.event(
                 json!({"event":"raw-copy", "offset":framed.offset,"length":framed.len,
-                "retained_inert_evidence":matches!(framed.content, PileRecordContent::RetiredCollectionEquation { .. }),
                 "frame_hash":hex::encode(blake3::hash(bytes).as_bytes())}),
             )?;
         }
