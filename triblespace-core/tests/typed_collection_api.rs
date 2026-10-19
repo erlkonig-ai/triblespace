@@ -11,7 +11,7 @@ use triblespace_core::capability::{CapabilityProof, CapabilityResource};
 use triblespace_core::collection::{
     write_capability, AdmissionPolicy, CollectionCommit, CollectionDerive, CollectionMerge,
     CollectionPolicy, CollectionRead, CollectionRecord, CollectionSnapshotExt, CollectionStore,
-    CollectionStoreExt,
+    CollectionStoreExt, MERGE_FAN_IN,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -239,7 +239,14 @@ fn a_source_union_changes_nothing_downstream() {
         row[56..64].copy_from_slice(&ordinal.to_be_bytes());
         large.insert(&Trible::force_raw(row).unwrap());
     }
-    let expected = small.clone() + large.clone();
+    // A MERGE joins exactly eight distinct inputs, so the source holds eight
+    // foundations: the small and the large fact set, and six single facts.
+    let more: Vec<TribleSet> = (212u8..218).map(one_fact).collect();
+    assert_eq!(2 + more.len(), MERGE_FAN_IN);
+    let expected = more
+        .iter()
+        .cloned()
+        .fold(small.clone() + large.clone(), |union, facts| union + facts);
     // The authority signs the source union below, so it is the store's host.
     let mut store = MemoryRepo::for_host(authority.verifying_key());
     let source = store
@@ -247,7 +254,7 @@ fn a_source_union_changes_nothing_downstream() {
         .unwrap();
     let raw = store.derive::<Image>(source, (), policy.clone()).unwrap();
     let accelerated = store.derive::<ImageTwo>(raw, (), policy).unwrap();
-    for facts in [small, large] {
+    for facts in [small, large].into_iter().chain(more) {
         store
             .commit(source, &authority, Fragment::from(facts))
             .unwrap();
@@ -261,17 +268,38 @@ fn a_source_union_changes_nothing_downstream() {
         .members()
         .map(|handle| children.get::<Blob<Image>, _>(handle).unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(inputs.len(), 2);
+    assert_eq!(inputs.len(), MERGE_FAN_IN);
     let accelerated_children = children.collection(accelerated).unwrap();
     let tiers = accelerated_children
         .cover()
         .members()
         .map(|handle| children.blob_info(handle).unwrap().unwrap().length.ilog2())
         .collect::<Vec<_>>();
-    assert_eq!(tiers.len(), 2);
-    assert_ne!(
-        tiers[0], tiers[1],
+    assert_eq!(tiers.len(), MERGE_FAN_IN);
+    assert!(
+        tiers.iter().any(|tier| *tier != tiers[0]),
         "ordinary target LSM would not pair these"
+    );
+
+    // Eight leaves fill the target's lowest tier, so the target carries
+    // them now, into one MERGE of its own, before the source holds any
+    // union: what follows can only be work on the source's merge.
+    let carried = block_on(store.maintain(accelerated, &authority)).unwrap();
+    assert_eq!(carried.collection(raw).unwrap().cover().len(), MERGE_FAN_IN);
+    let carried_target = carried.collection(accelerated).unwrap();
+    assert_eq!(carried_target.cover().len(), 1);
+    let target_root = carried_target.cover().members().next().unwrap();
+    let target_merges = carried
+        .records()
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|record| matches!(record, CollectionRecord::Merge(_)))
+        .collect::<Vec<_>>();
+    assert!(
+        matches!(target_merges.as_slice(), [CollectionRecord::Merge(merge)]
+            if merge.collection() == accelerated.handle()
+                && merge.result() == Handle::<ImageTwo>::to_hash(target_root)),
+        "{target_merges:?}"
     );
 
     // The host has already compacted the immediate source. A derived
@@ -301,7 +329,7 @@ fn a_source_union_changes_nothing_downstream() {
             CollectionMerge::sign(
                 &authority,
                 raw.handle(),
-                [input_records[0], input_records[1]],
+                input_records.iter().copied(),
                 Handle::<Image>::to_hash(union_handle),
             )
             .unwrap(),
@@ -318,7 +346,7 @@ fn a_source_union_changes_nothing_downstream() {
 
     // Coverage is already complete: ensure does not perform upkeep.
     let ensured = block_on(store.ensure(accelerated, &authority)).unwrap();
-    assert_eq!(ensured.collection(accelerated).unwrap().cover().len(), 2);
+    assert_eq!(ensured.collection(accelerated).unwrap().cover().len(), 1);
     assert_eq!(
         ensured
             .blobs()
@@ -340,14 +368,18 @@ fn a_source_union_changes_nothing_downstream() {
         records_before
     );
 
-    // Two leaves are below the fan-in, and the source's merge is not the
-    // target's: maintenance publishes nothing and stores nothing, and the
-    // target still reads every fact.
+    // The target's tier is already carried, and the source's merge is not
+    // the target's: maintenance publishes nothing and stores nothing, and
+    // the target still reads every fact, from the node its own carry made
+    // before the source union existed. That node is byte for byte the image
+    // of the source's union (the test images join homomorphically), so the
+    // records above, not the blobs, are what tell a mirror from a carry.
     let after = block_on(store.maintain(accelerated, &authority)).unwrap();
     let observed = after.collection(accelerated).unwrap();
     assert_eq!(stood_for(&observed), support);
-    assert_eq!(observed.cover().len(), 2);
-    assert!(!observed.cover().contains(expected_root.get_handle()));
+    assert_eq!(observed.cover().len(), 1);
+    assert!(observed.cover().contains(target_root));
+    assert_eq!(target_root, expected_root.get_handle());
     assert_eq!(observed.view::<ImageFacts>().unwrap().0, expected);
     assert_eq!(
         after
@@ -365,8 +397,11 @@ fn a_source_union_changes_nothing_downstream() {
             .unwrap(),
         records_before
     );
-    assert_eq!(children.collection(raw).unwrap().cover().len(), 2);
-    assert_eq!(children.collection(accelerated).unwrap().cover().len(), 2);
+    assert_eq!(children.collection(raw).unwrap().cover().len(), MERGE_FAN_IN);
+    assert_eq!(
+        children.collection(accelerated).unwrap().cover().len(),
+        MERGE_FAN_IN
+    );
 }
 
 #[test]
