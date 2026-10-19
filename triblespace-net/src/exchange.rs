@@ -466,6 +466,10 @@ pub(crate) struct Exchange {
     excluded: PATCH<KEY_BYTES, IdentitySchema, ()>,
     /// Received values skipped, for grant health.
     skipped: u64,
+    /// The first grant this walk did not keep, which stands in the peer's
+    /// delta for every later one it does not keep: the membership proof
+    /// hashes keys only, so what is not kept costs a leaf, not its bytes.
+    stand_in: Option<CapabilityProof>,
     sends: bool,
     receives: bool,
     agreed: Option<Arc<Tree>>,
@@ -541,6 +545,7 @@ impl Exchange {
             gate,
             excluded: PATCH::new(),
             skipped: 0,
+            stand_in: None,
             sends,
             receives,
             agreed,
@@ -1167,10 +1172,14 @@ impl Exchange {
                 if offered {
                     let offers = self.offers.as_mut().unwrap();
                     if offers.values.get(&key).is_some() {
-                        if self
-                            .tree_value(&self.peer, key)
-                            .and_then(|v| v.bytes(self.collection))
-                            != Some(bytes)
+                        // A grant's key is the hash of its bytes, checked as
+                        // it was read; one this side did not keep holds a
+                        // stand-in, not its bytes.
+                        if self.kind != WalkKind::Authorization
+                            && self
+                                .tree_value(&self.peer, key)
+                                .and_then(|v| v.bytes(self.collection))
+                                != Some(bytes)
                         {
                             return Err(Failure::BadValue);
                         }
@@ -1193,6 +1202,17 @@ impl Exchange {
                         return Ok(());
                     }
                 }
+                let value = match &admit {
+                    Admit::Skip(_) | Admit::Pending(_) => Value::Proof(
+                        self.stand_in
+                            .get_or_insert_with(|| match value {
+                                Value::Proof(proof) => proof,
+                                _ => unreachable!("only grants are skipped or pending"),
+                            })
+                            .clone(),
+                    ),
+                    _ => value,
+                };
                 self.peer.insert(key, value);
                 self.proof_budget()?;
                 self.admit(admit, outs);
@@ -1238,6 +1258,12 @@ impl Exchange {
                 Ok(())
             }
         }
+    }
+
+    /// The bytes the peer's delta holds under `key`.
+    #[cfg(test)]
+    pub(crate) fn peer_bytes(&self, key: [u8; KEY_BYTES]) -> Option<Vec<u8>> {
+        self.tree_value(&self.peer, key)?.bytes(self.collection)
     }
 
     fn delta_value(&self, key: [u8; KEY_BYTES]) -> Option<Value> {

@@ -646,15 +646,20 @@ impl Peerings {
         })
     }
 
-    /// Every collection peered on each connection, by connection id.
-    pub(crate) fn peered(&self) -> Vec<(u64, CollectionHandle)> {
+    /// Every collection peered on each connection, by connection id, and
+    /// whether this side sends it on that connection.
+    pub(crate) fn peered(&self) -> Vec<(u64, CollectionHandle, bool)> {
         self.meshes
             .iter()
             .flat_map(|(raw, mesh)| {
                 mesh.peerings
                     .iter()
-                    .filter(|(_, peering)| peering.peered())
-                    .map(|(id, _)| (*id, CollectionHandle::new(*raw)))
+                    .filter_map(|(id, peering)| match peering.side {
+                        Side::Peered { mine, .. } => {
+                            Some((*id, CollectionHandle::new(*raw), mine.send))
+                        }
+                        _ => None,
+                    })
             })
             .collect()
     }

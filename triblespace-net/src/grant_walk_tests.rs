@@ -2,8 +2,9 @@
 //!
 //! A walk of kind Authorization reconciles the grants over any resource R
 //! from the grant index, not a collection's evidence. The sender sends to a
-//! participant of R; the receiver always receives and keeps a proof only
-//! when a prefix names it, it takes part in R, or the link is peered for R.
+//! participant of R (a peering counts only where it sends R); the receiver
+//! receives and keeps a proof only when a prefix names it, it takes part in
+//! R, or the link is peered for R either way.
 //! Anything else is skipped and the walk still confirms. Every negative
 //! assertion has a positive control in the same test.
 
@@ -71,13 +72,19 @@ fn proof_count(node: &mut Node) -> usize {
 
 /// Mark `peer` as peered for `collection` in `node`'s health.
 fn peer_with(node: &Node, collection: CollectionHandle, peer: PeerId) {
+    peer_sending(node, collection, peer, true);
+}
+
+/// Mark `peer` as peered for `collection` in `node`'s health, with this side
+/// sending C to it or not.
+fn peer_sending(node: &Node, collection: CollectionHandle, peer: PeerId, sends: bool) {
     node.health.update(|health| {
         health.peerings.push(PeeringHealth {
             collection,
             peer,
             asked: false,
             peered: true,
-            sends: true,
+            sends,
             receives: true,
             refused_by_me: false,
             refused_by_them: false,
@@ -428,4 +435,91 @@ fn a_cold_grantee_receives_one_way_and_a_proof_it_cannot_validate_does_not_land(
     let local = bob.node.serving().grants().summary(r);
     let Side { exchange, .. } = bob;
     assert_eq!(exchange.end().agreed.unwrap().summary(), local);
+}
+
+/// A walk keeps the peer's delta as a membership proof over keys, so a grant
+/// it does not keep costs a leaf, not its bytes: every skipped grant shares
+/// one stand-in value. The grant it keeps holds its own bytes (positive
+/// control), and the walk still confirms.
+#[test]
+fn a_walk_keeps_no_bytes_of_the_grants_it_does_not_keep() {
+    let [alice, stranger] = [0x68, 0x6D].map(key);
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::Open,
+        AdmissionPolicy::direct(alice.verifying_key()),
+    );
+    let mut bob = Node::new(0x69);
+    let bob_key = key(0x69);
+    let c = bob.hold("keeps no skipped bytes", policy);
+    let foreign: Vec<CapabilityProof> = (0..4u8)
+        .map(|index| {
+            let elsewhere = CollectionHandle::new([0x40 + index; 32]);
+            grant(elsewhere, &alice, write_capability(), &bob_key)
+        })
+        .collect();
+    let valid = grant(c, &alice, write_capability(), &bob_key);
+    let joined = bob
+        .walks
+        .start_incoming(id(&stranger), c, AUTH, Algorithm::Prefix, None)
+        .unwrap();
+    let mut side = Side::with(bob, joined);
+    let mut values: Vec<_> = foreign.iter().map(value).collect();
+    values.push(value(&valid));
+    scripted(&mut side, c, &values);
+    assert_eq!(side.outcome(), Some(Outcome::Confirmed));
+    assert!(stored(&mut side.node, &valid).is_some(), "positive control: it landed");
+    assert_eq!(
+        side.exchange.peer_bytes(valid.id().raw),
+        Some(valid.as_bytes().to_vec()),
+        "positive control: a kept grant holds its own bytes"
+    );
+    let held: std::collections::BTreeSet<Vec<u8>> = foreign
+        .iter()
+        .map(|proof| side.exchange.peer_bytes(proof.id().raw).expect("each is a leaf"))
+        .collect();
+    assert_eq!(held.len(), 1, "four skipped grants share one stand-in");
+    let Side { exchange, .. } = side;
+    let ended = exchange.end();
+    assert_eq!(ended.skipped, 4);
+}
+
+/// A peering on which this side does not send C (the peer may write C but
+/// not read it) makes the peer no participant: a walk with it over C sends
+/// none of C's grants and a receive-only opener is refused. Positive
+/// control: a peering on which this side sends C does both.
+#[test]
+fn a_write_only_peering_is_sent_no_grants() {
+    let [owner, reader, writer] = [0xB0, 0xB1, 0xBF].map(key);
+    for sends in [false, true] {
+        let mut a = Node::new(0xB0);
+        let c = a.hold(
+            "private read, open write",
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(owner.verifying_key()),
+                AdmissionPolicy::Open,
+            ),
+        );
+        insert(&mut a, &[&grant(c, &owner, triblespace_core::collection::read_capability(), &reader)]);
+        let local = a.serving().grants().summary(c);
+        assert_eq!(local.leaf_count(), 1);
+        peer_sending(&a, c, id(&writer), sends);
+
+        let mut opened = a.walks.start(id(&writer), c, AUTH).unwrap();
+        let joined = a.walks.start_incoming(
+            id(&writer),
+            c,
+            AUTH,
+            Algorithm::Prefix,
+            Some(OfferRole::Receive),
+        );
+        if sends {
+            assert_eq!(opened.offer_role(), None, "positive control: both ways");
+            assert_eq!(opened.next_delta(), Some(root(local)));
+            assert!(joined.is_some(), "positive control: a sender joins a receiver");
+        } else {
+            assert_eq!(opened.offer_role(), Some(OfferRole::Receive));
+            assert_eq!(opened.next_delta(), Some(root(empty())), "no reader is disclosed");
+            assert!(joined.is_none(), "nobody would send");
+        }
+    }
 }

@@ -181,7 +181,8 @@ fn pending_grants_are_bounded_per_sender_and_evict_the_oldest() {
     assert!(bob.grants.waiting().contains(id(&dave), &others));
 }
 
-/// The total and byte bounds evict the oldest grant whoever sent it.
+/// The total and byte bounds evict the oldest grant of the sender holding
+/// the most, the first to arrive of equals.
 #[test]
 fn pending_grants_are_bounded_in_all_and_in_bytes() {
     let [alice, carol, dave] = [0xF0, 0xF2, 0xF3].map(key);
@@ -313,7 +314,7 @@ fn each_participant_is_listed_its_resources_and_a_stranger_nothing() {
     let (mut to_bob, _) = open_to(&mut host, id(&bob), 2);
     let (mut to_carol, _) = open_to(&mut host, id(&carol), 3);
     let (mut to_stranger, _) = open_to(&mut host, id(&stranger), 4);
-    host.grants.peered([(3, c)]);
+    host.grants.peered([(3, c, true)]);
     host.observe();
     let r_listed = (r, index.summary(r));
     assert_eq!(index.summary(r).leaf_count(), 1);
@@ -473,11 +474,11 @@ fn peering_for_r_reopens_a_walk_whose_root_still_differs() {
     assert_eq!(hear(&mut host, &linked, vec![(c, summary(3))]).walks, [(id(&peer), c)]);
     assert!(hear(&mut host, &linked, vec![(c, summary(3))]).walks.is_empty());
     assert_eq!(
-        host.grants.peered([(1, c)]).walks,
+        host.grants.peered([(1, c, true)]).walks,
         [(id(&peer), c)],
         "a walk whose grants were skipped before peering opens again"
     );
-    assert!(host.grants.peered([(1, c)]).walks.is_empty(), "only when peering starts");
+    assert!(host.grants.peered([(1, c, true)]).walks.is_empty(), "only when peering starts");
 }
 
 #[test]
@@ -600,7 +601,6 @@ fn a_failed_grant_walk_reopens_after_a_backoff_on_the_same_connection() {
     );
     for outcome in [
         GrantOutcome::Replaced,
-        GrantOutcome::NotStarted(NotStarted::AlreadyRunning),
         GrantOutcome::NotStarted(NotStarted::Queued),
     ] {
         host.grants.walked(ended(&peer, r, outcome), after(base, 1));
@@ -611,6 +611,7 @@ fn a_failed_grant_walk_reopens_after_a_backoff_on_the_same_connection() {
         GrantOutcome::Refused,
         GrantOutcome::NotStarted(NotStarted::NoConnection),
         GrantOutcome::NotStarted(NotStarted::StartDeclined),
+        GrantOutcome::NotStarted(NotStarted::AlreadyRunning),
     ] {
         let mut host = listed_to(&peer, r, summary(5)).0;
         host.grants.walked(ended(&peer, r, outcome), base);
@@ -1015,4 +1016,221 @@ fn a_granted_unselected_collection_is_published_until_selected() {
     host.observe();
     host.grants.publish(&health);
     assert!(health.snapshot().named_unselected.is_empty(), "selected now");
+}
+
+// ---- review fixes: bounds, recovery and re-opening ----
+
+/// A grant that waits for its descriptor has only that descriptor fetched:
+/// its definitions are asked for once it validated and landed (positive
+/// control), never before a root has been checked.
+#[test]
+fn a_pending_grant_fetches_only_its_descriptor_until_it_lands() {
+    let [alice, bob_key, carol] = [0x14, 0x15, 0x16].map(key);
+    let mut bob = Node::new(0x15);
+    bob.observe();
+    let (descriptor, _, r, handle) = unheld(&alice, "descriptor first");
+    let proof = grant(r, &alice, handle, &bob_key);
+    let effects = bob.grants.walked(pending(id(&carol), &proof), now());
+    assert!(
+        effects.fetch.iter().any(|fetch| fetch.blobs.contains(&r.raw)),
+        "the descriptor is fetched: {:?}",
+        effects.fetch
+    );
+    assert!(
+        effects.fetch.iter().all(|fetch| !fetch.blobs.contains(&handle.raw)),
+        "no definition before the root is checked: {:?}",
+        effects.fetch
+    );
+    bob.put(&descriptor);
+    let landed = bob.observe();
+    assert_eq!(landed.land, [proof.clone()]);
+    assert!(
+        landed
+            .fetch
+            .iter()
+            .any(|fetch| fetch.blobs.contains(&handle.raw) && fetch.sources.first() == Some(&id(&carol))),
+        "positive control: once it lands its definition is fetched from the sender: {:?}",
+        landed.fetch
+    );
+}
+
+/// When every sender together fills the pending bounds, the sender holding
+/// the most gives up its oldest: a sender with few waiting grants is not
+/// starved by one with many, in count or in bytes.
+#[test]
+fn a_sender_filling_the_pending_bounds_evicts_its_own_oldest() {
+    let [alice, carol, dave] = [0x17, 0x18, 0x19].map(key);
+    let (_, _, r, handle) = unheld(&alice, "fair");
+    let proofs: Vec<_> = (0..5u8)
+        .map(|index| grant(r, &alice, handle, &key(0x60 + index)))
+        .collect();
+    let size = proofs[0].as_bytes().len();
+    for limits in [
+        PendingLimits { per_sender: 10, total: 4, bytes: usize::MAX },
+        PendingLimits { per_sender: 10, total: 10, bytes: 4 * size },
+    ] {
+        let mut pending = Pending::new(limits);
+        assert!(pending.insert(id(&dave), proofs[0].clone()).is_empty());
+        for proof in &proofs[1..4] {
+            assert!(pending.insert(id(&carol), proof.clone()).is_empty());
+        }
+        let evicted = pending.insert(id(&carol), proofs[4].clone());
+        assert_eq!(evicted, [(id(&carol), r)], "{limits:?}");
+        assert!(pending.contains(id(&dave), &proofs[0]), "the small sender keeps its grant");
+        assert!(!pending.contains(id(&carol), &proofs[1]), "the large sender's oldest left");
+        assert!(pending.contains(id(&carol), &proofs[4]), "positive control: the newest waits");
+        assert_eq!(pending.kept(id(&carol)), 3);
+    }
+}
+
+/// A peering on which this side does not send C (the peer may write C but
+/// not read it) lists C to nobody; a peering on which it sends does
+/// (positive control). Either one widens what a walk over C keeps, so both
+/// open a walk again whose root still differs.
+#[test]
+fn a_write_only_peering_is_listed_no_grants() {
+    use triblespace_core::collection::{
+        AdmissionPolicy, CollectionPolicy, CollectionStoreExt, read_capability,
+    };
+    use triblespace_core::patch::Entry;
+    let [reader, writer, neighbour] = [0x1B, 0x1C, 0x1D].map(key);
+    let mut host = Node::new(0x1A);
+    let owner = host.key.clone();
+    let c = host
+        .store
+        .collection(
+            "private read, open write",
+            CollectionPolicy::new(AdmissionPolicy::direct(owner.verifying_key()), AdmissionPolicy::Open),
+        )
+        .unwrap()
+        .handle();
+    host.active.insert(&Entry::new(&c.raw));
+    host.store
+        .insert_proof(grant(c, &owner, read_capability(), &reader))
+        .unwrap();
+    host.observe();
+    let local = host.snapshot().grants().summary(c);
+    let (mut to_writer, _) = open_to(&mut host, id(&writer), 3);
+    let (mut to_neighbour, _) = open_to(&mut host, id(&neighbour), 4);
+    assert_eq!(hear(&mut host, &to_writer, vec![(c, summary(5))]).walks, [(id(&writer), c)]);
+    assert!(hear(&mut host, &to_writer, vec![(c, summary(5))]).walks.is_empty());
+    let effects = host.grants.peered([(3, c, false), (4, c, true)]);
+    assert_eq!(effects.walks, [(id(&writer), c)], "a receiving peering widens the gate");
+    host.observe();
+    assert!(listed(&mut to_writer).is_empty(), "the reader set is not disclosed");
+    assert_eq!(listed(&mut to_neighbour), [(c, local)], "positive control");
+}
+
+/// A pending grant given up before its walk's end arrived: the walk still
+/// opens again after the backoff, whatever the confirmed end says.
+#[test]
+fn a_give_up_before_the_walk_confirms_still_reopens_it() {
+    let [alice, peer] = [0x26, 0x27].map(key);
+    let (_, _, r, handle) = unheld(&alice, "given up first");
+    let (mut host, _linked) = listed_to(&peer, r, summary(30));
+    let base = now();
+    let proof = grant(r, &alice, handle, &key(0x28));
+    host.grants.walked(pending(id(&peer), &proof), base);
+    host.grants.fetch_failed(r.raw, base);
+    assert_eq!(host.grants.deadline(), Some(after(base, 1)), "control: scheduled");
+    host.grants.walked(ended(&peer, r, confirmed()), base);
+    assert_eq!(host.grants.deadline(), Some(after(base, 1)), "the confirmed end keeps it");
+    assert_eq!(host.grants.retry(after(base, 1)).walks, [(id(&peer), r)]);
+}
+
+/// A peer whose pending grants are given up after every confirmed walk is
+/// walked again on a growing backoff: 1, 2, 4, then 8 s.
+#[test]
+fn a_pending_grant_given_up_after_every_confirmed_walk_backs_off() {
+    let [alice, peer] = [0x29, 0x2A].map(key);
+    let (_, _, r, handle) = unheld(&alice, "given up again");
+    let (mut host, _linked) = listed_to(&peer, r, summary(31));
+    let proof = grant(r, &alice, handle, &key(0x2B));
+    let mut at = now();
+    for delay in [1, 2, 4, 8] {
+        host.grants.walked(pending(id(&peer), &proof), at);
+        host.grants.walked(ended(&peer, r, confirmed()), at);
+        host.grants.fetch_failed(r.raw, at);
+        let due = host.grants.deadline().expect("a retry is scheduled");
+        assert_eq!(due, after(at, delay), "after {delay} s");
+        assert_eq!(host.grants.retry(due).walks, [(id(&peer), r)]);
+        at = due;
+    }
+}
+
+/// A stored grant's definition that no source has is asked for again on a
+/// growing backoff, not every second.
+#[test]
+fn a_definition_found_nowhere_is_asked_for_again_on_a_growing_backoff() {
+    let [alice, bob_key, peer] = [0x2C, 0x2D, 0x2E].map(key);
+    let (descriptor, _, r, handle) = unheld(&alice, "never found");
+    let mut host = Node::new(0x2D);
+    host.put(&descriptor);
+    host.store
+        .insert_proof(grant(r, &alice, handle, &bob_key))
+        .unwrap();
+    host.observe();
+    let (linked, _) = open_to(&mut host, id(&peer), 3);
+    hear(&mut host, &linked, vec![(r, summary(32))]);
+    let mut at = now();
+    host.grants.walked(ended(&peer, r, confirmed()), at);
+    for delay in [1, 2, 4, 8] {
+        host.grants.fetch_failed(handle.raw, at);
+        let due = host.grants.deadline().expect("a retry is scheduled");
+        assert_eq!(due, after(at, delay), "after {delay} s");
+        let retried = host.grants.retry(due);
+        assert!(
+            retried.fetch.iter().any(|fetch| fetch.blobs.contains(&handle.raw)),
+            "positive control: asked again: {:?}",
+            retried.fetch
+        );
+        at = due;
+    }
+}
+
+/// A node that becomes a participant of R (its own grant landed) walks R
+/// again with each peer that listed a differing root, so it receives the
+/// grants it skipped while it took no part; once.
+#[test]
+fn becoming_a_participant_walks_again_what_it_skipped() {
+    let [alice, bob_key, carol] = [0x33, 0x34, 0x35].map(key);
+    let mut bob = Node::new(0x34);
+    bob.observe();
+    let (descriptor, definition, r, handle) = unheld(&alice, "joins later");
+    let to_bob = grant(r, &alice, handle, &bob_key);
+    let (linked, _) = open_to(&mut bob, id(&carol), 1);
+    assert_eq!(hear(&mut bob, &linked, vec![(r, summary(33))]).walks, [(id(&carol), r)]);
+    bob.grants.walked(pending(id(&carol), &to_bob), now());
+    bob.grants.walked(ended(&carol, r, confirmed()), now());
+    assert!(bob.observe().walks.is_empty(), "control: nothing changed");
+    bob.put(&definition);
+    bob.put(&descriptor);
+    let landed = bob.observe();
+    assert_eq!(landed.land, [to_bob.clone()]);
+    bob.land(&landed);
+    let joined = bob.observe();
+    assert!(bob.snapshot().grants().participates(r, id(&bob_key)));
+    assert_eq!(joined.walks, [(id(&carol), r)], "walked again on becoming a participant");
+    assert!(bob.observe().walks.is_empty(), "once");
+}
+
+/// A listing heard while a walk over the same resource runs with that peer
+/// is walked after the backoff, although that walk then confirms: it may
+/// have walked an older root. A confirmed end with nothing heard meanwhile
+/// schedules nothing (control).
+#[test]
+fn a_listing_heard_while_its_walk_runs_is_walked_after_that_walk_ends() {
+    let peer = key(0x36);
+    let r = handle(36);
+    let (mut host, linked) = listed_to(&peer, r, summary(34));
+    let base = now();
+    host.grants.walked(ended(&peer, r, confirmed()), base);
+    assert_eq!(host.grants.deadline(), None, "control: nothing heard meanwhile");
+    assert_eq!(hear(&mut host, &linked, vec![(r, summary(35))]).walks, [(id(&peer), r)]);
+    let running = GrantOutcome::NotStarted(NotStarted::AlreadyRunning);
+    assert!(host.grants.walked(ended(&peer, r, running), base).walks.is_empty());
+    host.grants.walked(ended(&peer, r, confirmed()), base);
+    let due = host.grants.deadline().expect("the root heard meanwhile is walked");
+    assert_eq!(due, after(base, 1));
+    assert_eq!(host.grants.retry(due).walks, [(id(&peer), r)]);
 }

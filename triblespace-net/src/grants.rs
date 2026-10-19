@@ -2,8 +2,9 @@
 //!
 //! A grant over resource R is shown to every node that takes part in R: a
 //! root of R, a key named on a delegation-valid grant over R, or a node
-//! peered for R. One passive mechanism serves every kind of resource, with
-//! no routing by kind and no dial on a grant's behalf.
+//! peered for R that this side sends R to (one that may write R but not read
+//! it takes no part). One passive mechanism serves every kind of resource,
+//! with no routing by kind and no dial on a grant's behalf.
 //!
 //! - [`GrantIndex`] holds every grant this host stores, over any resource,
 //!   keyed R | proof id, with R's participants. It is the only AUTH tree
@@ -16,21 +17,28 @@
 //!   opens a grant walk over R ([`crate::walk`]) where the peer's listed
 //!   root differs from this side's.
 //! - A received grant goes through the walk's [`Gate`]: kept when it names
-//!   this node, this node takes part in R, or the link is peered for R, and
-//!   skipped otherwise, never failing the walk. A kept grant lands once R's
-//!   descriptor is resident and it starts at one of R's roots; until the
-//!   descriptor arrives it waits in bounded memory ([`Pending`]).
-//! - What a waiting grant needs (R's descriptor and name, its definitions)
-//!   is fetched over `blob/1`, from the peers that listed R first. A peering
-//!   refused for want of definitions fetches them the same way.
+//!   this node, this node takes part in R, or the link is peered for R
+//!   either way, and skipped otherwise, never failing the walk. A kept grant
+//!   lands once R's descriptor is resident and it starts at one of R's
+//!   roots; until the descriptor arrives it waits in bounded memory
+//!   ([`Pending`]), and only that descriptor is fetched for it.
+//! - What a stored grant waiting in the index needs (R's descriptor and
+//!   name, its definitions) is fetched over `blob/1`, from the peers that
+//!   listed R first. A peering refused for want of definitions fetches them
+//!   the same way.
 //! - Every grant walk's end reaches the exchange ([`GrantWalkEnd`]). One that
-//!   failed, was refused or could not start opens again on the same
-//!   connection after a backoff of 1 s doubling to 60 s, while the peer's
-//!   listed root still differs; a confirmed walk or a root change resets it.
-//!   A pending grant given up (evicted, or its descriptor found nowhere)
-//!   opens its walk again the same way, and a definition found nowhere is
-//!   asked for again when the retry falls due, so recovery never waits for a
-//!   listing that may not change.
+//!   failed, was refused or could not start, a running walk over R included,
+//!   opens again on the same connection after a backoff of 1 s doubling to
+//!   60 s, while the peer's listed root still differs; a confirmed walk or a
+//!   root change resets it, except that a confirmed walk keeps a retry that
+//!   is due or one whose pending grant may still be given up. A pending
+//!   grant given up (evicted, or its descriptor found nowhere) opens its
+//!   walk again the same way, and a definition found nowhere is asked for
+//!   again on the same backoff, so recovery never waits for a listing that
+//!   may not change, and never repeats faster than the backoff.
+//! - Becoming a participant of R (a grant naming this node landed) walks R
+//!   again with every peer whose listed root differs, so the grants skipped
+//!   while this node took no part arrive.
 //! - What this side holds of R's grants, and each connected peer's standing
 //!   listing of R, is published into health as grant agreement
 //!   ([`crate::health::GrantHealth`]); a collection's pair reads its grant
@@ -120,8 +128,8 @@ pub(crate) enum Verdict {
     /// Never offered and names no participant.
     Junk(Junk),
     /// R's descriptor or a definition is not resident yet: every such
-    /// handle. Neither offered nor a source of participants.
-    Waiting(BTreeSet<RawHash>),
+    /// handle, in order. Neither offered nor a source of participants.
+    Waiting(Arc<[RawHash]>),
 }
 
 /// Every grant this host holds, over any resource R, with R's participants:
@@ -138,16 +146,18 @@ pub(crate) enum Verdict {
 /// store's index, so an unrelated arrival reads no blob. A resource's entry is shared, by
 /// `Arc`, with the previous index unless one of its grants landed. Nothing is
 /// filtered by local selection; participation decides what is offered.
-/// Building it reads the store and writes nothing.
+/// Building it reads the store and writes nothing. All its state is
+/// persistent PATCHes, so the next observation starts from a clone that
+/// shares every node.
 #[derive(Clone, Default)]
 pub(crate) struct GrantIndex {
     resources: PATCH<32, IdentitySchema, Arc<ResourceGrants>>,
     /// Proof id to verdict.
     verdicts: PATCH<32, IdentitySchema, Verdict>,
     /// Waiting proofs by id.
-    waiting_proofs: BTreeMap<RawHash, CapabilityProof>,
-    /// Missing handle to the waiting proofs that need it.
-    waiting: BTreeMap<RawHash, BTreeSet<RawHash>>,
+    waiting_proofs: PATCH<32, IdentitySchema, CapabilityProof>,
+    /// Missing handle | id of a waiting proof that needs it.
+    waiting: PATCH<64, IdentitySchema, ()>,
     /// Proofs judged so far, over the whole incremental chain.
     evaluations: u64,
 }
@@ -173,12 +183,23 @@ impl GrantIndex {
         if blobs_changed {
             // Waiting proofs one of whose handles became resident are judged
             // again; one still missing another handle waits on that.
-            let ready: BTreeSet<RawHash> = index
-                .waiting
-                .iter()
-                .filter(|(handle, _)| resident(snapshot, **handle))
-                .flat_map(|(_, ids)| ids.iter().copied())
-                .collect();
+            // Scratch for this observation: each missing handle's residency
+            // is checked once, in handle order.
+            let mut ready: Vec<RawHash> = Vec::new();
+            let mut checked: Option<(RawHash, bool)> = None;
+            for key in index.waiting.iter_ordered() {
+                let handle: RawHash = key[..32].try_into().unwrap();
+                let arrived = match checked {
+                    Some((last, arrived)) if last == handle => arrived,
+                    _ => resident(snapshot, handle),
+                };
+                checked = Some((handle, arrived));
+                if arrived {
+                    ready.push(key[32..].try_into().unwrap());
+                }
+            }
+            ready.sort_unstable();
+            ready.dedup();
             for id in ready {
                 let proof = index.unwait(id);
                 index.evaluate(snapshot, proof);
@@ -218,17 +239,20 @@ impl GrantIndex {
         self.evaluations += 1;
         let id = proof.id().raw;
         let resource = CollectionHandle::new(proof.resource().into_bytes());
-        let missing: BTreeSet<RawHash> = std::iter::once(resource.raw)
+        let mut missing: Vec<RawHash> = std::iter::once(resource.raw)
             .chain(proof.capabilities().map(|handle| handle.raw))
             .filter(|handle| !resident(snapshot, *handle))
             .collect();
+        missing.sort_unstable();
+        missing.dedup();
         if !missing.is_empty() {
             for handle in &missing {
-                self.waiting.entry(*handle).or_default().insert(id);
+                self.waiting.insert(&PatchEntry::new(&waiting_key(*handle, id)));
             }
-            self.waiting_proofs.insert(id, proof);
+            self.waiting_proofs
+                .replace(&PatchEntry::with_value(&id, proof));
             self.verdicts
-                .replace(&PatchEntry::with_value(&id, Verdict::Waiting(missing)));
+                .replace(&PatchEntry::with_value(&id, Verdict::Waiting(missing.into())));
             return;
         }
         let descriptor = read_facts(snapshot, resource.raw);
@@ -256,19 +280,18 @@ impl GrantIndex {
 
     /// Take a waiting proof out of the waiting sets, for judging again.
     fn unwait(&mut self, id: RawHash) -> CapabilityProof {
-        if let Some(Verdict::Waiting(missing)) = self.verdicts.get(&id) {
-            for handle in missing {
-                if let Some(ids) = self.waiting.get_mut(handle) {
-                    ids.remove(&id);
-                    if ids.is_empty() {
-                        self.waiting.remove(handle);
-                    }
-                }
+        if let Some(Verdict::Waiting(missing)) = self.verdicts.get(&id).cloned() {
+            for handle in missing.iter() {
+                self.waiting.remove(&waiting_key(*handle, id));
             }
         }
-        self.waiting_proofs
-            .remove(&id)
-            .expect("a waiting verdict keeps its proof")
+        let proof = self
+            .waiting_proofs
+            .get(&id)
+            .cloned()
+            .expect("a waiting verdict keeps its proof");
+        self.waiting_proofs.remove(&id);
+        proof
     }
 
     /// Root and count of R's indexed grants.
@@ -314,26 +337,30 @@ impl GrantIndex {
             .map(|raw| CollectionHandle::new(*raw))
     }
 
-    /// Every waiting proof with every handle it waits for.
-    pub(crate) fn waiting(
-        &self,
-    ) -> impl Iterator<Item = (CapabilityProofId, &BTreeSet<RawHash>)> + '_ {
+    /// Every waiting proof with every handle it waits for, in id order.
+    pub(crate) fn waiting(&self) -> impl Iterator<Item = (CapabilityProofId, &[RawHash])> + '_ {
         self.waiting_proofs
-            .keys()
+            .iter_ordered()
             .filter_map(|id| match self.verdicts.get(id) {
-                Some(Verdict::Waiting(missing)) => Some((CapabilityProofId::new(*id), missing)),
+                Some(Verdict::Waiting(missing)) => {
+                    Some((CapabilityProofId::new(*id), &missing[..]))
+                }
                 _ => None,
             })
     }
 
-    /// Every waiting proof itself, with every handle it waits for.
-    pub(crate) fn waiting_grants(
-        &self,
-    ) -> impl Iterator<Item = (&CapabilityProof, &BTreeSet<RawHash>)> + '_ {
+    /// Every waiting proof itself, with every handle it waits for, in id
+    /// order.
+    pub(crate) fn waiting_grants(&self) -> impl Iterator<Item = (&CapabilityProof, &[RawHash])> + '_ {
         self.waiting_proofs
-            .iter()
-            .filter_map(|(id, proof)| match self.verdicts.get(id) {
-                Some(Verdict::Waiting(missing)) => Some((proof, missing)),
+            .iter_ordered()
+            .filter_map(|id| match self.verdicts.get(id) {
+                Some(Verdict::Waiting(missing)) => Some((
+                    self.waiting_proofs
+                        .get(id)
+                        .expect("an ordered waiting id holds its proof"),
+                    &missing[..],
+                )),
                 _ => None,
             })
     }
@@ -453,9 +480,12 @@ impl Gate {
         }
     }
 
-    /// Judge one decoded proof against the latest serving observation.
+    /// Judge one decoded proof against the latest serving observation. The
+    /// cheap checks come first, and each kept proof's signatures are
+    /// verified once: by admission's predicate where R's descriptor is
+    /// resident, on their own where it is not.
     pub(crate) fn admit(&mut self, snapshot: &StoreSnapshot, proof: CapabilityProof) -> Gated {
-        if proof.resource().into_bytes() != self.resource.raw || proof.verify_signatures().is_err() {
+        if proof.resource().into_bytes() != self.resource.raw {
             return Gated::Skip;
         }
         let local = snapshot.local();
@@ -467,7 +497,10 @@ impl Gate {
         }
         let resource = self.resource;
         let Some(policies) = self.policies(snapshot) else {
-            return Gated::Pending(proof);
+            return match proof.verify_signatures() {
+                Ok(()) => Gated::Pending(proof),
+                Err(_) => Gated::Skip,
+            };
         };
         match validate_proof_for_policies(resource, policies.iter().cloned(), &proof) {
             Ok(()) => Gated::Land(proof),
@@ -575,8 +608,11 @@ impl Default for PendingLimits {
 /// pile, each charged to the sender that delivered it, until R's descriptor
 /// arrives: then each lands if it starts at one of R's roots and is dropped
 /// otherwise. At most [`PendingLimits`] wait, per sender, in all and in
-/// bytes; the oldest go first. A waiting grant neither admits anything nor
-/// names a participant, and a sender's leave with its last connection.
+/// bytes. A sender over its own share gives up its oldest; when all of them
+/// together are over, the sender holding the most gives up its oldest, so
+/// one that floods never evicts another's few. A waiting grant neither
+/// admits anything nor names a participant, and a sender's leave with its
+/// last connection.
 #[derive(Default)]
 pub(crate) struct Pending {
     limits: PendingLimits,
@@ -624,18 +660,47 @@ impl Pending {
         }
         let mut evicted = Vec::new();
         while self.kept(sender) >= self.limits.per_sender {
-            evicted.extend(self.evict(|key| pending_sender(key) == sender));
+            let Some(gone) = self.evict(|key| pending_sender(key) == sender) else {
+                break;
+            };
+            evicted.push(gone);
         }
         while self.proofs.len() as usize >= self.limits.total
             || self.bytes + size > self.limits.bytes
         {
-            evicted.extend(self.evict(|_| true));
+            let Some(largest) = self.largest(sender) else {
+                break;
+            };
+            let Some(gone) = self.evict(|key| pending_sender(key) == largest) else {
+                break;
+            };
+            evicted.push(gone);
         }
         let key = pending_key(self.next, sender, proof.id());
         self.next += 1;
         self.bytes += size;
         self.proofs.insert(&PatchEntry::with_value(&key, proof));
         evicted
+    }
+
+    /// The sender holding the most waiting grants, counting `newcomer`'s
+    /// next one; of equals, the one whose oldest waited longest.
+    fn largest(&self, newcomer: PeerId) -> Option<PeerId> {
+        // Scratch for one insertion, in arrival order: (sender, count).
+        let mut counts: Vec<(PeerId, usize)> = Vec::new();
+        for key in self.proofs.iter_ordered() {
+            let sender = pending_sender(key);
+            match counts.iter_mut().find(|(other, _)| *other == sender) {
+                Some((_, count)) => *count += 1,
+                None => counts.push((sender, 1)),
+            }
+        }
+        let weight = |(sender, count): &(PeerId, usize)| count + usize::from(*sender == newcomer);
+        let most = counts.iter().map(weight).max()?;
+        counts
+            .iter()
+            .find(|entry| weight(entry) == most)
+            .map(|(sender, _)| *sender)
     }
 
     /// Drop the oldest grant `which` selects.
@@ -782,6 +847,13 @@ fn descriptor_name(bytes: anybytes::Bytes, resource: CollectionHandle) -> Option
     name(&facts).ok().flatten().map(|name| name.raw)
 }
 
+fn waiting_key(handle: RawHash, id: RawHash) -> [u8; 64] {
+    let mut key = [0; 64];
+    key[..32].copy_from_slice(&handle);
+    key[32..].copy_from_slice(&id);
+    key
+}
+
 fn grant_key(resource: CollectionHandle, id: CapabilityProofId) -> [u8; 64] {
     let mut key = [0; 64];
     key[..32].copy_from_slice(&resource.raw);
@@ -839,10 +911,19 @@ struct Listing {
     /// Listed resources this side took no part in when first heard, charged
     /// to the connection's budget before they are kept.
     unknown: PATCH<32, IdentitySchema, ()>,
-    /// The resources the connection is peered for.
+    /// The resources the connection is peered for, whichever way they flow:
+    /// a walk over one keeps all of its grants.
     peered: PATCH<32, IdentitySchema, (), Blake3Merkle>,
+    /// The resources the connection is peered for with this side sending
+    /// them: the peer takes part in those, is listed them and sent their
+    /// grants. A peer that may write R but not read it is not.
+    serves: PATCH<32, IdentitySchema, (), Blake3Merkle>,
     /// Walks over R to open again after a failure, with their backoff.
     retries: PATCH<32, IdentitySchema, Retry>,
+    /// Resources a walk delivered a grant over that waits for its
+    /// descriptor, until that walk's end: a confirmed end keeps the backoff
+    /// while a give-up may still follow.
+    held_back: PATCH<32, IdentitySchema, ()>,
     /// What this side held of R's grants when the last walk over R
     /// confirmed.
     agreed: PATCH<32, IdentitySchema, PatchSummary>,
@@ -868,6 +949,10 @@ struct Retry {
     at: Option<Mono>,
     /// This side's root when it was scheduled: a change resets the backoff.
     local: PatchSummary,
+    /// Scheduled because a blob a stored grant waits for was found nowhere:
+    /// the backoff is kept between attempts, so the fetch is asked again on
+    /// it, not every second.
+    fetch: bool,
 }
 
 impl Listing {
@@ -880,7 +965,9 @@ impl Listing {
             opened: PATCH::new(),
             unknown: PATCH::new(),
             peered: PATCH::new(),
+            serves: PATCH::new(),
             retries: PATCH::new(),
+            held_back: PATCH::new(),
             agreed: PATCH::new(),
             counters: PATCH::new(),
         }
@@ -895,16 +982,15 @@ impl Listing {
     }
 
     /// Open the walk over R again after a backoff: 1 s after the first
-    /// failure, doubling to 60 s.
-    fn schedule(&mut self, resource: CollectionHandle, local: PatchSummary, now: Mono) {
-        let delay = self
-            .retries
-            .get(&resource.raw)
-            .map_or(MIN_RETRY, |retry| (retry.delay * 2).min(MAX_RETRY));
+    /// failure, doubling to 60 s. `fetch` marks a retry of a fetch.
+    fn schedule(&mut self, resource: CollectionHandle, local: PatchSummary, fetch: bool, now: Mono) {
+        let previous = self.retries.get(&resource.raw).copied();
+        let delay = previous.map_or(MIN_RETRY, |retry| (retry.delay * 2).min(MAX_RETRY));
         let retry = Retry {
             delay,
             at: Some(now + delay),
             local,
+            fetch: fetch || previous.is_some_and(|retry| retry.fetch),
         };
         self.retries
             .replace(&PatchEntry::with_value(&resource.raw, retry));
@@ -933,7 +1019,8 @@ impl Listing {
 /// resource and listed root. Nobody dials on a grant's behalf.
 ///
 /// The peer takes part in R when it is a root of R, a key named on a grant
-/// over R the index holds, or peered for R on that connection. A listing
+/// over R the index holds, or peered for R on that connection with this side
+/// sending R to it. A listing
 /// for an R this side takes no part in is still heard (a non-syncing
 /// grantee learns its grants this way), within
 /// [`MAX_UNKNOWN_RESOURCES_PER_LINK`] such resources per connection, charged
@@ -1193,12 +1280,12 @@ impl Grants {
         let mut fetches = Vec::new();
         for (proof, missing) in snapshot.grants().waiting_grants() {
             if proof.resource().into_bytes() == resource.raw && self.wanted(proof) {
-                fetches.extend(self.fetch(proof, missing.iter().copied(), first));
+                fetches.extend(self.fetch(proof, missing.iter().copied(), true, first));
             }
         }
         for (_, proof) in self.waiting.iter() {
             if proof.resource().into_bytes() == resource.raw {
-                fetches.extend(self.fetch(proof, [resource.raw], first));
+                fetches.extend(self.fetch(proof, [resource.raw], false, first));
             }
         }
         fetches
@@ -1213,23 +1300,27 @@ impl Grants {
             || self.takes_part(CollectionHandle::new(proof.resource().into_bytes()))
     }
 
-    /// Fetch `missing` and whatever else of `proof`'s descriptor and
-    /// definitions is not resident, with R's name once the descriptor is, so
-    /// R can be presented, from `first`, R's listers and the proof's keys.
-    /// R's other definitions wait for its selection, like the rest of its
-    /// metadata.
+    /// Fetch `missing` and whatever else of `proof`'s descriptor and, with
+    /// `definitions`, its definitions is not resident, with R's name once
+    /// the descriptor is, so R can be presented, from `first`, R's listers
+    /// and the proof's keys. R's other definitions wait for its selection,
+    /// like the rest of its metadata. A grant that waits for its descriptor
+    /// has only that fetched: what its steps name is fetched once it
+    /// started at one of R's roots and landed.
     fn fetch(
         &self,
         proof: &CapabilityProof,
         missing: impl IntoIterator<Item = RawHash>,
+        definitions: bool,
         first: &[PeerId],
     ) -> Option<Fetch> {
         let snapshot = self.snapshot.as_ref()?;
         let resource = CollectionHandle::new(proof.resource().into_bytes());
         let resident = |handle: &RawHash| snapshot.get_blob(handle).is_some();
+        let named = definitions.then(|| proof.capabilities().map(|handle| handle.raw));
         let mut blobs: Vec<RawHash> = missing
             .into_iter()
-            .chain(proof.capabilities().map(|handle| handle.raw))
+            .chain(named.into_iter().flatten())
             .collect();
         if let Some(descriptor) = snapshot.get_blob(&resource.raw) {
             blobs.extend(descriptor_name(descriptor, resource));
@@ -1272,8 +1363,8 @@ impl Grants {
         }
         listing.from = Some(index.clone());
         let peer = listing.link.peer();
-        let peered = listing
-            .peered
+        let served = listing
+            .serves
             .iter_ordered()
             .map(|raw| CollectionHandle::new(*raw))
             .filter(|resource| index.grants(*resource).is_none());
@@ -1281,9 +1372,9 @@ impl Grants {
             .resources()
             .filter(|resource| {
                 index.participates(*resource, peer)
-                    || listing.peered.get(&resource.raw).is_some()
+                    || listing.serves.get(&resource.raw).is_some()
             })
-            .chain(peered)
+            .chain(served)
             .collect::<Vec<_>>();
         let mut roots = Vec::new();
         for resource in resources {
@@ -1306,22 +1397,29 @@ impl Grants {
     /// existed are offered again.
     pub(crate) fn peered(
         &mut self,
-        peered: impl IntoIterator<Item = (u64, CollectionHandle)>,
+        peered: impl IntoIterator<Item = (u64, CollectionHandle, bool)>,
     ) -> Effects {
         self.changed = true;
-        let mut now: HashMap<u64, PATCH<32, IdentitySchema, (), Blake3Merkle>> = HashMap::new();
-        for (id, resource) in peered {
-            now.entry(id)
-                .or_default()
-                .insert(&PatchEntry::new(&resource.raw));
+        // Scratch for this call: per connection, every peered resource and
+        // those this side sends.
+        type Set = PATCH<32, IdentitySchema, (), Blake3Merkle>;
+        let mut now: HashMap<u64, (Set, Set)> = HashMap::new();
+        for (id, resource, sends) in peered {
+            let (all, serves) = now.entry(id).or_default();
+            all.insert(&PatchEntry::new(&resource.raw));
+            if sends {
+                serves.insert(&PatchEntry::new(&resource.raw));
+            }
         }
         let mut effects = Effects::default();
         let ids: Vec<u64> = self.listings.keys().copied().collect();
         for id in ids {
-            let resources = now.remove(&id).unwrap_or_default();
+            let (resources, serves) = now.remove(&id).unwrap_or_default();
             let fresh: Vec<CollectionHandle> = {
                 let listing = &self.listings[&id];
-                if resources.merkle_root() == listing.peered.merkle_root() {
+                if resources.merkle_root() == listing.peered.merkle_root()
+                    && serves.merkle_root() == listing.serves.merkle_root()
+                {
                     continue;
                 }
                 resources
@@ -1334,6 +1432,7 @@ impl Grants {
                 fresh.iter().map(|resource| self.summary(*resource)).collect();
             let listing = self.listings.get_mut(&id).unwrap();
             listing.peered = resources;
+            listing.serves = serves;
             listing.from = None;
             for (resource, local) in fresh.into_iter().zip(locals) {
                 listing.opened.remove(&resource.raw);
@@ -1386,15 +1485,21 @@ impl Grants {
                 let local = self.summary(resource);
                 let listing = self.listings.get_mut(&id).unwrap();
                 let peer = listing.link.peer();
+                let mut retry = *listing.retries.get(&resource.raw).unwrap();
+                retry.at = None;
                 if listing.reopen(resource, local) {
-                    let mut retry = *listing.retries.get(&resource.raw).unwrap();
-                    retry.at = None;
                     listing
                         .retries
                         .replace(&PatchEntry::with_value(&resource.raw, retry));
                     listing.count(resource, |counters| counters.retries += 1);
                     self.changed = true;
                     effects.walks.push((peer, resource));
+                } else if retry.fetch {
+                    // The fetch below runs; its backoff is kept for the next
+                    // time it finds nothing.
+                    listing
+                        .retries
+                        .replace(&PatchEntry::with_value(&resource.raw, retry));
                 } else {
                     listing.retries.remove(&resource.raw);
                 }
@@ -1429,18 +1534,23 @@ impl Grants {
             let local = self.summary(resource);
             for listing in self.listings.values_mut() {
                 if listing.listed.get(&resource.raw).is_some() {
-                    listing.schedule(resource, local, now);
+                    listing.schedule(resource, local, true, now);
                 }
             }
         }
         Effects::default()
     }
 
-    /// A grant walk ended: a confirmed one resets the backoff; one that
-    /// failed, was refused or could not start opens again after it. A
-    /// replaced, running or queued one changes nothing.
+    /// A grant walk ended: a confirmed one resets the backoff, unless a
+    /// retry is already due or the walk delivered a grant that waits for its
+    /// descriptor, whose give-up may still follow; one that failed, was
+    /// refused or could not start opens again after it. So does one asked
+    /// for while another with the peer over R ran, which may have walked an
+    /// older listed root: never at once, which would race that walk's end.
+    /// A replaced or queued one changes nothing.
     fn ended(&mut self, end: GrantWalkEnd, now: Mono) {
         let local = self.summary(end.resource);
+        let raw = end.resource.raw;
         self.changed = true;
         for listing in self.listings.values_mut() {
             if listing.link.peer() != end.peer {
@@ -1458,19 +1568,31 @@ impl Grants {
             });
             match end.outcome {
                 GrantOutcome::Confirmed { agreed } => {
-                    listing.retries.remove(&end.resource.raw);
+                    let held_back = listing.held_back.get(&raw).is_some();
+                    listing.held_back.remove(&raw);
+                    let due = listing
+                        .retries
+                        .get(&raw)
+                        .is_some_and(|retry| retry.at.is_some());
+                    if !due && !held_back {
+                        listing.retries.remove(&raw);
+                    }
                     listing
                         .agreed
-                        .replace(&PatchEntry::with_value(&end.resource.raw, agreed));
+                        .replace(&PatchEntry::with_value(&raw, agreed));
                 }
-                GrantOutcome::Unconfirmed(_)
-                | GrantOutcome::Refused
-                | GrantOutcome::NotStarted(NotStarted::NoConnection | NotStarted::StartDeclined) => {
-                    listing.opened.remove(&end.resource.raw);
-                    listing.schedule(end.resource, local, now);
+                GrantOutcome::Unconfirmed(_) | GrantOutcome::Refused => {
+                    listing.held_back.remove(&raw);
+                    listing.opened.remove(&raw);
+                    listing.schedule(end.resource, local, false, now);
                 }
-                GrantOutcome::Replaced
-                | GrantOutcome::NotStarted(NotStarted::AlreadyRunning | NotStarted::Queued) => {}
+                GrantOutcome::NotStarted(
+                    NotStarted::NoConnection | NotStarted::StartDeclined | NotStarted::AlreadyRunning,
+                ) => {
+                    listing.opened.remove(&raw);
+                    listing.schedule(end.resource, local, false, now);
+                }
+                GrantOutcome::Replaced | GrantOutcome::NotStarted(NotStarted::Queued) => {}
             }
         }
     }
@@ -1482,7 +1604,7 @@ impl Grants {
         for listing in self.listings.values_mut() {
             if listing.link.peer() == sender {
                 listing.opened.remove(&resource.raw);
-                listing.schedule(resource, local, now);
+                listing.schedule(resource, local, false, now);
             }
         }
     }
@@ -1513,11 +1635,15 @@ impl Grants {
                         listing.count(CollectionHandle::new(resource), |counters| {
                             counters.pending += 1
                         });
+                        listing.held_back.insert(&PatchEntry::new(&resource));
                     }
                 }
-                effects.fetch.extend(self.fetch(&proof, [resource], &[peer]));
-                for (sender, resource) in self.waiting.insert(peer, proof) {
+                // Only a grant that found room is fetched for.
+                for (sender, resource) in self.waiting.insert(peer, proof.clone()) {
                     self.give_up(sender, resource, now);
+                }
+                if self.waiting.contains(peer, &proof) {
+                    effects.fetch.extend(self.fetch(&proof, [resource], false, &[peer]));
                 }
             }
         }
@@ -1530,14 +1656,14 @@ impl Grants {
     /// changed roots on every connection.
     pub(crate) fn observe(&mut self, snapshot: Arc<StoreSnapshot>) -> Effects {
         let mut effects = Effects::default();
-        self.snapshot = Some(snapshot.clone());
+        let previous = self.snapshot.replace(snapshot.clone());
         self.changed = true;
         let mut policies = HashMap::new();
         for (proof, senders) in self
             .waiting
             .settle(|proof| settles(&snapshot, &mut policies, proof))
         {
-            effects.fetch.extend(self.fetch(&proof, [], &senders));
+            effects.fetch.extend(self.fetch(&proof, [], true, &senders));
             effects.land.push(proof);
         }
 
@@ -1551,7 +1677,7 @@ impl Grants {
                 asked.insert(&PatchEntry::new(&id));
                 effects
                     .fetch
-                    .extend(self.fetch(proof, missing.iter().copied(), &[]));
+                    .extend(self.fetch(proof, missing.iter().copied(), true, &[]));
             }
         }
         self.asked = asked;
@@ -1574,6 +1700,31 @@ impl Grants {
                 listing.retries.remove(&resource.raw);
                 if listing.reopen(resource, index.summary(resource)) {
                     effects.walks.push((listing.link.peer(), resource));
+                }
+            }
+        }
+        // Becoming a participant of R widens what a walk over R keeps: walk
+        // it again with each peer whose listed root still differs, so the
+        // grants skipped while this side took no part arrive.
+        if let Some(previous) = previous.filter(|previous| !Arc::ptr_eq(previous.grants(), index)) {
+            let before = previous.grants();
+            let local = self.local;
+            for id in &ids {
+                let listing = self.listings.get_mut(id).unwrap();
+                let joined: Vec<CollectionHandle> = listing
+                    .listed
+                    .iter_ordered()
+                    .map(|raw| CollectionHandle::new(*raw))
+                    .filter(|resource| {
+                        index.participates(*resource, local)
+                            && !before.participates(*resource, local)
+                    })
+                    .collect();
+                for resource in joined {
+                    listing.opened.remove(&resource.raw);
+                    if listing.reopen(resource, index.summary(resource)) {
+                        effects.walks.push((listing.link.peer(), resource));
+                    }
                 }
             }
         }

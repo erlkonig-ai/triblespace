@@ -1081,6 +1081,7 @@ async fn riblt_runtime_one_way_walks_use_prefix_and_refuse_incoming_riblt() {
         events,
         grants: mpsc::unbounded_channel().0,
         grant_queue: GrantQueue::default(),
+        unknown_joins: PATCH::new(),
         running: HashMap::new(),
         next_id: 0,
     };
@@ -1252,6 +1253,7 @@ async fn riblt_runtime_simultaneous_open_tie_break_preserves_winners_explicit_al
                 events,
                 grants: mpsc::unbounded_channel().0,
                 grant_queue: GrantQueue::default(),
+                unknown_joins: PATCH::new(),
                 running: HashMap::new(),
                 next_id: 778,
             };
@@ -1357,6 +1359,7 @@ async fn riblt_runtime_task_retains_prefix_agreement_but_releases_cached_source_
             events,
             grants: mpsc::unbounded_channel().0,
             grant_queue: GrantQueue::default(),
+            unknown_joins: PATCH::new(),
             running: HashMap::new(),
             next_id: 1,
         };

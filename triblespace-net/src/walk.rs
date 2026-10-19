@@ -16,15 +16,21 @@
 //! proof id under R) from the grant index: a held reference a side lacks is
 //! noted held when the blob is resident, and fetched by hash from the peer
 //! first otherwise. A record lands as it is. A grant walk is Prefix only and
-//! keeps no agreement; it is sent to a participant of R and always
-//! received, and a received grant goes through [`crate::grants::Gate`]:
-//! what this side does not keep is skipped, never failed.
+//! keeps no agreement; it is sent to a participant of R (a peer peered for R
+//! counts only where this side sends R to it) and received, and a received
+//! grant goes through [`crate::grants::Gate`]: what this side does not keep
+//! is skipped, never failed, and costs the walk a leaf, not its bytes.
 //!
 //! At most [`MAX_GRANT_WALKS_PER_PEER`] grant walks with one peer run at
 //! once; the rest wait in order, at most [`MAX_QUEUED_GRANT_WALKS_PER_PEER`]
-//! of them, and start as running ones end. Every grant walk's end, and every
-//! one that does not start, is reported to the grant exchange
-//! ([`crate::grants::GrantWalkEnd`]), which retries what failed.
+//! of them, and start as running ones end. Of the grant walks a peer opens,
+//! at most [`MAX_JOINED_GRANT_WALKS_PER_PEER`] run here at once, and those
+//! over a resource this side takes no part in, on a link not peered for it,
+//! are charged to the peer's budget of
+//! [`crate::grants::MAX_UNKNOWN_RESOURCES_PER_LINK`] such resources until
+//! its connection closes; past either the stream is refused. Every grant
+//! walk's end, and every one that does not start, is reported to the grant
+//! exchange ([`crate::grants::GrantWalkEnd`]), which retries what failed.
 //!
 //! The walks task runs one node's exchanges. Either side opens the stream
 //! when its timer fires ([`crate::schedule`]), on the current connection to
@@ -80,7 +86,9 @@ use crate::connection::{
     Service, open_walk, read_frame, write_frame,
 };
 use crate::exchange::{Ended, Exchange, Out, Outcome, Pinned, Tree};
-use crate::grants::{GrantEvent, GrantOutcome, GrantWalkEnd, NotStarted};
+use crate::grants::{
+    GrantEvent, GrantOutcome, GrantWalkEnd, MAX_UNKNOWN_RESOURCES_PER_LINK, NotStarted,
+};
 use crate::health::Health;
 use crate::host::{CollectionSnapshot, StoreSnapshot};
 use crate::landing::{LandSlot, Landed};
@@ -193,6 +201,10 @@ pub(crate) const WALK_DEADLINE: Duration = Duration::from_secs(60);
 pub(crate) const MAX_WALK_REQUESTS: usize = 64;
 /// Grant walks one peer runs at once; the rest wait in order.
 pub(crate) const MAX_GRANT_WALKS_PER_PEER: usize = 8;
+/// Grant walks a peer opened that run here at once; past these its next is
+/// refused, and it asks again after its backoff. Twice the opener's own cap,
+/// so a peer's next walk racing the end of its last is not refused.
+pub(crate) const MAX_JOINED_GRANT_WALKS_PER_PEER: usize = 2 * MAX_GRANT_WALKS_PER_PEER;
 /// Grant walks that wait for one peer; past these a walk is declined, and
 /// the grant exchange asks again after its backoff.
 pub(crate) const MAX_QUEUED_GRANT_WALKS_PER_PEER: usize = 4096;
@@ -271,7 +283,7 @@ impl Walks {
                 return None;
             }
             let (pinned, peered) = self.grant_pin(peer, collection)?;
-            let sends = self.participates(peer, collection, peered);
+            let sends = self.participates(peer, collection);
             let exchange = if sends {
                 Exchange::start(collection, kind, pinned, None, true, true)
             } else {
@@ -325,7 +337,7 @@ impl Walks {
                 return None;
             }
             let (pinned, peered) = self.grant_pin(peer, collection)?;
-            let sends = self.participates(peer, collection, peered);
+            let sends = self.participates(peer, collection);
             let exchange = match offer {
                 None => Exchange::start(collection, kind, pinned, None, sends, true),
                 Some(OfferRole::Send) => {
@@ -510,26 +522,48 @@ impl Walks {
         Some((Pinned::Grants(resource, grants), self.peered(peer, resource)))
     }
 
-    /// Whether an active peering with `peer` for R exists. Merely asking
-    /// does not count.
-    fn peered(&self, peer: PeerId, resource: CollectionHandle) -> bool {
-        let mut peered = false;
+    /// Whether an active peering with `peer` for R exists, and whether this
+    /// side sends R on it. Merely asking does not count.
+    fn peering(&self, peer: PeerId, resource: CollectionHandle) -> Option<bool> {
+        let mut sends = None;
         self.health.update(|health| {
-            peered = health.peerings.iter().any(|peering| {
-                peering.collection == resource && peering.peer == peer && peering.peered
-            });
+            sends = health
+                .peerings
+                .iter()
+                .find(|peering| {
+                    peering.collection == resource && peering.peer == peer && peering.peered
+                })
+                .map(|peering| peering.sends);
         });
-        peered
+        sends
+    }
+
+    /// Whether an active peering with `peer` for R exists: what a walk over
+    /// R with it keeps widens to all of R's grants, whichever way R flows.
+    fn peered(&self, peer: PeerId, resource: CollectionHandle) -> bool {
+        self.peering(peer, resource).is_some()
     }
 
     /// Whether `peer` takes part in R as this side sees it: a root of R, a
-    /// key named on a delegation-valid grant over R, or peered for R here.
-    fn participates(&self, peer: PeerId, resource: CollectionHandle, peered: bool) -> bool {
-        peered
+    /// key named on a delegation-valid grant over R, or peered for R with
+    /// this side sending R to it. A peer that may write R but not read it
+    /// takes no part, and is sent none of R's grants.
+    fn participates(&self, peer: PeerId, resource: CollectionHandle) -> bool {
+        self.peering(peer, resource) == Some(true)
             || self
                 .snapshot
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.grants().participates(resource, peer))
+    }
+
+    /// Whether this side takes part in R or the link to `peer` is peered for
+    /// R: a grant walk over any other R that the peer opens is charged to its
+    /// budget of unknown resources.
+    fn knows(&self, peer: PeerId, resource: CollectionHandle) -> bool {
+        self.peered(peer, resource)
+            || self.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.grants().participates(resource, snapshot.local())
+            })
     }
 
     /// Whether this side sends C to `peer`: an active peering's directional
@@ -921,6 +955,7 @@ pub(crate) fn spawn<T: Transport, S: Service>(
         events,
         grants,
         grant_queue: GrantQueue::default(),
+        unknown_joins: PATCH::new(),
         running: HashMap::new(),
         next_id: 0,
     };
@@ -941,6 +976,11 @@ struct Task<T: Transport, S> {
     grants: mpsc::UnboundedSender<GrantEvent>,
     /// Grant walks waiting for one of their peer's running ones to end.
     grant_queue: GrantQueue,
+    /// Peer | R of every resource this side took no part in that a peer
+    /// opened a grant walk over here, charged to the peer's budget of
+    /// [`crate::grants::MAX_UNKNOWN_RESOURCES_PER_LINK`] and forgotten when
+    /// its connection closes.
+    unknown_joins: PATCH<64, IdentitySchema, ()>,
     /// Exchanges running, by peer, collection and kind.
     running: HashMap<Key, Running>,
     next_id: u64,
@@ -1064,6 +1104,15 @@ impl<T: Transport, S: Service> Task<T, S> {
             Command::Closed { peer } => {
                 self.running.retain(|(other, _, _), _| *other != peer);
                 self.grant_queue.forget(peer);
+                let charged: Vec<[u8; 64]> = self
+                    .unknown_joins
+                    .iter()
+                    .filter(|key| key[..32] == peer)
+                    .copied()
+                    .collect();
+                for key in charged {
+                    self.unknown_joins.remove(&key);
+                }
                 self.walks.closed(peer);
             }
             Command::Incoming {
@@ -1242,6 +1291,11 @@ impl<T: Transport, S: Service> Task<T, S> {
             recv.stop(RESET_WALK_DUPLICATE);
             return;
         }
+        if kind == WalkKind::Authorization && !self.joins(peer, collection) {
+            send.reset(RESET_WALK_REFUSED);
+            recv.stop(RESET_WALK_REFUSED);
+            return;
+        }
         let Some(exchange) = self
             .walks
             .start_incoming(peer, collection, kind, algorithm, offer)
@@ -1255,6 +1309,44 @@ impl<T: Transport, S: Service> Task<T, S> {
             let (ended, duplicate) = drive(&driver, exchange, send, recv, acked, replaced).await;
             driver.ended(ended, duplicate);
         });
+    }
+
+    /// Whether a grant walk `peer` opened over R may run here: at most
+    /// [`MAX_JOINED_GRANT_WALKS_PER_PEER`] of the peer's run at once, and an
+    /// R this side takes no part in, on a link not peered for it, is charged
+    /// to the peer's budget of [`MAX_UNKNOWN_RESOURCES_PER_LINK`] such
+    /// resources, the same bound a listing of them meets. One that replaces a
+    /// running walk takes its place.
+    fn joins(&mut self, peer: PeerId, resource: CollectionHandle) -> bool {
+        let joined = self
+            .running
+            .iter()
+            .filter(|((other, raw, kind), running)| {
+                *other == peer
+                    && *kind == WalkKind::Authorization
+                    && !running.opened
+                    && *raw != resource.raw
+            })
+            .count();
+        if joined >= MAX_JOINED_GRANT_WALKS_PER_PEER {
+            return false;
+        }
+        if self.walks.knows(peer, resource) {
+            return true;
+        }
+        let mut key = [0; 64];
+        key[..32].copy_from_slice(&peer);
+        key[32..].copy_from_slice(&resource.raw);
+        if self.unknown_joins.get(&key).is_some() {
+            return true;
+        }
+        let mut charged = 0;
+        self.unknown_joins.infixes(&peer, |_: &[u8; 32]| charged += 1);
+        if charged >= MAX_UNKNOWN_RESOURCES_PER_LINK {
+            return false;
+        }
+        self.unknown_joins.insert(&Entry::new(&key));
+        true
     }
 
     /// Register an exchange under `key`, replacing one running there, and
@@ -3191,6 +3283,7 @@ pub(crate) mod tests {
                 events,
                 grants: mpsc::unbounded_channel().0,
                 grant_queue: GrantQueue::default(),
+                unknown_joins: PATCH::new(),
                 running: HashMap::new(),
                 next_id: 0,
             };
@@ -3355,6 +3448,7 @@ pub(crate) mod tests {
                 events,
                 grants: mpsc::unbounded_channel().0,
                 grant_queue: GrantQueue::default(),
+                unknown_joins: PATCH::new(),
                 running: HashMap::new(),
                 next_id: 0,
             };
@@ -4367,6 +4461,7 @@ pub(crate) mod tests {
                 events,
                 grants,
                 grant_queue: GrantQueue::default(),
+                unknown_joins: PATCH::new(),
                 running: HashMap::new(),
                 next_id: 0,
             };
@@ -4490,6 +4585,7 @@ pub(crate) mod tests {
                 events,
                 grants,
                 grant_queue: GrantQueue::default(),
+                unknown_joins: PATCH::new(),
                 running: HashMap::new(),
                 next_id: 0,
             };
@@ -4534,6 +4630,163 @@ pub(crate) mod tests {
             assert_eq!(queued, resources.len() - MAX_GRANT_WALKS_PER_PEER);
             assert_eq!(confirmed, resources.len(), "{ends:?}");
             assert_eq!(running(&task), 0);
+        }
+
+        /// A walks task for `hosted` that has observed `snapshot`, and where
+        /// its grant walks report.
+        fn grant_task<S: Service>(
+            hosted: &Hosted<S>,
+            snapshot: Arc<StoreSnapshot>,
+        ) -> (Task<Tapped, S>, mpsc::UnboundedReceiver<GrantEvent>) {
+            let (landing, _) = mpsc::unbounded_channel();
+            let (events, _) = mpsc::unbounded_channel();
+            let (commands, _) = mpsc::unbounded_channel();
+            let (grants, walked) = mpsc::unbounded_channel();
+            let mut task = Task {
+                connections: hosted.table.clone(),
+                snapshots: hosted.lander.snapshots.subscribe(),
+                walks: Walks::new(hosted.lander.node.lock().unwrap().health.clone()),
+                commands: WalksHandle(commands),
+                landing,
+                events,
+                grants,
+                grant_queue: GrantQueue::default(),
+                unknown_joins: PATCH::new(),
+                running: HashMap::new(),
+                next_id: 0,
+            };
+            task.observe(snapshot);
+            (task, walked)
+        }
+
+        /// The halves of a grant walk `peer` opened over R and offered to the
+        /// task: the opener's end, kept open, and where a refusal is noted.
+        fn join<S: Service>(
+            task: &mut Task<Tapped, S>,
+            peer: PeerId,
+            resource: CollectionHandle,
+        ) -> (Arc<Mutex<Option<u32>>>, DuplexStream) {
+            let (opener, acceptor) = tokio::io::duplex(1 << 16);
+            let (recv, send) = tokio::io::split(acceptor);
+            let reset = Arc::new(Mutex::new(None));
+            task.command(Command::Incoming {
+                peer,
+                collection: resource,
+                kind: WalkKind::Authorization,
+                algorithm: crate::walk_stream::Algorithm::Prefix,
+                offer: None,
+                send: Box::new(Tx(send, reset.clone())),
+                recv: Box::new(Rx(recv, reset.clone())),
+            });
+            (reset, opener)
+        }
+
+        /// End the grant walk with `peer` over R running in the task, as
+        /// failed.
+        fn end_grant_walk<S: Service>(
+            task: &mut Task<Tapped, S>,
+            peer: PeerId,
+            resource: CollectionHandle,
+        ) {
+            let empty = PatchSummary::new(None, 0).unwrap();
+            let id = task.running[&(peer, resource.raw, WalkKind::Authorization)].id;
+            task.command(Command::Ended {
+                id,
+                peer,
+                collection: resource,
+                kind: WalkKind::Authorization,
+                ended: Ended {
+                    retain_agreement: false,
+                    sends: false,
+                    receives: true,
+                    confirmed: false,
+                    landed: false,
+                    root: empty,
+                    peer_root: None,
+                    agreed: None,
+                    failure: None,
+                    refused: false,
+                    skipped: 0,
+                },
+                duplicate: false,
+            });
+        }
+
+        fn absent(index: u64) -> CollectionHandle {
+            let mut raw = [0xA7; 32];
+            raw[..8].copy_from_slice(&index.to_be_bytes());
+            CollectionHandle::new(raw)
+        }
+
+        /// A peer may open grant walks here over at most
+        /// [`crate::grants::MAX_UNKNOWN_RESOURCES_PER_LINK`] resources this
+        /// side takes no part in, however many it ends first: past that it
+        /// is refused. A resource already charged, one this side takes part
+        /// in, another peer, and the same peer after its connection closed
+        /// are each joined (positive controls).
+        #[tokio::test]
+        async fn grant_walks_a_peer_opens_over_resources_this_side_takes_no_part_in_are_budgeted() {
+            use crate::grants::MAX_UNKNOWN_RESOURCES_PER_LINK;
+            let net = SimNet::new(0x3A50, SimConfig::default());
+            let mut node = Node::new(0x46);
+            let mut other = Node::new(0x47);
+            let known = rooted_resources(&mut node, &mut other, 1)[0];
+            let snapshot = node.snapshot();
+            let hosted = Hosted::new(node, &net);
+            let (mut task, _walked) = grant_task(&hosted, snapshot);
+            let stranger = Node::new(0x48).id();
+            let mut kept = Vec::new();
+            for index in 0..MAX_UNKNOWN_RESOURCES_PER_LINK as u64 {
+                let (reset, opener) = join(&mut task, stranger, absent(index));
+                assert_eq!(*reset.lock().unwrap(), None, "within the budget: {index}");
+                end_grant_walk(&mut task, stranger, absent(index));
+                kept.push(opener);
+            }
+            let (reset, _opener) = join(&mut task, stranger, absent(9_999));
+            assert_eq!(*reset.lock().unwrap(), Some(RESET_WALK_REFUSED), "past the budget");
+
+            let (reset, _charged) = join(&mut task, stranger, absent(0));
+            assert_eq!(*reset.lock().unwrap(), None, "an R already charged");
+            end_grant_walk(&mut task, stranger, absent(0));
+            let (reset, _known) = join(&mut task, stranger, known);
+            assert_eq!(*reset.lock().unwrap(), None, "an R this side takes part in");
+            end_grant_walk(&mut task, stranger, known);
+            let (reset, _another) = join(&mut task, other.id(), absent(9_999));
+            assert_eq!(*reset.lock().unwrap(), None, "another peer has its own budget");
+            end_grant_walk(&mut task, other.id(), absent(9_999));
+            task.command(Command::Closed { peer: stranger });
+            let (reset, _again) = join(&mut task, stranger, absent(9_999));
+            assert_eq!(*reset.lock().unwrap(), None, "a closed connection's budget is gone");
+        }
+
+        /// At most [`MAX_JOINED_GRANT_WALKS_PER_PEER`] grant walks a peer
+        /// opened run here at once; the next is refused until one ends.
+        /// Another peer's are its own (positive control).
+        #[tokio::test]
+        async fn a_peer_s_grant_walks_joined_here_at_once_are_capped() {
+            let net = SimNet::new(0x3A51, SimConfig::default());
+            let mut node = Node::new(0x49);
+            let mut other = Node::new(0x4A);
+            let peer = other.id();
+            let resources =
+                rooted_resources(&mut node, &mut other, MAX_JOINED_GRANT_WALKS_PER_PEER as u8 + 1);
+            let snapshot = node.snapshot();
+            let hosted = Hosted::new(node, &net);
+            let (mut task, _walked) = grant_task(&hosted, snapshot);
+            let mut kept = Vec::new();
+            for resource in &resources[..MAX_JOINED_GRANT_WALKS_PER_PEER] {
+                let (reset, opener) = join(&mut task, peer, *resource);
+                assert_eq!(*reset.lock().unwrap(), None, "within the cap");
+                kept.push(opener);
+            }
+            let last = resources[MAX_JOINED_GRANT_WALKS_PER_PEER];
+            let (reset, _refused) = join(&mut task, peer, last);
+            assert_eq!(*reset.lock().unwrap(), Some(RESET_WALK_REFUSED), "past the cap");
+            let (reset, _another) = join(&mut task, Node::new(0x4B).id(), last);
+            assert_eq!(*reset.lock().unwrap(), None, "another peer's walks are its own");
+            end_grant_walk(&mut task, peer, resources[0]);
+            let (reset, _next) = join(&mut task, peer, last);
+            assert_eq!(*reset.lock().unwrap(), None, "a slot freed by an end");
         }
     }
 }

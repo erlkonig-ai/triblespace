@@ -577,8 +577,12 @@ fn write_proof_later_activates_repaired_commit_without_reaching_publisher() {
         assert_eq!(records_of(&after, collection.handle()), 1);
         assert_eq!(after.proofs().unwrap().count(), 2);
         assert_eq!(reader_collection.admitted(&after).unwrap().len(), 1);
+        // Nor any other grant over C: the reader sends C to no key it does
+        // not admit to READ C, so it lists the publisher none of C's grants,
+        // its own READ grant included, which the publisher checked in memory
+        // when the reader presented it.
         let publisher = server.snapshot().unwrap();
-        assert_eq!(publisher.proofs().unwrap().count(), 1);
+        assert_eq!(publisher.proofs().unwrap().count(), 0);
         assert!(collection.admitted(&publisher).unwrap().is_empty());
     }));
 }

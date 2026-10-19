@@ -297,10 +297,11 @@ fn a_waiting_proof_names_every_missing_handle_and_is_evaluated_once_more() {
     pile.insert(&[&chain]);
     pile.insert(&siblings.iter().collect::<Vec<_>>());
     let waiting = pile.observe();
-    let missing = BTreeSet::from([r.raw, first_handle.raw, second_handle.raw]);
-    assert_eq!(waiting.verdict(chain.id()), Some(&Verdict::Waiting(missing.clone())));
+    let mut missing = vec![r.raw, first_handle.raw, second_handle.raw];
+    missing.sort_unstable();
+    assert_eq!(waiting.verdict(chain.id()), Some(&Verdict::Waiting(missing.clone().into())));
     assert_eq!(
-        waiting.waiting().map(|(proof, handles)| (proof, handles.clone())).collect::<Vec<_>>(),
+        waiting.waiting().map(|(proof, handles)| (proof, handles.to_vec())).collect::<Vec<_>>(),
         vec![(chain.id(), missing)]
     );
     for sibling in &siblings {
