@@ -1767,4 +1767,66 @@ mod tests {
             .collect();
         assert_eq!(selected, BTreeSet::from([commit, derive]));
     }
+
+    /// The retired routing backlink, declared locally (anchored: anchor and
+    /// encoding reproduce the published id) so old-shape resource
+    /// descriptors can be written once core no longer exports it.
+    mod retired {
+        use crate::prelude::attributes;
+        attributes! {
+            "62E951EC3ABB7F9B7F123BB7DE2F9F99" as pub resource_collection: crate::inline::encodings::hash::Handle<crate::blob::encodings::simplearchive::SimpleArchive>;
+        }
+    }
+
+    /// Grant gossip redesign: a proof over a resource R whose descriptor
+    /// names C through the retired backlink, from R's own root, seeds nothing
+    /// in held(C). Its definitions travel with R's grants, by participation,
+    /// not as C's blobs. Base: proof_seeds follows the backlink and seeds it.
+    #[test]
+    #[ignore = "grant gossip redesign"]
+    fn a_proof_over_a_resource_naming_c_seeds_nothing_in_c() {
+        use crate::capability::policy::resource_policy;
+        use crate::collection::AdmissionPolicy;
+
+        let mut store = Store::default();
+        let root = SigningKey::from_bytes(&[60; 32]);
+        let resource_root = SigningKey::from_bytes(&[61; 32]);
+        let subject = SigningKey::from_bytes(&[62; 32]).verifying_key();
+        let c = governed(&mut store, "backlinked", &root);
+        let own: Inline<Handle<SimpleArchive>> =
+            Inline::new(blob(&mut store, b"definition over C"));
+        let routed: Inline<Handle<SimpleArchive>> =
+            Inline::new(blob(&mut store, b"definition over R naming C"));
+        let resource = store
+            .put::<SimpleArchive, _>(
+                entity! {
+                    retired::resource_collection: c,
+                    resource_policy*: AdmissionPolicy::direct(resource_root.verifying_key())
+                        .binding(routed),
+                }
+                .facts()
+                .clone(),
+            )
+            .unwrap();
+        for (resource, root, definition) in [(c, &root, own), (resource, &resource_root, routed)] {
+            store
+                .insert_proof(CapabilityProof::new(
+                    CapabilityResource::from(resource),
+                    root,
+                    definition,
+                    subject,
+                ))
+                .unwrap();
+        }
+        store.track_held([c]);
+        let held = held_set(&store.snapshot().unwrap(), c);
+        assert!(
+            held.contains(&own.raw),
+            "positive control: a proof over C from C's root seeds C"
+        );
+        assert!(
+            !held.contains(&routed.raw),
+            "a proof over R seeded C through R's backlink"
+        );
+    }
 }

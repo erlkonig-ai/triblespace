@@ -1089,3 +1089,112 @@ mod policy_tests {
         assert!(policies.contains(&AdmissionPolicy::direct(key(14))));
     }
 }
+
+/// Grant gossip redesign, written against the base before any production
+/// change. A grant over a resource travels to the resource's participants by
+/// one mechanism; no collection adopts another resource's proofs through a
+/// backlink on that resource's descriptor.
+#[cfg(test)]
+mod grant_gossip_tests {
+    use ed25519_dalek::SigningKey;
+
+    use super::*;
+    use crate::capability::{CapabilityProof, CapabilityResource};
+    use crate::collection::policy::{AdmissionPolicy, CollectionPolicy};
+
+    /// The retired routing backlink, declared locally so old-shape resource
+    /// descriptors can still be written once core no longer exports it. It
+    /// is an anchored attribute: anchor and encoding together are its
+    /// identity, so this declaration reproduces the published id exactly.
+    pub(crate) mod retired {
+        use crate::prelude::attributes;
+        attributes! {
+            "62E951EC3ABB7F9B7F123BB7DE2F9F99" as pub resource_collection: crate::inline::encodings::hash::Handle<crate::blob::encodings::simplearchive::SimpleArchive>;
+        }
+    }
+
+    /// The derived id of the published `resource_collection` attribute,
+    /// recorded on the base f2a2b5a1 where core still exported it.
+    const RETIRED_RESOURCE_COLLECTION_ID: Id =
+        crate::macros::id_hex!("926F34A0A81715F0C44F77C691A42468");
+
+    #[test]
+    fn the_local_retired_backlink_has_the_published_identity() {
+        assert_eq!(
+            retired::resource_collection.id(),
+            crate::capability::policy::resource_collection.id(),
+            "{:X}",
+            crate::capability::policy::resource_collection.id()
+        );
+        assert_eq!(
+            retired::resource_collection.id(),
+            RETIRED_RESOURCE_COLLECTION_ID,
+            "{:X}",
+            retired::resource_collection.id()
+        );
+    }
+
+    /// A proof over a resource R other than C is never C's evidence, even
+    /// when R's descriptor still names C through the retired backlink and the
+    /// proof starts at R's own root. Base: the subordinate branch accepts it.
+    #[test]
+    #[ignore = "grant gossip redesign"]
+    fn a_proof_over_another_resource_is_never_a_collections_evidence() {
+        let collection_root = SigningKey::from_bytes(&[0x71; 32]);
+        let resource_root = SigningKey::from_bytes(&[0x72; 32]);
+        let subject = SigningKey::from_bytes(&[0x73; 32]).verifying_key();
+        let direct = AdmissionPolicy::direct(collection_root.verifying_key());
+        let mut blobs = Fragment::empty();
+        let descriptor =
+            naming::<SimpleArchive>("backlinked", CollectionPolicy::new(direct.clone(), direct));
+        let collection = blobs.put::<SimpleArchive, _>(descriptor.facts().clone());
+        let definition = blobs.put::<SimpleArchive, _>(
+            entity! { metadata::name: "a resource's definition" }
+                .facts()
+                .clone(),
+        );
+        let resource_policy_binding =
+            AdmissionPolicy::direct(resource_root.verifying_key()).binding(definition);
+        let resource_facts = entity! {
+            retired::resource_collection: collection,
+            resource_policy*: resource_policy_binding,
+        }
+        .facts()
+        .clone();
+        let resource = blobs.put::<SimpleArchive, _>(resource_facts);
+        let reader = SnapshotSource::snapshot(&mut blobs.blobs().clone()).unwrap();
+
+        // Positive controls: the predicate admits a proof over C from C's
+        // root, and the proof over R is valid under R's own policies.
+        let over_collection = CapabilityProof::new(
+            CapabilityResource::from(collection),
+            &collection_root,
+            read_capability(),
+            subject,
+        );
+        assert_eq!(
+            validate_proof_evidence(&reader, collection, descriptor.facts(), &over_collection),
+            Ok(())
+        );
+        let over_resource = CapabilityProof::new(
+            CapabilityResource::from(resource),
+            &resource_root,
+            definition,
+            subject,
+        );
+        assert_eq!(
+            validate_proof_for_policies(
+                resource,
+                [AdmissionPolicy::direct(resource_root.verifying_key())],
+                &over_resource,
+            ),
+            Ok(())
+        );
+
+        assert_eq!(
+            validate_proof_evidence(&reader, collection, descriptor.facts(), &over_resource),
+            Err(ProofEvidenceError::WrongResource),
+            "R's backlink made its proof C's evidence"
+        );
+    }
+}
