@@ -1097,7 +1097,8 @@ pub(crate) async fn run<T: Transport, S: Service>(
 ) {
     let mut peerings = Peerings::new(connections.transport().local_id());
     let mut grants = Grants::new(connections.transport().local_id());
-    let sink = Sink::new(connections.clone(), admissions, walks.clone());
+    let (failed_tx, mut failed) = tokio::sync::mpsc::unbounded_channel();
+    let sink = Sink::new(connections.clone(), admissions, walks.clone(), failed_tx);
     let mut schedules = Schedules::default();
     let (dialled_tx, mut dialled) = tokio::sync::mpsc::unbounded_channel();
     let mut lookups = FuturesUnordered::new();
@@ -1112,6 +1113,13 @@ pub(crate) async fn run<T: Transport, S: Service>(
         let push_at = schedules.deadline();
         let push_due = async {
             match push_at {
+                Some(at) => tokio::time::sleep(at.duration_since(crate::clock::mono_now())).await,
+                None => std::future::pending().await,
+            }
+        };
+        let retry_at = grants.deadline();
+        let retry_due = async {
+            match retry_at {
                 Some(at) => tokio::time::sleep(at.duration_since(crate::clock::mono_now())).await,
                 None => std::future::pending().await,
             }
@@ -1134,7 +1142,13 @@ pub(crate) async fn run<T: Transport, S: Service>(
                 peerings.event(event);
             }
             Some(event) = received.recv() => schedules.event(event, crate::clock::mono_now()),
-            Some(event) = walked.recv() => sink.apply(grants.walked(event)),
+            Some(event) = walked.recv() => {
+                sink.apply(grants.walked(event, crate::clock::mono_now()));
+            }
+            Some(handle) = failed.recv() => {
+                sink.apply(grants.fetch_failed(handle, crate::clock::mono_now()));
+            }
+            () = retry_due => sink.apply(grants.retry(crate::clock::mono_now())),
             () = push_due => {
                 for (peer, collection, kind) in schedules.poll(crate::clock::mono_now()) {
                     walks.open(peer, collection, kind);

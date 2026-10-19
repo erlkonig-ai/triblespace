@@ -87,6 +87,10 @@ fn unheld(root: &SigningKey, label: &str) -> (TribleSet, TribleSet, CollectionHa
     (descriptor, definition, r, handle)
 }
 
+fn now() -> Mono {
+    crate::clock::mono_now()
+}
+
 fn pending(peer: PeerId, proof: &CapabilityProof) -> GrantEvent {
     GrantEvent::Pending {
         peer,
@@ -102,7 +106,7 @@ fn a_pending_grant_lands_only_once_its_descriptor_arrives() {
     let (descriptor, definition, r, handle) = unheld(&alice, "arrives later");
     let proof = grant(r, &alice, handle, &bob_key);
 
-    let effects = bob.grants.walked(pending(id(&carol), &proof));
+    let effects = bob.grants.walked(pending(id(&carol), &proof), now());
     assert!(effects.land.is_empty(), "no descriptor, no landing");
     assert!(
         effects
@@ -137,7 +141,7 @@ fn a_pending_grant_that_starts_outside_r_s_roots_is_dropped_once_r_arrives() {
     let wrong = grant(r, &mallory, handle, &bob_key);
     let valid = grant(r, &alice, handle, &bob_key);
     for proof in [&wrong, &valid] {
-        assert!(bob.grants.walked(pending(id(&carol), proof)).land.is_empty());
+        assert!(bob.grants.walked(pending(id(&carol), proof), now()).land.is_empty());
         assert!(bob.grants.waiting().contains(id(&carol), proof));
     }
     bob.put(&definition);
@@ -162,12 +166,12 @@ fn pending_grants_are_bounded_per_sender_and_evict_the_oldest() {
         SigningKey::from_bytes(&seed)
     };
     let others = grant(r, &alice, handle, &subject(10_000));
-    bob.grants.walked(pending(id(&dave), &others));
+    bob.grants.walked(pending(id(&dave), &others), now());
     let proofs: Vec<_> = (0..=MAX_PENDING_PER_SENDER)
         .map(|index| grant(r, &alice, handle, &subject(index)))
         .collect();
     for proof in &proofs {
-        bob.grants.walked(pending(id(&carol), proof));
+        bob.grants.walked(pending(id(&carol), proof), now());
     }
     assert_eq!(bob.grants.waiting().kept(id(&carol)), MAX_PENDING_PER_SENDER);
     assert!(!bob.grants.waiting().contains(id(&carol), &proofs[0]), "the oldest left");
@@ -227,8 +231,8 @@ fn a_sender_s_pending_grants_leave_with_its_last_connection() {
     let (dave_link, _dave_frames) = Link::detached(2, id(&dave));
     bob.grants.event(&ReconEvent::Opened(carol_link.clone()));
     bob.grants.event(&ReconEvent::Opened(dave_link.clone()));
-    bob.grants.walked(pending(id(&carol), &from_carol));
-    bob.grants.walked(pending(id(&dave), &from_dave));
+    bob.grants.walked(pending(id(&carol), &from_carol), now());
+    bob.grants.walked(pending(id(&dave), &from_dave), now());
     bob.grants.event(&ReconEvent::Closed(carol_link));
     assert!(!bob.grants.waiting().contains(id(&carol), &from_carol));
     assert!(
@@ -444,7 +448,7 @@ fn a_grant_over_a_granted_unselected_collection_fetches_its_name() {
     let mut bob = Node::new(0x81);
     bob.observe();
     let read = grant(c, &owner, read_capability(), &bob_key);
-    bob.grants.walked(pending(id(&carol), &read));
+    bob.grants.walked(pending(id(&carol), &read), now());
     bob.put(&descriptor);
     let effects = bob.observe();
     assert_eq!(effects.land, [read], "positive control: the grant lands");
@@ -490,7 +494,7 @@ fn an_evicted_pending_grant_lets_the_next_listing_reopen_its_walk() {
         seed[..8].copy_from_slice(&(index as u64).to_be_bytes());
         let subject = SigningKey::from_bytes(&seed);
         bob.grants
-            .walked(pending(id(&peer), &grant(r, &alice, handle, &subject)));
+            .walked(pending(id(&peer), &grant(r, &alice, handle, &subject)), now());
     }
     assert_eq!(
         hear(&mut bob, &linked, vec![(r, summary(4))]).walks,
@@ -541,5 +545,196 @@ fn a_stranger_cannot_make_a_grant_walk_decode_a_large_blob_or_one_per_proof() {
     assert!(
         over_resident < 4 * resident_decode,
         "{over_resident:?} against one decode {resident_decode:?}"
+    );
+}
+
+// ---- walk ends, retries and backoff ----
+
+fn ended(peer: &SigningKey, resource: CollectionHandle, outcome: GrantOutcome) -> GrantEvent {
+    GrantEvent::Ended(GrantWalkEnd {
+        peer: id(peer),
+        resource,
+        outcome,
+    })
+}
+
+fn after(base: Mono, seconds: u64) -> Mono {
+    base + std::time::Duration::from_secs(seconds)
+}
+
+fn confirmed() -> GrantOutcome {
+    GrantOutcome::Confirmed {
+        agreed: PatchSummary::new(None, 0).unwrap(),
+    }
+}
+
+/// A host connected to `peer`, which listed `summary` for R: the walk it
+/// opened is the first.
+fn listed_to(peer: &SigningKey, resource: CollectionHandle, summary: PatchSummary) -> (Node, Linked) {
+    let mut host = Node::new(0x01);
+    host.observe();
+    let (linked, _) = open_to(&mut host, id(peer), 7);
+    assert_eq!(hear(&mut host, &linked, vec![(resource, summary)]).walks, [(id(peer), resource)]);
+    (host, linked)
+}
+
+#[test]
+fn a_failed_grant_walk_reopens_after_a_backoff_on_the_same_connection() {
+    let peer = key(0xB0);
+    let r = handle(1);
+    let (mut host, linked) = listed_to(&peer, r, summary(5));
+    let base = now();
+    host.grants.walked(ended(&peer, r, confirmed()), base);
+    assert_eq!(host.grants.deadline(), None, "control: a confirmed walk is not retried");
+    assert!(host.grants.retry(after(base, 600)).walks.is_empty());
+
+    host.grants
+        .walked(ended(&peer, r, GrantOutcome::Unconfirmed(None)), base);
+    assert_eq!(host.grants.deadline(), Some(after(base, 1)));
+    assert!(host.grants.retry(base).walks.is_empty(), "not before the backoff");
+    assert_eq!(
+        host.grants.retry(after(base, 1)).walks,
+        [(id(&peer), r)],
+        "the same connection, no new listing"
+    );
+    for outcome in [
+        GrantOutcome::Replaced,
+        GrantOutcome::NotStarted(NotStarted::AlreadyRunning),
+        GrantOutcome::NotStarted(NotStarted::Queued),
+    ] {
+        host.grants.walked(ended(&peer, r, outcome), after(base, 1));
+        assert_eq!(host.grants.deadline(), None, "{outcome:?} changes nothing");
+    }
+    assert!(hear(&mut host, &linked, vec![(r, summary(5))]).walks.is_empty());
+    for outcome in [
+        GrantOutcome::Refused,
+        GrantOutcome::NotStarted(NotStarted::NoConnection),
+        GrantOutcome::NotStarted(NotStarted::StartDeclined),
+    ] {
+        let mut host = listed_to(&peer, r, summary(5)).0;
+        host.grants.walked(ended(&peer, r, outcome), base);
+        assert_eq!(host.grants.retry(after(base, 1)).walks, [(id(&peer), r)], "{outcome:?}");
+    }
+}
+
+/// A peer that refuses every walk is asked again at 1, 3, 7, 15, 31 and
+/// 63 s, then once a minute: 15 walks in ten minutes, never more.
+#[test]
+fn a_refusing_peer_is_walked_on_the_backoff_schedule_only() {
+    let peer = key(0xB1);
+    let r = handle(2);
+    let (mut host, _linked) = listed_to(&peer, r, summary(6));
+    let base = now();
+    let mut walks = 1;
+    host.grants
+        .walked(ended(&peer, r, GrantOutcome::Refused), base);
+    while let Some(at) = host.grants.deadline() {
+        if at > after(base, 600) {
+            break;
+        }
+        for (_, resource) in host.grants.retry(at).walks {
+            walks += 1;
+            host.grants
+                .walked(ended(&peer, resource, GrantOutcome::Refused), at);
+        }
+    }
+    assert_eq!(walks, 15);
+}
+
+#[test]
+fn a_root_change_resets_the_backoff() {
+    let peer = key(0xB2);
+    let r = handle(3);
+    let (mut host, linked) = listed_to(&peer, r, summary(7));
+    let base = now();
+    let mut at = base;
+    for _ in 0..4 {
+        host.grants
+            .walked(ended(&peer, r, GrantOutcome::Unconfirmed(None)), at);
+        at = host.grants.deadline().unwrap();
+        assert_eq!(host.grants.retry(at).walks.len(), 1);
+    }
+    host.grants
+        .walked(ended(&peer, r, GrantOutcome::Unconfirmed(None)), at);
+    assert_eq!(host.grants.deadline(), Some(after(at, 16)), "grown to 16 s");
+    assert_eq!(
+        hear(&mut host, &linked, vec![(r, summary(8))]).walks,
+        [(id(&peer), r)],
+        "a new root opens at once"
+    );
+    host.grants
+        .walked(ended(&peer, r, GrantOutcome::Unconfirmed(None)), at);
+    assert_eq!(host.grants.deadline(), Some(after(at, 1)), "and starts again at 1 s");
+}
+
+/// The walk confirmed while the grant it delivered waited for its
+/// descriptor; when that grant is evicted, the walk opens again on the
+/// same connection although the peer lists nothing new.
+#[test]
+fn a_confirmed_walk_whose_pending_grant_is_evicted_reopens_without_a_new_listing() {
+    let [alice, peer] = [0xC8, 0xCF].map(key);
+    let (_, _, r, handle) = unheld(&alice, "evicted after confirming");
+    let (mut host, _linked) = listed_to(&peer, r, summary(9));
+    let base = now();
+    let first = grant(r, &alice, handle, &key(0xC9));
+    host.grants.walked(pending(id(&peer), &first), base);
+    host.grants.walked(ended(&peer, r, confirmed()), base);
+    assert_eq!(host.grants.deadline(), None, "control: nothing to retry yet");
+    for index in 0..MAX_PENDING_PER_SENDER {
+        let mut seed = [0xCA; 32];
+        seed[..8].copy_from_slice(&(index as u64).to_be_bytes());
+        let other = grant(r, &alice, handle, &SigningKey::from_bytes(&seed));
+        host.grants.walked(pending(id(&peer), &other), base);
+    }
+    assert!(!host.grants.waiting().contains(id(&peer), &first), "evicted");
+    let due = host.grants.deadline().expect("a retry is scheduled");
+    assert!(due <= after(base, 1));
+    assert_eq!(host.grants.retry(due).walks, [(id(&peer), r)]);
+}
+
+/// The same when the pending grant's descriptor cannot be fetched.
+#[test]
+fn a_confirmed_walk_whose_descriptor_fetch_fails_reopens_without_a_new_listing() {
+    let [alice, peer] = [0xD8, 0xDF].map(key);
+    let (_, _, r, handle) = unheld(&alice, "never fetched");
+    let (mut host, _linked) = listed_to(&peer, r, summary(10));
+    let base = now();
+    let proof = grant(r, &alice, handle, &key(0xD9));
+    host.grants.walked(pending(id(&peer), &proof), base);
+    host.grants.walked(ended(&peer, r, confirmed()), base);
+    assert_eq!(host.grants.deadline(), None, "control: nothing to retry yet");
+    host.grants.fetch_failed(r.raw, base);
+    assert!(!host.grants.waiting().contains(id(&peer), &proof), "given up");
+    assert_eq!(host.grants.deadline(), Some(after(base, 1)));
+    assert_eq!(host.grants.retry(after(base, 1)).walks, [(id(&peer), r)]);
+}
+
+/// A stored grant whose definition could not be fetched has it fetched
+/// again from the lister when the retry falls due.
+#[test]
+fn a_stored_grant_whose_definition_fetch_fails_is_fetched_again_at_the_retry() {
+    let [alice, bob_key, peer] = [0xE8, 0xE9, 0xEF].map(key);
+    let (descriptor, _, r, handle) = unheld(&alice, "definition missing");
+    let mut host = Node::new(0xE9);
+    host.put(&descriptor);
+    host.store
+        .insert_proof(grant(r, &alice, handle, &bob_key))
+        .unwrap();
+    host.observe();
+    let (linked, _) = open_to(&mut host, id(&peer), 3);
+    let base = now();
+    let heard = hear(&mut host, &linked, vec![(r, summary(11))]);
+    assert!(heard.fetch.iter().any(|fetch| fetch.blobs.contains(&handle.raw)));
+    host.grants.walked(ended(&peer, r, confirmed()), base);
+    host.grants.fetch_failed(handle.raw, base);
+    let due = host.grants.deadline().expect("a retry is scheduled");
+    let retried = host.grants.retry(due);
+    assert!(
+        retried
+            .fetch
+            .iter()
+            .any(|fetch| fetch.blobs.contains(&handle.raw) && fetch.sources.first() == Some(&id(&peer))),
+        "{:?}",
+        retried.fetch
     );
 }

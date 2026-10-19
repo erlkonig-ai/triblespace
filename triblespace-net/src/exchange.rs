@@ -445,6 +445,10 @@ pub(crate) struct Ended {
     /// retiring this task and never keep a second per-neighbour source pin.
     pub(crate) retain_agreement: bool,
     pub(crate) agreed: Option<Arc<Tree>>,
+    /// How the exchange failed, if it decided that itself.
+    pub(crate) failure: Option<Failure>,
+    /// The peer reset the stream as refused.
+    pub(crate) refused: bool,
 }
 
 pub(crate) struct Exchange {
@@ -929,6 +933,11 @@ impl Exchange {
             // equal subtrees still prune.
             retain_agreement: self.riblt.is_none() && self.kind != WalkKind::Authorization,
             agreed: next.map(Arc::new),
+            failure: match self.outcome {
+                Some(Outcome::Failed(failure)) => Some(failure),
+                _ => None,
+            },
+            refused: false,
         }
     }
 

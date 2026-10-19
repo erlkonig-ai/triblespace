@@ -23,6 +23,14 @@
 //! - What a waiting grant needs (R's descriptor and name, its definitions)
 //!   is fetched over `blob/1`, from the peers that listed R first. A peering
 //!   refused for want of definitions fetches them the same way.
+//! - Every grant walk's end reaches the exchange ([`GrantWalkEnd`]). One that
+//!   failed, was refused or could not start opens again on the same
+//!   connection after a backoff of 1 s doubling to 60 s, while the peer's
+//!   listed root still differs; a confirmed walk or a root change resets it.
+//!   A pending grant given up (evicted, or its descriptor found nowhere)
+//!   opens its walk again the same way, and a definition found nowhere is
+//!   asked for again when the retry falls due, so recovery never waits for a
+//!   listing that may not change.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -46,6 +54,7 @@ use triblespace_core::repo::{BlobStoreGet, BlobStoreList, CapabilityProofRead, S
 use triblespace_core::trible::TribleSet;
 
 use crate::channel::{NetEvent, NetEventBatch};
+use crate::clock::Mono;
 use crate::connection::{ConnectionTable, Link, ReconEvent, Service};
 use crate::host::{ActiveCollections, METADATA_BLOB_BYTES, StoreSnapshot};
 use crate::patch_repair::PatchSummary;
@@ -61,6 +70,11 @@ const FETCH_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_PENDING_PER_SENDER: usize = 256;
 /// Proofs every sender together keeps waiting in memory.
 const MAX_PENDING: usize = 1024;
+/// The first wait before a failed grant walk opens again; it doubles with
+/// each failure up to [`MAX_RETRY`].
+const MIN_RETRY: Duration = Duration::from_secs(1);
+const MAX_RETRY: Duration = Duration::from_secs(60);
+
 /// Resources a connection may list that this side takes no part in (a
 /// non-syncing grantee learns its grants this way). Reset per connection.
 pub(crate) const MAX_UNKNOWN_RESOURCES_PER_LINK: usize = 256;
@@ -489,6 +503,44 @@ pub(crate) enum GrantEvent {
     /// A walk with `peer` kept `proof`, but R's descriptor is not resident
     /// here: it waits in memory until it is.
     Pending { peer: PeerId, proof: CapabilityProof },
+    /// A grant walk ended, or did not start.
+    Ended(GrantWalkEnd),
+}
+
+/// How a grant walk with `peer` over R ended, or why it did not start: one
+/// for every walk the walks task was asked to open or joined.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GrantWalkEnd {
+    pub(crate) peer: PeerId,
+    pub(crate) resource: CollectionHandle,
+    pub(crate) outcome: GrantOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GrantOutcome {
+    /// Both sides confirmed. `agreed` is what this side holds of what the
+    /// walk carried: never a key it skipped or holds pending.
+    Confirmed { agreed: PatchSummary },
+    /// It ended any other way: failed, cut or timed out.
+    Unconfirmed(Option<crate::exchange::Failure>),
+    /// The peer refused it.
+    Refused,
+    /// Another walk with the peer over R took its place.
+    Replaced,
+    NotStarted(NotStarted),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NotStarted {
+    /// No current connection to the peer.
+    NoConnection,
+    /// A walk with the peer over R is running.
+    AlreadyRunning,
+    /// This side would neither send nor receive, or no observation yet, or
+    /// the queue of walks waiting for the peer is full.
+    StartDeclined,
+    /// It waits for one of the peer's running grant walks to end.
+    Queued,
 }
 
 /// Bounds on the grants waiting in memory for their descriptor.
@@ -613,6 +665,23 @@ impl Pending {
     #[cfg(test)]
     pub(crate) fn size(&self) -> (usize, usize) {
         (self.proofs.len() as usize, self.bytes)
+    }
+
+    /// Drop every grant over `resource`; the senders that delivered them.
+    pub(crate) fn give_up(&mut self, resource: CollectionHandle) -> Vec<PeerId> {
+        let keys: Vec<[u8; 72]> = self
+            .proofs
+            .iter()
+            .filter(|key| self.proofs.get(key).unwrap().resource().into_bytes() == resource.raw)
+            .copied()
+            .collect();
+        let mut senders: Vec<PeerId> = keys.iter().map(pending_sender).collect();
+        for key in keys {
+            self.remove(&key);
+        }
+        senders.sort_unstable();
+        senders.dedup();
+        senders
     }
 
     /// Drop every grant `sender` delivered.
@@ -750,6 +819,19 @@ struct Listing {
     unknown: PATCH<32, IdentitySchema, ()>,
     /// The resources the connection is peered for.
     peered: PATCH<32, IdentitySchema, (), Blake3Merkle>,
+    /// Walks over R to open again after a failure, with their backoff.
+    retries: PATCH<32, IdentitySchema, Retry>,
+}
+
+/// A backoff for one connection and resource.
+#[derive(Clone, Copy, Debug)]
+struct Retry {
+    /// The wait before the next attempt, doubled by each failure.
+    delay: Duration,
+    /// When it falls due; none while the attempt it started runs.
+    at: Option<Mono>,
+    /// This side's root when it was scheduled: a change resets the backoff.
+    local: PatchSummary,
 }
 
 impl Listing {
@@ -762,7 +844,24 @@ impl Listing {
             opened: PATCH::new(),
             unknown: PATCH::new(),
             peered: PATCH::new(),
+            retries: PATCH::new(),
         }
+    }
+
+    /// Open the walk over R again after a backoff: 1 s after the first
+    /// failure, doubling to 60 s.
+    fn schedule(&mut self, resource: CollectionHandle, local: PatchSummary, now: Mono) {
+        let delay = self
+            .retries
+            .get(&resource.raw)
+            .map_or(MIN_RETRY, |retry| (retry.delay * 2).min(MAX_RETRY));
+        let retry = Retry {
+            delay,
+            at: Some(now + delay),
+            local,
+        };
+        self.retries
+            .replace(&PatchEntry::with_value(&resource.raw, retry));
     }
 
     /// Open a walk over R if the peer's listed root differs from `local`
@@ -893,6 +992,10 @@ impl Grants {
                     continue;
                 }
                 listing.unknown.insert(&PatchEntry::new(&resource.raw));
+            }
+            if listing.listed.get(&resource.raw) != Some(&theirs) {
+                // A root change resets the backoff.
+                listing.retries.remove(&resource.raw);
             }
             listing
                 .listed
@@ -1083,12 +1186,138 @@ impl Grants {
         effects
     }
 
+    /// When the next retry is due, if one is scheduled.
+    pub(crate) fn deadline(&self) -> Option<Mono> {
+        self.listings
+            .values()
+            .flat_map(|listing| {
+                listing
+                    .retries
+                    .iter()
+                    .filter_map(|key| listing.retries.get(key).unwrap().at)
+            })
+            .min()
+    }
+
+    /// Take the retries due at `now`: walk R again where the peer's listed
+    /// root still differs, and fetch again what grants over R waiting here
+    /// need, from that peer first.
+    pub(crate) fn retry(&mut self, now: Mono) -> Effects {
+        let mut effects = Effects::default();
+        let ids: Vec<u64> = self.listings.keys().copied().collect();
+        for id in ids {
+            let due: Vec<CollectionHandle> = {
+                let listing = &self.listings[&id];
+                listing
+                    .retries
+                    .iter()
+                    .filter(|key| {
+                        listing
+                            .retries
+                            .get(key)
+                            .unwrap()
+                            .at
+                            .is_some_and(|at| at <= now)
+                    })
+                    .map(|key| CollectionHandle::new(*key))
+                    .collect()
+            };
+            for resource in due {
+                let local = self.summary(resource);
+                let listing = self.listings.get_mut(&id).unwrap();
+                let peer = listing.link.peer();
+                if listing.reopen(resource, local) {
+                    let mut retry = *listing.retries.get(&resource.raw).unwrap();
+                    retry.at = None;
+                    listing
+                        .retries
+                        .replace(&PatchEntry::with_value(&resource.raw, retry));
+                    effects.walks.push((peer, resource));
+                } else {
+                    listing.retries.remove(&resource.raw);
+                }
+                effects.fetch.extend(self.needed(resource, &[peer]));
+            }
+        }
+        effects
+    }
+
+    /// A fetch of `handle` found it at no source. Pending grants over the
+    /// resource it describes are given up, and their senders' walks over it
+    /// open again after a backoff; stored grants waiting for it are fetched
+    /// again from their listers then.
+    pub(crate) fn fetch_failed(&mut self, handle: RawHash, now: Mono) -> Effects {
+        let resource = CollectionHandle::new(handle);
+        for sender in self.waiting.give_up(resource) {
+            self.give_up(sender, resource, now);
+        }
+        let waiting: Vec<CollectionHandle> = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .grants()
+                    .waiting_grants()
+                    .filter(|(_, missing)| missing.contains(&handle))
+                    .map(|(proof, _)| CollectionHandle::new(proof.resource().into_bytes()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for resource in waiting {
+            let local = self.summary(resource);
+            for listing in self.listings.values_mut() {
+                if listing.listed.get(&resource.raw).is_some() {
+                    listing.schedule(resource, local, now);
+                }
+            }
+        }
+        Effects::default()
+    }
+
+    /// A grant walk ended: a confirmed one resets the backoff; one that
+    /// failed, was refused or could not start opens again after it. A
+    /// replaced, running or queued one changes nothing.
+    fn ended(&mut self, end: GrantWalkEnd, now: Mono) {
+        let local = self.summary(end.resource);
+        for listing in self.listings.values_mut() {
+            if listing.link.peer() != end.peer {
+                continue;
+            }
+            match end.outcome {
+                GrantOutcome::Confirmed { .. } => {
+                    listing.retries.remove(&end.resource.raw);
+                }
+                GrantOutcome::Unconfirmed(_)
+                | GrantOutcome::Refused
+                | GrantOutcome::NotStarted(NotStarted::NoConnection | NotStarted::StartDeclined) => {
+                    listing.opened.remove(&end.resource.raw);
+                    listing.schedule(end.resource, local, now);
+                }
+                GrantOutcome::Replaced
+                | GrantOutcome::NotStarted(NotStarted::AlreadyRunning | NotStarted::Queued) => {}
+            }
+        }
+    }
+
+    /// A grant `sender` delivered over R was dropped unlanded: the walk
+    /// over R opens again after a backoff, whatever its peer lists next.
+    fn give_up(&mut self, sender: PeerId, resource: CollectionHandle, now: Mono) {
+        let local = self.summary(resource);
+        for listing in self.listings.values_mut() {
+            if listing.link.peer() == sender {
+                listing.opened.remove(&resource.raw);
+                listing.schedule(resource, local, now);
+            }
+        }
+    }
+
     /// Hear what a grant walk reports: a kept grant whose descriptor is not
     /// resident waits in memory, and that descriptor and its definitions
     /// are fetched from the sender first.
-    pub(crate) fn walked(&mut self, event: GrantEvent) -> Effects {
+    pub(crate) fn walked(&mut self, event: GrantEvent, now: Mono) -> Effects {
         let mut effects = Effects::default();
         match event {
+            GrantEvent::Ended(end) => self.ended(end, now),
             GrantEvent::Pending { peer, proof } => {
                 // The descriptor may have landed since the walk judged it.
                 if let Some(snapshot) = self.snapshot.clone() {
@@ -1104,21 +1333,11 @@ impl Grants {
                 let resource = proof.resource().into_bytes();
                 effects.fetch.extend(self.fetch(&proof, [resource], &[peer]));
                 for (sender, resource) in self.waiting.insert(peer, proof) {
-                    self.evicted(sender, resource);
+                    self.give_up(sender, resource, now);
                 }
             }
         }
         effects
-    }
-
-    /// A grant `sender` delivered over R was dropped unlanded: a walk over R
-    /// may open again for the same listed root.
-    fn evicted(&mut self, sender: PeerId, resource: CollectionHandle) {
-        for listing in self.listings.values_mut() {
-            if listing.link.peer() == sender {
-                listing.opened.remove(&resource.raw);
-            }
-        }
     }
 
     /// Take a new store observation: land the waiting grants whose
@@ -1152,7 +1371,27 @@ impl Grants {
         }
         self.asked = asked;
 
+        // A change of this side's root resets the backoff and walks at once
+        // where the peer's root still differs.
         let ids: Vec<u64> = self.listings.keys().copied().collect();
+        for id in &ids {
+            let listing = self.listings.get_mut(id).unwrap();
+            let changed: Vec<CollectionHandle> = listing
+                .retries
+                .iter()
+                .filter(|key| {
+                    let resource = CollectionHandle::new(**key);
+                    listing.retries.get(key).unwrap().local != index.summary(resource)
+                })
+                .map(|key| CollectionHandle::new(*key))
+                .collect();
+            for resource in changed {
+                listing.retries.remove(&resource.raw);
+                if listing.reopen(resource, index.summary(resource)) {
+                    effects.walks.push((listing.link.peer(), resource));
+                }
+            }
+        }
         for id in ids {
             self.list(id);
         }
@@ -1162,11 +1401,12 @@ impl Grants {
 
 /// Carries out [`Effects`] for the host: lands proofs and fetched blobs
 /// through the store's admission channel, fetches each blob once at a time,
-/// and opens grant walks.
+/// reports a blob no source had on `failed`, and opens grant walks.
 pub(crate) struct Sink<T: Transport, S> {
     connections: ConnectionTable<T, S>,
     admissions: tokio::sync::mpsc::Sender<NetEventBatch>,
     walks: WalksHandle,
+    failed: tokio::sync::mpsc::UnboundedSender<RawHash>,
     fetching: Arc<Mutex<HashSet<RawHash>>>,
 }
 
@@ -1175,11 +1415,13 @@ impl<T: Transport, S: Service> Sink<T, S> {
         connections: ConnectionTable<T, S>,
         admissions: tokio::sync::mpsc::Sender<NetEventBatch>,
         walks: WalksHandle,
+        failed: tokio::sync::mpsc::UnboundedSender<RawHash>,
     ) -> Self {
         Self {
             connections,
             admissions,
             walks,
+            failed,
             fetching: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -1209,6 +1451,7 @@ impl<T: Transport, S: Service> Sink<T, S> {
                 self.connections.clone(),
                 self.admissions.clone(),
                 self.fetching.clone(),
+                self.failed.clone(),
                 blobs,
                 fetch.sources,
             ));
@@ -1236,17 +1479,20 @@ async fn land(
     }
 }
 
-/// Fetch each blob from the first connected source that has it. Definitions
-/// and descriptors are metadata, bounded alike.
+/// Fetch each blob from the first connected source that has it, and report
+/// one no source had. Definitions and descriptors are metadata, bounded
+/// alike.
 async fn fetch_blobs<T: Transport, S: Service>(
     connections: ConnectionTable<T, S>,
     admissions: tokio::sync::mpsc::Sender<NetEventBatch>,
     fetching: Arc<Mutex<HashSet<RawHash>>>,
+    failed: tokio::sync::mpsc::UnboundedSender<RawHash>,
     blobs: Vec<RawHash>,
     sources: Vec<PeerId>,
 ) {
     let local = connections.transport().local_id();
     for handle in blobs {
+        let mut found = false;
         for source in &sources {
             let Some(connection) = connections.current(*source) else {
                 continue;
@@ -1255,10 +1501,14 @@ async fn fetch_blobs<T: Transport, S: Service>(
             let fetched = tokio::time::timeout(FETCH_DEADLINE, fetch).await;
             if let Ok(Ok(Some(blob))) = fetched {
                 land(&admissions, std::iter::once(NetEvent::Blob(blob))).await;
+                found = true;
                 break;
             }
         }
         fetching.lock().unwrap().remove(&handle);
+        if !found {
+            let _ = failed.send(handle);
+        }
     }
 }
 

@@ -20,6 +20,12 @@
 //! received, and a received grant goes through [`crate::grants::Gate`]:
 //! what this side does not keep is skipped, never failed.
 //!
+//! At most [`MAX_GRANT_WALKS_PER_PEER`] grant walks with one peer run at
+//! once; the rest wait in order, at most [`MAX_QUEUED_GRANT_WALKS_PER_PEER`]
+//! of them, and start as running ones end. Every grant walk's end, and every
+//! one that does not start, is reported to the grant exchange
+//! ([`crate::grants::GrantWalkEnd`]), which retries what failed.
+//!
 //! The walks task runs one node's exchanges. Either side opens the stream
 //! when its timer fires ([`crate::schedule`]), on the current connection to
 //! the neighbour, and the task never dials; the other side joins it. One
@@ -74,7 +80,7 @@ use crate::connection::{
     Service, open_walk, read_frame, write_frame,
 };
 use crate::exchange::{Ended, Exchange, Out, Outcome, Pinned, Tree};
-use crate::grants::GrantEvent;
+use crate::grants::{GrantEvent, GrantOutcome, GrantWalkEnd, NotStarted};
 use crate::health::Health;
 use crate::host::{CollectionSnapshot, StoreSnapshot};
 use crate::landing::{LandSlot, Landed};
@@ -185,6 +191,11 @@ impl Reader<'_> {
 pub(crate) const WALK_DEADLINE: Duration = Duration::from_secs(60);
 /// Value requests and blob fetches one exchange keeps in flight.
 pub(crate) const MAX_WALK_REQUESTS: usize = 64;
+/// Grant walks one peer runs at once; the rest wait in order.
+pub(crate) const MAX_GRANT_WALKS_PER_PEER: usize = 8;
+/// Grant walks that wait for one peer; past these a walk is declined, and
+/// the grant exchange asks again after its backoff.
+pub(crate) const MAX_QUEUED_GRANT_WALKS_PER_PEER: usize = 4096;
 /// Values one exchange hands to landing before they are acknowledged. An
 /// exchange whose landing queue is full reads no further.
 pub(crate) const MAX_WALK_UNLANDED: usize = 1024;
@@ -914,6 +925,7 @@ pub(crate) fn spawn<T: Transport, S: Service>(
         landing,
         events,
         grants,
+        grant_queue: GrantQueue::default(),
         running: HashMap::new(),
         next_id: 0,
     };
@@ -932,9 +944,57 @@ struct Task<T: Transport, S> {
     events: mpsc::UnboundedSender<Event>,
     /// What grant walks report to the grant exchange.
     grants: mpsc::UnboundedSender<GrantEvent>,
+    /// Grant walks waiting for one of their peer's running ones to end.
+    grant_queue: GrantQueue,
     /// Exchanges running, by peer, collection and kind.
     running: HashMap<Key, Running>,
     next_id: u64,
+}
+
+/// Grant walks a peer's running ones hold back, in the order asked, at most
+/// [`MAX_QUEUED_GRANT_WALKS_PER_PEER`] per peer, each once.
+#[derive(Default)]
+struct GrantQueue {
+    /// Peer | arrival sequence | resource.
+    waiting: PATCH<72, IdentitySchema, ()>,
+    next: u64,
+}
+
+impl GrantQueue {
+    fn queued(&self, peer: PeerId) -> impl Iterator<Item = &[u8; 72]> + '_ {
+        self.waiting.iter_ordered().filter(move |key| key[..32] == peer)
+    }
+
+    /// Queue a walk with `peer` over R; whether it waits now.
+    fn push(&mut self, peer: PeerId, resource: CollectionHandle) -> bool {
+        if self.queued(peer).any(|key| key[40..] == resource.raw) {
+            return true;
+        }
+        if self.queued(peer).count() >= MAX_QUEUED_GRANT_WALKS_PER_PEER {
+            return false;
+        }
+        let mut key = [0; 72];
+        key[..32].copy_from_slice(&peer);
+        key[32..40].copy_from_slice(&self.next.to_be_bytes());
+        key[40..].copy_from_slice(&resource.raw);
+        self.next += 1;
+        self.waiting.insert(&Entry::new(&key));
+        true
+    }
+
+    /// The walk with `peer` that waited longest.
+    fn pop(&mut self, peer: PeerId) -> Option<CollectionHandle> {
+        let key = *self.queued(peer).next()?;
+        self.waiting.remove(&key);
+        Some(CollectionHandle::new(key[40..].try_into().unwrap()))
+    }
+
+    fn forget(&mut self, peer: PeerId) {
+        let keys: Vec<[u8; 72]> = self.queued(peer).copied().collect();
+        for key in keys {
+            self.waiting.remove(&key);
+        }
+    }
 }
 
 /// A running exchange's driver, as the task reaches it.
@@ -1008,6 +1068,7 @@ impl<T: Transport, S: Service> Task<T, S> {
             } => self.open(peer, collection, kind),
             Command::Closed { peer } => {
                 self.running.retain(|(other, _, _), _| *other != peer);
+                self.grant_queue.forget(peer);
                 self.walks.closed(peer);
             }
             Command::Incoming {
@@ -1034,6 +1095,21 @@ impl<T: Transport, S: Service> Task<T, S> {
                     .is_some_and(|running| running.id == id);
                 if current {
                     self.running.remove(&key);
+                }
+                if kind == WalkKind::Authorization {
+                    let outcome = if !current || duplicate {
+                        GrantOutcome::Replaced
+                    } else if let Some(agreed) = &ended.agreed {
+                        GrantOutcome::Confirmed {
+                            agreed: agreed.summary(),
+                        }
+                    } else if ended.refused {
+                        GrantOutcome::Refused
+                    } else {
+                        GrantOutcome::Unconfirmed(ended.failure)
+                    };
+                    self.grant_end(peer, collection, outcome);
+                    self.start_queued(peer);
                 }
                 if ended.receives {
                     let _ = self.events.send(Event::Received {
@@ -1062,14 +1138,28 @@ impl<T: Transport, S: Service> Task<T, S> {
     /// none runs.
     fn open(&mut self, peer: PeerId, collection: CollectionHandle, kind: WalkKind) {
         let key = (peer, collection.raw, kind);
+        let grant = kind == WalkKind::Authorization;
+        let not_started = |task: &Self, why| {
+            if grant {
+                task.grant_end(peer, collection, GrantOutcome::NotStarted(why));
+            }
+        };
         if self.running.contains_key(&key) {
-            return;
+            return not_started(self, NotStarted::AlreadyRunning);
         }
         let Some(connection) = self.connections.current(peer) else {
-            return;
+            return not_started(self, NotStarted::NoConnection);
         };
+        if grant && self.grant_walks(peer) >= MAX_GRANT_WALKS_PER_PEER {
+            let why = if self.grant_queue.push(peer, collection) {
+                NotStarted::Queued
+            } else {
+                NotStarted::StartDeclined
+            };
+            return not_started(self, why);
+        }
         let Some(exchange) = self.walks.start(peer, collection, kind) else {
-            return;
+            return not_started(self, NotStarted::StartDeclined);
         };
         let (driver, acked, replaced) = self.register(key, true, &exchange);
         tokio::spawn(async move {
@@ -1097,6 +1187,33 @@ impl<T: Transport, S: Service> Task<T, S> {
             };
             driver.ended(ended, duplicate);
         });
+    }
+
+    /// Tell the grant exchange how a grant walk with `peer` over R ended.
+    fn grant_end(&self, peer: PeerId, resource: CollectionHandle, outcome: GrantOutcome) {
+        let _ = self.grants.send(GrantEvent::Ended(GrantWalkEnd {
+            peer,
+            resource,
+            outcome,
+        }));
+    }
+
+    /// Grant walks with `peer` running now, either side's.
+    fn grant_walks(&self, peer: PeerId) -> usize {
+        self.running
+            .keys()
+            .filter(|(other, _, kind)| *other == peer && *kind == WalkKind::Authorization)
+            .count()
+    }
+
+    /// Start the grant walks with `peer` that waited, as slots free.
+    fn start_queued(&mut self, peer: PeerId) {
+        while self.grant_walks(peer) < MAX_GRANT_WALKS_PER_PEER {
+            let Some(resource) = self.grant_queue.pop(peer) else {
+                return;
+            };
+            self.open(peer, resource, WalkKind::Authorization);
+        }
     }
 
     /// Join the exchange `peer` opened for C's `kind` tree: refused unless
@@ -1358,6 +1475,7 @@ async fn drive<T: Transport, S: Service>(
     let mut deferred_delta = None;
     let mut heard_at = tokio::time::Instant::now();
     let mut duplicate = false;
+    let mut refused = false;
     let failed = 'drive: loop {
         match exchange.outcome() {
             Some(Outcome::Confirmed) => break false,
@@ -1414,6 +1532,7 @@ async fn drive<T: Transport, S: Service>(
                 }
                 Some(Err(code)) => {
                     duplicate = code == Some(RESET_WALK_DUPLICATE);
+                    refused = code == Some(RESET_WALK_REFUSED);
                     break 'drive true;
                 }
                 None => break 'drive true,
@@ -1495,6 +1614,7 @@ async fn drive<T: Transport, S: Service>(
     };
     let mut ended = exchange.end();
     ended.landed = landed_written;
+    ended.refused = refused;
     if failed || !finished || !landed_written {
         // A queued LANDED is not a write receipt. The peer's independent
         // receipt can still count our push, but no shared agreement survives.
@@ -1941,6 +2061,8 @@ pub(crate) mod tests {
                     root: summary(kind, pinned.repair()),
                     peer_root: Some(summary(kind, pinned.repair())),
                     agreed: Some(Arc::new(Tree::pinned(kind, pinned.repair()))),
+                    failure: None,
+                    refused: false,
                 };
                 assert!(!node.walks.ended(peer, collection, kind, ended, now));
             }
@@ -2047,6 +2169,8 @@ pub(crate) mod tests {
                 root,
                 peer_root: Some(root),
                 agreed: Some(Arc::new(Tree::pinned(kind, pinned.repair()))),
+                failure: None,
+                refused: false,
             },
             crate::clock::mono_now(),
         );
@@ -3062,6 +3186,7 @@ pub(crate) mod tests {
                 landing,
                 events,
                 grants: mpsc::unbounded_channel().0,
+                grant_queue: GrantQueue::default(),
                 running: HashMap::new(),
                 next_id: 0,
             };
@@ -3102,6 +3227,8 @@ pub(crate) mod tests {
                     root: summary(kind, pinned.repair()),
                     peer_root: Some(summary(kind, pinned.repair())),
                     agreed: Some(Arc::new(Tree::pinned(kind, pinned.repair()))),
+                    failure: None,
+                    refused: false,
                 },
             });
             assert!(
@@ -3222,6 +3349,7 @@ pub(crate) mod tests {
                 landing,
                 events,
                 grants: mpsc::unbounded_channel().0,
+                grant_queue: GrantQueue::default(),
                 running: HashMap::new(),
                 next_id: 0,
             };
@@ -4160,6 +4288,246 @@ pub(crate) mod tests {
                 root,
                 &handles
             ));
+        }
+
+        /// `count` resources rooted at `node`, each with one delegable
+        /// definition and one grant, put in both `node` and `other`, so
+        /// both index them with `node` as a root: the resources.
+        fn rooted_resources(node: &mut Node, other: &mut Node, count: u8) -> Vec<CollectionHandle> {
+            use crate::grants_index_tests::{deliver, grant, handle_of, key, resource};
+            use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+            use triblespace_core::repo::{BlobStorePut, CapabilityProofStore};
+            let definition = deliver(true);
+            let handle = handle_of(&definition);
+            let resources = (0..count)
+                .map(|index| {
+                    let descriptor = resource(&[(&node.key, handle)], &format!("rooted {index}"));
+                    let resource = CollectionHandle::new(
+                        triblespace_core::blob::IntoBlob::<SimpleArchive>::to_blob(
+                            descriptor.clone(),
+                        )
+                        .get_handle()
+                        .raw,
+                    );
+                    let granted = grant(resource, &node.key, handle, &key(0x7E));
+                    for store in [&mut node.store, &mut other.store] {
+                        store.put::<SimpleArchive, _>(definition.clone()).unwrap();
+                        store.put::<SimpleArchive, _>(descriptor.clone()).unwrap();
+                        store.insert_proof(granted.clone()).unwrap();
+                    }
+                    resource
+                })
+                .collect();
+            node.observe();
+            other.observe();
+            resources
+        }
+
+        /// The grant walk ends the exchange reported, in order.
+        fn grant_ends(
+            walked: &mut mpsc::UnboundedReceiver<GrantEvent>,
+        ) -> Vec<crate::grants::GrantWalkEnd> {
+            let mut ends = Vec::new();
+            while let Ok(event) = walked.try_recv() {
+                if let GrantEvent::Ended(end) = event {
+                    ends.push(end);
+                }
+            }
+            ends
+        }
+
+        /// Every way a grant walk can end, or not start, reaches the grant
+        /// exchange exactly once.
+        #[tokio::test(start_paused = true)]
+        async fn every_grant_walk_outcome_is_reported_once() {
+            use crate::grants::{GrantOutcome, NotStarted};
+            let net = SimNet::new(0x3A40, SimConfig::default());
+            let mut node = Node::new(0x41);
+            let mut other = Node::new(0x42);
+            let resources = rooted_resources(&mut node, &mut other, 12);
+            let snapshot = node.snapshot();
+            let hosted = Hosted::new(node, &net);
+            let other = Hosted::new(other, &net);
+            let _connection = hosted.table.connect(other.peer).await.unwrap();
+            let (landing, _landings) = mpsc::unbounded_channel();
+            let (events, _events) = mpsc::unbounded_channel();
+            let (commands, _commanded) = mpsc::unbounded_channel();
+            let (grants, mut walked) = mpsc::unbounded_channel();
+            let mut task = Task {
+                connections: hosted.table.clone(),
+                snapshots: hosted.lander.snapshots.subscribe(),
+                walks: Walks::new(hosted.lander.node.lock().unwrap().health.clone()),
+                commands: WalksHandle(commands),
+                landing,
+                events,
+                grants,
+                grant_queue: GrantQueue::default(),
+                running: HashMap::new(),
+                next_id: 0,
+            };
+            let kind = WalkKind::Authorization;
+            let open = |task: &mut Task<_, _>, peer, resource| {
+                task.command(Command::Open {
+                    peer,
+                    collection: resource,
+                    kind,
+                })
+            };
+            let outcome = |walked: &mut mpsc::UnboundedReceiver<GrantEvent>| {
+                let ends = grant_ends(walked);
+                assert_eq!(ends.len(), 1, "{ends:?}");
+                ends[0].outcome
+            };
+            // No observation yet: the walks start nothing.
+            open(&mut task, other.peer, resources[0]);
+            assert_eq!(outcome(&mut walked), GrantOutcome::NotStarted(NotStarted::StartDeclined));
+            task.observe(snapshot);
+            open(&mut task, Node::new(0x43).id(), resources[0]);
+            assert_eq!(outcome(&mut walked), GrantOutcome::NotStarted(NotStarted::NoConnection));
+            for resource in &resources[..MAX_GRANT_WALKS_PER_PEER] {
+                open(&mut task, other.peer, *resource);
+                assert!(grant_ends(&mut walked).is_empty(), "a started walk reports at its end");
+            }
+            open(&mut task, other.peer, resources[0]);
+            assert_eq!(outcome(&mut walked), GrantOutcome::NotStarted(NotStarted::AlreadyRunning));
+            open(&mut task, other.peer, resources[MAX_GRANT_WALKS_PER_PEER]);
+            assert_eq!(outcome(&mut walked), GrantOutcome::NotStarted(NotStarted::Queued));
+
+            let id = |task: &Task<_, _>, resource: CollectionHandle| {
+                task.running[&(other.peer, resource.raw, kind)].id
+            };
+            let end = |agreed: bool, failure: Option<crate::exchange::Failure>, refused: bool| {
+                let empty = PatchSummary::new(None, 0).unwrap();
+                Ended {
+                    retain_agreement: false,
+                    sends: false,
+                    receives: true,
+                    confirmed: agreed,
+                    landed: agreed,
+                    root: empty,
+                    peer_root: Some(empty),
+                    agreed: agreed.then(|| {
+                        Arc::new(Tree::Authorization(resources[0], PATCH::new()))
+                    }),
+                    failure,
+                    refused,
+                }
+            };
+            let cases = [
+                (end(true, None, false), false, GrantOutcome::Confirmed {
+                    agreed: PatchSummary::new(None, 0).unwrap(),
+                }),
+                (
+                    end(false, Some(crate::exchange::Failure::BadValue), false),
+                    false,
+                    GrantOutcome::Unconfirmed(Some(crate::exchange::Failure::BadValue)),
+                ),
+                (end(false, None, true), false, GrantOutcome::Refused),
+                (end(false, None, false), true, GrantOutcome::Replaced),
+            ];
+            for (index, (ended, duplicate, expected)) in cases.into_iter().enumerate() {
+                let resource = resources[index];
+                let running = id(&task, resource);
+                task.command(Command::Ended {
+                    id: running,
+                    peer: other.peer,
+                    collection: resource,
+                    kind,
+                    ended,
+                    duplicate,
+                });
+                let ends = grant_ends(&mut walked);
+                let ours: Vec<_> = ends.iter().filter(|end| end.resource == resource).collect();
+                assert_eq!(ours.len(), 1, "{ends:?}");
+                assert_eq!(ours[0].outcome, expected);
+            }
+            // An end from a stream that was replaced in the meantime.
+            let resource = resources[5];
+            let running = id(&task, resource);
+            task.command(Command::Ended {
+                id: running + 1_000,
+                peer: other.peer,
+                collection: resource,
+                kind,
+                ended: end(true, None, false),
+                duplicate: false,
+            });
+            let ends = grant_ends(&mut walked);
+            assert_eq!(ends.len(), 1, "{ends:?}");
+            assert_eq!(ends[0].outcome, GrantOutcome::Replaced);
+        }
+
+        /// Twenty walks to one peer run at most eight at a time, and the
+        /// queued ones start as running ones end, until all twenty
+        /// confirmed. The peak is exactly eight.
+        #[tokio::test(start_paused = true)]
+        async fn grant_walks_to_one_peer_run_eight_at_a_time_until_all_confirm() {
+            use crate::grants::{GrantOutcome, NotStarted};
+            let net = SimNet::new(0x3A41, SimConfig::default());
+            let mut node = Node::new(0x44);
+            let mut other = Node::new(0x45);
+            let resources = rooted_resources(&mut node, &mut other, 20);
+            let snapshot = node.snapshot();
+            let hosted = Hosted::new(node, &net);
+            let other = Hosted::new(other, &net);
+            let _connection = hosted.table.connect(other.peer).await.unwrap();
+            let (landing, _landings) = mpsc::unbounded_channel();
+            let (events, _events) = mpsc::unbounded_channel();
+            let (commands, mut commanded) = mpsc::unbounded_channel();
+            let (grants, mut walked) = mpsc::unbounded_channel();
+            let mut task = Task {
+                connections: hosted.table.clone(),
+                snapshots: hosted.lander.snapshots.subscribe(),
+                walks: Walks::new(hosted.lander.node.lock().unwrap().health.clone()),
+                commands: WalksHandle(commands),
+                landing,
+                events,
+                grants,
+                grant_queue: GrantQueue::default(),
+                running: HashMap::new(),
+                next_id: 0,
+            };
+            task.observe(snapshot);
+            let kind = WalkKind::Authorization;
+            let running = |task: &Task<_, _>| {
+                task.running
+                    .keys()
+                    .filter(|(peer, _, kind)| *peer == other.peer && *kind == WalkKind::Authorization)
+                    .count()
+            };
+            for resource in &resources {
+                task.command(Command::Open {
+                    peer: other.peer,
+                    collection: *resource,
+                    kind,
+                });
+            }
+            let mut peak = running(&task);
+            let (mut queued, mut confirmed) = (0, 0);
+            let mut ends = Vec::new();
+            while confirmed < resources.len() {
+                for end in grant_ends(&mut walked) {
+                    match end.outcome {
+                        GrantOutcome::NotStarted(NotStarted::Queued) => queued += 1,
+                        GrantOutcome::Confirmed { .. } => confirmed += 1,
+                        _ => {}
+                    }
+                    ends.push(end);
+                }
+                if confirmed == resources.len() {
+                    break;
+                }
+                let command = tokio::time::timeout(Duration::from_secs(120), commanded.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("stalled: {ends:?}"))
+                    .unwrap();
+                task.command(command);
+                peak = peak.max(running(&task));
+            }
+            assert_eq!(peak, MAX_GRANT_WALKS_PER_PEER, "exactly eight at once");
+            assert_eq!(queued, resources.len() - MAX_GRANT_WALKS_PER_PEER);
+            assert_eq!(confirmed, resources.len(), "{ends:?}");
+            assert_eq!(running(&task), 0);
         }
     }
 }
