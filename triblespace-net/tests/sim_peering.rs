@@ -509,7 +509,8 @@ fn a_demand_host_and_a_full_host_compare_no_held_blobs() {
 /// Astra's R3 through whole hosts. A writer that cannot read asks the
 /// collection's owner to peer with its send flag set, presenting its WRITE
 /// grant. The owner accepts without sending: the writer's pushes land its
-/// record and grant, and the owner starts no push back. The shared agreed
+/// record, its grant reaches the owner by a grant walk that moves no push or
+/// receive counter, and the owner starts no push back. The shared agreed
 /// tree contains the writer's delta, never the owner's private record, and
 /// the writer holds nothing of the
 /// owner's, however long the peering stands.

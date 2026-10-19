@@ -318,8 +318,9 @@ impl Frames {
 /// 130 collections, each with a record on either side, converge both ways
 /// between two neighbours on one connection, and the pushes that follow
 /// stay within the design's estimate (section 6: 130 collections, ten
-/// neighbours each, the 60 s cap: about 22 roots per second, which is three
-/// `walk/1` streams per root here: COMMIT, DERIVE and AUTH). Each side counts the walk
+/// neighbours each, the 60 s cap: about 22 roots per second, which is two
+/// `walk/1` streams per root here: COMMIT and DERIVE; grants walk only when a
+/// listing differs, never on the push timer). Each side counts the walk
 /// streams it opens on the wire. After the first push of each collection
 /// both sides hold equal records, so every later push is a periodic one of
 /// the confirmed root: exact ROOTs and clean FINs in cached mode.
@@ -409,7 +410,7 @@ fn one_hundred_thirty_collections_converge_both_ways_within_the_push_estimate() 
             dials
         );
         let per_neighbour = opened as f64 / 2.0 / WINDOW as f64;
-        let estimate = COLLECTIONS as f64 * 10.0 / 60.0 * 3.0;
+        let estimate = COLLECTIONS as f64 * 10.0 / 60.0 * 2.0;
         assert!(
             per_neighbour * 10.0 <= estimate * 1.1,
             "{opened} walk streams in {WINDOW} s: {per_neighbour:.2} per second per node and \

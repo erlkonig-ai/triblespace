@@ -281,12 +281,14 @@ fn issuer_held_read_proof_reaches_a_handle_only_recipient_by_grant_exchange() {
         let mut recipient = bring_up(&net, &recipient_key, MemoryRepo::default(), Some(issuer_id));
         issuer.activate_collection(collection.handle());
 
-        // The recipient begins with only C and one issuer endpoint. The issuer
-        // dials the subject of the grant it signed, and the grant exchange
-        // delivers it with the definition it names; it waits in memory for
-        // its descriptor. An initial exact-H lookup also gives the issuer's
-        // provider leases a reachable DHT replica; a retry then obtains the
-        // self-describing C bytes.
+        // The recipient begins with only C and one issuer endpoint. The
+        // recipient is a participant of C, named on the issuer's READ grant,
+        // so the issuer's discovery dials it like any participant, and the
+        // grant exchange lists C on that connection and walks the grant to
+        // it; it waits in memory for its descriptor while the completion
+        // fetch brings the definition it names. An initial exact-H lookup
+        // also gives the issuer's provider leases a reachable DHT replica; a
+        // retry then obtains the self-describing C bytes.
         let descriptor = acquire_once(
             &clock,
             &mut recipient,
@@ -317,7 +319,9 @@ fn issuer_held_read_proof_reaches_a_handle_only_recipient_by_grant_exchange() {
         advance(&clock, &mut [&mut issuer, &mut recipient], 2).await;
         let before_selection = recipient.snapshot().unwrap();
         let recipient_id = recipient_key.verifying_key().to_bytes();
-        assert_eq!(net.dial_count(issuer_id, recipient_id), 1);
+        // Discovery dials participants, at its own pace: at least once, and
+        // the grant converged.
+        assert!(net.dial_count(issuer_id, recipient_id) >= 1);
         assert_eq!(
             before_selection
                 .proofs()

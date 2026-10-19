@@ -39,7 +39,10 @@
 //! [`SimNet::tap`] joins through a [`Tapped`] transport, whose streams note
 //! every frame crossing a `recon/1` or `walk/1` stream in its [`Taps`]: a
 //! test counts what a protocol put on the wire without the protocol
-//! reporting it.
+//! reporting it, reads the resources a GRANT_ROOTS frame lists and a walk
+//! OPEN names, and can silence walk streams: [`Taps::silence_walks`] drops
+//! every later frame of the walks that open meanwhile, both ways, while their
+//! connection stays up.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
@@ -58,7 +61,10 @@ use rand::rngs::StdRng;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
+use triblespace_core::collection::CollectionHandle;
+
 use super::{Alpn, Conn, Harness, Incoming, PeerId, Transport};
+use crate::patch_repair::PatchSummary;
 use crate::protocol::{TAG_RECON, TAG_WALK};
 
 /// Bytes one direction of a stream holds unread before its writer blocks:
@@ -793,21 +799,46 @@ pub struct Crossed {
     /// Component byte of a complete ALPN32 walk OPEN (records=0, AUTH=1,
     /// references=2). Test-only classification; does not change counted bytes.
     pub walk_kind: Option<u8>,
+    /// The collection or resource a complete walk OPEN names.
+    pub walk_resource: Option<[u8; 32]>,
+}
+
+/// One GRANT_ROOTS frame that crossed a tapped `recon/1` stream, decoded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Listed {
+    /// Its place among every frame the tap noted, as [`Taps::len`] counts.
+    pub at: usize,
+    /// The remote peer of the stream's connection.
+    pub peer: PeerId,
+    /// Whether the tapped side sent it.
+    pub sent: bool,
+    /// The resources it lists, each with its grant root and count.
+    pub roots: Vec<(CollectionHandle, PatchSummary)>,
+}
+
+#[derive(Default)]
+struct Noted {
+    crossed: Vec<Crossed>,
+    listed: Vec<Listed>,
+    /// The walk component whose newly opened streams are silenced.
+    silence: Option<u8>,
+    /// Walk streams silenced so far.
+    silenced: usize,
 }
 
 /// Every frame that crossed a `recon/1` or `walk/1` stream of a [`Tapped`]
 /// transport, in the order its halves saw them.
 #[derive(Clone, Default)]
-pub struct Taps(Arc<Mutex<Vec<Crossed>>>);
+pub struct Taps(Arc<Mutex<Noted>>);
 
 impl Taps {
     pub fn crossed(&self) -> Vec<Crossed> {
-        self.0.lock().unwrap().clone()
+        self.0.lock().unwrap().crossed.clone()
     }
 
     /// How many frames crossed so far.
     pub fn len(&self) -> usize {
-        self.0.lock().unwrap().len()
+        self.0.lock().unwrap().crossed.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -817,11 +848,37 @@ impl Taps {
     /// The frames that crossed since the first `from` did, on streams to
     /// `peer`, with their tag.
     pub fn since(&self, from: usize, peer: PeerId, tag: u8) -> Vec<Crossed> {
-        self.0.lock().unwrap()[from..]
+        self.0.lock().unwrap().crossed[from..]
             .iter()
             .filter(|crossed| crossed.peer == peer && crossed.tag == tag)
             .copied()
             .collect()
+    }
+
+    /// The GRANT_ROOTS frames that crossed since the first `from` frames
+    /// did, on `recon/1` streams to `peer`, either way.
+    pub fn listed(&self, from: usize, peer: PeerId) -> Vec<Listed> {
+        self.0
+            .lock()
+            .unwrap()
+            .listed
+            .iter()
+            .filter(|listed| listed.at >= from && listed.peer == peer)
+            .cloned()
+            .collect()
+    }
+
+    /// Silence the walk streams whose OPEN names `component` from now on,
+    /// or none: every frame after the OPEN, either way, is dropped at the
+    /// tap, as a path that loses packets would, and the connection stays up.
+    /// Streams silenced before keep dropping until they end.
+    pub fn silence_walks(&self, component: Option<u8>) {
+        self.0.lock().unwrap().silence = component;
+    }
+
+    /// How many walk streams have been silenced.
+    pub fn silenced(&self) -> usize {
+        self.0.lock().unwrap().silenced
     }
 }
 
@@ -910,12 +967,14 @@ impl TappedConn {
         opened: bool,
     ) -> (TappedSend, TappedRecv) {
         let tag = Arc::new(OnceLock::new());
+        let silenced = Arc::new(AtomicBool::new(false));
         let stream = self.streams.fetch_add(1, Ordering::Relaxed);
         let tap = |sent| Tap {
             taps: self.taps.clone(),
             peer: self.inner.remote_id(),
             stream,
             tag: tag.clone(),
+            silenced: silenced.clone(),
             first: sent == opened,
             sent,
             buffer: Vec::new(),
@@ -961,6 +1020,8 @@ struct Tap {
     peer: PeerId,
     stream: u64,
     tag: Arc<OnceLock<u8>>,
+    /// The stream is silenced: no frame after its walk OPEN crosses.
+    silenced: Arc<AtomicBool>,
     /// The tag is this half's first byte.
     first: bool,
     sent: bool,
@@ -996,11 +1057,20 @@ impl Tap {
                 && kind == crate::walk_stream::FRAME_SUBTREE
                 && length == 5 + crate::walk_stream::SUBTREE_BYTES)
                 .then(|| self.buffer[5]);
-            let walk_kind =
-                (tag == TAG_WALK && kind == crate::walk_stream::FRAME_OPEN && length == 5 + 34)
-                    .then(|| self.buffer[5 + 32]);
+            let open =
+                tag == TAG_WALK && kind == crate::walk_stream::FRAME_OPEN && length == 5 + 34;
+            let walk_kind = open.then(|| self.buffer[5 + 32]);
+            let walk_resource = open.then(|| self.buffer[5..5 + 32].try_into().unwrap());
+            let roots = (tag == TAG_RECON && kind == crate::recon::FRAME_GRANT_ROOTS)
+                .then(|| crate::recon::Frame::decode(kind, &self.buffer[5..length]))
+                .and_then(|decoded| match decoded {
+                    Ok(Some(crate::recon::Frame::GrantRoots(roots))) => Some(roots),
+                    _ => None,
+                });
             self.buffer.drain(..length);
-            self.taps.0.lock().unwrap().push(Crossed {
+            let mut noted = self.taps.0.lock().unwrap();
+            let at = noted.crossed.len();
+            noted.crossed.push(Crossed {
                 peer: self.peer,
                 stream: self.stream,
                 tag,
@@ -1009,7 +1079,22 @@ impl Tap {
                 wire_bytes: length,
                 walk_depth,
                 walk_kind,
+                walk_resource,
             });
+            if let Some(roots) = roots {
+                noted.listed.push(Listed {
+                    at,
+                    peer: self.peer,
+                    sent: self.sent,
+                    roots,
+                });
+            }
+            if walk_kind.is_some()
+                && walk_kind == noted.silence
+                && !self.silenced.swap(true, Ordering::SeqCst)
+            {
+                noted.silenced += 1;
+            }
         }
     }
 }
@@ -1031,6 +1116,10 @@ impl AsyncWrite for TappedSend {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        if this.tap.silenced.load(Ordering::SeqCst) {
+            // Dropped on the path: written as far as the writer can tell.
+            return Poll::Ready(Ok(buf.len()));
+        }
         let polled = Pin::new(&mut this.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(written)) = polled {
             this.tap.note(&buf[..written]);
@@ -1043,7 +1132,12 @@ impl AsyncWrite for TappedSend {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        let this = self.get_mut();
+        if this.tap.silenced.load(Ordering::SeqCst) {
+            // The end is lost on the path too.
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
 
@@ -1060,6 +1154,10 @@ impl AsyncRead for TappedRecv {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if this.tap.silenced.load(Ordering::SeqCst) {
+            // Nothing arrives any more; the reader's own deadline ends it.
+            return Poll::Pending;
+        }
         let before = buf.filled().len();
         let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = polled {
@@ -1082,6 +1180,7 @@ fn hex_prefix(id: &PeerId) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt as _;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[derive(Default)]
@@ -1405,5 +1504,140 @@ mod tests {
             c_recv.read_exact(&mut resp).await.is_err(),
             "client read on an abandoned stream must EOF, not hang"
         );
+    }
+
+    /// A frame as it crosses a stream: kind, big-endian length, payload.
+    fn framed(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![kind];
+        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn walk_open(resource: [u8; 32], kind: crate::walk::WalkKind) -> Vec<u8> {
+        let (frame, payload) = crate::walk_stream::Frame::Open {
+            collection: CollectionHandle::new(resource),
+            kind,
+            algorithm: crate::walk_stream::Algorithm::Prefix,
+            offer: None,
+        }
+        .encode();
+        framed(frame, &payload)
+    }
+
+    /// The tap reads what a GRANT_ROOTS frame lists and which resource a walk
+    /// OPEN names, from the bytes that cross, either way.
+    #[tokio::test(start_paused = true)]
+    async fn a_tap_reads_grant_roots_and_the_resource_a_walk_opens() {
+        let net = SimNet::new(7, SimConfig::default());
+        let (tapped, taps) = net.tap(&SigningKey::from_bytes(&[1; 32]));
+        let other = SigningKey::from_bytes(&[2; 32]);
+        let mut joined = net.join(&other);
+        let other = other.verifying_key().to_bytes();
+        let conn = tapped
+            .transport
+            .dial(other, crate::protocol::PILE_SYNC_ALPN)
+            .await
+            .unwrap();
+        let accepted = joined.incoming.recv().await.unwrap().conn;
+        let roots = vec![
+            (
+                CollectionHandle::new([3; 32]),
+                PatchSummary::new(Some([4; 32]), 2).unwrap(),
+            ),
+            (
+                CollectionHandle::new([5; 32]),
+                PatchSummary::new(None, 0).unwrap(),
+            ),
+        ];
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        send.write_all(&[TAG_RECON]).await.unwrap();
+        send.write_all(&framed(crate::recon::FRAME_OPEN, &1u64.to_be_bytes()))
+            .await
+            .unwrap();
+        let (kind, payload) = crate::recon::Frame::GrantRoots(roots.clone()).encode();
+        send.write_all(&framed(kind, &payload)).await.unwrap();
+        // The peer lists back on a stream it opened.
+        let (mut back, _back_recv) = accepted.open_bi().await.unwrap();
+        back.write_all(&[TAG_RECON]).await.unwrap();
+        let (kind, payload) = crate::recon::Frame::GrantRoots(roots[..1].to_vec()).encode();
+        back.write_all(&framed(kind, &payload)).await.unwrap();
+        let (_send, mut heard) = conn.accept_bi().await.unwrap();
+        let mut read = vec![0; 1 + 5 + payload.len()];
+        heard.read_exact(&mut read).await.unwrap();
+
+        let listed = taps.listed(0, other);
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        assert!(listed[0].sent && listed[0].roots == roots);
+        assert!(!listed[1].sent && listed[1].roots == roots[..1]);
+        assert_eq!(listed[0].at, 1, "after the recon OPEN");
+        assert!(taps.listed(listed[1].at + 1, other).is_empty());
+
+        let (mut walk, _walk_recv) = conn.open_bi().await.unwrap();
+        walk.write_all(&[TAG_WALK]).await.unwrap();
+        walk.write_all(&walk_open([6; 32], crate::walk::WalkKind::Authorization))
+            .await
+            .unwrap();
+        let opened = taps.since(0, other, TAG_WALK);
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].walk_kind, Some(1));
+        assert_eq!(opened[0].walk_resource, Some([6; 32]));
+    }
+
+    /// A silenced walk stream delivers nothing after its OPEN, either way,
+    /// and its connection stays up; a walk of another component, opened
+    /// meanwhile on the same connection, is not silenced (the control).
+    #[tokio::test(start_paused = true)]
+    async fn a_silenced_walk_delivers_nothing_after_its_open() {
+        let net = SimNet::new(8, SimConfig::default());
+        let (tapped, taps) = net.tap(&SigningKey::from_bytes(&[1; 32]));
+        let other = SigningKey::from_bytes(&[2; 32]);
+        let mut joined = net.join(&other);
+        let other = other.verifying_key().to_bytes();
+        let conn = tapped
+            .transport
+            .dial(other, crate::protocol::PILE_SYNC_ALPN)
+            .await
+            .unwrap();
+        let accepted = joined.incoming.recv().await.unwrap().conn;
+        taps.silence_walks(Some(1));
+        let done = framed(crate::walk_stream::FRAME_DONE, &[]);
+        // Every half stays alive: a dropped writer would end its stream.
+        let mut streams = Vec::new();
+        for kind in [
+            crate::walk::WalkKind::Authorization,
+            crate::walk::WalkKind::Commit,
+        ] {
+            let (mut send, recv) = conn.open_bi().await.unwrap();
+            send.write_all(&[TAG_WALK]).await.unwrap();
+            send.write_all(&walk_open([6; 32], kind)).await.unwrap();
+            send.write_all(&done).await.unwrap();
+            let (mut back, mut heard) = accepted.accept_bi().await.unwrap();
+            let mut open = vec![0; 1 + 5 + 34];
+            heard.read_exact(&mut open).await.unwrap();
+            back.write_all(&done).await.unwrap();
+            streams.push((send, recv, back, heard));
+        }
+        taps.silence_walks(None);
+        assert_eq!(taps.silenced(), 1);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let mut byte = [0; 1];
+        let [silenced, control] = &mut streams[..] else {
+            unreachable!()
+        };
+        assert!(
+            silenced.3.read(&mut byte).now_or_never().is_none(),
+            "a frame crossed a silenced walk"
+        );
+        assert!(
+            silenced.1.read(&mut byte).now_or_never().is_none(),
+            "an answer crossed a silenced walk"
+        );
+        assert!(
+            control.3.read(&mut byte).now_or_never().is_some(),
+            "the control walk delivered nothing"
+        );
+        assert!(control.1.read(&mut byte).now_or_never().is_some());
+        assert!(!accepted.closed.load(Ordering::SeqCst), "the connection closed");
     }
 }
