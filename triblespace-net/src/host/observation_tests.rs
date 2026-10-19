@@ -1080,16 +1080,6 @@ fn scoped_unrelated_blobs_reuse_proofs_and_records_without_blob_reads() {
                 old.repair.authorization_evidence().get(id).unwrap(),
                 new.repair.authorization_evidence().get(id).unwrap(),
             ));
-            // The subject index is part of the reused evidence, not rebuilt.
-            let [old_naming, new_naming] = [&old, &new].map(|snapshot| {
-                snapshot
-                    .repair
-                    .authorization_evidence()
-                    .proofs_naming(fixture.local)
-                    .collect::<Vec<_>>()
-            });
-            assert_eq!(old_naming, [&fixture.proofs[index]]);
-            assert!(std::ptr::eq(old_naming[0], new_naming[0]));
         }
         assert!(before.1.get_blob(&arrived.raw).is_none());
         assert!(after.1.get_blob(&arrived.raw).is_some());
@@ -1164,12 +1154,7 @@ fn scoped_proof_change_refreshes_authorization_without_losing_record_interests()
         new.repair.authorization_evidence().get(proof.id()),
         Some(&proof)
     );
-    let evidence = [&old, &new].map(|snapshot| snapshot.repair.authorization_evidence());
-    assert_eq!(evidence[0].proof_digest(reader).leaf_count(), 0);
-    assert_eq!(
-        evidence[1].proofs_naming(reader).collect::<Vec<_>>(),
-        [&proof]
-    );
+    assert!(old.repair.authorization_evidence().get(proof.id()).is_none());
 
     let record = fixture
         .store

@@ -15,9 +15,10 @@
 //!
 //! Each selected collection has up to [`MAX_ASKED`] neighbours this side asked
 //! for, plus up to [`MAX_INBOUND_PEERINGS`] peerings others asked for or were
-//! invited to. Candidates come in tiers -- grant-chain keys and owners that
-//! pass READ here, the other grant-chain keys and owners, then DHT providers
-//! -- each tier ranked by `blake3(salt || key)`. The walk through that order
+//! invited to. Candidates come in tiers -- C's participants in the grant
+//! index (its roots and the keys named on its indexed grants) and owners that
+//! pass READ here, the other participants and owners, then DHT providers --
+//! each tier ranked by `blake3(salt || key)`. The walk through that order
 //! is the only retry state: a refusal, a failed dial or an ended peering is
 //! replaced by the next candidate, and the end of the order draws a new salt.
 //! Drawing an order also looks up the collection's DHT providers again; their
@@ -25,10 +26,21 @@
 //! Every [`SWAP_INTERVAL`] one healthy asked-for neighbour makes room for the
 //! next candidate, so groups formed during a partition meet again after it.
 //!
+//! One more slot per collection is reserved for participants of C that no
+//! connection reaches, walked in the same tiers: a full neighbour set still
+//! reaches a new grantee, whose grants the grant exchange then lists on the
+//! connection. Its holder keeps it while it is dialled or asked; once peered
+//! for [`MIN_RESHUFFLE_INTERVAL`] it is unpeered when another such
+//! participant waits, so the slot rotates. Nobody dials on a grant's behalf:
+//! the slot follows participation, like the rest of discovery.
+//!
+//! Credentials are computed when sent: every prefix of C's evidence that
+//! names this node, truncated there.
+//!
 //! The peering task also runs each collection's push schedule
 //! ([`crate::schedule`]), which pushes to the neighbours its peerings make.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -147,6 +159,10 @@ struct Mesh {
     /// A lookup of those providers is running.
     looking_up: bool,
     next_swap: Option<Mono>,
+    /// The walk through C's participants for the reserved slot.
+    named: Order,
+    /// The reserved slot's holder, and when it took the slot.
+    reserved: Option<(PeerId, Mono)>,
 }
 
 /// Every collection's peerings on every connection of one node.
@@ -246,13 +262,16 @@ fn wanted(
     })
 }
 
-/// The keys a node may ask to peer for C, in order: grant-chain keys and
-/// owners that pass READ under local evidence, the other grant-chain keys
-/// and owners, then DHT `providers`, each tier ranked by
-/// `blake3(salt || key)`. Owners are the signers of records whose signer may
-/// WRITE C. `local` is left out.
+/// The keys a node may ask to peer for C, in order: C's participants in
+/// `grants` and owners that pass READ under local evidence, the other
+/// participants and owners, then DHT `providers`, each tier ranked by
+/// `blake3(salt || key)`. Participants are C's roots and the keys named on
+/// its indexed grants, so a key named only by junk delegation or by a grant
+/// still waiting for its definitions is none. Owners are the signers of
+/// records whose signer may WRITE C. `local` is left out.
 pub(crate) fn candidate_order(
     collection: &CollectionSnapshot,
+    grants: &crate::grants::GrantIndex,
     providers: &[PeerId],
     local: PeerId,
     salt: &[u8; 32],
@@ -274,9 +293,12 @@ pub(crate) fn candidate_order(
                 )
             })
         });
-    let keys = evidence
-        .discovery_candidates()
-        .map(|key| key.to_bytes())
+    let participants = grants
+        .grants(collection.repair().collection())
+        .map(|grants| grants.participants.iter_ordered().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let keys = participants
+        .into_iter()
         .chain(signers)
         .filter(|key| *key != local)
         .collect::<BTreeSet<_>>();
@@ -307,6 +329,51 @@ pub(crate) fn candidate_order(
     ranked.sort_unstable();
     ranked.dedup_by_key(|(_, key)| *key);
     ranked.into_iter().map(|(_, key)| key).collect()
+}
+
+/// Every prefix of C's evidence proofs that names `local`, truncated there,
+/// by proof id: the signed chain that key holds, without later delegates.
+/// Resource, root and the kept signatures are the proof's own bytes, so a
+/// prefix of valid evidence is valid evidence too.
+fn naming(
+    evidence: &crate::collection_activation::CollectionAuthorizationEvidencePatch,
+    local: VerifyingKey,
+) -> BTreeMap<RawHash, CapabilityProof> {
+    let mut naming = BTreeMap::new();
+    for proof in evidence.proofs() {
+        for prefix in proof.prefixes() {
+            if prefix.subject() == local {
+                let prefix = prefix.to_proof();
+                naming.entry(prefix.id().raw).or_insert(prefix);
+            }
+        }
+    }
+    naming
+}
+
+/// This side's credentials for C: every prefix of C's evidence proofs that
+/// names `local`, truncated there, in proof-id order, at most
+/// [`MAX_PROOFS_PER_EXCHANGE`].
+pub(crate) fn credentials(
+    evidence: &crate::collection_activation::CollectionAuthorizationEvidencePatch,
+    local: VerifyingKey,
+) -> Vec<CapabilityProof> {
+    naming(evidence, local)
+        .into_values()
+        .take(MAX_PROOFS_PER_EXCHANGE)
+        .collect()
+}
+
+/// A digest of every credential `local` holds for C, to notice a change.
+fn credential_digest(
+    evidence: &crate::collection_activation::CollectionAuthorizationEvidencePatch,
+    local: VerifyingKey,
+) -> RawHash {
+    let mut hasher = blake3::Hasher::new();
+    for id in naming(evidence, local).keys() {
+        hasher.update(id);
+    }
+    *hasher.finalize().as_bytes()
 }
 
 impl Peerings {
@@ -431,14 +498,23 @@ impl Peerings {
             let changed = before
                 .as_ref()
                 .is_none_or(|before| evidence(before) != evidence(&after));
+            // C's participants come from the grant index, whose entry for an
+            // untouched resource keeps its Arc.
+            let participants_changed = previous.as_ref().is_none_or(|previous| {
+                match (previous.grants().grants(collection), snapshot.grants().grants(collection)) {
+                    (Some(before), Some(after)) => !Arc::ptr_eq(&before, &after),
+                    (before, after) => before.is_some() != after.is_some(),
+                }
+            });
             let full_changed = previous
                 .as_ref()
                 .is_none_or(|previous| previous.full(collection) != snapshot.full(collection));
             // Changed evidence can change which neighbours count as full.
             self.changed |= changed;
             let mesh = self.meshes.get_mut(&raw).unwrap();
-            if changed {
+            if changed || participants_changed {
                 mesh.order.stale = true;
+                mesh.named.stale = true;
             }
             let revisit = mesh
                 .peerings
@@ -459,10 +535,7 @@ impl Peerings {
             }
             let own = |collection: &CollectionSnapshot| {
                 local.map(|local| {
-                    collection
-                        .repair()
-                        .authorization_evidence()
-                        .proof_digest(local)
+                    credential_digest(collection.repair().authorization_evidence(), local)
                 })
             };
             // A newly selected collection's requests carry the credentials.
@@ -486,13 +559,19 @@ impl Peerings {
             let Some(selected) = snapshot.selected(collection) else {
                 continue;
             };
+            let held = self.reserved_holder(collection);
             let mesh = self.meshes.entry(collection.raw).or_default();
+            if held.is_none() {
+                mesh.reserved = None;
+            }
+            // The reserved slot's holder is not one of the asked-for set.
             let mut asked = mesh.dialling.len()
                 + mesh
                     .peerings
                     .values()
                     .filter(|peering| peering.asked())
-                    .count();
+                    .count()
+                - usize::from(held.is_some());
             let swap = *mesh.next_swap.get_or_insert(now + SWAP_INTERVAL);
             if now >= swap {
                 mesh.next_swap = Some(now + SWAP_INTERVAL);
@@ -510,6 +589,7 @@ impl Peerings {
                 self.ask_or_dial(collection, peer, &mut dials);
                 asked += 1;
             }
+            self.fill_reserved(collection, &selected, now, &mut dials);
         }
         dials.sort_unstable();
         dials.dedup();
@@ -905,13 +985,7 @@ impl Peerings {
         let Ok(local) = VerifyingKey::from_bytes(&self.local) else {
             return Vec::new();
         };
-        collection
-            .repair()
-            .authorization_evidence()
-            .proofs_naming(local)
-            .take(MAX_PROOFS_PER_EXCHANGE)
-            .cloned()
-            .collect()
+        credentials(collection.repair().authorization_evidence(), local)
     }
 
     /// Send this side's credentials for C to C's neighbours and to keys that
@@ -967,15 +1041,131 @@ impl Peerings {
             .filter(|(_, peering)| matches!(peering.side, Side::Peered { asked: true, .. }))
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
-        let Some(id) = healthy.choose(&mut rand::thread_rng()) else {
+        let Some(id) = healthy.choose(&mut rand::thread_rng()).copied() else {
             return;
         };
-        if let Some(link) = self.links.get(id) {
+        self.end_peering(collection, id);
+    }
+
+    /// End the peering for C on connection `id`.
+    fn end_peering(&mut self, collection: CollectionHandle, id: u64) {
+        let Some(mesh) = self.meshes.get_mut(&collection.raw) else {
+            return;
+        };
+        if let Some(link) = self.links.get(&id) {
             link.send(Frame::Unpeer { collection });
         }
-        mesh.peerings.get_mut(id).unwrap().side = Side::Idle;
+        if let Some(peering) = mesh.peerings.get_mut(&id) {
+            peering.side = Side::Idle;
+        }
         mesh.peerings.retain(|_, peering| !peering.is_empty());
         self.changed = true;
+    }
+
+    /// The reserved slot's holder for C, while it holds it: it is being
+    /// dialled, or a peering this side asked for with it stands.
+    fn reserved_holder(&self, collection: CollectionHandle) -> Option<PeerId> {
+        let mesh = self.meshes.get(&collection.raw)?;
+        let (holder, _) = mesh.reserved?;
+        let asked = mesh.peerings.iter().any(|(id, peering)| {
+            peering.asked() && self.links.get(id).is_some_and(|link| link.peer() == holder)
+        });
+        (asked || mesh.dialling.contains(&holder)).then_some(holder)
+    }
+
+    /// Fill C's reserved slot with the next participant no connection
+    /// reaches. A holder peered for [`MIN_RESHUFFLE_INTERVAL`] gives the slot
+    /// up, and is unpeered, when another such participant waits.
+    fn fill_reserved(
+        &mut self,
+        collection: CollectionHandle,
+        local: &CollectionSnapshot,
+        now: Mono,
+        dials: &mut Vec<PeerId>,
+    ) {
+        let Some(mesh) = self.meshes.get(&collection.raw) else {
+            return;
+        };
+        let held = match mesh.reserved {
+            None => None,
+            Some((holder, since)) => {
+                let peered = mesh
+                    .peerings
+                    .iter()
+                    .filter(|(_, peering)| peering.asked() && peering.peered())
+                    .filter_map(|(id, _)| self.links.get(id).filter(|link| link.peer() == holder))
+                    .map(Link::id)
+                    .next();
+                match peered {
+                    Some(id) if now >= since + MIN_RESHUFFLE_INTERVAL => Some(id),
+                    _ => return,
+                }
+            }
+        };
+        let Some(peer) = self.next_named(collection, local, now) else {
+            return;
+        };
+        if let Some(id) = held {
+            self.end_peering(collection, id);
+        }
+        self.ask_or_dial(collection, peer, dials);
+        self.meshes.get_mut(&collection.raw).unwrap().reserved = Some((peer, now));
+    }
+
+    /// The next participant of C in the reserved slot's walk that no open
+    /// connection reaches and that is not taken, as [`Self::next_candidate`]
+    /// takes them. Its end draws the walk again on the same terms, and looks
+    /// nothing up.
+    fn next_named(
+        &mut self,
+        collection: CollectionHandle,
+        local: &CollectionSnapshot,
+        now: Mono,
+    ) -> Option<PeerId> {
+        let grants = self.snapshot.as_ref()?.grants().clone();
+        let mesh = self.meshes.get_mut(&collection.raw)?;
+        let skipped = mesh
+            .peerings
+            .iter()
+            .filter(|(_, peering)| !matches!(peering.side, Side::Idle) || peering.refused_by_them)
+            .filter_map(|(id, _)| self.links.get(id).map(Link::peer))
+            .chain(mesh.dialling.iter().copied())
+            .chain(
+                self.links
+                    .values()
+                    .filter(|link| !link.closed())
+                    .map(Link::peer),
+            )
+            .collect::<BTreeSet<_>>();
+        let order = &mut mesh.named;
+        loop {
+            while let Some(peer) = order.peers.get(order.next).copied() {
+                order.next += 1;
+                if !skipped.contains(&peer) {
+                    return Some(peer);
+                }
+            }
+            let due = order
+                .drawn_at
+                .is_none_or(|drawn| now >= drawn + MIN_RESHUFFLE_INTERVAL);
+            if !due && !order.stale {
+                return None;
+            }
+            let peers = candidate_order(local, &grants, &[], self.local, &rand::random())
+                .into_iter()
+                .filter(|peer| grants.participates(collection, *peer))
+                .collect::<Vec<_>>();
+            let changed = order.stale
+                && peers.iter().collect::<BTreeSet<_>>()
+                    != order.peers.iter().collect::<BTreeSet<_>>();
+            order.stale = false;
+            if !due && !changed {
+                return None;
+            }
+            order.peers = peers;
+            order.next = 0;
+            order.drawn_at = Some(now);
+        }
     }
 
     /// The next candidate in C's order that is not already a neighbour, being
@@ -1011,7 +1201,9 @@ impl Peerings {
             if !due && !order.stale {
                 return None;
             }
-            let peers = candidate_order(local, &mesh.providers, self.local, &rand::random());
+            let grants = self.snapshot.as_ref()?.grants().clone();
+            let peers =
+                candidate_order(local, &grants, &mesh.providers, self.local, &rand::random());
             // Any change to C's records or evidence makes the order stale;
             // only a change of its candidates draws it before it is due.
             let changed = order.stale
@@ -1838,7 +2030,8 @@ mod tests {
             reader.verifying_key().to_bytes(),
         ]);
         for salt in [[0; 32], [1; 32], [2; 32]] {
-            let order = candidate_order(&local, &[provider], node.id(), &salt);
+            let snapshot = node.peerings.snapshot.clone().unwrap();
+            let order = candidate_order(&local, snapshot.grants(), &[provider], node.id(), &salt);
             assert_eq!(order.len(), 4);
             assert_eq!(
                 order[..2].iter().copied().collect::<BTreeSet<_>>(),
@@ -1863,6 +2056,180 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(node.peerings.fill(now + MIN_RESHUFFLE_INTERVAL), [provider]);
+    }
+
+    /// A definition granting and delegating READ, and one naming no action.
+    fn delegable_read_and_empty(node: &mut Node) -> (CapabilityHandle, CapabilityHandle) {
+        use triblespace_core::capability::capability_delegate_action;
+        let delegable = entity! {
+            capability_action: ACTION_READ,
+            capability_delegate_action: ACTION_READ,
+        };
+        let empty = entity! { metadata::name: "names no action" };
+        let delegable = node
+            .pile
+            .store
+            .put::<SimpleArchive, _>(delegable.facts().clone())
+            .unwrap();
+        let empty = node
+            .pile
+            .store
+            .put::<SimpleArchive, _>(empty.facts().clone())
+            .unwrap();
+        (delegable, empty)
+    }
+
+    /// Candidates are C's participants in the grant index: a key named only
+    /// by an extension from a grantee that may not delegate, or by a step
+    /// through a definition naming no action, is no candidate. The control is
+    /// a validly delegated key, which is one, as are the grantees themselves.
+    #[test]
+    fn junk_delegates_are_no_candidates_and_a_valid_delegate_is() {
+        let mut node = Node::new(90);
+        let [root, g, valid, may_not, z, via_empty, e] = [91, 92, 93, 94, 95, 96, 97].map(key);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(root.verifying_key()),
+            AdmissionPolicy::direct(root.verifying_key()),
+        );
+        let collection = node.hold(policy);
+        let (delegable, empty) = delegable_read_and_empty(&mut node);
+        let delegated = grant(&root, &g, delegable, collection)
+            .delegate(&g, read_capability(), valid.verifying_key())
+            .unwrap();
+        let undelegated = grant(&root, &may_not, read_capability(), collection)
+            .delegate(&may_not, read_capability(), z.verifying_key())
+            .unwrap();
+        let through_empty = grant(&root, &via_empty, delegable, collection)
+            .delegate(&via_empty, empty, e.verifying_key())
+            .unwrap();
+        for proof in [delegated, undelegated, through_empty] {
+            node.learn(proof);
+        }
+        node.select(collection, true);
+        let snapshot = node.peerings.snapshot.clone().unwrap();
+        let local = snapshot.selected(collection).unwrap();
+        let order = candidate_order(&local, snapshot.grants(), &[], node.id(), &[0; 32])
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        for (key, what) in [(&valid, "a validly delegated key"), (&g, "a grantee")] {
+            assert!(order.contains(&key.verifying_key().to_bytes()), "{what} is a candidate");
+        }
+        for (key, what) in [(&z, "an undelegated extension"), (&e, "a step naming no action")] {
+            assert!(!order.contains(&key.verifying_key().to_bytes()), "{what} names no candidate");
+        }
+    }
+
+    /// Credentials are computed on demand from C's evidence: every prefix
+    /// naming this node, truncated there, in proof-id order. They are the
+    /// exact bytes the base subject index handed out for the same store
+    /// (digest recorded from base f2a2b5a1 output).
+    #[test]
+    fn credentials_are_the_prefixes_naming_this_node_byte_for_byte() {
+        let mut node = Node::new(100);
+        let [root, a, b, c] = [101, 102, 103, 104].map(key);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(root.verifying_key()),
+            AdmissionPolicy::direct(root.verifying_key()),
+        );
+        let collection = node.hold(policy);
+        let (delegable, _) = delegable_read_and_empty(&mut node);
+        let direct = grant(&root, &a, read_capability(), collection);
+        let through_b = grant(&root, &b, delegable, collection)
+            .delegate(&b, read_capability(), a.verifying_key())
+            .unwrap();
+        let past_a = grant(&root, &a, delegable, collection)
+            .delegate(&a, read_capability(), c.verifying_key())
+            .unwrap();
+        let unrelated = grant(&root, &c, read_capability(), collection);
+        for proof in [direct, through_b, past_a, unrelated] {
+            node.learn(proof);
+        }
+        let snapshot = node.peerings.snapshot.clone().unwrap();
+        let local = snapshot.collection(collection).unwrap();
+        let evidence = local.repair().authorization_evidence();
+        let credentials = credentials(evidence, a.verifying_key());
+        let mut hasher = blake3::Hasher::new();
+        for proof in &credentials {
+            hasher.update(&proof.id().raw);
+            hasher.update(proof.as_bytes());
+        }
+        assert_eq!(credentials.len(), 3, "the direct grant, through B and the prefix of A's own grant");
+        assert!(credentials.windows(2).all(|pair| pair[0].id().raw < pair[1].id().raw));
+        for proof in &credentials {
+            let last = proof.prefixes().last().unwrap().subject();
+            assert_eq!(last, a.verifying_key(), "truncated at A");
+        }
+        // blake3 over (id, bytes) of the base subject index's output for this
+        // store, `proofs_naming(a).take(MAX_PROOFS_PER_EXCHANGE)` at f2a2b5a1
+        // with this file's fixture, recorded before that index was removed.
+        assert_eq!(
+            hex::encode(hasher.finalize().as_bytes()),
+            "5d35088bff8ec4fba4a1c995e436b178a8c4e2bde92bd20f731001596e0344cd"
+        );
+    }
+
+    /// One neighbour slot per collection is reserved for participants named
+    /// by its grants that no connection reaches. With the asked set full of
+    /// connected neighbours, a new grantee is dialled at once; the slot holds
+    /// one at a time, and once its holder is peered for the reshuffle
+    /// interval it moves on to the next such grantee, unpeering the holder.
+    #[test]
+    fn a_reserved_slot_dials_a_named_unconnected_grantee_past_a_full_set() {
+        let mut node = Node::new(80);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(node.key.verifying_key()),
+            AdmissionPolicy::direct(node.key.verifying_key()),
+        );
+        let collection = node.hold(policy.clone());
+        let mut unread = Vec::new();
+        for (index, byte) in (81..86).enumerate() {
+            let grantee = key(byte);
+            let proof = grant(&node.key, &grantee, read_capability(), collection);
+            node.learn(proof);
+            let (link, frames) = Link::detached(10 + index as u64, grantee.verifying_key().to_bytes());
+            node.peerings.event(ReconEvent::Opened(link));
+            unread.push(frames);
+        }
+        node.select(collection, true);
+        let now = crate::clock::mono_now();
+        assert!(node.peerings.fill(now).is_empty(), "connected candidates are asked, not dialled");
+        let asked = |node: &Node| node.health().iter().filter(|peering| peering.asked).count();
+        assert_eq!(asked(&node), MAX_ASKED, "the asked set is full");
+
+        let mut newcomer = Node::new(87);
+        assert_eq!(newcomer.hold(policy), collection);
+        let to_newcomer = grant(&node.key, &newcomer.key, read_capability(), collection);
+        newcomer.learn(to_newcomer.clone());
+        newcomer.select(collection, true);
+        node.learn(to_newcomer);
+        assert_eq!(
+            node.peerings.fill(now + PEERING_TICK),
+            [newcomer.id()],
+            "the named, unconnected grantee is dialled past the full set"
+        );
+        let later = key(88);
+        node.learn(grant(&node.key, &later, read_capability(), collection));
+        assert!(
+            node.peerings.fill(now + PEERING_TICK * 2).is_empty(),
+            "one reserved slot: the next grantee waits"
+        );
+
+        let mut wire = connect(&mut node, &mut newcomer, 20);
+        carry(&mut node, &mut newcomer, &mut wire);
+        assert!(
+            peering(&node, newcomer.id()).is_some_and(|peering| peering.peered && peering.asked),
+            "the newcomer peered"
+        );
+        assert!(node.peerings.fill(now + PEERING_TICK * 3).is_empty(), "not before the interval");
+        assert_eq!(
+            node.peerings.fill(now + PEERING_TICK + MIN_RESHUFFLE_INTERVAL),
+            [later.verifying_key().to_bytes()],
+            "the slot moves on to the next named, unconnected grantee"
+        );
+        let carried = carry(&mut node, &mut newcomer, &mut wire);
+        assert!(kinds(&carried).contains(&("left", FRAME_UNPEER)), "{:?}", kinds(&carried));
+        assert!(!peering(&node, newcomer.id()).is_some_and(|peering| peering.peered));
+        assert_eq!(asked(&node), MAX_ASKED, "the five regular neighbours stay");
     }
 
     #[test]
