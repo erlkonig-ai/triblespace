@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Grant gossip by participation, in the unreleased ALPN33 candidate: one
+  passive mechanism for the grants over every resource R, with no routing by
+  resource kind. A grant over R is shown to every node that takes part in R
+  (R's roots, the keys named on its delegation-valid grants, and the nodes
+  peered for R) and to no other; nobody dials on a grant's behalf.
+  - One incremental grant index per host, keyed R | proof id, holds the grants
+    whose descriptor and definitions are resident, that start at one of R's
+    roots, whose delegation is valid, and each of whose steps names an
+    action. It is the only grant tree walked, listed or reported; a
+    collection's authorization evidence stays as admission input only.
+  - `recon/1` GRANT_ROOTS (`0x06`; 72-byte entries, at most 910 a frame)
+    lists the root and count of R's grants for every R the peer takes part
+    in, on open and on change, and replaces the digest exchange, whose kinds
+    `0x02` to `0x05` are now skipped as unknown. A side takes listings of at
+    most 256 resources it takes no part in per connection.
+  - A grant walk is the Authorization kind of `walk/1` over any R, Prefix
+    only; cached RIBLT is refused for it. The receiver skips a grant it cannot
+    use, never failing the walk, and lands a kept one only once R's
+    descriptor is resident and validates it, holding it meanwhile in bounded
+    memory (256 per sender, 1,024 and 1 MiB in all) while one fetch brings
+    every missing descriptor and definition. Skipped and pending grants never
+    enter the agreement. At most 8 grant walks run per peer; every end is
+    reported, and a failed walk opens again after a backoff of 1 s doubling to
+    60 s on the same connection.
+  - Collections no longer push grants: the schedule walks COMMIT and DERIVE
+    (and references between Full neighbours), and the record root (version 6)
+    no longer hashes the authorization evidence, so a new grant moves no
+    record walk.
+  - Health: `pair()` reads its grant part from the peer's standing listing,
+    with no age. `HealthSnapshot::grants` reports per-resource agreement,
+    walk ends and skipped, pending and retried grants, and
+    `HealthSnapshot::named_unselected` (what this node was granted and does
+    not sync) replaces `available`. `local_authorizations` and
+    `remote_authorizations` are now grant-index counts, under the same
+    attribute ids.
+  - Discovery takes a collection's candidates from its participants, with one
+    reserved neighbour place per collection for participants no connection
+    reaches. Credentials are computed when sent; the subject index is gone.
+  - The deterministic simulation's tap reads the resource each walk OPEN
+    names and the entries of every GRANT_ROOTS frame, and can silence the walk
+    streams of one kind while the connection stays up.
+  - Disclosure widens: a participant of R, a WRITE grantee among them, sees
+    every grant over R. A non-participant still sees nothing about R.
+  No live activation; pre-redesign ALPN33 builds are a different candidate
+  and are never mixed with this one.
+
 - In the isolated occurrence-view candidate, advance each shared collection
   peer set from repeated append evidence, exact semantic deltas, or a full
   rebuild after physical-source replacement. Retain full-body collision checks

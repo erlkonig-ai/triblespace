@@ -1,11 +1,12 @@
 //! Collection-scoped anti-entropy for triblespace.
 //!
 //! [`Peer<S>`](peer::Peer) wraps one store. Authorized pushes of PATCH trees
-//! converge one explicitly active collection's records and collection-scoped
-//! native evidence for descriptor-declared capabilities. Neighbours that peer
+//! converge one explicitly active collection's records. Neighbours that peer
 //! for a selected collection on the one `recon/1` stream of their connection
 //! each push it the part of their trees it has not confirmed, on `walk/1`
-//! streams of their own. Policy roots, scoped AUTH keys and ordinary
+//! streams of their own. The grants over any resource reach the nodes that
+//! take part in it by grant gossip (the crate's `grants` module), whatever
+//! connection two such nodes share. A collection's participants and ordinary
 //! descriptor-blob providers supply candidate contacts, never authority;
 //! every useful collection byte remains capability-gated.
 //! Exact content reads are independent: every served resident blob may publish

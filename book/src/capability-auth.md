@@ -230,39 +230,45 @@ already delivered. It does not expire COMMIT membership or collection READ.
 Secrets-specific delivery grants need not be listed in collection descriptors:
 a separate immutable resource may have its own delivery policy.
 
-Ordinary collection facts can reference such a resource with `resource_handle`;
-the immutable resource can declare its repair audience with `resource_collection`.
-This names the collection whose READ-authorized peers may exchange the resource's
-proofs; it does not inherit that collection's authority. Their anchors, minted
-with `trible genid` on 2026-09-14, are respectively
-`5059416BAF824B364FF52F56A0D1CF9F` and `62E951EC3ABB7F9B7F123BB7DE2F9F99`.
-The resource's own policy roots still decide its actions.
+Ordinary collection facts can reference such a resource with `resource_handle`,
+whose anchor, minted with `trible genid` on 2026-09-14, is
+`5059416BAF824B364FF52F56A0D1CF9F`. The resource's own policy roots decide its
+actions, and its grants travel like any resource's, to the nodes that take part
+in it (*Repair and discovery* below), whatever collection references it.
+`resource_collection` (anchor `62E951EC3ABB7F9B7F123BB7DE2F9F99`, minted the
+same day) once named a collection whose READ peers would exchange the
+resource's proofs. It is retired and its anchor is never to be reused:
+descriptors that carry it keep it, and nothing reads it.
 
 ## Repair and discovery
 
-For proofs naming exact resource C, collection AUTH repair uses C's declared
-policy roots. It no longer filters by grant-handle equality:
-different definitions can delegate the same action. This byte-local relevance
-check does not interpret the definitions or confer READ. Peering admission and
-push admission separately interpret the requested READ action using resident
-definitions, the pinned proof set and the credentials a peer presented, before
-any record or proof is sent.
+A collection's authorization evidence holds the proofs over exact resource C
+that start at one of C's declared policy roots. It no longer filters by
+grant-handle equality: different definitions can delegate the same action.
+This byte-local relevance check does not interpret the definitions or confer
+READ. Peering admission and push admission separately interpret the requested
+READ action using resident definitions, the evidence and the credentials a
+peer presented, before any record is sent. The evidence is admission input
+only; it is never walked or compared.
 
-Pushes transfer records and proofs, not capability-definition blobs, payload
+Grants travel by one passive mechanism for every resource R. A host's grant
+index holds each grant over R whose descriptor and definitions are resident,
+that starts at one of R's roots (every `resource_policy` binding in R's
+descriptor, with no test of R's kind), and whose delegation is valid with an
+action at every step. R's roots and the keys on its indexed grants take part in
+R, and so does a node peered for R. Each connection lists the root of R's
+grants for every R the peer takes part in, and the two walk R's grants where
+the roots differ: every node that takes part in R sees every grant over R, and
+a node that takes no part in R sees nothing about it. A receiver skips what it
+cannot use, never failing the walk, and lands a grant only once R's descriptor
+is resident and the grant starts at one of R's roots. Nobody dials on a
+grant's behalf.
+
+Walks transfer records and proofs, not capability-definition blobs, payload
 closure, or WANT bookkeeping. Definition bytes travel by hash over the bearer
-blob protocol: for a proof received through the grant exchange or as a peer's
-credential, a node fetches the definitions it names from its sender, then from
-the proof's root and delegated keys.
-
-Subordinate-resource transport also routes proofs naming R when
-R's immutable descriptor contains `resource_collection: C` and `resource_policy`
-on the same entity. It checks R's policy roots and signatures, while the push
-remains gated by READ(C). No mutable fact in C can create or revoke the route.
-A missing R descriptor is fetched by hash from the peer that pushed the proof;
-if it does not route the proof to C, the proof stays deferred without blocking
-C's records push, and the authorization push does not land, so the peer's next
-push of that tree carries the proof again. Its repair PATCH prefix
-names the routing audience C, not necessarily the proof's signed resource R.
+blob protocol: for a grant waiting on its descriptor or definitions, or a
+peer's credential, a node fetches what it names from its sender or the peers
+that listed R, then from the proof's root and delegated keys.
 
 ## Explicit protocol cutover
 

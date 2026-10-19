@@ -6,14 +6,18 @@ model:
 
 1. one QUIC connection per peer pair carries typed streams: one long-lived
    `recon/1` stream for the grant exchange and for every collection's
-   peering, a `walk/1` stream for each push of a collection's tree, and
-   short `dht/1` and `blob/1` request streams;
+   peering, a `walk/1` stream for each push of a collection's tree or walk
+   of a resource's grants, and short `dht/1` and `blob/1` request streams;
 2. for each collection both sides select, each peered neighbour pushes the
-   other the collection's trees, its foundation records and scoped AUTH
-   (and, between two Full neighbours, its held blobs), as Merkle walks pruned
-   by what the receiver already holds; the receiver pulls the values it lacks
-   and lands them as they arrive; and
-3. exact blob handles fetch only the immutable bytes a resolver actually
+   other the collection's trees, its foundation records (and, between two
+   Full neighbours, its held blobs), as Merkle walks pruned by what the
+   receiver already holds; the receiver pulls the values it lacks and lands
+   them as they arrive;
+3. the grants over any resource R, a collection or not, reach every node
+   that takes part in R by one passive mechanism, grant gossip: each
+   connection lists the root of R's grants for every R the peer takes part
+   in, and the two walk R's grants where the roots differ; and
+4. exact blob handles fetch only the immutable bytes a resolver actually
    chooses through a collection-independent, mutually authenticated bearer
    protocol.
 
@@ -31,7 +35,7 @@ The boundaries are deliberately small:
 
 ```text
 know C           -> find holders of C's descriptor and ask them to peer for C
-prove READ(C)    -> be pushed C's records, scoped proofs and held set
+prove READ(C)    -> be pushed C's records and held set, and shown C's grants
 know H           -> derive its opaque locator, discover providers, and fetch H
 satisfy WRITE(C) -> make a signed COMMIT or DERIVE active in C, and send C to a reader
 ```
@@ -52,6 +56,15 @@ ancestry, routing knowledge, and possession of a blob do not silently supply
 collection authority. Downstream delegation is a restriction signed into each
 proof path, not a second descriptor threshold.
 
+A node takes part in a resource R when one of its keys is a root of R (from
+any `resource_policy` binding in R's descriptor), when its key is named on a
+delegation-valid grant over R, or when it is peered for R; merely asking does
+not count. Every node that takes part in R is shown every grant over R, which
+is how grants spread from participant to participant, and a node that takes
+no part in R is shown nothing about R, whatever else the pile it shares
+holds. A peer admitted to READ(C) and peered for C therefore sees C's grants,
+and so does a WRITE grantee of C: its key is named on one.
+
 Local stores remain permissive grow-only ledgers. They may contain a COMMIT
 whose signer does not currently satisfy WRITE(C), or a proof irrelevant to any
 resident collection. Admission is applied when a snapshot is observed. Later
@@ -62,35 +75,41 @@ nothing.
 
 ## The collection repair product
 
-For one collection, sync compares three PATCH components:
+For one collection, sync pushes two kinds of PATCH component and keeps a third
+as admission input:
 
 - every structurally valid foundation record naming exact C: signed `COMMIT`
   and `DERIVE` records independent of current WRITE(C) admission. A collection
   is a set of foundations; a `MERGE` is its signing host's own lattice node,
   is never served, and a `MERGE` value fails the push that received it;
-- every signature-valid native proof scoped to exact resource C and beginning
-  at a root named by C's supported policy bindings, without requiring its grant
-  handles to match those bindings. Subordinate-resource transport
-  also includes proofs for R whose immutable descriptor declares C as its repair
-  audience, under R's own policy roots; and
 - C's held-blob set: the resident blobs reachable from C's descriptor, its
   foundations' direct references and its proofs' capability definitions (see
-  *Held blobs* below). Only a host that replicates C in full keeps one.
+  *Held blobs* below). Only a host that replicates C in full keeps one; and
+- C's authorization evidence: every signature-valid native proof over exact
+  resource C beginning at a root named by C's supported policy bindings,
+  without requiring its grant handles to match those bindings. A proof over
+  any other resource is never C's evidence, whatever that resource's
+  descriptor names. The evidence is what admission reads. It is never walked,
+  summarised into a frontier or compared: the grants over C travel by grant
+  gossip from the grant index (*Grant exchange*), like those over any
+  resource.
 
 Each set is represented by an immutable BLAKE3-Merkle PATCH. Collection
 records are keyed physically by the full 32-byte fingerprint of their exact
-canonical value; authorization evidence uses a `repair_collection | proof_hash` PATCH
-whose values share ownership of the original proof bytes. Only C's prefix is
-exposed; the wire leaf key is the 32-byte proof hash and its value is the
-complete native proof body. The host keeps one such index per collection
-overlay, not a shared global inventory. Resident-blob leaves use exact H as
+canonical value; authorization evidence uses a `collection | proof_hash` PATCH
+whose values share ownership of the original proof bytes, one per collection
+overlay, not a shared global inventory. The grants that are walked come from
+the host's grant index, an `R | proof_hash` PATCH per resource R of the same
+shape: a grant walk exposes only R's prefix, its wire leaf key is the 32-byte
+proof hash and its value the complete native proof body. Resident-blob leaves use exact H as
 their 32-byte key and have an empty value. There is no companion claim blob or
 authorization closure to transfer.
 
-The record root (`record_root`) commits to C and to the record and
-authorization-evidence summaries, including their leaf counts, under a
-versioned domain (version 4). It discloses no record, proof, count or
-component root. The held set is not part of it: the held set's Merkle root,
+The record root (`record_root`) commits to C and to the COMMIT and DERIVE
+summaries, including their leaf counts, under a versioned domain (version 6;
+version 5 also hashed the authorization evidence). It discloses no record,
+count or component root. Grants are no part of it, so a new grant moves no
+record walk. The held set is not part of it: the held set's Merkle root,
 all zeros when the set is empty, is the root of its own tree, which only two
 neighbours that both replicate C in full push each other.
 
@@ -102,32 +121,29 @@ action's policy roots. Generic authority has no clock. Each root path is
 evaluated independently; no fixed-point over sibling paths can create
 delegation support.
 
-A grant reaches its subject through the grant exchange (below): any connected
-holder of a proof naming a key hands it to that key, and the host whose key
-signed a grant dials its subject. That is the capability delivery boundary,
-not a Secrets-specific channel. Once one collection participant has the proof,
-the authorization walk distributes that one record to READ(C) peers.
-Interpretation needs any referenced capability definitions to be resident;
-pushes carry proof bytes, never definition bodies, which travel by hash over
-`blob/1`. An application may use the same proof kernel for another resource,
-such as Secrets key delivery, without treating collection READ as decryption
-authority.
+A grant reaches the nodes that take part in its resource through the grant
+exchange (below): whenever two hosts are connected, for whatever reason, each
+lists the root of R's grants for every R the other takes part in, and the two
+walk R's grants where the roots differ. Nobody dials on a grant's behalf. That
+is the capability delivery boundary, and it is the same for every kind of
+resource: a collection's grants and, say, a Secrets version's delivery grants
+travel alike, with no test of the resource's kind. Interpretation needs any
+referenced capability definitions to be resident; walks carry proof bytes,
+never definition bodies, which travel by hash over `blob/1`. An application
+may use the same proof kernel for another resource, such as Secrets key
+delivery, without treating collection READ as decryption authority.
 
-Subordinate-resource transport reads R's `resource_collection: C`
-and its policy bindings from the same descriptor entity, without requiring a
-mutable referencing fact in C. When R's descriptor is not resident, the
-receiver of an authorization push fetches it by hash from the sender, over
-`blob/1` and at most 1 MiB. If that descriptor routes the proof to C, both
-land; otherwise the proof stays deferred and the push does not land, so the
-sender's next push of the same tree carries the proof again. C's records push
-continues either way, and no WANT is emitted. A push is still gated by the
-sender's decision to send C to the receiver, not by R's action. Open action
-policies remain explicitly non-enumerable.
+There is no backlink from a resource to a collection. The retired
+`resource_collection` attribute (anchor `62E951EC3ABB7F9B7F123BB7DE2F9F99`)
+once routed a resource's proofs as a collection's evidence; descriptors that
+carry it keep it, every reader ignores it, and the anchor is never reused.
+Open action policies remain explicitly non-enumerable.
 
 This product matters. Synchronizing only collection records would miss the
 case where a newly arrived proof activates an old COMMIT. Synchronizing a whole
-proof store would disclose unrelated capability structure. The complete repair
-evidence algebra remains `Record × AuthorizationEvidence`, scoped to C.
+proof store would disclose unrelated capability structure. The admission
+algebra remains `Record × AuthorizationEvidence`, scoped to C, while the
+evidence's proofs arrive by grant gossip, scoped to C's participants.
 The held component is different: it observes physical availability and may
 shrink or be rebuilt. It does not create semantic membership or change WRITE
 admission. The receiver always derives its admitted view locally; record and
@@ -140,9 +156,9 @@ the next overlay without re-enumeration or Merkle hashing. Changed
 collections apply selected record additions and removals to that retained PATCH.
 Native stores obtain the difference from persistent indexes; cold activation
 still constructs the initial full overlay. Blob arrival
-still refreshes the authorization observation: a newly resident capability or
-subordinate-resource descriptor can enable admission or proof routing without
-changing any record. The held set comes from the store's own index, fixed by
+still refreshes the authorization observation: a newly resident capability
+definition or resource descriptor can enable admission, or let a waiting
+grant be indexed, without changing any record. The held set comes from the store's own index, fixed by
 the same snapshot; it can change the held set's root, never the record root.
 
 A DERIVE is a foundation of its derived collection and is pushed like a COMMIT.
@@ -300,9 +316,9 @@ streams.
 A connection's frame queue refuses no frame, so what it holds is bounded by
 what is put on it. A side asked to peer leaves the request unanswered while
 the connection already queues 1,024 frames, at most 64 KiB each, and the
-grant exchange answers one proof request per digest it sent; a peer that asks
-faster than it reads therefore stops being answered rather than growing the
-queue, and an unanswered peering request waits until the stalled stream's end
+grant exchange sends a listing only when a root it lists changes; a peer that
+asks faster than it reads therefore stops being answered rather than growing
+the queue, and an unanswered peering request waits until the stalled stream's end
 closes the connection. A push is not on this queue: it has a stream of its
 own, and QUIC's flow control holds a sender whose receiver stops reading
 (*Walk streams*).
@@ -315,10 +331,7 @@ stream:
 | Kind | Frame | Payload |
 |---:|---|---|
 | `0x01` | OPEN | dialler sequence number, `u64` |
-| `0x02` | PROOF_DIGEST | digest of the sender's proofs naming the receiver |
-| `0x03` | PROOF_REQUEST | empty |
-| `0x04` | PROOFS | proofs naming the receiver |
-| `0x05` | PROOFS_END | empty |
+| `0x06` | GRANT_ROOTS | resource, grant root, count; repeated |
 | `0x10` | PEER_REQUEST | collection, flags, credentials |
 | `0x11` | PEER_ACCEPT | collection, flags |
 | `0x12` | PEER_REFUSE | collection |
@@ -327,9 +340,13 @@ stream:
 | `0x15` | UNPEER | collection |
 
 Peering flags are one byte: bit 0 is the send flag, bit 1 the full flag, and
-in a PEER_REQUEST bit 2 marks an invitation. A proof digest is a presence byte, a Merkle root (zeros for
-the empty set) and a big-endian `u64` count. Credentials, like the proofs of a
-PROOFS frame, are a big-endian `u16` count followed by that many proofs, each a
+in a PEER_REQUEST bit 2 marks an invitation. A GRANT_ROOTS entry is 72 bytes:
+the resource's 32-byte handle, the Merkle root of the sender's grants over it
+(zeros for the empty set) and a big-endian `u64` count; a frame holds at most
+910 entries, a root of zeros with a nonzero count or a root with a zero count
+is malformed, and so is a payload that is not whole entries. The kinds `0x02`
+to `0x05` of the retired digest exchange are skipped like any unknown kind.
+Credentials are a big-endian `u16` count followed by that many proofs, each a
 big-endian `u16` length and its bytes. A reader skips a frame kind it does not
 know and a proof whose bytes do not decode; a known frame whose payload does
 not parse is a protocol violation and closes the connection.
@@ -349,10 +366,11 @@ and carries the asker's flags and credentials:
   its prefix, READ and WRITE alike, at most 1,024 of them. Those that do not
   fit the request travel first in CREDENTIAL frames.
 
-Apart from the grant exchange, which hands a key only the proofs naming that
-key, these credentials are the only collection data a side sends before it is
+Apart from the grant exchange, which shows each node that takes part in a
+resource every grant over it and a node that takes no part nothing about it,
+these credentials are the only collection data a side sends before it is
 admitted. Its other frames before admission carry only handles, hashes, flags
-and digests.
+and grant roots.
 
 The key asked accepts only if it has C active with its descriptor resident,
 selects C, and has room for the peering (at most 16 per collection that others
@@ -398,10 +416,10 @@ peerings. The asker never asks again on its own.
 Each selected collection has up to five neighbours this side asked for, plus
 the peerings others asked for. The candidates come in three tiers:
 
-1. grant-chain keys (C's policy roots and the roots and delegates of its
-   retained proofs) and owners (signers of C's records who pass WRITE) that
-   pass READ under local evidence;
-2. the other grant-chain keys and owners; and
+1. C's participants in the grant index (its policy roots and the keys named
+   on its indexed grants) and owners (signers of C's records who pass WRITE)
+   that pass READ under local evidence;
+2. the other participants and owners; and
 3. DHT providers of `blob_locator(C)`, the holders of C's descriptor blob.
 
 Within a tier keys are ranked by `blake3(salt || key)` under a salt drawn
@@ -422,6 +440,19 @@ another candidate is available, one healthy asked-for neighbour chosen at
 random is unpeered and replaced by the next candidate, so neighbour groups that
 formed separately during a partition meet again after it heals.
 
+One more place per collection is reserved for participants of C that no open
+connection reaches, walked in the same tiers and redrawn on the same terms,
+with no provider lookup. Its holder keeps it while it is being dialled or its
+asked-for peering stands; once the holder has been peered for 60 seconds it is
+unpeered when another such participant waits, so the place rotates, and the
+five asked-for places never shrink for it. This is how a new grantee is
+reached when every neighbour set that could reach it is full: nobody dials on
+a grant's behalf, but the grant makes the grantee a participant, a reserved
+place at any participant dials it like any candidate, and the grant exchange
+lists C to it on that connection. A grantee that selects nothing refuses the
+peering and still holds its grant; `HealthSnapshot::named_unselected` then
+tells it that it was granted C.
+
 `HealthSnapshot::peerings` lists every peering on an open connection: its
 collection and peer, whether this side asked for it, whether both sides
 accepted, which way C flows, and which side refused the other.
@@ -429,15 +460,16 @@ accepted, which way C flows, and which side refused the other.
 ## Pushes
 
 Each neighbour exchanges one kind of one selected collection on a bidirectional
-`walk/1` stream: records, authorization evidence, or (between Full neighbours)
-held references. Either side may open it. Each sends its own immutable delta
+`walk/1` stream: COMMIT records, DERIVE records, or (between Full neighbours)
+held references. Grants are not pushed on the timer; they travel by grant
+walks, which grant gossip opens where listed roots differ (*Grant exchange*). Either side may open it. Each sends its own immutable delta
 against the last agreement on this connection; both directions share the stream.
 Nothing is broadcast or forwarded merely because it arrived.
 
 Each selected collection retains its existing Trickle-style timer: two to sixty
 seconds, doubling while quiet, with one transmit opportunity in the second half.
-A local records/evidence change restarts the minimum interval unless an incoming
-exchange is landing it. A successful changed receive resets it once, not for each
+A local records change restarts the minimum interval unless an incoming
+exchange is landing it; a new grant restarts nothing. A successful changed receive resets it once, not for each
 intermediate snapshot. Held-set changes wait for the ordinary timer. A successful
 exchange followed by genuinely new local keys starts another immediately; a
 lagging published subset of the agreement does not. Failed exchanges wait for the
@@ -447,7 +479,8 @@ The walks task uses only current connections and never dials. At most one exchan
 per peer, collection and kind runs at a time. Simultaneous opens preserve the
 stream opened by the smaller peer id and reset the other as a duplicate; a newer
 incoming stream can replace an existing incoming one. Both Open and Incoming
-require local selection and an active descriptor. Active peering flags determine
+require local selection and an active descriptor (a grant walk requires
+neither). Active peering flags determine
 send/receive directions; credentials provide fallback admission only when there
 is no active peering. A false send flag cannot be widened by another grant.
 
@@ -469,7 +502,8 @@ receipt added here.
 ## Walk streams
 
 The opener writes the stream tag and OPEN naming collection, kind (COMMIT
-`0`, authorization `1`, references `2`, DERIVE `3`) and profile (`0` pull Prefix, `1` cached
+`0`, authorization `1` for the grants over any resource R, whose handle the
+OPEN names in the collection's place, references `2`, DERIVE `3`) and profile (`0` pull Prefix, `1` cached
 RIBLT, `2` offer Prefix with opener sending, `3` offer Prefix with opener receiving).
 OPEN remains 34 bytes. Profiles 2/3 require Records or AUTH and the opposite
 locally authorized one-way role before driver registration. Profile 0 always
@@ -478,8 +512,8 @@ profiles and inconsistent offer roles are refused, not guessed from data frames.
 The accept loop hands both halves to
 the walks task. Missing OPEN within ten seconds, or no task, resets the stream.
 Frames have a one-byte kind, big-endian u32 payload length, then at most 64 KiB.
-Keys are 32 bytes relative to the kind's base; authorization hashes bind the full
-collection32 || proof-id32 key. Integers are big-endian.
+Keys are 32 bytes relative to the kind's base; a grant walk's hashes bind the full
+resource32 || proof-id32 key. Integers are big-endian.
 
 | Kind | Frame | Payload |
 |---:|---|---|
@@ -536,11 +570,12 @@ prefixes cannot close. Exact non-root subtree inclusion currently enumerates its
 keys; only empty-prefix whole-tree inclusion uses a shared clone.
 
 Records must decode with valid signatures to COMMIT/DERIVE for the collection
-under the requested fingerprint. Proofs must match their id, signatures and
-collection evidence; a subordinate descriptor is fetched and checked, or the
-proof remains deferred and fails completion. References have no VALUE payload:
+under the requested fingerprint. A grant must decode and match its id, or the
+exchange fails; otherwise it goes through the grant walk's gate (*Grant
+exchange*), which lands it, holds it pending or skips it, and none of those
+fails the walk. References have no VALUE payload:
 resident blobs are noted held, absent ones fetched by hash and landed with their
-held note. All actual landing/fetch/deferred outcomes precede LANDED. A value
+held note. All actual landing/fetch outcomes precede LANDED. A value
 request is served only from the immutable advertised delta. A receive-only side
 announces empty and cannot advertise its private pinned tree or serve ordinary
 values. Offer-mode receipts only repeat commitments the sender already offered.
@@ -558,9 +593,10 @@ idempotent. HAVE prunes queued descendants and suppresses unqueued eager bodies,
 but cannot recall already queued/written frames.
 
 The receiver acknowledges an explicit offered leaf if its immutable typed value
-is already held, or after its validated VALUE has actually landed. A routed AUTH
-proof returns no credit while its descriptor is missing, fetched or unlanded;
-the descriptor and proof must both land successfully. Retained sound G may
+is already held, or after its validated VALUE has actually landed. A grant the
+gate skips or holds pending is acknowledged at once: it returns credit without
+landing, and it never enters the walk's agreement, so a later walk offers it
+again. Retained sound G may
 certify an exact offered subtree, including a leaf whose physical publication
 lags. An already queued descendant after such a coarse HAVE creates no new body
 debt. Private-prefix equality grafts and unlanded VALUEs remain proof-only: they
@@ -631,7 +667,8 @@ symmetric equations. Collection/component admission and reference eligibility
 are otherwise unchanged.
 
 Each published collection observation owns three separate latest cache Arcs:
-Records, scoped AUTH, and positive resident References. A generation binds the
+COMMIT, DERIVE and positive resident References. Grant walks are Prefix only
+and keep no cache: an Authorization OPEN that names cached RIBLT is refused. A generation binds the
 immutable native source, collection, component and profile to one flat grow-only
 `Vec<CodedSymbol<KeySymbol>>`. Running exchanges retain that generation; they
 have residual decoders, not full per-peer encoders or cell caches. Normal local
@@ -716,8 +753,7 @@ remote-only keys must not, and both recovered sets must be unique. A sparse
 native Merkle union summary combines the COW source minus local-only keys with
 the remote-only key PATCH, sharing all unchanged native subtree summaries. It
 checks the exact peer root/count without waiting for unknown typed bodies and
-without a copied full-source key inventory. AUTH hashes still bind physical
-collection32 || proof32 keys. Typed peer reconstruction and canonical signature
+without a copied full-source key inventory. Typed peer reconstruction and canonical signature
 admission independently guard final landing.
 
 Once this exact proof holds, stop coded output only when the **complete locally
@@ -777,46 +813,75 @@ persistence boundary.
 
 Serving snapshots are a latest-value handoff. The peering, scheduling and
 walks tasks each read the newest observation, never a queue of them. Evidence
-that arrives outside pushes (proofs from the grant exchange, fetched
+that arrives outside walks (pending grants whose descriptor arrived, fetched
 definitions, descriptor warmups) crosses the bounded admission bridge and lands
 at the next `Peer::refresh`, which also reobserves the store at once.
 
 ## Grant exchange
 
-A grant notifies its subject. On every connection, and whenever it changes,
-each side sends on `recon/1` a PROOF_DIGEST of the proofs it holds naming the
-other side: the subject-truncated prefixes its collections' evidence indexes
-under that key. A side whose own proofs naming itself differ sends one
-PROOF_REQUEST per digest and connection; the answer is PROOFS frames closed by
-PROOFS_END and holds only the proofs naming the asker's TLS-authenticated key,
-at most `MAX_PROOFS_PER_EXCHANGE` (1,024). The sender answers once per digest
-it sent on that connection, and a request before any digest goes unanswered.
-The answer reflects what is held when it is sent, so an asker whose request
-crossed a newer digest already has the newer state. A received proof, like a
-peer's credential, is kept only if it names the receiver or the sender.
-It lands when its held descriptor validates it, waits in memory while the
-descriptor is missing (`HealthSnapshot::available` lists its collection), and
-is dropped otherwise. A waiting proof waits for every sender that delivered
-it and is dropped when the last connection of the last of them closes, so
-keys that came and went do not keep the bound full. Waiting proofs are
-bounded: one sender keeps at most 256 waiting and every sender together at
-most 1,024, and the rest are dropped before their signatures are checked and
-fetch nothing. A proof counts against every sender it waits for, not only
-its first, so a sender that repeats others' proofs spends its own share on
-them and keeps no more waiting than its share once the others leave. A proof
-that is evidence under a held descriptor never waits, so these bounds keep
-none of those out. A proof for a collection that is not active is validated
-against the resident blob at its resource, which is taken for a descriptor
-only up to 1 MiB and decoded at most once per store observation, not once per
-proof.
+Grants gossip by participation, with one passive mechanism for every
+resource. A grant over a resource R is shown to every node that takes part in
+R (*Four independent capabilities* above: R's roots, the keys named on its
+delegation-valid grants, and the nodes peered for R), and to no other.
 
-The definitions a proof names are fetched over `blob/1` from the sender, then
-from its root and delegated keys among connected peers, as are those a refused
-peering request waits for. Definitions are policy metadata and are fetched
-under the same 1 MiB bound as descriptors, so a key cannot make a node store a
-blob of its choosing by signing a proof whose capability handle names it. A
-host also dials the subject of every grant its own key signed, once per grant
-and process, so a grant written while the subject is unknown still reaches it.
+Each host keeps one grow-only grant index of every grant it holds, keyed by R
+and proof id, with R's participants. A grant is indexed once R's descriptor
+and every definition it names are resident, it starts at one of R's roots
+(`descriptor::resource_grant_policies`, every `resource_policy` binding in
+the descriptor, whatever the resource's kind), its delegation is valid, and
+every step's definition names an action, every later step's parent a
+delegable one. A grant that fails one of these is not indexed, offered or
+counted as naming a participant; it stays in the store, and a collection's
+evidence keeps what admission reads. A grant whose blobs are missing waits,
+naming every missing handle at once. The index is the only grant tree that is
+walked, listed or reported; it is built incrementally, one judgement per new
+grant, and not filtered by local selection: participation decides what is
+offered.
+
+On every connection, when it opens and whenever a listed root changes, each
+side sends on `recon/1` a GRANT_ROOTS listing: for every R the peer takes part
+in, the root and count of this side's grants over R. Where the peer's listed
+root differs from this side's, and differs from what this side last opened a
+walk for, it opens one grant walk over R on that connection: the
+Authorization kind of `walk/1`, Prefix only, over any R. A side takes listings
+of at most 256 resources it takes no part in per connection, so a grantee
+that syncs nothing still learns its grants, and a stranger cannot make it walk
+more. At most eight grant walks with one peer run at once, and the rest wait
+in order.
+
+The sender of a walk is a participant of R, and the receiver always receives.
+Each received grant goes through the walk's gate: a grant over another
+resource or with a bad signature is skipped, and so is one that does not name
+this node when this node takes no part in R and the link is not peered for R.
+A kept grant lands only once R's descriptor is resident and the grant starts at
+one of R's roots; until the descriptor arrives it waits in bounded memory
+(256 grants per sender, 1,024 and 1 MiB in all, oldest first out), and one
+whose descriptor turns out not to validate it is dropped. Skipped and pending
+grants neither fail the walk nor enter its agreement, so the next walk offers
+them again; nothing negative is recorded, and absence of a grant revokes
+nothing. A waiting grant is forgotten when the last connection of its sender
+closes.
+
+What a waiting grant needs, R's descriptor (with R's name, once the
+descriptor is resident) and every definition it names, is fetched over
+`blob/1` in one request, from its sender or the peers that listed R first,
+then from the grant's root and delegated keys among connected peers; a
+refused peering request's definitions are fetched the same way. Definitions
+and descriptors are policy metadata, fetched under the same 1 MiB bound, so a
+key cannot make a node store a blob of its choosing by signing a grant whose
+capability handle names it.
+
+Every grant walk's end reaches the grant exchange, including one that never
+started. A walk that failed, was refused or could not start opens again on
+the same connection after a backoff of one second, doubling to sixty, while
+the peer's listed root still differs; a confirmed walk or a root change resets
+the backoff, and a pending grant given up (evicted, or its descriptor found
+nowhere) reopens its walk the same way. Nobody dials on a grant's behalf: a
+grantee no connection reaches is reached by discovery (*Neighbours*).
+
+Credentials remain the peering request's: each is a prefix of the asker's
+own evidence naming itself, computed when sent. The grant exchange does not
+land them.
 
 ## Blob transfer is lazy and bearer-addressed
 
@@ -1079,8 +1144,8 @@ frozen.
 
 A host's peers come from its pile, never from configuration; there is no list
 of peers to give it. The keys a selected collection's content names, the
-signers of its records and its grant-chain keys, are its first peering
-candidates (tiers 1 and 2 under *Neighbours*), dialled by key through iroh's
+signers of its records and its participants in the grant index, are its first
+peering candidates (tiers 1 and 2 under *Neighbours*), dialled by key through iroh's
 address discovery. TLS authenticates every connection, so each connection a
 host dials makes the key it dialled a verified DHT route, and the provider
 lookup at the collection's next draw has a contact: a host whose only route is
@@ -1326,11 +1391,10 @@ the collections `Peer::set_replication` puts in `Full` mode. A host that
 replicates on demand or shallowly keeps none. Seeds are the blobs C's
 replicated records name -- the descriptor, each COMMIT's data and metadata
 archive, each DERIVE's output -- and the capability definitions named by the
-proofs C's authorization evidence keeps. That is the predicate AUTH applies
-(`descriptor::validate_proof_evidence`): a proof over C from one of C's policy
-roots, or over a resource whose immutable descriptor entity both routes to C
-and declares the proof's root, whether or not that resource is tracked as
-well. A valid proof irrelevant to C seeds nothing. A descriptor that arrives
+proofs C's authorization evidence keeps. That is the predicate the evidence
+applies (`descriptor::validate_proof_evidence`): a proof over exact C from one
+of C's policy roots. A proof over any other resource seeds nothing in C,
+whatever that resource's descriptor names. A descriptor that arrives
 after its proof lets the proof be judged on arrival; one that is resident but
 cannot be read judges nothing. A MERGE result is never a seed, and neither is
 a blob no record names. Reachability is conservative: an aligned 32-byte word
@@ -1428,9 +1492,14 @@ guarantee.
 
 ## Wire surface
 
-The ALPN is `/triblespace/pile-sync/32`. Generation 32 adds explicit one-way
-Prefix offer roles and HAVE/eager typed bodies; generation 31 and earlier are
-refused at the handshake. Generation 31 added the explicit OPEN algorithm
+The ALPN is `/triblespace/pile-sync/33`, an unreleased generation. It
+separates the COMMIT and DERIVE trees, and replaces the grant digest exchange
+with grant gossip by participation: GRANT_ROOTS listings on `recon/1` and a
+grant walk per resource on `walk/1`, Prefix only, whose receiver skips what it
+cannot use and lands a grant only once its descriptor validates it; the
+digest kinds `0x02` to `0x05` are skipped as unknown. Generation 32 added
+explicit one-way Prefix offer roles and HAVE/eager typed bodies; generation 32
+and earlier are refused at the handshake. Generation 31 added the explicit OPEN algorithm
 discriminator and cached whole-component RIBLT profile. Generation 27 replaced the bearer
 locator, directory token and exact-GET proofs with one-block constructions, so
 a generation-26 peer cannot connect at all; generation 28 exports foundations
@@ -1440,8 +1509,8 @@ its `recon/1` stream; generation 30 moves collection sync off `recon/1` onto
 `walk/1` pushes, so a generation-29 peer, which announces and pulls on
 `recon/1`, is refused at the handshake like every older one. Within the ALPN,
 each stream's first byte selects its layout (*One connection per peer*):
-peerings and the grant exchange run on `recon/1`, and every collection tree
-travels on a `walk/1` stream. Bytes that opened earlier layouts are not
+peerings and grant listings run on `recon/1`, and every collection tree and
+every resource's grants travel on `walk/1` streams. Bytes that opened earlier layouts are not
 accepted: `0x0E` was the collection repair session that pushes on `walk/1`
 replaced, `0x0D` its record/AUTH-only predecessor, and `0x06`, `0x07` and
 `0x0C` the DHT operations now under `dht/1`. A stream that opens with one of them is reset as an unknown
@@ -1452,7 +1521,7 @@ tag. Mixed-version collection sync is not supported: deploy a cohort together.
 | `FIND_VALUE` | `dht/1` | `0x0F` | one iterative XOR-DHT lookup step: the K closest verified routes and bounded provider hints for one opaque key |
 | `PROVIDER_PUT` | `dht/1` | `0x06` | renew this endpoint's opaque provider lease; the answer says stored (`0x00`) or not stored (`0x01`) |
 | exact GET | `blob/1` | | locator-addressed, mutual-proof exact bearer transport |
-| push | `walk/1` | | one bidirectional collection-kind delta, pruned by matching prefix commitments |
+| push | `walk/1` | | one bidirectional collection-kind delta, or one resource's grants, pruned by matching prefix commitments |
 
 `FIND_VALUE` answers in one reply what `FIND_NODE` and `PROVIDER_GET` (`0x0C`
 and `0x07`) answered in two rounds. Every `recon/1` frame is listed in *One
@@ -1554,22 +1623,34 @@ work the host already performs. Sampling does not run a probe or advance the
 host's observation clock. For each collection and peer the sample keeps the
 ends of both directions, the pushes of this side's trees and the pushes of
 the peer's trees received here (when the last one ended, whether it ended
-well, and how many did either way), with the roots of the records and
-authorization trees the peer confirmed and the roots that landed whole here.
-Semantic health compares record and AUTH evidence, not blob cache equality:
+well, and how many did either way), with the roots of the record trees the
+peer confirmed and the roots that landed whole here. Grant walks move none of
+these. Semantic health compares records and grant agreement, not blob cache
+equality:
 Demand and Full peers can legitimately cache different bytes, held sets are
 not part of the record root, and the references tree is in neither set of
 roots. Held-set churn neither creates semantic stalls nor extends their
-progress grace. `HealthSnapshot::pair` reads a pair as `Current` when the
-peer confirmed the records and evidence this side serves now, where this side
-sends, and the last push from the peer landed whole, where it receives;
-`Behind` names the direction that is not; and a stale sample, a changed local
-frontier, a withdrawn serving snapshot, an ended peering or no end within the
-age limit leaves it `Unknown`. Receiving records is progress evidence, not
-proof they have already become admitted.
-`HealthSnapshot::peerings` lists every peering on an open connection, and
-`HealthSnapshot::available` the collections named by proofs naming this node
-that wait in memory for their descriptor.
+progress grace. `HealthSnapshot::pair` reads a pair as `Current` when, where
+this side sends, the peer confirmed the records this side serves now and has
+listed its root of C's grants, and, where it receives, the last COMMIT and
+DERIVE pushes from the peer landed whole within the age limit and the peer's
+listed root of C's grants is this side's; `Behind` names the direction that is
+not; and a stale sample, a changed local frontier, a withdrawn serving
+snapshot, an ended peering or no end within the age limit leaves it
+`Unknown`. Grant agreement carries no age: a listing is the peer's standing
+statement for the life of its connection, so two hosts that agree on grants
+stay `Current` without walking them again. Receiving records is progress
+evidence, not proof they have already become admitted.
+`HealthSnapshot::peerings` lists every peering on an open connection.
+`HealthSnapshot::grants` lists, per resource R (every active collection, and
+every R listed to or by a connected peer), this side's grant root and count
+and, per connected peer, its standing listing, the agreement of the last
+confirmed grant walk, its walk ends, and the grants it delivered that were
+skipped, waited for their descriptor, or were walked again after a failure.
+`HealthSnapshot::named_unselected` lists the collections an indexed grant
+names this node on that it does not select: what it was granted and does not
+sync yet. `pile net sync` prints a line per resource and peer while their
+listed roots differ, and once when they agree again.
 
 The long-running CLI can publish these observations as native facts using
 `pile net sync --health`. Reports use the same key as the endpoint. An explicit

@@ -70,8 +70,8 @@ Missing definition blobs must become resident through the separate blob layer;
 repair does not acquire them. The server verifies the TLS client before revealing a
 manifest or PATCH leaf; the publisher itself needs no READ(C). Proofs are
 non-secret authorization certificates. A caller without READ(C) receives no
-collection manifest, PATCH leaf, record, authorization evidence, blob-inventory
-handle, or component root;
+collection manifest, PATCH leaf, record, blob-inventory handle, or component
+root, and it is shown C's grants only if it takes part in C;
 merely knowing C grants no disclosure.
 
 The AUTH inventory recognizes roots from every supported capability-policy
@@ -85,35 +85,44 @@ not substitute for READ(C) unless it actually conveys READ under those roots;
 quorum shares never borrow another action's roots. Capability definition blobs
 are not fetched by repair.
 
-The subordinate-resource transport candidate extends this overlay to proofs
-for R when R's immutable descriptor declares `resource_collection: C` beside
-its own policy bindings on the same entity. R's roots authenticate its proof;
-READ(C) still gates the repair session, without granting any action on R.
-A missing R descriptor defers the proof leaf with explicit incomplete AUTH
-state, while collection-record repair continues. Blob arrival enables retry;
-repair does not fetch R or require a mutable referencing fact in C.
+Grants travel by grant gossip, one passive mechanism for every resource R, a
+collection or not. A grant over R is shown to every node that takes part in R:
+R's roots, the keys named on its delegation-valid grants, and the nodes peered
+for R. Each host keeps one incremental grant index, keyed R | proof hash, of
+the grants whose descriptor and definitions are resident and that start at one
+of R's roots; each connection lists the root of R's grants on `recon/1`
+(GRANT_ROOTS) for every R the peer takes part in, and the two walk R's grants
+on `walk/1` where the roots differ, Prefix only. The receiver skips what it
+cannot use, never failing the walk, holds a grant whose descriptor is missing
+in bounded memory while fetching it, and lands it only once the descriptor
+validates it. Nobody dials on a grant's behalf. The `resource_collection`
+backlink that once routed a resource's proofs as a collection's evidence is
+retired; descriptors that carry it keep it, and nothing reads it.
 
-Each overlay currently owns a repair-collection | proof-hash PATCH whose proof values
-share the raw record's byte ownership. This is a validated membership projection,
-not validation during Pile replay and not a shared global host index. Summaries
-and repair nodes expose only C's fixed prefix; hashes bind the full keys while
-wire keys and compressed paths omit that prefix. The three components are
-pushed on `walk/1` streams under `/triblespace/pile-sync/30`; the old repair
-opcodes `0x0E` and `0x0D` are reset as unknown stream tags. Generation 27
+Each overlay also owns C's authorization evidence, a collection | proof-hash
+PATCH whose proof values share the raw record's byte ownership: the proofs over
+exact C that start at one of C's roots, which admission reads. It is never
+walked. This is a validated membership projection, not validation during Pile
+replay and not a shared global host index. The record trees and, between Full
+neighbours, the held set are pushed on `walk/1` streams under
+`/triblespace/pile-sync/33`; the old repair opcodes `0x0E` and `0x0D` are reset
+as unknown stream tags, and the grant digest kinds `0x02` to `0x05` of
+`recon/1` are skipped as unknown. Generation 27
 changed the blob locator, directory token and exact-GET proofs to one-block
 constructions; generation 28 exports foundations only (COMMIT and DERIVE, never
 MERGE) and syncs each collection's held-blob set; generation 29 replaced
 gossip wakes and repair sessions with one connection per peer and its
 `recon/1` stream; generation 30 moves the trees from pull walks on `recon/1`
-to pushes on `walk/1`. Older peers cannot connect and all nodes switch
-together. No AUTH or collection-repair operation transfers
+to pushes on `walk/1`; generation 33 separates the COMMIT and DERIVE trees and
+replaces the grant digest exchange with grant gossip. Older peers cannot
+connect and all nodes switch together. No AUTH or collection-repair operation transfers
 blob bodies or creates WANT; exact H remains the blob read capability.
 
 DHT provider-directory operations use the ordinary blob-locator namespace,
 KDF(H). There is no separate collection-participant advertisement. Peering
-candidates for C are descriptor policy roots, root/delegate endpoint keys in
-validated scoped AUTH evidence, signers of C's records, and providers of the
-descriptor blob H=C. A descriptor provider may only cache that blob: it is a
+candidates for C are C's participants in the grant index (its descriptor
+policy roots and the keys named on its indexed grants), signers of C's
+records, and providers of the descriptor blob H=C. A descriptor provider may only cache that blob: it is a
 candidate, not a repair source or an authority grant. Each exact-content lease
 carries a token derived from H and the provider endpoint, which a requester
 who knows H verifies before dialing.
@@ -134,16 +143,19 @@ peerings of every collection and the grant exchange, and each push of a
 collection tree opens a `walk/1` stream of its own.
 
 A host asks up to five candidates to peer for each collection it selects:
-grant-chain keys and record signers that pass READ under local evidence, then
-the other grant-chain keys and signers, then DHT providers of the descriptor
-blob H=C, each tier in an order shuffled under a fresh salt. The order is the
+participants and record signers that pass READ under local evidence, then the
+other participants and signers, then DHT providers of the descriptor blob H=C,
+each tier in an order shuffled under a fresh salt. One more place is reserved
+for participants no open connection reaches, so a new grantee is dialled even
+when every neighbour set that could reach it is full; once its holder has been
+peered for a minute it rotates to the next such participant. The order is the
 only retry state. A refusal, a failed dial or an ended peering is replaced by
 the next candidate, and an exhausted order is drawn again at most once a
 minute, which also looks up C's providers again. The acceptor admits a key that
 passes READ for C, or one that sends and passes WRITE.
 
-Each neighbour pushes C's trees, its records and authorization evidence and,
-between two Full neighbours, its held set, on a randomized timer that grows
+Each neighbour pushes C's trees, its COMMIT and DERIVE records and, between two
+Full neighbours, its held set, on a randomized timer that grows
 from two to sixty seconds and that a local append resets. A push walks the
 sender's pinned tree depth first and skips the subtrees the receiver says it
 holds; the receiver asks for the values it lacks and lands them as they
@@ -157,8 +169,8 @@ for none; it still publishes and serves resident exact blobs under bearer
 handle H and services durable `Blob(H)` WANTs through the ordinary KDF(H) path.
 
 Peers come from the pile, never from configuration. The keys that signed a
-selected collection's records and its grant-chain keys are its first
-candidates, and every connection they open puts its peer in the DHT routing
+selected collection's records and its participants in the grant index are its
+first candidates, and every connection they open puts its peer in the DHT routing
 table, through which the collection's other providers are found. A process
 whose pile names no peer, such as a foreground reader, reaches the DHT
 through the pile's sync daemon (`PeerConfig::daemon`): it dials the addresses
@@ -235,7 +247,7 @@ visible without enabling broad packet-level tracing.
 
 ## Crate layout
 
-- `collection_activation` — per-collection record and authorization-evidence PATCHes
+- `collection_activation` — per-collection record PATCHes and the authorization evidence admission reads
 - `walk` / `walk_stream` / `push` / `receive` / `landing` — pushes on `walk/1` streams: their frames, the sender, the receiver and the task that lands their values
 - `patch_repair` — Merkle node summaries and their validation for the walks
 - `peer` — synchronous store wrapper, monotone admission, and local WANT intent
@@ -244,6 +256,6 @@ visible without enabling broad packet-level tracing.
 - `protocol` — public direct-operation framing
 - `host` — immutable overlays, connection table, DHT client, and scheduler
 - `peering` / `schedule` / `wake_schedule` — per-collection peering, the push scheduler and its timer
-- `grants` — the grant exchange on `recon/1`
+- `grants` — grant gossip: the grant index, GRANT_ROOTS listings on `recon/1`, the grant walk's gate and the pending set
 - `transport` — production iroh and deterministic simulation transports
 - `identity` — persistent network signing-key handling

@@ -47,6 +47,14 @@ use crate::transport::PeerId;
 /// Generation 32's combined Records root has different meaning and is refused.
 /// This unreleased generation also removes the redundant cached ROOT key and
 /// uses gated FIN completion for cached RIBLT only; Prefix keeps DONE/LANDED.
+/// It replaces the grant digest exchange with grant gossip by participation:
+/// `recon/1` GRANT_ROOTS lists, for every resource R the peer takes part in,
+/// the root and count of the sender's grants over R, and a grant walk over
+/// any R (the Authorization kind, Prefix only) reconciles them where the
+/// roots differ. A receiver skips the grants it cannot use, never failing the
+/// walk, and lands a kept grant only once R's descriptor is resident and
+/// validates it. The digest kinds `0x02` to `0x05` are skipped as unknown,
+/// and grants are no longer part of a collection's pushes or its root.
 pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/33";
 
 // Stream type tags — first byte on each stream, read before any admission

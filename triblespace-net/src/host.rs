@@ -3,11 +3,14 @@
 //! TLS authenticates endpoint identities, but establishing a transport
 //! connection grants no team or collection authority. Each semantic repair is
 //! one stream admitted from the server's complete local READ(C) closure.
-//! Grants reach their subjects by the grant exchange on `recon/1`
-//! ([`crate::grants`]). DHT routing and provider-directory
+//! Grants gossip by participation: each connection lists on `recon/1` the
+//! grant root of every resource the peer takes part in, and the two walk a
+//! resource's grants where the roots differ ([`crate::grants`]). Nobody dials
+//! on a grant's behalf. DHT routing and provider-directory
 //! operations discover exact blob holders through opaque KDF(H) locators.
-//! Descriptor holders and scoped authority keys are peering candidates
-//! ([`crate::peering`]), never declarations of membership or authority.
+//! Descriptor holders and a collection's participants in the grant index are
+//! peering candidates ([`crate::peering`]), never declarations of membership
+//! or authority.
 
 use std::collections::{BTreeSet, HashSet};
 use std::net::SocketAddr;
