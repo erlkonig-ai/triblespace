@@ -205,10 +205,11 @@ impl BlobStoreGet for ResidentBlobReader {
     }
 }
 
-/// One collection's immutable server overlay.
+/// One collection's immutable server overlay. Grants are walked from the
+/// grant index, Prefix only, so no component cache serves them.
 pub(crate) struct CollectionSnapshot {
     repair: Arc<CollectionRepairOverlay>,
-    caches: [Arc<crate::riblt_cache::Generation>; 4],
+    caches: [Arc<crate::riblt_cache::Generation>; 3],
 }
 
 impl CollectionSnapshot {
@@ -250,9 +251,8 @@ impl CollectionSnapshot {
         };
         let caches = [
             advance(0, WalkKind::Commit)?,
-            advance(1, WalkKind::Authorization)?,
-            advance(2, WalkKind::References)?,
-            advance(3, WalkKind::Derive)?,
+            advance(1, WalkKind::References)?,
+            advance(2, WalkKind::Derive)?,
         ];
         Ok(Self { repair, caches })
     }
@@ -261,9 +261,9 @@ impl CollectionSnapshot {
         use crate::walk::WalkKind;
         self.caches[match kind {
             WalkKind::Commit => 0,
-            WalkKind::Authorization => 1,
-            WalkKind::References => 2,
-            WalkKind::Derive => 3,
+            WalkKind::References => 1,
+            WalkKind::Derive => 2,
+            WalkKind::Authorization => unreachable!("grant walks keep no component cache"),
         }]
         .clone()
     }
@@ -470,6 +470,11 @@ impl StoreSnapshot {
     /// participants.
     pub(crate) fn grants(&self) -> &Arc<GrantIndex> {
         &self.grants
+    }
+
+    /// This node's key.
+    pub(crate) fn local(&self) -> PeerId {
+        self.local.to_bytes()
     }
 
     /// Replicate `full`'s collections in full: their peerings say so, and

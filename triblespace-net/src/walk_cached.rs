@@ -144,6 +144,8 @@ pub(super) async fn drive<T: Transport, S: Service>(
                 Out::Land(events) => {
                     let _ = driver.landing.send((driver.id, events));
                 }
+                // Cached exchanges never walk grants.
+                Out::Pending(_) => {}
                 Out::Fetch(handle) => {
                     let connections = driver.connections.clone();
                     let fetches = fetches.clone();

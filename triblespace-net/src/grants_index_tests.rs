@@ -36,7 +36,7 @@ use crate::patch_repair::PatchSummary;
 /// The retired routing backlink, declared here so an old-shape resource
 /// descriptor can be written. Anchored: anchor and encoding reproduce the
 /// published id 926F34A0A81715F0C44F77C691A42468.
-mod retired {
+pub(crate) mod retired {
     use triblespace_core::macros::attributes;
     use triblespace_core::prelude::*;
 
@@ -48,22 +48,22 @@ mod retired {
 /// Tag of the test's non-collection resource descriptors, standing in for a
 /// Secrets version. Minted with `trible genid` on 2026-10-19 for the grant
 /// gossip scenarios and reused here.
-const KIND_TEST_RESOURCE: Id = id_hex!("6F0A88AB3F0B3C732CB85805DA09D148");
+pub(crate) const KIND_TEST_RESOURCE: Id = id_hex!("6F0A88AB3F0B3C732CB85805DA09D148");
 /// The action the test definitions grant. Minted with `trible genid` on
 /// 2026-10-19 for the grant gossip scenarios and reused here.
-const ACTION_TEST_DELIVER: Id = id_hex!("5766257B997431DDEC2AC40CC3E3B682");
+pub(crate) const ACTION_TEST_DELIVER: Id = id_hex!("5766257B997431DDEC2AC40CC3E3B682");
 
-fn key(byte: u8) -> SigningKey {
+pub(crate) fn key(byte: u8) -> SigningKey {
     SigningKey::from_bytes(&[byte; 32])
 }
 
-fn id(key: &SigningKey) -> [u8; 32] {
+pub(crate) fn id(key: &SigningKey) -> [u8; 32] {
     key.verifying_key().to_bytes()
 }
 
 /// A definition that invokes the test action and, when `delegable`, may
 /// delegate it.
-fn deliver(delegable: bool) -> TribleSet {
+pub(crate) fn deliver(delegable: bool) -> TribleSet {
     if delegable {
         entity! {
             capability_action: ACTION_TEST_DELIVER,
@@ -81,14 +81,14 @@ fn empty_definition() -> TribleSet {
     entity! { metadata::name: "names no action" }.facts().clone()
 }
 
-fn handle_of(facts: &TribleSet) -> CapabilityHandle {
+pub(crate) fn handle_of(facts: &TribleSet) -> CapabilityHandle {
     use triblespace_core::blob::IntoBlob;
     IntoBlob::<SimpleArchive>::to_blob(facts.clone()).get_handle()
 }
 
 /// A Secrets-shaped resource descriptor: one entity tagged with the test
 /// kind, not a collection, with one direct binding per `(root, definition)`.
-fn resource(bindings: &[(&SigningKey, CapabilityHandle)], label: &str) -> TribleSet {
+pub(crate) fn resource(bindings: &[(&SigningKey, CapabilityHandle)], label: &str) -> TribleSet {
     let entity = triblespace_core::id::rngid();
     let mut facts = entity! { &entity @
         metadata::tag: KIND_TEST_RESOURCE,
@@ -109,7 +109,7 @@ fn labelled(label: &str) -> TribleSet {
         .clone()
 }
 
-fn grant(
+pub(crate) fn grant(
     over: CollectionHandle,
     issuer: &SigningKey,
     definition: CapabilityHandle,

@@ -16,12 +16,7 @@ fn default_two_way_walks_use_cached_riblt_and_explicit_prefix_still_works() {
     let mut walks = Walks::new(local.health.clone());
     walks.observe(local.snapshot());
 
-    for kind in [
-        WalkKind::Commit,
-        WalkKind::Derive,
-        WalkKind::Authorization,
-        WalkKind::References,
-    ] {
+    for kind in [WalkKind::Commit, WalkKind::Derive, WalkKind::References] {
         assert_eq!(
             walks
                 .start(peer.id(), collection, kind)
@@ -40,6 +35,25 @@ fn default_two_way_walks_use_cached_riblt_and_explicit_prefix_still_works() {
             );
         }
     }
+
+    // Grant walks are Prefix only, whatever the default or the request.
+    assert_eq!(
+        walks
+            .start(peer.id(), collection, WalkKind::Authorization)
+            .unwrap()
+            .algorithm(),
+        Algorithm::Prefix,
+    );
+    assert!(
+        walks
+            .start_selected(
+                peer.id(),
+                collection,
+                WalkKind::Authorization,
+                Some(Algorithm::CachedRiblt),
+            )
+            .is_none()
+    );
 
     let prefix = walks.with_algorithm(Algorithm::Prefix);
     assert_eq!(
@@ -80,12 +94,8 @@ fn default_one_way_walks_use_prefix_without_disclosing_receive_only_holdings() {
         let mut walks = Walks::new(local.health.clone());
         walks.observe(local.snapshot());
 
-        for kind in [
-            WalkKind::Commit,
-            WalkKind::Derive,
-            WalkKind::Authorization,
-            WalkKind::References,
-        ] {
+        // Grant walks always receive (grant_walk_tests).
+        for kind in [WalkKind::Commit, WalkKind::Derive, WalkKind::References] {
             assert!(
                 walks
                     .start_selected(peer.id(), collection, kind, Some(Algorithm::CachedRiblt))

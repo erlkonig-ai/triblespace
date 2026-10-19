@@ -237,7 +237,7 @@ fn riblt_cache_collection_and_component_profiles_do_not_reuse_each_other() {
 }
 
 #[test]
-fn riblt_cache_typed_records_and_authorization_suffixes_match_upstream() {
+fn riblt_cache_typed_records_match_upstream() {
     let mut node = Node::new(81);
     let collection = node.hold("riblt-independent-cache", open());
     for number in 0..16 {
@@ -248,32 +248,6 @@ fn riblt_cache_typed_records_and_authorization_suffixes_match_upstream() {
     let generation = Generation::advance(collection, WalkKind::Commit, records, None).unwrap();
     assert_eq!(generation.summary().leaf_count(), 16);
     exact_prefix(&generation, 2049);
-
-    let root = SigningKey::from_bytes(&[82; 32]);
-    let mut patch = PATCH::new();
-    for number in 83..91 {
-        let delegate = SigningKey::from_bytes(&[number; 32]);
-        let proof = CapabilityProof::new(
-            CapabilityResource::new(collection.raw),
-            &root,
-            read_capability(),
-            delegate.verifying_key(),
-        );
-        let mut key = [0; 64];
-        key[..32].copy_from_slice(&collection.raw);
-        key[32..].copy_from_slice(&proof.id().raw);
-        patch.insert(&Entry::with_value(&key, proof));
-    }
-    let authorization = Generation::advance(
-        collection,
-        WalkKind::Authorization,
-        Tree::Authorization(collection, patch),
-        None,
-    )
-    .unwrap();
-    assert_eq!(authorization.summary().leaf_count(), 8);
-    assert_ne!(authorization.key(), generation.key());
-    exact_prefix(&authorization, 2049);
 }
 
 #[test]
@@ -340,12 +314,7 @@ fn riblt_cache_snapshot_constructor_tracks_authored_and_inserted_record_deltas()
     )
     .unwrap();
     let unchanged = third.collection(collection).unwrap();
-    for kind in [
-        WalkKind::Commit,
-        WalkKind::Derive,
-        WalkKind::Authorization,
-        WalkKind::References,
-    ] {
+    for kind in [WalkKind::Commit, WalkKind::Derive, WalkKind::References] {
         assert!(Arc::ptr_eq(&new_pin.cache(kind), &unchanged.cache(kind)));
     }
 }

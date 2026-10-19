@@ -142,8 +142,6 @@ fn typed_structural_views_cannot_bypass_foreign_kind_signature_or_identity_check
     let mut node = Node::new(196);
     let c = node.hold("typed-ingress", open());
     node.observe();
-    let pin = node.pinned(c);
-    let evidence = pin.repair().authorization_evidence();
     let commit = CollectionRecord::Commit(CollectionCommit::sign(&node.key, c,
         Inline::new([44; 32]), Inline::new([45; 32])));
     let derive = CollectionRecord::Derive(CollectionDerive::sign(&node.key, c,
@@ -152,21 +150,21 @@ fn typed_structural_views_cannot_bypass_foreign_kind_signature_or_identity_check
         (WalkKind::Derive, WalkKind::Commit, derive)] {
         let key = record.fingerprint().raw();
         let bytes = record.to_bytes();
-        assert!(admit_value(kind, c, key, &bytes, evidence).is_ok());
-        assert!(admit_value(wrong_kind, c, key, &bytes, evidence).is_err());
-        assert!(admit_value(kind, Inline::new([99; 32]), key, &bytes, evidence).is_err());
-        assert!(admit_value(kind, c, [0; 32], &bytes, evidence).is_err());
-        assert!(admit_value(kind, c, key, &bytes[..192], evidence).is_err());
+        assert!(admit_value(kind, c, key, &bytes).is_ok());
+        assert!(admit_value(wrong_kind, c, key, &bytes).is_err());
+        assert!(admit_value(kind, Inline::new([99; 32]), key, &bytes).is_err());
+        assert!(admit_value(kind, c, [0; 32], &bytes).is_err());
+        assert!(admit_value(kind, c, key, &bytes[..192]).is_err());
         let mut trailing = bytes.clone(); trailing.push(0);
-        assert!(admit_value(kind, c, key, &trailing, evidence).is_err());
+        assert!(admit_value(kind, c, key, &trailing).is_err());
         let mut invalid = bytes.clone(); *invalid.last_mut().unwrap() ^= 1;
-        assert!(admit_value(kind, c, key, &invalid, evidence).is_err());
+        assert!(admit_value(kind, c, key, &invalid).is_err());
     }
     let mut invalid = commit.to_bytes(); *invalid.last_mut().unwrap() ^= 1;
     let structural = anybytes::Bytes::from_source(invalid.to_vec())
         .view::<EncodedCommit>().unwrap();
     assert!(structural.to_record().is_err());
-    assert!(admit_value(WalkKind::Commit, c, structural.fingerprint().raw(), &invalid, evidence).is_err());
+    assert!(admit_value(WalkKind::Commit, c, structural.fingerprint().raw(), &invalid).is_err());
 }
 
 #[test]

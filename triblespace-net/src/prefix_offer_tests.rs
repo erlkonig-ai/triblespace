@@ -45,6 +45,7 @@ impl Side {
                 Out::Land(events) if self.hold => self.held.push(events),
                 Out::Land(events) => self.land(events),
                 Out::Fetch(_) => panic!("records need no fetch"),
+                Out::Pending(_) => panic!("records are never pending"),
             }
         }
     }

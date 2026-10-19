@@ -11,12 +11,14 @@
 //! for a peer when a connection to it closes, and for a collection when it
 //! is deselected; none is persisted.
 //!
-//! The kinds of tree are the collection's records, its authorization
-//! evidence (keyed by proof id under the collection) and the blobs it holds,
-//! as handles without values: a held reference a side lacks is noted held
-//! when the blob is resident, and fetched by hash from the peer first
-//! otherwise. A record lands as it is; a proof lands once it validates as
-//! the collection's evidence, and fails the exchange otherwise.
+//! The kinds of tree are the collection's records and the blobs it holds, as
+//! handles without values, and the grants over any resource R (keyed by
+//! proof id under R) from the grant index: a held reference a side lacks is
+//! noted held when the blob is resident, and fetched by hash from the peer
+//! first otherwise. A record lands as it is. A grant walk is Prefix only and
+//! keeps no agreement; it is sent to a participant of R and always
+//! received, and a received grant goes through [`crate::grants::Gate`]:
+//! what this side does not keep is skipped, never failed.
 //!
 //! The walks task runs one node's exchanges. Either side opens the stream
 //! when its timer fires ([`crate::schedule`]), on the current connection to
@@ -53,7 +55,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tracing::debug;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::Blob;
-use triblespace_core::capability::{CapabilityProof, CapabilityProofId, QuorumOutcome};
+use triblespace_core::capability::{CapabilityProof, QuorumOutcome};
 use triblespace_core::collection::{
     CollectionHandle, CollectionRecordView, EncodedCommit, EncodedDerive,
 };
@@ -63,7 +65,7 @@ use triblespace_core::patch::{Blake3Merkle, Entry, IdentitySchema, PATCH};
 
 use crate::channel::NetEvent;
 use crate::clock::Mono;
-use crate::collection_activation::{CollectionAuthorizationEvidencePatch, CollectionRepairOverlay};
+use crate::collection_activation::CollectionRepairOverlay;
 use crate::collection_delta::decode_record;
 #[cfg(test)]
 use crate::collection_delta::encode_record;
@@ -71,7 +73,7 @@ use crate::connection::{
     ConnectionTable, FrameError, RESET_WALK_DUPLICATE, RESET_WALK_FAILED, RESET_WALK_REFUSED,
     Service, open_walk, read_frame, write_frame,
 };
-use crate::exchange::{Ended, Exchange, Out, Outcome, Tree};
+use crate::exchange::{Ended, Exchange, Out, Outcome, Pinned, Tree};
 use crate::health::Health;
 use crate::host::{CollectionSnapshot, StoreSnapshot};
 use crate::landing::{LandSlot, Landed};
@@ -95,7 +97,7 @@ pub(crate) enum WalkKind {
     Commit,
     /// The collection's signed DERIVE foundations.
     Derive,
-    /// Its authorization evidence, keyed by proof id under the collection.
+    /// The grants over a resource R, keyed by proof id under R.
     Authorization,
     /// The blobs it holds, as handles without values.
     References,
@@ -252,6 +254,19 @@ impl Walks {
         kind: WalkKind,
         requested: Option<crate::walk_stream::Algorithm>,
     ) -> Option<Exchange> {
+        if kind == WalkKind::Authorization {
+            if requested == Some(crate::walk_stream::Algorithm::CachedRiblt) {
+                return None;
+            }
+            let (pinned, peered) = self.grant_pin(peer, collection)?;
+            let sends = self.participates(peer, collection, peered);
+            let exchange = if sends {
+                Exchange::start(collection, kind, pinned, None, true, true)
+            } else {
+                Exchange::start_one_way(collection, kind, pinned, None, false, true)
+            };
+            return Some(exchange.peered(peered));
+        }
         self.selected.get(&collection.raw)?;
         let pinned = self.local(collection)?;
         let sends = self.sends(peer, &pinned);
@@ -291,6 +306,26 @@ impl Walks {
         offer: Option<crate::walk_stream::OfferRole>,
     ) -> Option<Exchange> {
         use crate::walk_stream::{Algorithm, OfferRole};
+        if kind == WalkKind::Authorization {
+            // Prefix only. The opener's role decides the direction: an
+            // opener that only receives is joined by a sender, or refused.
+            if algorithm != Algorithm::Prefix {
+                return None;
+            }
+            let (pinned, peered) = self.grant_pin(peer, collection)?;
+            let sends = self.participates(peer, collection, peered);
+            let exchange = match offer {
+                None => Exchange::start(collection, kind, pinned, None, sends, true),
+                Some(OfferRole::Send) => {
+                    Exchange::start_one_way(collection, kind, pinned, None, false, true)
+                }
+                Some(OfferRole::Receive) if sends => {
+                    Exchange::start_one_way(collection, kind, pinned, None, true, false)
+                }
+                Some(OfferRole::Receive) => return None,
+            };
+            return Some(exchange.peered(peered));
+        }
         self.selected.get(&collection.raw)?;
         let pinned = self.local(collection)?;
         let sends = self.sends(peer, &pinned);
@@ -346,11 +381,20 @@ impl Walks {
             .as_ref()
             .map_or(ended.root, |agreed| agreed.summary());
         self.health.with_peer(collection, peer, |health| {
-            if ended.sends {
-                health.pushed(now, kind, confirmed, ended.confirmed)
-            }
-            if ended.receives {
-                health.received(now, kind, ended.peer_root, ended.landed)
+            // A grant walk is no push or receive of the collection (D5): it
+            // moves no counter. Until health reads grant agreement from the
+            // listings, it still keeps the AUTH roots and receive completion.
+            if kind == WalkKind::Authorization {
+                if ended.receives {
+                    health.grants_received(now, ended.peer_root, ended.landed);
+                }
+            } else {
+                if ended.sends {
+                    health.pushed(now, kind, confirmed, ended.confirmed)
+                }
+                if ended.receives {
+                    health.received(now, kind, ended.peer_root, ended.landed)
+                }
             }
             // Directional end counters are LANDED/gated-FIN receipts. This diagnostic
             // root, unlike those counters, exists only with shared agreement.
@@ -366,10 +410,15 @@ impl Walks {
             self.agreed.remove(&key);
             return false;
         };
-        let moved = ended.sends
-            && self
+        let current = match kind {
+            WalkKind::Authorization => self
+                .grant_pin(peer, collection)
+                .map(|(pinned, _)| pinned.tree(kind)),
+            _ => self
                 .local(collection)
-                .is_some_and(|current| agreed.has_new_keys(&Tree::pinned(kind, current.repair())));
+                .map(|current| Tree::pinned(kind, current.repair())),
+        };
+        let moved = ended.sends && current.is_some_and(|current| agreed.has_new_keys(&current));
         // The key stays constant across exchanges; replace must publish the
         // new attached tree even though PATCH set equality observes keys only.
         if ended.retain_agreement {
@@ -442,6 +491,40 @@ impl Walks {
         self.snapshot.as_ref()?.collection(collection)
     }
 
+    /// R's grants from the latest grant index, empty when R has no entry
+    /// here, and whether the link to `peer` is peered for R.
+    fn grant_pin(&self, peer: PeerId, resource: CollectionHandle) -> Option<(Pinned, bool)> {
+        let grants = self
+            .snapshot
+            .as_ref()?
+            .grants()
+            .grants(resource)
+            .unwrap_or_default();
+        Some((Pinned::Grants(resource, grants), self.peered(peer, resource)))
+    }
+
+    /// Whether an active peering with `peer` for R exists. Merely asking
+    /// does not count.
+    fn peered(&self, peer: PeerId, resource: CollectionHandle) -> bool {
+        let mut peered = false;
+        self.health.update(|health| {
+            peered = health.peerings.iter().any(|peering| {
+                peering.collection == resource && peering.peer == peer && peering.peered
+            });
+        });
+        peered
+    }
+
+    /// Whether `peer` takes part in R as this side sees it: a root of R, a
+    /// key named on a delegation-valid grant over R, or peered for R here.
+    fn participates(&self, peer: PeerId, resource: CollectionHandle, peered: bool) -> bool {
+        peered
+            || self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.grants().participates(resource, peer))
+    }
+
     /// Whether this side sends C to `peer`: an active peering's directional
     /// flag, otherwise READ admission under the pinned evidence.
     fn sends(&self, peer: PeerId, pinned: &CollectionSnapshot) -> bool {
@@ -506,6 +589,10 @@ pub(crate) enum Admit {
     /// A held reference that could not be fetched: the exchange does not
     /// confirm, and the blob stays in the next delta.
     Fail,
+    /// A grant this side does not keep: accounted for, never agreed.
+    Skip([u8; KEY_BYTES]),
+    /// A kept grant whose resource descriptor is not resident here.
+    Pending(CapabilityProof),
 }
 
 /// The value under a key of one kind's tree.
@@ -539,16 +626,15 @@ impl Value {
     }
 }
 
-/// Check the value under `key` of a `kind` exchange of C against `evidence`
-/// (design 2.5): the value, and what to do with it. A record lands; a proof
-/// lands once it validates as C's evidence. Held references carry no
-/// values.
+/// Check the value under `key` of a `kind` exchange of C (design 2.5): the
+/// value, and what to do with it. A record lands. Grants go through their
+/// walk's gate ([`crate::grants::Gate`]) once [`decode_proof`] read them.
+/// Held references carry no values.
 pub(crate) fn admit_value(
     kind: WalkKind,
     collection: CollectionHandle,
     key: [u8; KEY_BYTES],
     bytes: &[u8],
-    evidence: &CollectionAuthorizationEvidencePatch,
 ) -> anyhow::Result<(Value, Admit)> {
     match kind {
         WalkKind::Commit | WalkKind::Derive => {
@@ -566,20 +652,19 @@ pub(crate) fn admit_value(
                 Admit::Land(vec![NetEvent::CollectionRecord(record)]),
             ))
         }
-        WalkKind::Authorization => {
-            let proof = CapabilityProof::from_bytes(bytes)?;
-            if proof.id().raw != key {
-                bail!("a proof under another proof's key");
-            }
-            proof.verify_signatures()?;
-            evidence.validate_proof(&proof)?;
-            Ok((
-                Value::Proof(proof.clone()),
-                Admit::Land(vec![NetEvent::CapabilityProof(proof)]),
-            ))
-        }
+        WalkKind::Authorization => bail!("grants are admitted by their walk's gate"),
         WalkKind::References => bail!("held references carry no values"),
     }
+}
+
+/// The proof a grant walk's VALUE carries under `key`: bytes that are no
+/// proof, or a proof under another proof's id, violate the walk.
+pub(crate) fn decode_proof(key: [u8; KEY_BYTES], bytes: &[u8]) -> anyhow::Result<CapabilityProof> {
+    let proof = CapabilityProof::from_bytes(bytes)?;
+    if proof.id().raw != key {
+        bail!("a proof under another proof's key");
+    }
+    Ok(proof)
 }
 
 /// What a leaf of a `kind` exchange of C that the local store lacks needs. A
@@ -635,7 +720,7 @@ pub(crate) fn summary(kind: WalkKind, overlay: &CollectionRepairOverlay) -> Patc
     match kind {
         WalkKind::Commit => PatchSummary::from_patch(overlay.records().commits()),
         WalkKind::Derive => PatchSummary::from_patch(overlay.records().derives()),
-        WalkKind::Authorization => overlay.authorization_evidence().summary(),
+        WalkKind::Authorization => unreachable!("grants are pinned from the grant index"),
         WalkKind::References => PatchSummary::from_patch(overlay.blob_inventory()),
     }
 }
@@ -651,7 +736,7 @@ pub(crate) fn local_summary(
     match kind {
         WalkKind::Commit => node_summary(overlay.records().commits(), prefix),
         WalkKind::Derive => node_summary(overlay.records().derives(), prefix),
-        WalkKind::Authorization => overlay.authorization_evidence().prefix_summary(prefix),
+        WalkKind::Authorization => unreachable!("grants are pinned from the grant index"),
         WalkKind::References => node_summary(overlay.blob_inventory(), prefix),
     }
 }
@@ -680,12 +765,7 @@ pub(crate) fn node(
         WalkKind::Derive => {
             patch_node_response(overlay.records().derives(), &[], prefix, |_, _| Ok(()))
         }
-        WalkKind::Authorization => patch_node_response(
-            overlay.authorization_evidence().patch(),
-            &overlay.collection().raw,
-            prefix,
-            |_, _| Ok(()),
-        ),
+        WalkKind::Authorization => unreachable!("grants are pinned from the grant index"),
         WalkKind::References => {
             patch_node_response(overlay.blob_inventory(), &[], prefix, |_, _| Ok(()))
         }
@@ -705,11 +785,7 @@ pub(crate) fn value(
     match kind {
         WalkKind::Commit => overlay.records().commits().get(&key).cloned().map(Value::Commit),
         WalkKind::Derive => overlay.records().derives().get(&key).cloned().map(Value::Derive),
-        WalkKind::Authorization => overlay
-            .authorization_evidence()
-            .get(CapabilityProofId::new(key))
-            .cloned()
-            .map(Value::Proof),
+        WalkKind::Authorization => unreachable!("grants are pinned from the grant index"),
         WalkKind::References => overlay
             .blob_inventory()
             .get(&key)
@@ -907,8 +983,10 @@ impl<T: Transport, S: Service> Task<T, S> {
         self.walks.observe(snapshot);
         // Dropping the replacement sender retires drivers admitted under
         // a selection that no longer exists. Their queued ends are stale.
-        self.running
-            .retain(|(_, collection, _), _| self.walks.selected.get(collection).is_some());
+        // Grant walks are not bound to a selection.
+        self.running.retain(|(_, collection, kind), _| {
+            *kind == WalkKind::Authorization || self.walks.selected.get(collection).is_some()
+        });
     }
 
     fn command(&mut self, command: Command) {
@@ -1345,6 +1423,9 @@ async fn drive<T: Transport, S: Service>(
                 Out::Land(events) => {
                     let _ = driver.landing.send((driver.id, events));
                 }
+                // Never landed unchecked: dropped, and offered again by the
+                // next walk, which keeps no agreement.
+                Out::Pending(_) => {}
                 Out::Fetch(handle) => {
                     let connections = driver.connections.clone();
                     let fetches = fetches.clone();
@@ -1577,6 +1658,10 @@ mod walk_default_tests;
 #[cfg(test)]
 #[path = "prefix_role_tests.rs"]
 mod prefix_role_tests;
+
+#[cfg(test)]
+#[path = "grant_walk_tests.rs"]
+mod grant_walk_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {

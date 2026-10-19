@@ -415,6 +415,90 @@ fn judge<R: BlobStoreGet>(
     Verdict::Indexed(resource)
 }
 
+/// The receiving side of one grant walk over R: which received proofs it
+/// keeps and whether a kept one lands now (design: grants gossip by
+/// participation).
+///
+/// A proof is kept when a prefix names this node, this node takes part in R,
+/// or the link is peered for R; a proof over another resource or with a bad
+/// signature is not. A kept proof lands once R's descriptor is resident and
+/// the proof starts at one of R's roots; delegation is the index's concern,
+/// not landing's. One whose descriptor is not resident is pending. Whatever
+/// is not kept is skipped: it neither fails the walk nor records anything.
+pub(crate) struct Gate {
+    resource: CollectionHandle,
+    /// The walk's link is peered for R.
+    peered: bool,
+    /// R's grant policies, read once from its resident descriptor; empty
+    /// when that blob is no readable descriptor.
+    policies: Option<Vec<AdmissionPolicy>>,
+}
+
+/// What a grant walk does with a received proof.
+#[derive(Debug)]
+pub(crate) enum Gated {
+    Land(CapabilityProof),
+    Pending(CapabilityProof),
+    Skip,
+}
+
+impl Gate {
+    pub(crate) fn new(resource: CollectionHandle, peered: bool) -> Self {
+        Self {
+            resource,
+            peered,
+            policies: None,
+        }
+    }
+
+    /// Judge one decoded proof against the latest serving observation.
+    pub(crate) fn admit(&mut self, snapshot: &StoreSnapshot, proof: CapabilityProof) -> Gated {
+        if proof.resource().into_bytes() != self.resource.raw || proof.verify_signatures().is_err() {
+            return Gated::Skip;
+        }
+        let local = snapshot.local();
+        let named = proof
+            .prefixes()
+            .any(|prefix| prefix.subject().to_bytes() == local);
+        if !named && !self.peered && !snapshot.grants().participates(self.resource, local) {
+            return Gated::Skip;
+        }
+        let resource = self.resource;
+        let Some(policies) = self.policies(snapshot) else {
+            return Gated::Pending(proof);
+        };
+        match validate_proof_for_policies(resource, policies.iter().cloned(), &proof) {
+            Ok(()) => Gated::Land(proof),
+            Err(_) => Gated::Skip,
+        }
+    }
+
+    /// R's grant policies, once its descriptor is resident.
+    fn policies(&mut self, snapshot: &StoreSnapshot) -> Option<&[AdmissionPolicy]> {
+        if self.policies.is_none() {
+            let bytes = snapshot.get_blob(&self.resource.raw)?;
+            self.policies = Some(descriptor_policies(bytes, self.resource));
+        }
+        self.policies.as_deref()
+    }
+}
+
+/// The grant policies of a resident descriptor: none for a blob larger than
+/// any descriptor this node fetches, or one that does not read as an
+/// archive.
+pub(crate) fn descriptor_policies(
+    bytes: anybytes::Bytes,
+    resource: CollectionHandle,
+) -> Vec<AdmissionPolicy> {
+    if bytes.len() as u64 > METADATA_BLOB_BYTES {
+        return Vec::new();
+    }
+    Blob::<SimpleArchive>::with_handle(bytes, Inline::new(resource.raw))
+        .try_from_blob::<TribleSet>()
+        .map(|facts| resource_grant_policies(&facts).collect())
+        .unwrap_or_default()
+}
+
 fn grant_key(resource: CollectionHandle, id: CapabilityProofId) -> [u8; 64] {
     let mut key = [0; 64];
     key[..32].copy_from_slice(&resource.raw);

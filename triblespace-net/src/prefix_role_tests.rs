@@ -54,7 +54,9 @@ fn prefix_offer_open_role_mismatch_refused_and_pull_never_infers_eager() {
         } else {
             OfferRole::Send
         };
-        for kind in [WalkKind::Commit, WalkKind::Authorization] {
+        // Grant walks choose their direction by participation instead
+        // (grant_walk_tests).
+        for kind in [WalkKind::Commit, WalkKind::Derive] {
             let outgoing = local.walks.start(peer.id(), collection, kind).unwrap();
             assert_eq!(outgoing.offer_role(), Some(wrong));
             assert!(

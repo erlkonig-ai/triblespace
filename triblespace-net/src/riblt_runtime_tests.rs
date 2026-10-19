@@ -218,7 +218,6 @@ fn riblt_runtime_large_source_summaries_do_not_impose_a_small_absolute_n_limit()
     for kind in [
         WalkKind::Commit,
         WalkKind::Derive,
-        WalkKind::Authorization,
         WalkKind::References,
     ] {
         let cache = local.pinned(collection).cache(kind);

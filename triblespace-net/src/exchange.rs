@@ -50,7 +50,7 @@ use std::sync::Arc;
 
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::encodings::UnknownBlob;
-use triblespace_core::capability::CapabilityProof;
+use triblespace_core::capability::{CapabilityProof, CapabilityProofId};
 use triblespace_core::collection::CollectionHandle;
 #[cfg(test)]
 use triblespace_core::collection::CollectionRecord;
@@ -58,6 +58,7 @@ use triblespace_core::patch::{Blake3Merkle, Entry, IdentitySchema, PATCH, PatchH
 
 use crate::channel::NetEvent;
 use crate::collection_activation::CollectionRepairOverlay;
+use crate::grants::{Gate, Gated, ResourceGrants};
 use crate::host::{CollectionSnapshot, StoreSnapshot};
 use crate::patch_repair::PatchSummary;
 use crate::protocol::RawHash;
@@ -65,7 +66,7 @@ use crate::riblt_cache::{CacheError, Cell, Generation, KeySymbol, MAX_CELLS};
 use crate::riblt_decode::{DecodeError, ResidualDecoder};
 use crate::walk::{
     Admit, KEY_BYTES, MAX_WALK_REQUESTS, MAX_WALK_UNLANDED, Value, WalkKind, admit_fetched,
-    admit_missing, admit_value, node_summary, summary, value,
+    admit_missing, admit_value, decode_proof, node_summary, value,
 };
 use crate::walk_stream::Algorithm;
 use crate::walk_stream::Frame;
@@ -108,15 +109,15 @@ pub(crate) enum Tree {
 }
 
 impl Tree {
-    /// The `kind` tree of `overlay`, shared with it.
+    /// The `kind` tree of `overlay`, shared with it. Grants are no
+    /// collection component: their tree is pinned from the grant index
+    /// ([`Pinned::Grants`]), and a collection's authorization evidence is
+    /// admission input only, never walked.
     pub(crate) fn pinned(kind: WalkKind, overlay: &CollectionRepairOverlay) -> Self {
         match kind {
             WalkKind::Commit => Self::Commit(overlay.records().commits().clone()),
             WalkKind::Derive => Self::Derive(overlay.records().derives().clone()),
-            WalkKind::Authorization => Self::Authorization(
-                overlay.collection(),
-                overlay.authorization_evidence().patch().clone(),
-            ),
+            WalkKind::Authorization => unreachable!("grants are pinned from the grant index"),
             WalkKind::References => Self::References(overlay.blob_inventory().clone()),
         }
     }
@@ -348,6 +349,34 @@ fn empty() -> PatchSummary {
     PatchSummary::new(None, 0).expect("the empty summary is canonical")
 }
 
+/// What an exchange pins: a collection's serving overlay, or the grants over
+/// one resource R from the grant index, empty when R has no entry here.
+#[derive(Clone)]
+pub(crate) enum Pinned {
+    Collection(Arc<CollectionSnapshot>),
+    Grants(CollectionHandle, Arc<ResourceGrants>),
+}
+
+impl From<Arc<CollectionSnapshot>> for Pinned {
+    fn from(snapshot: Arc<CollectionSnapshot>) -> Self {
+        Self::Collection(snapshot)
+    }
+}
+
+impl Pinned {
+    /// The pinned `kind` tree. A grant pin is walked as the Authorization
+    /// tree only.
+    pub(crate) fn tree(&self, kind: WalkKind) -> Tree {
+        match self {
+            Self::Collection(snapshot) => Tree::pinned(kind, snapshot.repair()),
+            Self::Grants(resource, grants) => {
+                assert_eq!(kind, WalkKind::Authorization, "a grant pin holds grants");
+                Tree::Authorization(*resource, grants.proofs.clone())
+            }
+        }
+    }
+}
+
 /// What an exchange asks of its driver.
 #[derive(Debug)]
 pub(crate) enum Out {
@@ -355,6 +384,9 @@ pub(crate) enum Out {
     Land(Vec<NetEvent>),
     /// Fetch a held reference by hash from the peer.
     Fetch(RawHash),
+    /// A kept grant whose resource descriptor is not resident here: it is
+    /// never landed unchecked.
+    Pending(CapabilityProof),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -420,7 +452,12 @@ pub(crate) struct Exchange {
     offers: Option<Offers>,
     collection: CollectionHandle,
     kind: WalkKind,
-    pinned: Arc<CollectionSnapshot>,
+    pinned: Pinned,
+    /// What a grant walk keeps of what it receives.
+    gate: Option<Gate>,
+    /// Peer keys accounted for but not kept here: skipped, or pending. They
+    /// are never part of the agreement.
+    excluded: PATCH<KEY_BYTES, IdentitySchema, ()>,
     sends: bool,
     receives: bool,
     agreed: Option<Arc<Tree>>,
@@ -472,12 +509,14 @@ impl Exchange {
     pub(crate) fn start(
         collection: CollectionHandle,
         kind: WalkKind,
-        pinned: Arc<CollectionSnapshot>,
+        pinned: impl Into<Pinned>,
         agreed: Option<Arc<Tree>>,
         sends: bool,
         receives: bool,
     ) -> Self {
-        let mine = Tree::pinned(kind, pinned.repair());
+        let pinned = pinned.into();
+        let mine = pinned.tree(kind);
+        let gate = matches!(pinned, Pinned::Grants(..)).then(|| Gate::new(collection, false));
         let delta = if sends {
             agreed
                 .as_ref()
@@ -491,6 +530,8 @@ impl Exchange {
             collection,
             kind,
             pinned,
+            gate,
+            excluded: PATCH::new(),
             sends,
             receives,
             agreed,
@@ -520,7 +561,7 @@ impl Exchange {
     pub(crate) fn start_one_way(
         collection: CollectionHandle,
         kind: WalkKind,
-        pinned: Arc<CollectionSnapshot>,
+        pinned: impl Into<Pinned>,
         agreed: Option<Arc<Tree>>,
         sends: bool,
         receives: bool,
@@ -538,6 +579,7 @@ impl Exchange {
         kind: WalkKind,
         pinned: Arc<CollectionSnapshot>,
     ) -> Self {
+        assert_ne!(kind, WalkKind::Authorization, "grant walks are Prefix only");
         let cache = pinned.cache(kind);
         let mut exchange = Self::start(collection, kind, pinned, None, true, true);
         // Full component, never the per-neighbour agreement difference G.
@@ -557,6 +599,14 @@ impl Exchange {
             eager: 0,
         });
         exchange
+    }
+
+    /// A grant walk on a link peered for R keeps what it receives over R.
+    pub(crate) fn peered(mut self, peered: bool) -> Self {
+        if peered {
+            self.gate = Some(Gate::new(self.collection, true));
+        }
+        self
     }
 
     pub(crate) fn algorithm(&self) -> Algorithm {
@@ -850,7 +900,13 @@ impl Exchange {
 
     pub(crate) fn end(self) -> Ended {
         let confirmed = self.outcome == Some(Outcome::Confirmed);
-        let next = confirmed.then(|| self.union_tree());
+        let next = confirmed.then(|| {
+            let mut union = self.union_tree();
+            for key in self.excluded.iter() {
+                union.remove(*key);
+            }
+            union
+        });
         let peer_root = self.peer_root.map(|_| {
             let mut peer = self
                 .agreed
@@ -865,9 +921,13 @@ impl Exchange {
             receives: self.receives,
             confirmed: self.landed_received,
             landed: self.landed_sent,
-            root: summary(self.kind, self.pinned.repair()),
+            root: self.pinned.tree(self.kind).summary(),
             peer_root,
-            retain_agreement: self.riblt.is_none(),
+            // A grant walk keeps no agreement: a key one side skipped or
+            // holds pending would otherwise never be offered again on this
+            // connection. Grant walks open only on a root mismatch, and
+            // equal subtrees still prune.
+            retain_agreement: self.riblt.is_none() && self.kind != WalkKind::Authorization,
             agreed: next.map(Arc::new),
         }
     }
@@ -1057,7 +1117,7 @@ impl Exchange {
                 } else if self.agreed.as_ref().and_then(|tree| tree.at(&prefix)) == Some(declared) {
                     self.agreed.as_deref().cloned()
                 } else {
-                    let pinned = Tree::pinned(self.kind, self.pinned.repair());
+                    let pinned = self.pinned.tree(self.kind);
                     (pinned.at(&prefix) == Some(declared)).then_some(pinned)
                 };
                 if let Some(held) = held {
@@ -1088,15 +1148,7 @@ impl Exchange {
                     self.wanted.retain(|wanted| wanted != &key);
                 }
                 self.requests.remove(&key);
-                let live = self.live()?;
-                let (value, admit) = admit_value(
-                    self.kind,
-                    self.collection,
-                    key,
-                    &bytes,
-                    live.repair().authorization_evidence(),
-                )
-                .map_err(|_| Failure::BadValue)?;
+                let (value, admit) = self.admit_value(key, &bytes)?;
                 if offered {
                     let offers = self.offers.as_mut().unwrap();
                     if offers.values.get(&key).is_some() {
@@ -1116,7 +1168,7 @@ impl Exchange {
                     self.wanted.retain(|wanted| wanted != &key);
                     // A HAVE may race a body already in the writer. Validate
                     // its exact attached value, but do not land it twice.
-                    if let Some(held) = self.held_value(&live, key) {
+                    if let Some(held) = self.held_value(key)? {
                         if held.bytes(self.collection) != Some(bytes) {
                             return Err(Failure::BadValue);
                         }
@@ -1195,11 +1247,53 @@ impl Exchange {
     /// One-way typed offers may rely on immutable, already shared G even
     /// while the serving snapshot lags a completed landing. Never consult the
     /// peer proof: it may contain a private-prefix graft or unlanded VALUE.
-    fn held_value(&self, live: &CollectionSnapshot, key: [u8; KEY_BYTES]) -> Option<Value> {
-        value(self.kind, live.repair(), key).or_else(|| {
+    /// A grant is held when the latest grant index offers it.
+    fn held_value(&self, key: [u8; KEY_BYTES]) -> Result<Option<Value>, Failure> {
+        let snapshot = self.snapshot.as_ref().ok_or(Failure::Unavailable)?;
+        let live = match self.kind {
+            WalkKind::Authorization => snapshot
+                .grants()
+                .get(self.collection, CapabilityProofId::new(key))
+                .cloned()
+                .map(Value::Proof),
+            kind => value(
+                kind,
+                snapshot
+                    .collection(self.collection)
+                    .ok_or(Failure::Unavailable)?
+                    .repair(),
+                key,
+            ),
+        };
+        Ok(live.or_else(|| {
             self.offers.as_ref()?;
             self.tree_value(self.agreed.as_deref()?, key)
-        })
+        }))
+    }
+
+    /// Check one received value: a record lands as it is; a grant goes
+    /// through the walk's gate, which lands, holds or skips it.
+    fn admit_value(
+        &mut self,
+        key: [u8; KEY_BYTES],
+        bytes: &[u8],
+    ) -> Result<(Value, Admit), Failure> {
+        let snapshot = self.snapshot.clone().ok_or(Failure::Unavailable)?;
+        if self.kind != WalkKind::Authorization {
+            snapshot
+                .collection(self.collection)
+                .ok_or(Failure::Unavailable)?;
+            return admit_value(self.kind, self.collection, key, bytes)
+                .map_err(|_| Failure::BadValue);
+        }
+        let proof = decode_proof(key, bytes).map_err(|_| Failure::BadValue)?;
+        let gate = self.gate.as_mut().expect("a grant walk has its gate");
+        let admit = match gate.admit(&snapshot, proof.clone()) {
+            Gated::Land(proof) => Admit::Land(vec![NetEvent::CapabilityProof(proof)]),
+            Gated::Pending(proof) => Admit::Pending(proof),
+            Gated::Skip => Admit::Skip(key),
+        };
+        Ok((Value::Proof(proof), admit))
     }
 
     fn have(&mut self, prefix: &[u8], summary: PatchSummary, outs: &mut Vec<Out>) {
@@ -1227,13 +1321,6 @@ impl Exchange {
             Some(root) if !self.peer_done => Ok(root),
             _ => Err(Failure::Protocol),
         }
-    }
-
-    fn live(&self) -> Result<Arc<CollectionSnapshot>, Failure> {
-        self.snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.collection(self.collection))
-            .ok_or(Failure::Unavailable)
     }
 
     fn proof_budget(&self) -> Result<(), Failure> {
@@ -1273,8 +1360,7 @@ impl Exchange {
         {
             return Ok(true);
         }
-        let live = self.live()?;
-        let Some(value) = self.held_value(&live, key) else {
+        let Some(value) = self.held_value(key)? else {
             return Ok(false);
         };
         self.peer.insert(key, value);
@@ -1333,6 +1419,18 @@ impl Exchange {
                 if self.offers.is_some() {
                     self.fail(Failure::InsertFailed);
                 }
+            }
+            // Accounted for in the peer's delta, so the walk confirms, but
+            // never agreed: a skipped key is offered again by the next walk.
+            Admit::Skip(key) => {
+                self.excluded.insert(&Entry::new(&key));
+                self.have_leaf(key, outs);
+            }
+            Admit::Pending(proof) => {
+                let key = proof.id().raw;
+                self.excluded.insert(&Entry::new(&key));
+                self.have_leaf(key, outs);
+                outs.push(Out::Pending(proof));
             }
         }
     }
@@ -1441,14 +1539,13 @@ pub(crate) mod tests {
 
     use std::collections::BTreeSet;
 
-    use triblespace_core::capability::CapabilityProofId;
     use triblespace_core::collection::{
         CollectionData, CollectionMerge, CollectionRecord, CollectionRecordFingerprint,
         CollectionStore,
     };
 
     use crate::patch_repair::{PatchBranch, PatchChild, PatchNode};
-    use crate::walk::node;
+    use crate::walk::{node, summary};
 
     use crate::collection_delta::{decode_record, encode_record};
     use crate::walk::tests::walking::{Node, open};
@@ -1556,6 +1653,21 @@ pub(crate) mod tests {
             }
         }
 
+        /// `node`'s side of an exchange its walks already started.
+        pub(crate) fn with(node: Node, exchange: Exchange) -> Self {
+            Self {
+                exchange,
+                node,
+                sent: Vec::new(),
+                heard: Vec::new(),
+                outbox: VecDeque::new(),
+                hold: false,
+                observe_landings: true,
+                held: Vec::new(),
+                fetches: Vec::new(),
+            }
+        }
+
         /// Both ways, against nothing.
         pub(crate) fn both(node: Node, collection: CollectionHandle, kind: WalkKind) -> Self {
             Self::new(node, collection, kind, None, true, true)
@@ -1582,11 +1694,13 @@ pub(crate) mod tests {
             replies.into()
         }
 
-        /// The next frame to send: an answer, or the next of the delta.
+        /// The next frame to send, in the driver's order: an answer, an
+        /// eager body, or the next of the delta.
         pub(crate) fn next(&mut self) -> Option<Frame> {
             let frame = self
                 .outbox
                 .pop_front()
+                .or_else(|| self.exchange.next_body())
                 .or_else(|| self.exchange.next_delta())?;
             self.sent.push(frame.clone());
             Some(frame)
@@ -1599,6 +1713,7 @@ pub(crate) mod tests {
                     Out::Land(events) if self.hold => self.held.push(events),
                     Out::Land(events) => self.land(events),
                     Out::Fetch(handle) => self.fetches.push(handle),
+                    Out::Pending(_) => {}
                 }
             }
         }
@@ -1726,12 +1841,7 @@ pub(crate) mod tests {
                 .get(CollectionRecordFingerprint::from_raw(key))
                 .map(|record| encode_record(collection, record).unwrap())
                 .unwrap(),
-            WalkKind::Authorization => overlay
-                .repair()
-                .authorization_evidence()
-                .get(CapabilityProofId::new(key))
-                .map(|proof| proof.as_bytes().to_vec())
-                .unwrap(),
+            WalkKind::Authorization => panic!("grants are walked from the grant index"),
             WalkKind::References => panic!("held references carry no values"),
         }
     }
@@ -1952,7 +2062,7 @@ pub(crate) mod tests {
             assert_eq!(side.agreed(), Some(agreed.summary()));
         }
         let (blank, collection) = sharing(34, "empty", &[]);
-        let mut blank = Side::both(blank, collection, WalkKind::Authorization);
+        let mut blank = Side::both(blank, collection, WalkKind::Derive);
         assert_eq!(blank.next(), Some(root(empty())));
         assert_eq!(blank.next(), Some(Frame::Done));
         assert_eq!(blank.next(), None);
@@ -3229,11 +3339,7 @@ pub(crate) mod tests {
     #[test]
     fn the_agreed_tree_mirrors_the_overlay_s_tree() {
         let (mut node, collection, records) = holding(85, "tree", 40);
-        for kind in [
-            WalkKind::Commit,
-            WalkKind::Authorization,
-            WalkKind::References,
-        ] {
+        for kind in [WalkKind::Commit, WalkKind::Derive, WalkKind::References] {
             let pinned = node.pinned(collection);
             let tree = Tree::pinned(kind, pinned.repair());
             assert_eq!(tree.summary(), summary(kind, pinned.repair()));

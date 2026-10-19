@@ -188,6 +188,15 @@ impl PeerHealth {
         self.received_complete_at[component] = (landed && root.is_some()).then_some(at);
     }
 
+    /// A grant walk over this collection ended here: no receive is counted,
+    /// but the AUTH root and receive completion are kept as for a receive.
+    pub(crate) fn grants_received(&mut self, at: Mono, root: Option<PatchSummary>, landed: bool) {
+        if let Some(root) = root.filter(|_| landed) {
+            self.received.set(WalkKind::Authorization, root);
+        }
+        self.received_complete_at[2] = (landed && root.is_some()).then_some(at);
+    }
+
     pub(crate) fn disconnected(&mut self) {
         // Keep last-confirmed/landed roots as diagnostics, as before. Only
         // receive completion needs fresh evidence on the next connection.

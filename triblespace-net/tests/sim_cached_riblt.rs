@@ -26,7 +26,7 @@ use triblespace_net::host::{self, PeerConfig};
 use triblespace_net::peer::Peer;
 use triblespace_net::protocol::TAG_WALK;
 use triblespace_net::reconcile::ReplicationMode;
-use triblespace_net::transport::sim::{SimConfig, SimNet, Taps};
+use triblespace_net::transport::sim::{Crossed, SimConfig, SimNet, Taps};
 use triblespace_net::transport::{Harness, Transport};
 use triblespace_net::walk_stream::{
     Algorithm, FRAME_DONE, FRAME_LANDED, FRAME_RIBLT_CELL, FRAME_RIBLT_ROOT, FRAME_SUBTREE,
@@ -202,8 +202,36 @@ fn confirmed(
         })
 }
 
-fn walk_counts(taps: &Taps, from: usize, other: [u8; 32]) -> (usize, usize, usize, usize) {
+/// Walk frames outside grant walks: those are Prefix only, whatever the
+/// host's preference (grants gossip by participation).
+fn component_frames(taps: &Taps, from: usize, other: [u8; 32]) -> Vec<Crossed> {
     let frames = taps.since(from, other, TAG_WALK);
+    let grant_streams: Vec<u64> = frames
+        .iter()
+        .filter(|frame| frame.walk_kind == Some(1))
+        .map(|frame| frame.stream)
+        .collect();
+    frames
+        .into_iter()
+        .filter(|frame| !grant_streams.contains(&frame.stream))
+        .collect()
+}
+
+/// Whether a grant walk crossed, as Prefix.
+fn grant_walk_crossed(taps: &Taps, from: usize, other: [u8; 32]) -> bool {
+    let frames = taps.since(from, other, TAG_WALK);
+    frames
+        .iter()
+        .filter(|frame| frame.walk_kind == Some(1))
+        .any(|opened| {
+            frames
+                .iter()
+                .any(|frame| frame.stream == opened.stream && frame.kind == FRAME_SUBTREE)
+        })
+}
+
+fn walk_counts(taps: &Taps, from: usize, other: [u8; 32]) -> (usize, usize, usize, usize) {
+    let frames = component_frames(taps, from, other);
     let count = |kind| frames.iter().filter(|frame| frame.kind == kind).count();
     (
         count(FRAME_RIBLT_ROOT),
@@ -281,16 +309,17 @@ fn cached_riblt_two_hosts_land_records_auth_and_held_blobs_then_reconnect() {
             roots >= 6 && cells > 0,
             "nonempty cached discovery in both directions"
         );
-        assert!(bodies >= 262, "actual record and proof bodies must cross");
+        assert!(bodies >= 260, "actual record bodies must cross");
         assert_eq!(
             requests, 0,
             "honest CachedRiblt must not request eager bodies"
         );
         assert!(
-            taps.since(0, b_id, TAG_WALK)
+            component_frames(&taps, 0, b_id)
                 .iter()
                 .all(|frame| !matches!(frame.kind, FRAME_SUBTREE | FRAME_DONE | FRAME_LANDED))
         );
+        assert!(grant_walk_crossed(&taps, 0, b_id), "grants cross as Prefix");
         assert!(taps.since(0, b_id, TAG_WALK).iter()
             .filter(|frame| frame.kind == FRAME_RIBLT_ROOT)
             .all(|frame| frame.wire_bytes == 45));
@@ -322,7 +351,7 @@ fn cached_riblt_two_hosts_land_records_auth_and_held_blobs_then_reconnect() {
         .await;
         assert!(net.dial_count(a_id, b_id) + net.dial_count(b_id, a_id) > initial_dials);
         let (roots, cells, bodies, requests) = walk_counts(&taps, from, b_id);
-        assert!(roots >= 6 && cells > 0 && bodies >= 3);
+        assert!(roots >= 6 && cells > 0 && bodies >= 2);
         assert_eq!(requests, 0);
     });
 }
