@@ -1234,3 +1234,296 @@ fn a_listing_heard_while_its_walk_runs_is_walked_after_that_walk_ends() {
     assert_eq!(due, after(base, 1));
     assert_eq!(host.grants.retry(due).walks, [(id(&peer), r)]);
 }
+
+// ---- a grant landed through a peering is completed ----
+
+/// A collection C whose READ is Open and whose WRITE is rooted at `owner`,
+/// with a delegable WRITE definition P also bound to `owner`, and the chain
+/// owner -> X (P) -> Y (Q), where Q is an attenuated WRITE definition C does
+/// not bind. Built in a pile of its own: nothing is resident anywhere else.
+struct Delegated {
+    c: CollectionHandle,
+    descriptor: TribleSet,
+    p: TribleSet,
+    q: TribleSet,
+    q_handle: CapabilityHandle,
+    chain: CapabilityProof,
+}
+
+fn delegated(owner: &SigningKey, x: &SigningKey, y: &SigningKey) -> Delegated {
+    use triblespace_core::capability::{capability_action, capability_delegate_action};
+    use triblespace_core::collection::{
+        ACTION_WRITE, AdmissionPolicy, CollectionPolicy, CollectionStoreExt,
+    };
+    use triblespace_core::metadata;
+    use triblespace_core::prelude::entity;
+    use triblespace_core::repo::BlobStoreGet;
+    let p = entity! {
+        capability_action: ACTION_WRITE,
+        capability_delegate_action: ACTION_WRITE,
+        metadata::name: "delegable write",
+    };
+    let q = entity! { capability_action: ACTION_WRITE, metadata::name: "attenuated write" }
+        .facts()
+        .clone();
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::Open,
+        AdmissionPolicy::direct(owner.verifying_key()),
+    )
+    .with_capability(p.clone(), AdmissionPolicy::direct(owner.verifying_key()));
+    let mut source = MemoryRepo::default();
+    let c = source.collection("delegated write", policy).unwrap().handle();
+    let descriptor: TribleSet = source
+        .snapshot()
+        .unwrap()
+        .get::<TribleSet, SimpleArchive>(c)
+        .unwrap();
+    let p = p.facts().clone();
+    let q_handle = handle_of(&q);
+    let chain = grant(c, owner, handle_of(&p), x)
+        .delegate(x, q_handle, y.verifying_key())
+        .unwrap();
+    Delegated {
+        c,
+        descriptor,
+        p,
+        q,
+        q_handle,
+        chain,
+    }
+}
+
+/// Whether `effects` fetch `blob`, and from whom first.
+fn fetched_from(effects: &Effects, blob: RawHash) -> Option<PeerId> {
+    effects
+        .fetch
+        .iter()
+        .find(|fetch| fetch.blobs.contains(&blob))
+        .map(|fetch| fetch.sources[0])
+}
+
+/// A grant over C that names neither this node nor a participant lands
+/// through a peering for C (the walk gate keeps it for the peering alone),
+/// with C's descriptor and its bound definition P already resident: the
+/// warm case. Its second step's definition Q, which C does not bind, is
+/// fetched from the peer that listed C, on observation and again on its next
+/// listing; once Q arrives the grant is indexed, its keys join C's
+/// participants, and C's new root is listed to a peer this side sends C to
+/// and to C's root, never to the peer it only receives C from.
+#[test]
+fn a_grant_landed_through_a_peering_has_its_unbound_definition_fetched_and_is_listed() {
+    let [owner, x, y, sender, neighbour] = [0x61, 0x62, 0x63, 0x64, 0x65].map(key);
+    let d = delegated(&owner, &x, &y);
+    let mut bob = Node::new(0x66);
+    assert_eq!(bob.put(&d.descriptor), d.c);
+    bob.put(&d.p);
+    bob.active
+        .insert(&triblespace_core::patch::Entry::new(&d.c.raw));
+    bob.observe();
+    let (mut to_sender, _) = open_to(&mut bob, id(&sender), 1);
+    let (mut to_neighbour, _) = open_to(&mut bob, id(&neighbour), 2);
+    let (mut to_owner, _) = open_to(&mut bob, id(&owner), 3);
+    bob.grants.peered([(1, d.c, false), (2, d.c, true)]);
+    bob.observe();
+    for linked in [&mut to_sender, &mut to_neighbour, &mut to_owner] {
+        listed(linked);
+    }
+    assert_eq!(
+        hear(&mut bob, &to_sender, vec![(d.c, summary(0x61))]).walks,
+        [(id(&sender), d.c)]
+    );
+
+    let snapshot = bob.snapshot();
+    assert!(!snapshot.grants().participates(d.c, bob.grants.local));
+    assert!(
+        matches!(Gate::new(d.c, false).admit(&snapshot, d.chain.clone()), Gated::Skip),
+        "control: without the peering the gate skips it"
+    );
+    let Gated::Land(landed) = Gate::new(d.c, true).admit(&snapshot, d.chain.clone()) else {
+        panic!("the peering keeps it, and C's descriptor is resident: it lands");
+    };
+    bob.store.insert_proof(landed).unwrap();
+
+    let observed = bob.observe();
+    assert!(
+        matches!(
+            bob.snapshot().grants().verdict(d.chain.id()),
+            Some(Verdict::Waiting(missing)) if missing[..] == [d.q_handle.raw]
+        ),
+        "it waits for Q alone"
+    );
+    assert_eq!(
+        fetched_from(&observed, d.q_handle.raw),
+        Some(id(&sender)),
+        "Q is fetched from the lister: {:?}",
+        observed.fetch
+    );
+    let relisted = hear(&mut bob, &to_sender, vec![(d.c, summary(0x62))]);
+    assert_eq!(
+        fetched_from(&relisted, d.q_handle.raw),
+        Some(id(&sender)),
+        "and again on the next listing: {:?}",
+        relisted.fetch
+    );
+
+    bob.put(&d.q);
+    bob.observe();
+    let snapshot = bob.snapshot();
+    assert_eq!(
+        snapshot.grants().verdict(d.chain.id()),
+        Some(&Verdict::Indexed(d.c))
+    );
+    assert!(snapshot.grants().participates(d.c, id(&y)));
+    let local = snapshot.grants().summary(d.c);
+    assert_eq!(local.leaf_count(), 1);
+    assert!(
+        listed(&mut to_neighbour).contains(&(d.c, local)),
+        "listed to a peer this side sends C to"
+    );
+    assert!(listed(&mut to_owner).contains(&(d.c, local)), "and to C's root");
+    assert!(
+        listed(&mut to_sender).iter().all(|(resource, _)| *resource != d.c),
+        "never to a peer this side only receives C from"
+    );
+}
+
+/// The cold case, a positive control that passed before the warm case did:
+/// the same grant arriving before C's descriptor waits in memory with only
+/// the descriptor fetched; once the descriptor and P arrive it lands and Q
+/// is fetched from its sender, and once Q arrives it is indexed.
+#[test]
+fn a_grant_pending_its_descriptor_under_a_peering_has_its_unbound_definition_fetched_on_landing() {
+    let [owner, x, y, sender] = [0x74, 0x75, 0x76, 0x77].map(key);
+    let d = delegated(&owner, &x, &y);
+    let mut bob = Node::new(0x78);
+    bob.active
+        .insert(&triblespace_core::patch::Entry::new(&d.c.raw));
+    bob.observe();
+    let (to_sender, _) = open_to(&mut bob, id(&sender), 1);
+    bob.grants.peered([(1, d.c, false)]);
+    hear(&mut bob, &to_sender, vec![(d.c, summary(0x74))]);
+
+    let snapshot = bob.snapshot();
+    let Gated::Pending(waiting) = Gate::new(d.c, true).admit(&snapshot, d.chain.clone()) else {
+        panic!("no descriptor yet: it waits");
+    };
+    let effects = bob.grants.walked(pending(id(&sender), &waiting), now());
+    assert_eq!(fetched_from(&effects, d.c.raw), Some(id(&sender)));
+    assert_eq!(
+        fetched_from(&effects, d.q_handle.raw),
+        None,
+        "nothing a step names before the grant starts at one of C's roots"
+    );
+
+    bob.put(&d.descriptor);
+    bob.put(&d.p);
+    let effects = bob.observe();
+    assert_eq!(effects.land, [d.chain.clone()]);
+    assert_eq!(
+        fetched_from(&effects, d.q_handle.raw),
+        Some(id(&sender)),
+        "landing fetches Q from the sender: {:?}",
+        effects.fetch
+    );
+    bob.land(&effects);
+    bob.put(&d.q);
+    bob.observe();
+    assert_eq!(
+        bob.snapshot().grants().verdict(d.chain.id()),
+        Some(&Verdict::Indexed(d.c))
+    );
+}
+
+/// A stranger's grant over C, offered on a connection not peered for C, to a
+/// node that takes no part in C and is not named on it, is skipped: nothing
+/// lands (positive control: the same grant on a peered connection lands).
+/// The same grant stored here by other means (a merged pile) has nothing
+/// fetched, neither on observation nor when the stranger lists C; a grant
+/// naming this node, waiting the same way for its own definition, is fetched
+/// for in the same observation (positive control).
+#[test]
+fn a_grant_this_node_is_neither_named_on_nor_peered_for_fetches_nothing() {
+    use triblespace_core::capability::capability_action;
+    use triblespace_core::collection::ACTION_WRITE;
+    use triblespace_core::prelude::entity;
+    let [owner, x, y, stranger] = [0x83, 0x84, 0x85, 0x86].map(key);
+    let d = delegated(&owner, &x, &y);
+    let mut bob = Node::new(0x88);
+    bob.put(&d.descriptor);
+    bob.put(&d.p);
+    bob.active
+        .insert(&triblespace_core::patch::Entry::new(&d.c.raw));
+    bob.observe();
+    let (to_stranger, _) = open_to(&mut bob, id(&stranger), 1);
+    let heard = hear(&mut bob, &to_stranger, vec![(d.c, summary(0x83))]);
+    assert!(heard.fetch.is_empty(), "nothing waits here yet: {:?}", heard.fetch);
+
+    let snapshot = bob.snapshot();
+    assert!(matches!(
+        Gate::new(d.c, false).admit(&snapshot, d.chain.clone()),
+        Gated::Skip
+    ));
+    assert!(
+        matches!(Gate::new(d.c, true).admit(&snapshot, d.chain.clone()), Gated::Land(_)),
+        "positive control: a peered connection keeps it"
+    );
+    assert_eq!(bob.proofs(), 0, "a skipped grant lands nothing");
+
+    let own = entity! { capability_action: ACTION_WRITE, triblespace_core::metadata::name: "bob's write" }
+        .facts()
+        .clone();
+    let named = grant(d.c, &owner, handle_of(&d.p), &x)
+        .delegate(&x, handle_of(&own), bob.key.verifying_key())
+        .unwrap();
+    bob.store.insert_proof(d.chain.clone()).unwrap();
+    bob.store.insert_proof(named).unwrap();
+    let observed = bob.observe();
+    assert!(
+        matches!(
+            bob.snapshot().grants().verdict(d.chain.id()),
+            Some(Verdict::Waiting(_))
+        ),
+        "it waits for Q"
+    );
+    assert_eq!(fetched_from(&observed, d.q_handle.raw), None, "not wanted: {:?}", observed.fetch);
+    assert!(
+        fetched_from(&observed, handle_of(&own).raw).is_some(),
+        "positive control: a grant naming this node is: {:?}",
+        observed.fetch
+    );
+    let heard = hear(&mut bob, &to_stranger, vec![(d.c, summary(0x84))]);
+    assert_eq!(
+        fetched_from(&heard, d.q_handle.raw),
+        None,
+        "a stranger's listing fetches nothing for it: {:?}",
+        heard.fetch
+    );
+}
+
+/// A stored grant over C waiting for Q, on a node that takes no part in C,
+/// is asked for once a connection becomes peered for C, from that peer
+/// first, without waiting for another observation or listing; a peering for
+/// another resource asks for nothing (control).
+#[test]
+fn a_new_peering_for_c_asks_for_what_a_stored_grant_over_c_waits_for() {
+    let [owner, x, y, partner] = [0x89, 0x8A, 0x8B, 0x8C].map(key);
+    let d = delegated(&owner, &x, &y);
+    let mut bob = Node::new(0x8D);
+    bob.put(&d.descriptor);
+    bob.put(&d.p);
+    bob.active
+        .insert(&triblespace_core::patch::Entry::new(&d.c.raw));
+    bob.store.insert_proof(d.chain.clone()).unwrap();
+    assert!(bob.observe().fetch.is_empty(), "not wanted yet");
+    let (to_partner, _) = open_to(&mut bob, id(&partner), 2);
+    hear(&mut bob, &to_partner, vec![(d.c, summary(0x89))]);
+    let elsewhere = bob.grants.peered([(2, handle(0x89), false)]);
+    assert!(elsewhere.fetch.is_empty(), "control: {:?}", elsewhere.fetch);
+    let peered = bob.grants.peered([(2, handle(0x89), false), (2, d.c, false)]);
+    assert_eq!(
+        fetched_from(&peered, d.q_handle.raw),
+        Some(id(&partner)),
+        "peered for C, Q is asked of that peer first: {:?}",
+        peered.fetch
+    );
+}

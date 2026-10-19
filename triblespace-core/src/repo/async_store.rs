@@ -302,7 +302,10 @@ pub trait AsyncCollectionRead {
     /// Failure while enumerating stored records.
     type RecordsError: Error + Debug + Send + Sync + 'static;
 
-    /// Return every record once, in a deterministic order.
+    /// Return the known record bag in a deterministic backend order for this
+    /// snapshot. Equal canonical records may occur more than once. Consumers
+    /// needing a set must fold idempotently or deduplicate there; order and
+    /// multiplicity need not agree between independently built stores.
     fn records(
         &self,
     ) -> impl Future<Output = Result<Vec<CollectionRecord>, Self::RecordsError>> + Send;

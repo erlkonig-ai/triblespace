@@ -231,22 +231,16 @@ fn a_source_union_changes_nothing_downstream() {
         AdmissionPolicy::direct(authority.verifying_key()),
         AdmissionPolicy::direct(authority.verifying_key()),
     );
-    let small = one_fact(211);
-    let mut large = TribleSet::new();
-    for ordinal in 0u64..512 {
-        let mut row = [77; TRIBLE_LEN];
-        row[8..16].copy_from_slice(&ordinal.to_be_bytes());
-        row[56..64].copy_from_slice(&ordinal.to_be_bytes());
-        large.insert(&Trible::force_raw(row).unwrap());
-    }
-    // A MERGE joins exactly eight distinct inputs, so the source holds eight
-    // foundations: the small and the large fact set, and six single facts.
-    let more: Vec<TribleSet> = (212u8..218).map(one_fact).collect();
-    assert_eq!(2 + more.len(), MERGE_FAN_IN);
-    let expected = more
+    // Fifteen disjoint nonempty foundations leave seven singleton supports
+    // and one eight-foundation support after each collection's own carry.
+    let foundations: Vec<TribleSet> = (211u8..226).map(one_fact).collect();
+    assert_eq!(foundations.len(), 2 * MERGE_FAN_IN - 1);
+    assert!(foundations.iter().all(|facts| facts.len() == 1));
+    let expected = foundations
         .iter()
         .cloned()
-        .fold(small.clone() + large.clone(), |union, facts| union + facts);
+        .fold(TribleSet::new(), |union, facts| union + facts);
+    assert_eq!(expected.len(), 15, "the foundations must be disjoint");
     // The authority signs the source union below, so it is the store's host.
     let mut store = MemoryRepo::for_host(authority.verifying_key());
     let source = store
@@ -254,7 +248,7 @@ fn a_source_union_changes_nothing_downstream() {
         .unwrap();
     let raw = store.derive::<Image>(source, (), policy.clone()).unwrap();
     let accelerated = store.derive::<ImageTwo>(raw, (), policy).unwrap();
-    for facts in [small, large].into_iter().chain(more) {
+    for facts in foundations {
         store
             .commit(source, &authority, Fragment::from(facts))
             .unwrap();
@@ -262,68 +256,94 @@ fn a_source_union_changes_nothing_downstream() {
     block_on(store.ensure(raw, &authority)).unwrap();
     let children = block_on(store.ensure(accelerated, &authority)).unwrap();
     let support = source.admitted(&children).unwrap();
-    let raw_cover = children.collection(raw).unwrap();
+    assert_eq!(support.len(), 15);
+
+    // The two collections carry independently. Their chosen groups need not
+    // match: maintenance tiers count covered foundations, not payload bytes.
+    let raw_carried = block_on(store.maintain(raw, &authority)).unwrap();
+    let carried = block_on(store.maintain(accelerated, &authority)).unwrap();
+    let raw_cover = carried.collection(raw).unwrap();
+    let carried_target = carried.collection(accelerated).unwrap();
+    assert_eq!(stood_for(&raw_cover), support);
+    assert_eq!(stood_for(&carried_target), support);
+    assert_eq!(raw_cover.view::<ImageFacts>().unwrap().0, expected);
+    assert_eq!(carried_target.view::<ImageFacts>().unwrap().0, expected);
+    let coverage = carried.coverage();
+    for (collection, nodes) in [
+        (
+            raw.handle(),
+            raw_cover
+                .cover()
+                .members()
+                .map(Handle::<Image>::to_hash)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            accelerated.handle(),
+            carried_target
+                .cover()
+                .members()
+                .map(Handle::<ImageTwo>::to_hash)
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        assert_eq!(nodes.len(), MERGE_FAN_IN);
+        let mut support_sizes = nodes
+            .iter()
+            .map(|node| coverage.of(collection, *node).unwrap().len())
+            .collect::<Vec<_>>();
+        support_sizes.sort_unstable();
+        assert_eq!(support_sizes, [1, 1, 1, 1, 1, 1, 1, 8]);
+        let (foundations, missing) = coverage.union_over(collection, nodes);
+        assert!(missing.is_empty());
+        assert_eq!(foundations.len(), 15);
+    }
     let inputs = raw_cover
         .cover()
         .members()
-        .map(|handle| children.get::<Blob<Image>, _>(handle).unwrap())
+        .map(|handle| carried.get::<Blob<Image>, _>(handle).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(inputs.len(), MERGE_FAN_IN);
-    let accelerated_children = children.collection(accelerated).unwrap();
-    let tiers = accelerated_children
-        .cover()
-        .members()
-        .map(|handle| children.blob_info(handle).unwrap().unwrap().length.ilog2())
-        .collect::<Vec<_>>();
-    assert_eq!(tiers.len(), MERGE_FAN_IN);
-    assert!(
-        tiers.iter().any(|tier| *tier != tiers[0]),
-        "ordinary target LSM would not pair these"
-    );
+    let target_members = carried_target.cover().members().collect::<BTreeSet<_>>();
 
-    // Eight leaves fill the target's lowest tier, so the target carries
-    // them now, into one MERGE of its own, before the source holds any
-    // union: what follows can only be work on the source's merge.
-    let carried = block_on(store.maintain(accelerated, &authority)).unwrap();
-    assert_eq!(carried.collection(raw).unwrap().cover().len(), MERGE_FAN_IN);
-    let carried_target = carried.collection(accelerated).unwrap();
-    assert_eq!(carried_target.cover().len(), 1);
-    let target_root = carried_target.cover().members().next().unwrap();
-    let target_merges = carried
-        .records()
-        .unwrap()
-        .map(Result::unwrap)
-        .filter(|record| matches!(record, CollectionRecord::Merge(_)))
-        .collect::<Vec<_>>();
-    assert!(
-        matches!(target_merges.as_slice(), [CollectionRecord::Merge(merge)]
-            if merge.collection() == accelerated.handle()
-                && merge.result() == Handle::<ImageTwo>::to_hash(target_root)),
-        "{target_merges:?}"
-    );
-
-    // The host has already compacted the immediate source. A derived
-    // collection's lattice is its own: its maintenance neither reads that
-    // merge nor creates upstream artifacts.
+    // The host can truthfully join these eight current raw nodes even though
+    // they span two maintenance tiers. Its full target image is not resident.
     let union = Image::join(&inputs);
-    let expected_root = ImageTwo::image(&union);
-    let union_handle = store.put(union).unwrap();
+    let expected_root = ImageTwo::image(&union).get_handle();
+    assert!(!carried_target.cover().contains(expected_root));
+    assert!(carried.blob_info(expected_root).unwrap().is_none());
+    let mut raw_derives = 0;
+    let mut raw_merges = 0;
     let input_records = inputs
         .iter()
         .map(|input| {
             let data = Handle::<Image>::to_hash(input.get_handle());
-            let _record = children
+            let record = carried
                 .records()
                 .unwrap()
                 .map(Result::unwrap)
-                .find(|record| {
-                    matches!(record, CollectionRecord::Derive(derive)
-                if derive.collection() == raw.handle() && derive.output() == data)
+                .find(|record| match record {
+                    CollectionRecord::Derive(derive) => {
+                        derive.collection() == raw.handle() && derive.output() == data
+                    }
+                    CollectionRecord::Merge(merge) => {
+                        merge.collection() == raw.handle()
+                            && merge.result() == data
+                            && merge.public_key().raw == authority.verifying_key().to_bytes()
+                    }
+                    _ => false,
                 })
-                .expect("ensure published each raw input's DERIVE");
+                .expect("each raw input has its DERIVE or the host's MERGE");
+            match record {
+                CollectionRecord::Derive(_) => raw_derives += 1,
+                CollectionRecord::Merge(_) => raw_merges += 1,
+                _ => unreachable!(),
+            }
             data
         })
         .collect::<Vec<_>>();
+    assert_eq!((raw_derives, raw_merges), (MERGE_FAN_IN - 1, 1));
+    let union_handle = store.put(union).unwrap();
     store
         .insert(CollectionRecord::Merge(
             CollectionMerge::sign(
@@ -337,6 +357,13 @@ fn a_source_union_changes_nothing_downstream() {
         .unwrap();
     let before = store.snapshot().unwrap();
     assert_eq!(before.collection(raw).unwrap().cover().len(), 1);
+    assert_eq!(stood_for(&before.collection(raw).unwrap()), support);
+    assert!(!before
+        .collection(accelerated)
+        .unwrap()
+        .cover()
+        .contains(expected_root));
+    assert!(before.blob_info(expected_root).unwrap().is_none());
     // BlobStoreList::blobs_diff permits an over-eager full listing. Compare
     // resident identities here because this test requires exact additions.
     let blobs_before = before
@@ -344,64 +371,61 @@ fn a_source_union_changes_nothing_downstream() {
         .map(|info| info.unwrap().handle)
         .collect::<BTreeSet<_>>();
 
-    // Coverage is already complete: ensure does not perform upkeep.
-    let ensured = block_on(store.ensure(accelerated, &authority)).unwrap();
-    assert_eq!(ensured.collection(accelerated).unwrap().cover().len(), 1);
-    assert_eq!(
-        ensured
-            .blobs()
-            .map(|info| info.unwrap().handle)
-            .collect::<BTreeSet<_>>(),
-        blobs_before
-    );
     let records_before = before
         .records()
         .unwrap()
         .collect::<Result<BTreeSet<_>, _>>()
         .unwrap();
+    // The raw foundation union is unchanged and the target has no eight
+    // nodes in either tier. Neither operation publishes a record or blob,
+    // including the absent image of the raw union. This is not a CPU/read bound.
+    for compact in [false, true] {
+        let after = if compact {
+            block_on(store.maintain(accelerated, &authority))
+        } else {
+            block_on(store.ensure(accelerated, &authority))
+        }
+        .unwrap();
+        let observed = after.collection(accelerated).unwrap();
+        assert_eq!(stood_for(&observed), support);
+        assert_eq!(
+            observed.cover().members().collect::<BTreeSet<_>>(),
+            target_members
+        );
+        assert!(!observed.cover().contains(expected_root));
+        assert!(after.blob_info(expected_root).unwrap().is_none());
+        assert_eq!(observed.view::<ImageFacts>().unwrap().0, expected);
+        assert_eq!(
+            after
+                .blobs()
+                .map(|info| info.unwrap().handle)
+                .collect::<BTreeSet<_>>(),
+            blobs_before
+        );
+        assert_eq!(after.wants().unwrap().count(), 0);
+        assert_eq!(
+            after
+                .records()
+                .unwrap()
+                .collect::<Result<BTreeSet<_>, _>>()
+                .unwrap(),
+            records_before
+        );
+    }
+    assert_eq!(children.collection(raw).unwrap().cover().len(), 15);
+    assert_eq!(children.collection(accelerated).unwrap().cover().len(), 15);
     assert_eq!(
-        ensured
-            .records()
-            .unwrap()
-            .collect::<Result<BTreeSet<_>, _>>()
-            .unwrap(),
-        records_before
-    );
-
-    // The target's tier is already carried, and the source's merge is not
-    // the target's: maintenance publishes nothing and stores nothing, and
-    // the target still reads every fact, from the node its own carry made
-    // before the source union existed. That node is byte for byte the image
-    // of the source's union (the test images join homomorphically), so the
-    // records above, not the blobs, are what tell a mirror from a carry.
-    let after = block_on(store.maintain(accelerated, &authority)).unwrap();
-    let observed = after.collection(accelerated).unwrap();
-    assert_eq!(stood_for(&observed), support);
-    assert_eq!(observed.cover().len(), 1);
-    assert!(observed.cover().contains(target_root));
-    assert_eq!(target_root, expected_root.get_handle());
-    assert_eq!(observed.view::<ImageFacts>().unwrap().0, expected);
-    assert_eq!(
-        after
-            .blobs()
-            .map(|info| info.unwrap().handle)
-            .collect::<BTreeSet<_>>(),
-        blobs_before
-    );
-    assert_eq!(after.wants().unwrap().count(), 0);
-    assert_eq!(
-        after
-            .records()
-            .unwrap()
-            .collect::<Result<BTreeSet<_>, _>>()
-            .unwrap(),
-        records_before
-    );
-    assert_eq!(children.collection(raw).unwrap().cover().len(), MERGE_FAN_IN);
-    assert_eq!(
-        children.collection(accelerated).unwrap().cover().len(),
+        raw_carried.collection(raw).unwrap().cover().len(),
         MERGE_FAN_IN
     );
+    assert_eq!(raw_carried.collection(accelerated).unwrap().cover().len(), 15);
+    assert_eq!(carried.collection(raw).unwrap().cover().len(), MERGE_FAN_IN);
+    assert_eq!(
+        carried_target.cover().members().collect::<BTreeSet<_>>(),
+        target_members
+    );
+    assert!(children.blob_info(expected_root).unwrap().is_none());
+    assert!(carried.blob_info(expected_root).unwrap().is_none());
 }
 
 #[test]

@@ -1149,9 +1149,68 @@ fn an_owners_current_leaf_is_kept_over_its_own_earlier_claim() {
     bytes.extend(std::fs::read(&dst).unwrap());
     std::fs::write(&merged, bytes).unwrap();
 
+    // The source is a bag: each of the four original kept COMMITs occurs
+    // twice, while the adopted Q1 occurs once. P1 contributes two distinct
+    // metadata variants, not one. Keep full signed identities as the oracle.
+    let expected: BTreeMap<_, _> = records(&dst)
+        .into_iter()
+        .filter_map(|record| match record {
+            CollectionRecord::Commit(commit) if commit.collection() == fixture.root => {
+                Some((commit.fingerprint().raw(), commit))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(expected.len(), 5);
+    assert_eq!(
+        expected
+            .values()
+            .filter(|commit| commit.data() == fixture.p1)
+            .map(|commit| commit.metadata().raw)
+            .collect::<BTreeSet<_>>(),
+        fixture.p1_metadata.into_iter().collect::<BTreeSet<_>>(),
+        "both of P1's metadata variants survive"
+    );
+    let mut occurrences = BTreeMap::<Raw, usize>::new();
+    for record in records(&merged) {
+        if let CollectionRecord::Commit(commit) = record {
+            let id = commit.fingerprint().raw();
+            if expected.contains_key(&id) {
+                *occurrences.entry(id).or_default() += 1;
+            }
+        }
+    }
+    assert_eq!(occurrences.values().sum::<usize>(), 9);
+    assert_eq!(occurrences.len(), 5);
+    for (id, commit) in &expected {
+        assert_eq!(
+            occurrences[id],
+            if commit.data() == fixture.q1 { 1 } else { 2 },
+            "only Q1 was absent from the original source"
+        );
+    }
+    let merged_before = sha256(&merged);
+
     let again = fixture.path("again.pile");
     assert_success(&fixture.clean(&merged, &again, &[], &[]));
-    assert_eq!(derives(&records(&again)), derives(&records(&dst)));
+    let written = records(&again);
+    assert_eq!(derives(&written), derives(&records(&dst)));
+    let commits: Vec<_> = written
+        .into_iter()
+        .filter_map(|record| match record {
+            CollectionRecord::Commit(commit) => Some(commit),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(commits.len(), 5, "the destination has five physical COMMITs");
+    assert_eq!(
+        commits
+            .into_iter()
+            .map(|commit| (commit.fingerprint().raw(), commit))
+            .collect::<BTreeMap<_, _>>(),
+        expected,
+        "the exact signed owner records, including both P1 metadata variants"
+    );
     let report = fixture.report(&again);
     for (target, kept) in [(fixture.succinct, 3), (fixture.rank9, 2)] {
         let frames = &find(&report["derived"], target)["derive_frames"];
@@ -1160,15 +1219,33 @@ fn an_owners_current_leaf_is_kept_over_its_own_earlier_claim() {
         assert!(owners(&frames["no_key_by_owner"]).is_empty());
     }
     let root = find(&report["roots"], fixture.root);
+    assert_eq!(root["source_frames"]["commit_frames"], 13, "the census remains physical");
     assert_eq!(
         root["kept_commits"], 5,
-        "P1 twice, P2, P5 and the adopted Q1"
+        "P1's two metadata variants, P2, P5 and the adopted Q1"
     );
     assert_eq!(report["records_written"]["commit"], 5);
     assert_eq!(
         report["destination_bytes"],
         report["destination_bytes_projected"]
     );
+
+    let dry = fixture.path("again-dry.pile");
+    assert_success(&fixture.clean(&merged, &dry, &["--dry-run"], &[]));
+    assert!(!dry.exists());
+    let dry_report = fixture.report(&dry);
+    assert!(dry_report["destination_bytes"].is_null());
+    for field in [
+        "roots",
+        "retired",
+        "derived",
+        "source_census",
+        "records_written",
+        "destination_bytes_projected",
+    ] {
+        assert_eq!(dry_report[field], report[field], "dry-run {field}");
+    }
+    assert_eq!(sha256(&merged), merged_before, "the source bag is untouched");
 }
 
 #[test]

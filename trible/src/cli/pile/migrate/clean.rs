@@ -2048,6 +2048,12 @@ impl Run {
             written: HashSet::new(),
         };
         let mut run: Option<((usize, Raw), Option<u32>)> = None;
+        // Operation-local scratch for the current root/payload run only.
+        // The source is a bag, while insertion into the fresh destination
+        // suppresses identical signed records. Match that in dry runs too,
+        // without collapsing metadata or distinct signatures by the owner.
+        // The raw source census still counts every physical occurrence.
+        let mut kept_in_run = HashSet::<CollectionCommit>::new();
         // The same owner rule per `(retired collection, data)`: only the
         // earliest admitted signer's metadata is carried into adoption.
         let mut retired_run: Option<((Raw, Raw), Option<Raw>)> = None;
@@ -2093,6 +2099,7 @@ impl Run {
                 if run.map(|(key, _)| key) != Some((root, data)) {
                     roots.close_run(run.take());
                     run = Some(((root, data), None));
+                    kept_in_run.clear();
                 }
                 let stats = &mut roots.stats[root];
                 if !verified {
@@ -2110,6 +2117,9 @@ impl Run {
                 }
                 if *owner != Some(signer) {
                     stats.duplicate_owner += 1;
+                    continue;
+                }
+                if !kept_in_run.insert(commit) {
                     continue;
                 }
                 stats.kept_commits += 1;

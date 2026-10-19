@@ -24,8 +24,10 @@
 //!   ([`Pending`]), and only that descriptor is fetched for it.
 //! - What a stored grant waiting in the index needs (R's descriptor and
 //!   name, its definitions) is fetched over `blob/1`, from the peers that
-//!   listed R first. A peering refused for want of definitions fetches them
-//!   the same way.
+//!   listed R first, when the gate would keep it: it names this node, this
+//!   node takes part in R, or a connection is peered for R. A connection
+//!   newly peered for R asks that peer first. A peering refused for want of
+//!   definitions fetches them the same way.
 //! - Every grant walk's end reaches the exchange ([`GrantWalkEnd`]). One that
 //!   failed, was refused or could not start, a running walk over R included,
 //!   opens again on the same connection after a backoff of 1 s doubling to
@@ -1028,10 +1030,12 @@ impl Listing {
 ///
 /// Grants a walk kept but cannot validate wait in [`Pending`]. A stored
 /// grant the index cannot judge yet, because R's descriptor or a definition
-/// is not resident, has every missing handle fetched at once, from the
-/// connected peers that listed R first, and R's name with them once its
-/// descriptor is resident; the same happens for a waiting grant whenever
-/// a peer lists its R.
+/// is not resident, and that a walk's gate would keep (it names this node,
+/// this node takes part in R, or a connection is peered for R), has every
+/// missing handle fetched at once, from the connected peers that listed R
+/// first, and R's name with them once its descriptor is resident; the same
+/// happens for a waiting grant whenever a peer lists its R or a connection
+/// becomes peered for it.
 pub(crate) struct Grants {
     local: PeerId,
     snapshot: Option<Arc<StoreSnapshot>>,
@@ -1291,13 +1295,20 @@ impl Grants {
         fetches
     }
 
-    /// Whether this node wants a grant completed: one naming it, or over a
-    /// resource it takes part in.
+    /// Whether this node wants a grant completed: one a walk's [`Gate`]
+    /// would keep, so every grant that lands here through a walk is. It
+    /// names this node, is over a resource this node takes part in, or over
+    /// one a connection is peered for, whichever way it flows.
     fn wanted(&self, proof: &CapabilityProof) -> bool {
+        let resource = CollectionHandle::new(proof.resource().into_bytes());
         proof
             .prefixes()
             .any(|prefix| prefix.subject().to_bytes() == self.local)
-            || self.takes_part(CollectionHandle::new(proof.resource().into_bytes()))
+            || self.takes_part(resource)
+            || self
+                .listings
+                .values()
+                .any(|listing| listing.peered.get(&resource.raw).is_some())
     }
 
     /// Fetch `missing` and whatever else of `proof`'s descriptor and, with
@@ -1394,7 +1405,8 @@ impl Grants {
     /// The resources each connection is peered for, by connection id. A
     /// connection newly peered for R lists R and walks R again where the
     /// peer's root still differs: grants it skipped before the peering
-    /// existed are offered again.
+    /// existed are offered again. What grants over R stored here wait for,
+    /// now wanted, is fetched from that peer first.
     pub(crate) fn peered(
         &mut self,
         peered: impl IntoIterator<Item = (u64, CollectionHandle, bool)>,
@@ -1431,16 +1443,20 @@ impl Grants {
             let locals: Vec<PatchSummary> =
                 fresh.iter().map(|resource| self.summary(*resource)).collect();
             let listing = self.listings.get_mut(&id).unwrap();
+            let peer = listing.link.peer();
             listing.peered = resources;
             listing.serves = serves;
             listing.from = None;
-            for (resource, local) in fresh.into_iter().zip(locals) {
+            for (resource, local) in fresh.iter().copied().zip(locals) {
                 listing.opened.remove(&resource.raw);
                 if listing.reopen(resource, local) {
-                    effects.walks.push((listing.link.peer(), resource));
+                    effects.walks.push((peer, resource));
                 }
             }
             self.list(id);
+            for resource in fresh {
+                effects.fetch.extend(self.needed(resource, &[peer]));
+            }
         }
         effects
     }
