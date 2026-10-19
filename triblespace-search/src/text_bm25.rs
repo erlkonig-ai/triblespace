@@ -474,6 +474,8 @@ mod tests {
             attribute: attribute.id(),
             tokenizer: Bm25Tokenizer::Word,
         };
+        let mut merges = 0;
+        let mut overlapping_merges = 0;
         for seed in 0..24u64 {
             let mut random = Stream(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) + 3);
             let mut store = MemoryRepo::for_host(host);
@@ -484,13 +486,16 @@ mod tests {
                 .unwrap();
             let target = store.attach::<PortableBM25Blob>(root, argument).unwrap();
             let mut union = TribleSet::new();
-            for _ in 0..2 + random.below(14) {
+            for index in 0..8 + random.below(8) {
                 let mut rows = Vec::new();
                 for _ in 0..1 + random.below(3) {
                     let words: Vec<&str> = (0..1 + random.below(4))
                         .map(|_| WORDS[random.below(WORDS.len() as u64) as usize])
                         .collect();
-                    let text = store.put::<UTF8String, _>(words.join(" ")).unwrap();
+                    // Real distinct foundations, while document IDs still overlap.
+                    let text = store
+                        .put::<UTF8String, _>(format!("{} node{index}", words.join(" ")))
+                        .unwrap();
                     rows.push((1 + random.below(5) as u8, text));
                 }
                 let facts = text_facts(attribute.id(), rows);
@@ -516,17 +521,34 @@ mod tests {
                 }
                 seen.into_iter().collect::<Vec<_>>()
             };
-            for _ in 0..random.below(4) {
+            // Keep no-extra-merge seeds and explicitly exercise overlapping support.
+            let merge_count = if seed % 3 == 0 {
+                0
+            } else {
+                2 + random.below(3)
+            };
+            let mut previous: Option<(CollectionData, CollectionData)> = None;
+            for _ in 0..merge_count {
                 let lattice = nodes(&mut store);
-                if lattice.len() < 2 {
-                    break;
+                assert!(lattice.len() >= 8, "seed {seed}");
+                let mut picked = Vec::new();
+                if let Some((result, input)) = previous {
+                    assert!(result != input);
+                    assert!(lattice.contains(&result) && lattice.contains(&input));
+                    picked.extend([result, input]);
+                    overlapping_merges += 1;
                 }
-                let picked: BTreeSet<CollectionData> = (0..2 + random.below(2))
-                    .map(|_| lattice[random.below(lattice.len() as u64) as usize])
+                let mut remaining: Vec<_> = lattice
+                    .into_iter()
+                    .filter(|node| !picked.contains(node))
                     .collect();
-                if picked.len() < 2 {
-                    continue;
+                let needed = 8 - picked.len();
+                for index in 0..needed {
+                    let choice = index + random.below((remaining.len() - index) as u64) as usize;
+                    remaining.swap(index, choice);
                 }
+                picked.extend_from_slice(&remaining[..needed]);
+                assert_eq!(picked.iter().copied().collect::<BTreeSet<_>>().len(), 8);
                 let snapshot = store.snapshot().unwrap();
                 let blobs: Vec<Blob<SimpleArchive>> = picked
                     .iter()
@@ -552,6 +574,10 @@ mod tests {
                         .unwrap(),
                     ))
                     .unwrap();
+                merges += 1;
+                let result = Handle::<SimpleArchive>::to_hash(result);
+                let input = *picked.iter().find(|&&input| input != result).unwrap();
+                previous = Some((result, input));
             }
             // An attachment at random nodes.
             for node in nodes(&mut store) {
@@ -615,6 +641,8 @@ mod tests {
                 "seed {seed}"
             );
         }
+        assert!(merges > 0);
+        assert!(overlapping_merges > 0);
     }
 
     /// The named case: one document present in two nodes, each attached by
