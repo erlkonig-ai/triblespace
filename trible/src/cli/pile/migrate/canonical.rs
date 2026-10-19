@@ -1,5 +1,6 @@
 //! One-time offline /32 conversion. Historical codecs never enter core replay.
 //! Original evidence remains in the operator-retained hash-bound source.
+//! Native retired signed equations are copied exactly as inert evidence only.
 use std::collections::BTreeSet; // One selector call's ephemeral scratch only.
 use std::fs::{File, Metadata};
 use std::io::Write;
@@ -324,6 +325,8 @@ fn rewrite(
     // a second frame catalogue. New canonical assertions append after this span.
     let mut copied = blake3::Hasher::new();
     let mut copied_bytes = 0usize;
+    let mut retained_inert_occurrences = 0u64;
+    let mut retained_inert_bytes = 0usize;
     let mut blocked = 0u64;
     // Pass one: validate every source frame. Copy only the exact allowlist.
     for framed in source.records()? {
@@ -357,10 +360,15 @@ fn rewrite(
                 PileRecordContent::Collection { record } => {
                     add(&mut expected.records, record.fingerprint().raw())
                 }
+                PileRecordContent::RetiredCollectionEquation { .. } => {
+                    retained_inert_occurrences += 1;
+                    retained_inert_bytes += framed.len;
+                }
                 _ => {}
             }
             report.event(
                 json!({"event":"raw-copy", "offset":framed.offset,"length":framed.len,
+                "retained_inert_evidence":matches!(framed.content, PileRecordContent::RetiredCollectionEquation { .. }),
                 "frame_hash":hex::encode(blake3::hash(bytes).as_bytes())}),
             )?;
         }
@@ -527,6 +535,7 @@ fn rewrite(
     }
     report.event(json!({"event":"verified", "operation":format!("{mode:?}"),"emitted_occurrences":emitted,
         "distinct_current_assertions":expected.records.len(),"retained_original_caches":retained_caches,
+        "retained_inert_occurrences":retained_inert_occurrences,"retained_inert_bytes":retained_inert_bytes,
         "source_retention_required":true,"dry_run":args.dry_run}))?;
     report.sync()?;
     ensure!(
@@ -560,6 +569,7 @@ fn rewrite(
         "operation":format!("{mode:?}"),"destination":args.into,
         "full_rewrite_obligations_satisfied":mode == Mode::Rewrite && !args.dry_run,
         "retained_original_only_caches":retained_caches,
+        "retained_inert_occurrences":retained_inert_occurrences,"retained_inert_bytes":retained_inert_bytes,
         "source_evidence_fully_replaced":false,
         "source_retention_required":true}),
         )
@@ -620,6 +630,11 @@ fn validate_frame(content: PileRecordContent, raw: &[u8], all: &[u8]) -> Result<
         PileRecordContent::Collection { record } => record
             .verify_strict()
             .map_err(|e| anyhow!("canonical signature: {e:?}"))?,
+        // Authorship of already-native v8/v9 evidence, not a current assertion.
+        // Pass one copies the original frame; pass two never reseals/promotes it.
+        PileRecordContent::RetiredCollectionEquation { equation } => equation
+            .verify_strict()
+            .map_err(|e| anyhow!("retired equation signature: {e:?}"))?,
         PileRecordContent::Want { .. } => ensure!(
             raw.get(32..64) == Some(frame::WANT.as_slice()),
             "not a current WANT frame"
@@ -667,6 +682,18 @@ fn audit(
             !matches!(framed.content, PileRecordContent::Opaque { .. }),
             "unexpected old/opaque output frame"
         );
+        if matches!(
+            framed.content,
+            PileRecordContent::RetiredCollectionEquation { .. }
+        ) {
+            ensure!(
+                framed
+                    .offset
+                    .checked_add(framed.len)
+                    .is_some_and(|end| end <= copied_bytes),
+                "retired equation is not wholly within the copied frame prefix"
+            );
+        }
         validate_frame(framed.content, raw, &bytes)?;
         match framed.content {
             PileRecordContent::Blob { hash, .. } => add(&mut actual.blobs, hash.raw),

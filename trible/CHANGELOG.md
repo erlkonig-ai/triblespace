@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- `pile migrate canonical` strictly verifies already-native retired v8 MERGE
+  and v9 DERIVE signatures and copies their exact frames as inert evidence,
+  with physical occurrence/byte reporting and a full copied-prefix audit bound.
+  No resealing, current membership promotion, refresh export, or permission to
+  discard the original source follows from this preservation.
+
 - Source-only ALPN31 candidate offers `pile net sync --walk-algorithm
   prefix|cached-riblt` (default `cached-riblt`, with explicit `prefix` retained).
   Cached symmetric discovery is refused

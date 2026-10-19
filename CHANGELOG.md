@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- The offline canonical migration preserves already-native, signature-valid
+  retired v8 MERGE/v9 DERIVE frames as exact inert copied-prefix evidence.
+  Preserve physical duplicates, reject retired frames beyond that prefix,
+  and keep refresh export, current membership and source-retention requirements
+  unchanged. No runtime format or live cutover change.
+
 - Back capability proofs with a typed, zero-copy slice-DST view of their
   existing header and encoded edges. Preserve exact AUTH bytes, proof IDs,
   literal-prefix signatures, validation boundaries and shared owner lifetimes;

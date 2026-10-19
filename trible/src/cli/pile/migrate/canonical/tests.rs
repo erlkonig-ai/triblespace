@@ -1,4 +1,7 @@
 //! CLI-private tests. Manual cases require the independently built /32 writer.
+#[path = "retired_tests.rs"]
+mod retired_tests;
+
 use super::*;
 use clap::Parser;
 use std::fs::OpenOptions;

@@ -37,7 +37,7 @@ fn converted(result: &legacy32::Conversion<'_>) -> CollectionRecord {
 // Independent old-codec vectors copied from deployed3ca5c1cb records.rs:2774-2871,
 // Git blob5783570aa228ff80213131b3acb5b5f8634d8cbb. Literal old signatures and
 // fingerprints, not values recomputed by the converter's transcript helper.
-fn golden(tag: u8) -> (Vec<u8>, [u8; 32]) {
+pub(super) fn golden(tag: u8) -> (Vec<u8>, [u8; 32]) {
     let author = hex!("EA4A6C63E29C520ABEF5507B132EC5F9954776AEBEBE7B92421EEA691446D22C");
     let (fields, signature, fingerprint) = match tag {
         1 => (

@@ -134,9 +134,18 @@ retained too; conversion itself grants no authority. Current canonical
 assertions are verified and copied unchanged.
 
 All valid source BLOB and current AUTH frames are copied exactly, as are the
-exact current Want, Branch and BranchTombstone kinds. Unknown, retired WANT,
-historical collection/proof forms, invalid signatures or missing foreign
-refreshes refuse full-rewrite publication. This initial tool does not support
+exact current Want, Branch and BranchTombstone kinds. Already-native retired
+signed v8 MERGE and v9 DERIVE equations are strictly signature-verified and
+copied byte-for-byte, preserving order and physical duplicates as **inert
+evidence**. They are never resealed, promoted into current membership, or
+exported by `canonical-refresh`. Audit requires each entire retired frame
+inside the digest-bound copied prefix; no extra retired tail is allowed.
+Reports count their retained inert occurrences/bytes separately. This does not
+replace the retained source, authorize reclamation, or prove old computations.
+The original handle-bearing evidence remains disclosed wherever the output is
+distributed. Unknown, retired WANT, other historical collection/proof forms,
+invalid signatures or missing foreign refreshes refuse full-rewrite publication.
+This initial tool does not support
 every historical format or repair missing source dependencies.
 
 Owned MAP and exact-eight MERGE caches reseal field-for-field; signatures do
