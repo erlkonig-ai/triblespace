@@ -39,6 +39,15 @@
 //! The host also dials the subject of every grant its own key signed, so the
 //! exchange delivers it.
 //!
+//! # The grant index
+//!
+//! [`GrantIndex`] holds every grant this host stores, over any resource R,
+//! keyed R | proof id, with R's participants: R's roots and the keys named on
+//! delegation-valid, hardened grants over R. It is the only AUTH tree that is
+//! walked, summarised, listed or reported for health. A collection's
+//! authorization evidence PATCH is admission input only: unchanged in
+//! membership, it is never walked, summarised into a frontier or compared.
+//!
 //! [`proof_digest`]: crate::collection_activation::CollectionAuthorizationEvidencePatch::proof_digest
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -47,14 +56,21 @@ use std::time::Duration;
 
 use triblespace_core::blob::Blob;
 use triblespace_core::blob::TryFromBlob as _;
+use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::capability::CapabilityProof;
+use triblespace_core::capability::{
+    CapabilityProof, CapabilityProofId, capability_action, capability_delegate_action,
+};
 use triblespace_core::collection::{AdmissionPolicy, CollectionHandle};
 use triblespace_core::collection::descriptor::{
-    capability_policies, name, validate_proof_for_policies,
+    ProofEvidenceError, capability_policies, name, resource_grant_policies,
+    validate_proof_for_policies,
 };
 use triblespace_core::inline::Inline;
-use triblespace_core::patch::Entry as PatchEntry;
+use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::patch::{Blake3Merkle, Entry as PatchEntry, IdentitySchema, PATCH};
+use triblespace_core::prelude::{exists, pattern};
+use triblespace_core::repo::{BlobStoreGet, BlobStoreList, CapabilityProofRead, StoreChanges};
 use triblespace_core::trible::TribleSet;
 
 use crate::channel::{NetEvent, NetEventBatch};
@@ -63,7 +79,7 @@ use crate::collection_activation::{
 };
 use crate::connection::{ConnectionTable, Link, ReconEvent, Service};
 use crate::health::Health;
-use crate::host::{METADATA_BLOB_BYTES, StoreSnapshot};
+use crate::host::{ActiveCollections, METADATA_BLOB_BYTES, StoreSnapshot};
 use crate::patch_repair::PatchSummary;
 use crate::protocol::{RawHash, op_get_blob_with_limit};
 use crate::recon::{Frame, proof_frames};
@@ -76,6 +92,335 @@ const FETCH_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_PENDING_PER_SENDER: usize = 256;
 /// Proofs every sender together keeps waiting in memory.
 const MAX_PENDING: usize = 1024;
+
+/// Grants over one resource R: the indexed proofs, keyed R | proof id, and
+/// the keys that take part in R.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ResourceGrants {
+    /// Exact stored proof bytes under R | proof id.
+    pub(crate) proofs: GrantProofs,
+    /// R's roots, and the root and every delegated key of each indexed
+    /// proof.
+    pub(crate) participants: PATCH<32, IdentitySchema, ()>,
+}
+
+/// Indexed proofs of one resource, keyed R | proof id.
+pub(crate) type GrantProofs = PATCH<64, IdentitySchema, CapabilityProof, Blake3Merkle>;
+
+/// Why a stored proof is not indexed. Final: proofs, descriptors and
+/// definitions are immutable once resident.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Junk {
+    /// It starts outside every root R's descriptor declares.
+    Root,
+    /// A signature in its chain is invalid.
+    Signature,
+    /// A step confers an action its parent's definition does not delegate.
+    Delegation,
+    /// A step's definition names no action, or a step extends a parent whose
+    /// definition delegates nothing (participation hardening).
+    NoActionStep,
+}
+
+/// The index's judgement of one stored proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum Verdict {
+    /// Offered for R, whose participants its keys join.
+    Indexed(CollectionHandle),
+    /// Never offered and names no participant.
+    Junk(Junk),
+    /// R's descriptor or a definition is not resident yet: every such
+    /// handle. Neither offered nor a source of participants.
+    Waiting(BTreeSet<RawHash>),
+}
+
+/// Every grant this host holds, over any resource R, with R's participants:
+/// the one AUTH index for grants (design: grants gossip by participation).
+///
+/// It is the only AUTH tree that is walked, summarised, listed or reported.
+/// A collection's authorization evidence PATCH stays what admission reads,
+/// unchanged, and is never walked or summarised as a frontier.
+///
+/// Grow-only and built incrementally: each stored proof is judged once, and
+/// a waiting proof again only when a handle it waits for becomes resident.
+/// Indexed and junk verdicts are final; a resident blob that does not read
+/// as an archive judges as one with no facts. Residency is checked in the
+/// store's index, so an unrelated arrival reads no blob. A resource's entry is shared, by
+/// `Arc`, with the previous index unless one of its grants landed. Nothing is
+/// filtered by local selection; participation decides what is offered.
+/// Building it reads the store and writes nothing.
+#[derive(Clone, Default)]
+pub(crate) struct GrantIndex {
+    resources: PATCH<32, IdentitySchema, Arc<ResourceGrants>>,
+    /// Proof id to verdict.
+    verdicts: PATCH<32, IdentitySchema, Verdict>,
+    /// Waiting proofs by id.
+    waiting_proofs: BTreeMap<RawHash, CapabilityProof>,
+    /// Missing handle to the waiting proofs that need it.
+    waiting: BTreeMap<RawHash, BTreeSet<RawHash>>,
+    /// Proofs judged so far, over the whole incremental chain.
+    evaluations: u64,
+}
+
+impl GrantIndex {
+    /// The index of `snapshot`, from `previous` (the index of an earlier
+    /// snapshot of the same store) when given; `changes` classifies what
+    /// changed since then.
+    pub(crate) fn observe<R>(
+        snapshot: &R,
+        active: &ActiveCollections,
+        previous: Option<&Arc<GrantIndex>>,
+        changes: StoreChanges,
+    ) -> Result<Arc<GrantIndex>, R::ProofsError>
+    where
+        R: BlobStoreGet + BlobStoreList + CapabilityProofRead,
+    {
+        let proofs_changed =
+            previous.is_none() || changes.contains(StoreChanges::CAPABILITY_PROOFS);
+        let blobs_changed = previous.is_none() || changes.contains(StoreChanges::BLOBS);
+        let mut index = previous.map_or_else(GrantIndex::default, |index| GrantIndex::clone(index));
+        let mut touched = false;
+        if blobs_changed {
+            // Waiting proofs one of whose handles became resident are judged
+            // again; one still missing another handle waits on that.
+            let ready: BTreeSet<RawHash> = index
+                .waiting
+                .iter()
+                .filter(|(handle, _)| resident(snapshot, **handle))
+                .flat_map(|(_, ids)| ids.iter().copied())
+                .collect();
+            for id in ready {
+                let proof = index.unwait(id);
+                index.evaluate(snapshot, proof);
+                touched = true;
+            }
+        }
+        if proofs_changed {
+            for proof in snapshot.proofs()? {
+                let proof = proof?;
+                if index.verdicts.get(&proof.id().raw).is_none() {
+                    index.evaluate(snapshot, proof);
+                    touched = true;
+                }
+            }
+        }
+        // An active collection takes part through its roots even with no
+        // grant; its descriptor is immutable, so this is done once.
+        for raw in active.iter_ordered() {
+            if index.resources.get(raw).is_some() || !resident(snapshot, *raw) {
+                continue;
+            }
+            index.resources.insert(&PatchEntry::with_value(
+                raw,
+                Arc::new(ResourceGrants::rooted(&read_facts(snapshot, *raw))),
+            ));
+            touched = true;
+        }
+        Ok(match previous {
+            Some(previous) if !touched => previous.clone(),
+            _ => Arc::new(index),
+        })
+    }
+
+    /// Judge one proof that has no final verdict, and index it if it is
+    /// usable (steps 1-5 of the design note).
+    fn evaluate<R: BlobStoreGet + BlobStoreList>(&mut self, snapshot: &R, proof: CapabilityProof) {
+        self.evaluations += 1;
+        let id = proof.id().raw;
+        let resource = CollectionHandle::new(proof.resource().into_bytes());
+        let missing: BTreeSet<RawHash> = std::iter::once(resource.raw)
+            .chain(proof.capabilities().map(|handle| handle.raw))
+            .filter(|handle| !resident(snapshot, *handle))
+            .collect();
+        if !missing.is_empty() {
+            for handle in &missing {
+                self.waiting.entry(*handle).or_default().insert(id);
+            }
+            self.waiting_proofs.insert(id, proof);
+            self.verdicts
+                .replace(&PatchEntry::with_value(&id, Verdict::Waiting(missing)));
+            return;
+        }
+        let descriptor = read_facts(snapshot, resource.raw);
+        let definitions: Vec<TribleSet> = proof
+            .capabilities()
+            .map(|handle| read_facts(snapshot, handle.raw))
+            .collect();
+        let verdict = judge(snapshot, resource, &descriptor, &definitions, &proof);
+        if verdict == Verdict::Indexed(resource) {
+            let mut grants = match self.resources.get(&resource.raw) {
+                Some(grants) => ResourceGrants::clone(grants),
+                None => ResourceGrants::rooted(&descriptor),
+            };
+            for key in std::iter::once(proof.root_key()).chain(proof.delegated_keys()) {
+                grants.participants.insert(&PatchEntry::new(key.as_bytes()));
+            }
+            grants
+                .proofs
+                .insert(&PatchEntry::with_value(&grant_key(resource, proof.id()), proof));
+            self.resources
+                .replace(&PatchEntry::with_value(&resource.raw, Arc::new(grants)));
+        }
+        self.verdicts.replace(&PatchEntry::with_value(&id, verdict));
+    }
+
+    /// Take a waiting proof out of the waiting sets, for judging again.
+    fn unwait(&mut self, id: RawHash) -> CapabilityProof {
+        if let Some(Verdict::Waiting(missing)) = self.verdicts.get(&id) {
+            for handle in missing {
+                if let Some(ids) = self.waiting.get_mut(handle) {
+                    ids.remove(&id);
+                    if ids.is_empty() {
+                        self.waiting.remove(handle);
+                    }
+                }
+            }
+        }
+        self.waiting_proofs
+            .remove(&id)
+            .expect("a waiting verdict keeps its proof")
+    }
+
+    /// Root and count of R's indexed grants.
+    pub(crate) fn summary(&self, resource: CollectionHandle) -> PatchSummary {
+        self.grants(resource)
+            .and_then(|grants| {
+                grants.proofs.merkle_node(&resource.raw).map(|node| {
+                    PatchSummary::new(Some(node.digest()), node.leaf_count())
+                        .expect("an indexed resource prefix is nonempty")
+                })
+            })
+            .unwrap_or_else(|| PatchSummary::new(None, 0).expect("the empty summary is canonical"))
+    }
+
+    /// R's entry, if it has an indexed grant or is an active collection.
+    pub(crate) fn grants(&self, resource: CollectionHandle) -> Option<Arc<ResourceGrants>> {
+        self.resources.get(&resource.raw).cloned()
+    }
+
+    /// One indexed grant over R.
+    pub(crate) fn get(
+        &self,
+        resource: CollectionHandle,
+        id: CapabilityProofId,
+    ) -> Option<&CapabilityProof> {
+        self.resources
+            .get(&resource.raw)?
+            .proofs
+            .get(&grant_key(resource, id))
+    }
+
+    /// Whether `key` takes part in R.
+    pub(crate) fn participates(&self, resource: CollectionHandle, key: PeerId) -> bool {
+        self.resources
+            .get(&resource.raw)
+            .is_some_and(|grants| grants.participants.get(&key).is_some())
+    }
+
+    /// Every resource with an entry, in handle order.
+    pub(crate) fn resources(&self) -> impl Iterator<Item = CollectionHandle> + '_ {
+        self.resources
+            .iter_ordered()
+            .map(|raw| CollectionHandle::new(*raw))
+    }
+
+    /// Every waiting proof with every handle it waits for.
+    pub(crate) fn waiting(
+        &self,
+    ) -> impl Iterator<Item = (CapabilityProofId, &BTreeSet<RawHash>)> + '_ {
+        self.waiting_proofs
+            .keys()
+            .filter_map(|id| match self.verdicts.get(id) {
+                Some(Verdict::Waiting(missing)) => Some((CapabilityProofId::new(*id), missing)),
+                _ => None,
+            })
+    }
+
+    /// The verdict on one stored proof, once judged.
+    pub(crate) fn verdict(&self, id: CapabilityProofId) -> Option<&Verdict> {
+        self.verdicts.get(&id.raw)
+    }
+
+    /// Proofs judged over the whole incremental chain of this index.
+    pub(crate) fn evaluations(&self) -> u64 {
+        self.evaluations
+    }
+}
+
+impl ResourceGrants {
+    /// An entry with R's roots as its only participants: the roots of every
+    /// quorum binding of any entity of R's descriptor. Open bindings name no
+    /// root.
+    fn rooted(descriptor: &TribleSet) -> Self {
+        let mut grants = Self::default();
+        for policy in resource_grant_policies(descriptor) {
+            for root in policy.roots().unwrap_or_default() {
+                grants.participants.insert(&PatchEntry::new(root.as_bytes()));
+            }
+        }
+        grants
+    }
+}
+
+/// Whether the store's index holds `handle`; reads no blob.
+fn resident<R: BlobStoreList>(snapshot: &R, handle: RawHash) -> bool {
+    snapshot
+        .contains_blob(Inline::<Handle<UnknownBlob>>::new(handle))
+        .unwrap_or(false)
+}
+
+/// The facts of one resident blob; none when it does not read as an archive.
+fn read_facts<R: BlobStoreGet>(snapshot: &R, handle: RawHash) -> TribleSet {
+    snapshot
+        .get::<TribleSet, SimpleArchive>(Inline::new(handle))
+        .unwrap_or_default()
+}
+
+/// The verdict on a proof whose descriptor and definitions are all resident.
+/// An unreadable descriptor names no root, and core's delegation check
+/// rejects an unreadable definition.
+///
+/// Admission's own predicate decides root and signatures, and core's
+/// delegation check decides attenuation. Participation hardening is local:
+/// every step's definition must name an action, and every step after the
+/// first must extend a parent whose definition delegates one. Core accepts a
+/// step naming no action (it has no action to compare), so without this a
+/// grantee with no delegation right could name any key.
+fn judge<R: BlobStoreGet>(
+    snapshot: &R,
+    resource: CollectionHandle,
+    descriptor: &TribleSet,
+    definitions: &[TribleSet],
+    proof: &CapabilityProof,
+) -> Verdict {
+    match validate_proof_for_policies(resource, resource_grant_policies(descriptor), proof) {
+        Ok(()) => {}
+        Err(ProofEvidenceError::Invalid(_)) => return Verdict::Junk(Junk::Signature),
+        Err(_) => return Verdict::Junk(Junk::Root),
+    }
+    if proof.validate_delegation(snapshot).is_err() {
+        return Verdict::Junk(Junk::Delegation);
+    }
+    let delegates =
+        |definition: &TribleSet| exists!(pattern!(definition, [{ _?step @ capability_delegate_action: _?action }]));
+    let names_action = |definition: &TribleSet| {
+        delegates(definition)
+            || exists!(pattern!(definition, [{ _?step @ capability_action: _?action }]))
+    };
+    if !definitions.iter().all(names_action)
+        || !definitions.windows(2).all(|steps| delegates(&steps[0]))
+    {
+        return Verdict::Junk(Junk::NoActionStep);
+    }
+    Verdict::Indexed(resource)
+}
+
+fn grant_key(resource: CollectionHandle, id: CapabilityProofId) -> [u8; 64] {
+    let mut key = [0; 64];
+    key[..32].copy_from_slice(&resource.raw);
+    key[32..].copy_from_slice(&id.raw);
+    key
+}
 
 /// One connection's exchange.
 struct Exchange {

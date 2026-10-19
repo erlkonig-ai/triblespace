@@ -40,6 +40,7 @@ use crate::collection_activation::{CollectionRepairOverlay, CollectionRepairOver
 use crate::collection_delta::update_collection_record_patch;
 use crate::collection_wire::manifest;
 use crate::connection::{ConnectionTable, RESET_UNKNOWN, ReconEvent, Service};
+use crate::grants::GrantIndex;
 use crate::health::{CollectionHealth, Health, HealthSnapshot, StoreHealth};
 use crate::identity::iroh_secret;
 use crate::landing::{Land, LandSlot};
@@ -291,6 +292,9 @@ pub(crate) struct StoreSnapshot {
     /// The collections this side replicates in full
     /// ([`ReplicationMode::Full`](crate::reconcile::ReplicationMode::Full)).
     full: ActiveCollections,
+    /// Every grant this host holds, over any resource, with each resource's
+    /// participants: the one AUTH index (see [`GrantIndex`]).
+    grants: Arc<GrantIndex>,
 }
 
 impl StoreSnapshot {
@@ -437,6 +441,20 @@ impl StoreSnapshot {
                 }),
             ));
         }
+        // Grants are indexed from the previous index: only proofs not yet
+        // judged, and waiting proofs whose handles became readable, are
+        // evaluated.
+        let grants = GrantIndex::observe(
+            &snapshot,
+            active,
+            previous.map(|previous| &previous.grants),
+            if previous_store.is_some() {
+                changes
+            } else {
+                StoreChanges::ALL
+            },
+        )
+        .map_err(anyhow::Error::new)?;
         Ok(Self {
             collections,
             local,
@@ -444,7 +462,14 @@ impl StoreSnapshot {
             bearer_locators,
             config,
             full: ActiveCollections::new(),
+            grants,
         })
+    }
+
+    /// Every grant this host holds, over any resource, with each resource's
+    /// participants.
+    pub(crate) fn grants(&self) -> &Arc<GrantIndex> {
+        &self.grants
     }
 
     /// Replicate `full`'s collections in full: their peerings say so, and

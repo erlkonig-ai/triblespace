@@ -588,9 +588,52 @@ fn assert_leech_has_no_serving_inventory(leech: &Leech<Counted<Pile>>, counts: &
     assert!(!leech.peer.observed());
     assert!(leech.peer.sender.current_snapshot().is_none());
     assert_eq!(leech.peer.serving_snapshot_rebuilds(), 0);
+    assert_eq!(
+        leech.peer.grant_index_evaluations(),
+        0,
+        "a leech built a grant index"
+    );
     let health = leech.health();
     assert!(!health.store.serving_snapshot);
     assert!(health.store.last_snapshot_published_at.is_none());
+}
+
+/// Positive control for the leech guard's grant-index assertion: a serving
+/// peer's first publication judges its one stored proof (waiting, as its
+/// resource descriptor is absent), so the counter the guard reads moves.
+#[test]
+fn a_serving_snapshot_builds_the_grant_index() {
+    use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+    use triblespace_core::repo::CapabilityProofStore;
+
+    let key = SigningKey::from_bytes(&[88; 32]);
+    let mut store = MemoryRepo::default();
+    let collection = store
+        .collection(
+            "grant index control",
+            CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+        )
+        .unwrap()
+        .handle();
+    store
+        .insert_proof(CapabilityProof::new(
+            triblespace_core::capability::CapabilityResource::new([89; 32]),
+            &key,
+            triblespace_core::inline::Inline::new([90; 32]),
+            SigningKey::from_bytes(&[91; 32]).verifying_key(),
+        ))
+        .unwrap();
+    let (sender, receiver, wiring) =
+        host::wire(crate::identity::iroh_secret(&key).public().into());
+    let startup = Box::new(move || {
+        let _wiring = wiring;
+        Ok(None)
+    });
+    let mut peer = Peer::assemble(store, sender, receiver, None, HostState::Dormant(startup));
+    assert_eq!(peer.grant_index_evaluations(), 0);
+    peer.activate_collection(collection);
+    assert_eq!(peer.serving_snapshot_rebuilds(), 1);
+    assert_eq!(peer.grant_index_evaluations(), 1);
 }
 
 #[test]

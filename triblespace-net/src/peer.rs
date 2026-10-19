@@ -229,6 +229,9 @@ struct Publication<T> {
     last_store_snapshot: Option<T>,
     #[cfg(test)]
     rebuilds: usize,
+    /// Grant-index evaluations behind the installed serving snapshot.
+    #[cfg(test)]
+    grant_evaluations: u64,
 }
 
 impl<S> Serving<S>
@@ -285,6 +288,10 @@ where
             changes,
         )?
         .with_full(publication.full.clone());
+        #[cfg(test)]
+        {
+            publication.grant_evaluations = serving.grants().evaluations();
+        }
         self.sender.update_snapshot(serving, &publication.active);
         #[cfg(test)]
         {
@@ -485,6 +492,8 @@ where
                 last_store_snapshot: None,
                 #[cfg(test)]
                 rebuilds: 0,
+                #[cfg(test)]
+                grant_evaluations: 0,
             }),
             last_event_at: Mutex::new(crate::clock::mono_now()),
         });
@@ -804,6 +813,13 @@ where
     #[cfg(test)]
     fn serving_snapshot_rebuilds(&self) -> usize {
         self.serving.publication.lock().unwrap().rebuilds
+    }
+
+    /// Grant-index evaluations behind the installed serving snapshot; zero
+    /// when no grant index was ever built.
+    #[cfg(test)]
+    fn grant_index_evaluations(&self) -> u64 {
+        self.serving.publication.lock().unwrap().grant_evaluations
     }
 
     /// Whether a store observation underlies the serving snapshot.

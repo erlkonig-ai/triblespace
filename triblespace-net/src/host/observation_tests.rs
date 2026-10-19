@@ -1037,9 +1037,10 @@ fn scoped_unrelated_blobs_reuse_proofs_and_records_without_blob_reads() {
     fixture.store.track_held(handles);
     let mut before = fixture.observe(&selected, None);
     let (records, proofs, _) = fixture.take_counts();
+    // One evidence build per C, plus the host-wide grant index's one.
     assert_eq!(
         (records, proofs),
-        (2, 2),
+        (2, 2 + 1),
         "one evidence build per C, not two"
     );
     for name in ["unrelated one", "unrelated two", "unrelated three"] {
@@ -1151,7 +1152,8 @@ fn scoped_proof_change_refreshes_authorization_without_losing_record_interests()
     let (records, proofs, _) = fixture.take_counts();
     // CapabilityProofRead currently enumerates the whole component. Its raw
     // dependency must remain conservative even for a proof naming just one C.
-    assert_eq!((records, proofs), (0, 2));
+    // The host-wide grant index enumerates once more, for both.
+    assert_eq!((records, proofs), (0, 2 + 1));
     let old = before
         .1
         .collection(fixture.collections[0].handle())
@@ -1209,7 +1211,12 @@ fn scoped_missing_descriptor_stays_pending_until_its_exact_blob_arrives() {
     let before = fixture.observe(&selected, None);
     assert!(before.1.collection(cold.handle()).is_none());
     assert_eq!(before.1.collections().count(), 0);
-    assert_eq!(fixture.take_counts(), (0, 0, 1));
+    // The cold descriptor's one read; and the grant index's first build,
+    // which enumerates the proofs once and judges the fixture's two, reading
+    // each one's resource descriptor and definition, and the definition
+    // again in core's delegation check. The absent cold descriptor is
+    // checked for residency in the store's index, which reads nothing.
+    assert_eq!(fixture.take_counts(), (0, 1, 1 + 2 * 3));
 
     fixture
         .store

@@ -29,6 +29,8 @@ pub mod connection;
 pub mod dashboard;
 pub(crate) mod exchange;
 pub(crate) mod grants;
+#[cfg(test)]
+mod grants_index_tests;
 pub mod health;
 pub mod health_record;
 pub mod host;
