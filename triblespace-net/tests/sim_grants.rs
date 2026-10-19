@@ -1,12 +1,12 @@
-//! The grant exchange through whole hosts over the deterministic transport:
-//! a grant reaches its subject with its collection's descriptor, a peering
-//! waits for the definitions a credential names, and a definition is fetched
-//! no larger than policy metadata.
+//! Grants through whole hosts over the deterministic transport: a grant
+//! reaches its subject with its collection's descriptor once discovery
+//! connects them, a peering waits for the definitions a credential names,
+//! and a definition is fetched no larger than policy metadata. Nobody dials
+//! on a grant's behalf.
 #![cfg(feature = "sim")]
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
 use iroh_base::EndpointId;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
@@ -124,15 +124,16 @@ fn proofs(peer: &mut Peer<MemoryRepo>) -> Vec<CapabilityProof> {
         .collect()
 }
 
-/// A grant written while its subject is unknown to the owner's host reaches
-/// the subject: the host dials it, and the subject asks for the proof. The
-/// subject holds no descriptor, has not selected the collection, and can
-/// look nothing up (no host publishes to the DHT), so the descriptor comes
-/// from the owner over the connection that brought the grant, with the
-/// definition the proof names and the collection's name; the proof lands.
-/// The subject dialled nobody, and the collection is not active on it.
+/// The owner's host selects C, so its discovery dials C's READ grantee, a
+/// key its grants name, and lists C to it. The subject holds no descriptor,
+/// has not selected the collection, and can look nothing up (no host
+/// publishes to the DHT): it walks C's grants from the owner, keeps the one
+/// naming it in memory, and fetches the descriptor from the owner over the
+/// same connection, with the definition the proof names and the
+/// collection's name; the proof lands. The subject dialled nobody, and the
+/// collection is not active on it.
 #[test]
-fn a_signed_grant_dials_its_subject() {
+fn discovery_brings_a_read_grantee_its_grant_and_descriptor() {
     run(async || {
         let net = SimNet::new(0x6EA7_0001, SimConfig::default());
         let clock = virtual_clock();
@@ -147,6 +148,7 @@ fn a_signed_grant_dials_its_subject() {
             .collection("granted", policy.clone())
             .unwrap()
             .handle();
+        select(&mut owner_store, &owner_key, collection);
         let mut owner = bring_up(&net, &owner_key, owner_store);
         let mut subject = bring_up(&net, &subject_key, MemoryRepo::default());
         owner.activate_collection(collection);
@@ -161,8 +163,8 @@ fn a_signed_grant_dials_its_subject() {
         let read = grant(&owner_key, &subject_key, read_capability(), collection);
         owner.store().insert_proof(read.clone()).unwrap();
         owner.refresh();
-        advance(&clock, &mut [&mut owner, &mut subject], 5).await;
-        assert_eq!(net.dial_count(owner_id, subject_id), 1);
+        advance(&clock, &mut [&mut owner, &mut subject], 10).await;
+        assert!(net.dial_count(owner_id, subject_id) >= 1);
         assert_eq!(net.dial_count(subject_id, owner_id), 0);
         assert!(
             holds_blob(&mut subject, collection),
@@ -170,7 +172,6 @@ fn a_signed_grant_dials_its_subject() {
         );
         assert!(holds_blob(&mut subject, read_capability()));
         assert_eq!(proofs(&mut subject), [read]);
-        assert!(subject.health().available.is_empty());
         let name = IntoBlob::<UTF8String>::to_blob("granted").get_handle();
         assert!(
             subject.snapshot().unwrap().contains_blob(name).unwrap(),
@@ -183,10 +184,13 @@ fn a_signed_grant_dials_its_subject() {
     });
 }
 
-/// A stranger grants the subject a capability whose definition handle names
-/// a 4 MiB blob of its choosing. The grant reaches the subject, which fetches
-/// the descriptor and the definitions a proof naming it names, but no more
-/// than policy metadata can take: the descriptor is stored, the blob is not.
+/// A stranger grants the subject a capability whose definition is a 4 MiB
+/// archive of its choosing: a valid definition naming READ, padded with
+/// filler, so the stranger's own index offers the grant (a definition that
+/// does not read as one is junk and never offered). The grant reaches the
+/// subject, which fetches the descriptor and the definitions a proof naming
+/// it names, but no more than policy metadata can take: the descriptor is
+/// stored, the definition is not.
 /// The grant is evidence under the stranger's own descriptor, so it lands,
 /// as any proof naming this node does once its descriptor is held; what a
 /// stranger can make the subject store per grant is bounded to that proof
@@ -204,7 +208,18 @@ fn a_stranger_cannot_make_the_subject_store_a_large_definition() {
         );
         let mut stranger_store = MemoryRepo::default();
         let collection = stranger_store.collection("bait", policy).unwrap().handle();
-        let junk = Blob::<SimpleArchive>::new(Bytes::from_source(vec![0x5A_u8; 4 << 20]));
+        select(&mut stranger_store, &stranger_key, collection);
+        let junk: Blob<SimpleArchive> = {
+            use triblespace_core::trible::Trible;
+            let mut facts = entity! { capability_action: ACTION_READ }.facts().clone();
+            for index in 0..(4u64 << 20) / 64 {
+                let mut raw = [0x5A_u8; 64];
+                raw[..8].copy_from_slice(&index.to_be_bytes());
+                facts.insert(&Trible::force_raw(raw).unwrap());
+            }
+            facts.to_blob()
+        };
+        assert!(junk.bytes.len() >= 4 << 20);
         let junk_handle = junk.get_handle();
         stranger_store.put::<SimpleArchive, _>(junk).unwrap();
         let bait = grant(&stranger_key, &subject_key, junk_handle, collection);
@@ -223,8 +238,15 @@ fn a_stranger_cannot_make_the_subject_store_a_large_definition() {
             "the subject stored the stranger's 4 MiB definition"
         );
         assert_eq!(proofs(&mut subject), [bait]);
-        assert!(subject.health().available.is_empty());
     });
+}
+
+/// Select `collection` for sync in `store`'s configuration.
+fn select(store: &mut MemoryRepo, key: &SigningKey, collection: CollectionHandle) {
+    let config = store
+        .collection(CONFIG_COLLECTION_NAME, private_policy(key.verifying_key()))
+        .unwrap();
+    write_sync_selection(store, config, key, collection, true).unwrap();
 }
 
 /// One node's pile for the custom-definition collection.
@@ -253,7 +275,8 @@ impl Pile {
 /// reader asks an acceptor that lacks it, presenting its grant. The
 /// acceptor refuses, fetches the definition from the reader, or, when the
 /// reader lacks it too, from the grant's root among its connected peers, and
-/// then invites the reader.
+/// then invites the reader. A reader that lacks the definition completes its
+/// own grant the same way.
 #[test]
 fn a_custom_definition_credential_is_admitted_after_its_definition_is_fetched() {
     for presenter_holds in [true, false] {
@@ -291,10 +314,12 @@ fn a_custom_definition_credential_is_admitted_after_its_definition_is_fetched() 
             }
             // The reader holds the acceptor's WRITE grant, which makes the
             // acceptor its candidate and admits the acceptor's invitation.
+            // Only the reader holds its own READ grant: the acceptor, which
+            // takes part in C, learns of it no earlier than the reader asks.
             let write = grant(&owner_key, &acceptor_key, write_capability(), collection);
             let read = grant(&owner_key, &reader_key, custom, collection);
+            owner.store.insert_proof(write.clone()).unwrap();
             for proof in [&write, &read] {
-                owner.store.insert_proof(proof.clone()).unwrap();
                 reader.store.insert_proof(proof.clone()).unwrap();
             }
             acceptor.store.insert_proof(write).unwrap();
@@ -313,10 +338,10 @@ fn a_custom_definition_credential_is_admitted_after_its_definition_is_fetched() 
                 acceptor_key.verifying_key().to_bytes(),
                 reader_key.verifying_key().to_bytes(),
             );
-            // The owner dials the subjects of the grants it signed, so the
-            // acceptor is connected to it before the reader asks.
+            // The acceptor's discovery dials C's root, so the acceptor is
+            // connected to the owner before the reader asks.
             advance(&clock, &mut [&mut owner, &mut acceptor, &mut reader], 5).await;
-            assert_eq!(net.dial_count(owner_id, acceptor_id), 1);
+            assert!(net.dial_count(acceptor_id, owner_id) >= 1);
             assert!(!holds_blob(&mut acceptor, custom));
 
             write_sync_selection(
@@ -330,7 +355,9 @@ fn a_custom_definition_credential_is_admitted_after_its_definition_is_fetched() 
             reader.refresh();
             advance(&clock, &mut [&mut owner, &mut acceptor, &mut reader], 10).await;
             assert!(holds_blob(&mut acceptor, custom), "{presenter_holds}");
-            assert_eq!(holds_blob(&mut reader, custom), presenter_holds);
+            // A grantee completes its own waiting grant: a reader that
+            // lacked the definition fetched it too.
+            assert!(holds_blob(&mut reader, custom), "{presenter_holds}");
             let peerings = acceptor.health().peerings.clone();
             let peering = peerings
                 .iter()

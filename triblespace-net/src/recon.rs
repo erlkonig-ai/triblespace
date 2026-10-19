@@ -10,10 +10,7 @@
 //! | kind | frame          | payload                                      | from |
 //! |------|----------------|----------------------------------------------|------|
 //! | 0x01 | OPEN           | dialler sequence number, `u64`               | M6   |
-//! | 0x02 | PROOF_DIGEST   | digest                                       | M10  |
-//! | 0x03 | PROOF_REQUEST  | empty                                        | M10  |
-//! | 0x04 | PROOFS         | proofs                                       | M10  |
-//! | 0x05 | PROOFS_END     | empty                                        | M10  |
+//! | 0x06 | GRANT_ROOTS    | resource, root, count; repeated              | /33  |
 //! | 0x10 | PEER_REQUEST   | collection, flags, credentials               | M7   |
 //! | 0x11 | PEER_ACCEPT    | collection, flags                            | M7   |
 //! | 0x12 | PEER_REFUSE    | collection                                   | M7   |
@@ -28,13 +25,16 @@
 //! 0x30 to 0x32 that once carried announcements and pull walks are skipped
 //! like any other unknown kind.
 //!
-//! The grant exchange's frames (0x02 to 0x05) are about the connection's two
-//! keys, not a collection, and carry no handle. A digest is a presence byte
-//! (1 for a nonempty set), the Merkle root (zeros for the empty set) and the
-//! big-endian `u64` count of proofs. PROOFS frames answer a PROOF_REQUEST
-//! and PROOFS_END closes the answer.
+//! GRANT_ROOTS lists, for each resource R the receiver takes part in, the
+//! root and count of the sender's grants over R ([`crate::grants`]): R's
+//! handle, the Merkle root (zeros for the empty set) and the big-endian
+//! `u64` count, [`GRANT_ROOT_BYTES`] per entry and at most
+//! [`MAX_GRANT_ROOTS_PER_FRAME`] per frame. An entry with no root and a
+//! nonzero count, a root with a zero count, or a payload that is not whole
+//! entries is malformed. The kinds 0x02 to 0x05 of the retired digest
+//! exchange are skipped like any other unknown kind.
 //!
-//! Credentials, like the proofs of a PROOFS frame, are a big-endian `u16`
+//! Credentials are a big-endian `u16`
 //! count followed by that many proofs, each a big-endian `u16` length and the
 //! proof's bytes, ending exactly at the end of the payload. A proof whose bytes do not decode is skipped, as anything
 //! a reader cannot model is; a list that overruns the payload is malformed.
@@ -51,14 +51,12 @@ pub const MAX_RECON_FRAME_BYTES: u32 = 64 * 1024;
 
 /// The dialler's first frame: its sequence number as a big-endian `u64`.
 pub const FRAME_OPEN: u8 = 0x01;
-/// The digest of the sender's proofs naming the receiver.
-pub const FRAME_PROOF_DIGEST: u8 = 0x02;
-/// Ask for the receiver's proofs naming the sender.
-pub const FRAME_PROOF_REQUEST: u8 = 0x03;
-/// Some of the sender's proofs naming the receiver.
-pub const FRAME_PROOFS: u8 = 0x04;
-/// The answer to one PROOF_REQUEST is complete.
-pub const FRAME_PROOFS_END: u8 = 0x05;
+/// The sender's grant roots for the resources the receiver takes part in.
+pub const FRAME_GRANT_ROOTS: u8 = 0x06;
+/// Bytes of one GRANT_ROOTS entry: resource, root and count.
+pub const GRANT_ROOT_BYTES: usize = 32 + 32 + 8;
+/// GRANT_ROOTS entries one frame carries.
+pub const MAX_GRANT_ROOTS_PER_FRAME: usize = MAX_RECON_FRAME_BYTES as usize / GRANT_ROOT_BYTES;
 /// Ask to peer for a collection, or invite a key whose request was refused.
 pub const FRAME_PEER_REQUEST: u8 = 0x10;
 /// Accept a peering request, with the acceptor's flags.
@@ -78,8 +76,6 @@ const FLAG_INVITATION: u8 = 0x04;
 
 /// Collection handle, flags byte and credential count.
 const REQUEST_HEADER_BYTES: usize = 32 + 1 + 2;
-/// Presence byte, root and count.
-const DIGEST_BYTES: usize = 1 + 32 + 8;
 
 /// One side's flags on a peering.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -120,13 +116,8 @@ pub enum Frame {
     Unpeer {
         collection: CollectionHandle,
     },
-    /// The digest of the sender's proofs naming the receiver.
-    ProofDigest(PatchSummary),
-    /// Ask for the receiver's proofs naming the sender.
-    ProofRequest,
-    /// Some of the sender's proofs naming the receiver.
-    Proofs(Vec<CapabilityProof>),
-    ProofsEnd,
+    /// The root and count of the sender's grants over each resource listed.
+    GrantRoots(Vec<(CollectionHandle, PatchSummary)>),
 }
 
 /// A frame of a known kind whose payload does not parse.
@@ -143,7 +134,7 @@ impl Frame {
             | Self::PeerFlags { collection, .. }
             | Self::Credential { collection, .. }
             | Self::Unpeer { collection } => Some(*collection),
-            Self::ProofDigest(_) | Self::ProofRequest | Self::Proofs(_) | Self::ProofsEnd => None,
+            Self::GrantRoots(_) => None,
         }
     }
 
@@ -178,18 +169,14 @@ impl Frame {
                 FRAME_CREDENTIAL
             }
             Self::Unpeer { .. } => FRAME_UNPEER,
-            Self::ProofDigest(digest) => {
-                payload.push(u8::from(digest.root().is_some()));
-                payload.extend_from_slice(&digest.root().unwrap_or_default());
-                payload.extend_from_slice(&digest.leaf_count().to_be_bytes());
-                FRAME_PROOF_DIGEST
+            Self::GrantRoots(roots) => {
+                for (resource, summary) in roots {
+                    payload.extend_from_slice(&resource.raw);
+                    payload.extend_from_slice(&summary.root().unwrap_or_default());
+                    payload.extend_from_slice(&summary.leaf_count().to_be_bytes());
+                }
+                FRAME_GRANT_ROOTS
             }
-            Self::ProofRequest => FRAME_PROOF_REQUEST,
-            Self::Proofs(proofs) => {
-                push_credentials(&mut payload, proofs);
-                FRAME_PROOFS
-            }
-            Self::ProofsEnd => FRAME_PROOFS_END,
         };
         (kind, payload)
     }
@@ -237,13 +224,7 @@ impl Frame {
             FRAME_UNPEER => Self::Unpeer {
                 collection: fixed(32)?,
             },
-            FRAME_PROOF_DIGEST => Self::ProofDigest(digest(payload)?),
-            FRAME_PROOF_REQUEST | FRAME_PROOFS_END if !payload.is_empty() => {
-                return Err(Malformed("recon/1 frame has the wrong length"));
-            }
-            FRAME_PROOF_REQUEST => Self::ProofRequest,
-            FRAME_PROOFS => Self::Proofs(credentials(payload)?),
-            FRAME_PROOFS_END => Self::ProofsEnd,
+            FRAME_GRANT_ROOTS => Self::GrantRoots(grant_roots(payload)?),
             _ => return Ok(None),
         }))
     }
@@ -290,16 +271,12 @@ pub fn credential_frames(
         .collect()
 }
 
-/// The answer to a PROOF_REQUEST: `proofs` in as few PROOFS frames as hold
-/// them, then PROOFS_END.
-pub fn proof_frames(proofs: &[CapabilityProof]) -> Vec<Frame> {
-    let mut frames = chunks(proofs)
-        .into_iter()
-        .filter(|chunk| !chunk.is_empty())
-        .map(Frame::Proofs)
-        .collect::<Vec<_>>();
-    frames.push(Frame::ProofsEnd);
-    frames
+/// `roots` in as few GRANT_ROOTS frames as hold them; none for none.
+pub fn grant_roots_frames(roots: &[(CollectionHandle, PatchSummary)]) -> Vec<Frame> {
+    roots
+        .chunks(MAX_GRANT_ROOTS_PER_FRAME)
+        .map(|chunk| Frame::GrantRoots(chunk.to_vec()))
+        .collect()
 }
 
 /// Split credentials into lists that each fit one frame beside the largest
@@ -340,18 +317,22 @@ fn collection(payload: &[u8]) -> Result<(CollectionHandle, &[u8]), Malformed> {
     Ok((CollectionHandle::new(handle.try_into().unwrap()), rest))
 }
 
-fn digest(payload: &[u8]) -> Result<PatchSummary, Malformed> {
-    if payload.len() != DIGEST_BYTES {
-        return Err(Malformed("proof digest has the wrong length"));
+fn grant_roots(payload: &[u8]) -> Result<Vec<(CollectionHandle, PatchSummary)>, Malformed> {
+    if payload.len() % GRANT_ROOT_BYTES != 0 {
+        return Err(Malformed("grant roots are not whole entries"));
     }
-    let root: [u8; 32] = payload[1..33].try_into().unwrap();
-    let root = match payload[0] {
-        0 if root == [0; 32] => None,
-        1 => Some(root),
-        _ => return Err(Malformed("malformed proof digest root")),
-    };
-    let count = u64::from_be_bytes(payload[33..].try_into().unwrap());
-    PatchSummary::new(root, count).map_err(|_| Malformed("proof digest root and count disagree"))
+    payload
+        .chunks_exact(GRANT_ROOT_BYTES)
+        .map(|entry| {
+            let resource = CollectionHandle::new(entry[..32].try_into().unwrap());
+            let root: [u8; 32] = entry[32..64].try_into().unwrap();
+            let count = u64::from_be_bytes(entry[64..].try_into().unwrap());
+            let root = (root != [0; 32]).then_some(root);
+            PatchSummary::new(root, count)
+                .map(|summary| (resource, summary))
+                .map_err(|_| Malformed("grant root and count disagree"))
+        })
+        .collect()
 }
 
 fn push_credentials(payload: &mut Vec<u8>, credentials: &[CapabilityProof]) {
@@ -453,44 +434,78 @@ mod tests {
         roundtrip(Frame::Unpeer {
             collection: handle(6),
         });
-        roundtrip(Frame::ProofDigest(
-            PatchSummary::new(Some([7; 32]), 3).unwrap(),
-        ));
-        roundtrip(Frame::ProofDigest(PatchSummary::new(None, 0).unwrap()));
-        roundtrip(Frame::ProofRequest);
-        roundtrip(Frame::Proofs(vec![proof(8), proof(9)]));
-        roundtrip(Frame::ProofsEnd);
+    }
+
+    /// A nonempty summary: its root is never all zeros, which stands for
+    /// the empty set.
+    fn summary(byte: u8) -> PatchSummary {
+        let mut root = [byte; 32];
+        root[0] = 1;
+        PatchSummary::new(Some(root), u64::from(byte) + 1).unwrap()
     }
 
     #[test]
-    fn grant_frames_carry_no_collection_and_an_answer_ends_once() {
-        for frame in [Frame::ProofRequest, Frame::ProofsEnd] {
-            assert_eq!(frame.collection(), None);
-            assert!(frame.encode().1.is_empty());
-        }
-        let (kind, payload) = Frame::ProofDigest(PatchSummary::new(None, 0).unwrap()).encode();
-        assert_eq!((kind, payload.len()), (FRAME_PROOF_DIGEST, DIGEST_BYTES));
-
-        assert_eq!(proof_frames(&[]), [Frame::ProofsEnd]);
-        let one = proof(2);
-        let per_frame =
-            (MAX_RECON_FRAME_BYTES as usize - REQUEST_HEADER_BYTES) / (2 + one.as_bytes().len());
-        let proofs = (0..per_frame + 1)
-            .map(|index| proof(index as u8))
+    fn grant_roots_round_trip_and_split_at_the_frame_bound() {
+        assert_eq!(MAX_GRANT_ROOTS_PER_FRAME, 910);
+        roundtrip(Frame::GrantRoots(vec![
+            (handle(1), summary(1)),
+            (handle(2), PatchSummary::new(None, 0).unwrap()),
+        ]));
+        let entries = (0..=MAX_GRANT_ROOTS_PER_FRAME)
+            .map(|index| {
+                let mut raw = [0; 32];
+                raw[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                (CollectionHandle::new(raw), summary(index as u8))
+            })
             .collect::<Vec<_>>();
-        let frames = proof_frames(&proofs);
-        assert_eq!(frames.len(), 3);
-        assert_eq!(frames[2], Frame::ProofsEnd);
+        let frames = grant_roots_frames(&entries);
+        assert_eq!(frames.len(), 2);
         let mut carried = Vec::new();
-        for frame in &frames[..2] {
+        for (frame, expected) in frames.iter().zip([MAX_GRANT_ROOTS_PER_FRAME, 1]) {
             let (kind, payload) = frame.encode();
+            assert_eq!(kind, FRAME_GRANT_ROOTS);
             assert!(payload.len() <= MAX_RECON_FRAME_BYTES as usize);
-            let Ok(Some(Frame::Proofs(proofs))) = Frame::decode(kind, &payload) else {
-                panic!("a PROOFS frame");
+            assert_eq!(payload.len(), expected * GRANT_ROOT_BYTES);
+            let Ok(Some(Frame::GrantRoots(roots))) = Frame::decode(kind, &payload) else {
+                panic!("a GRANT_ROOTS frame");
             };
-            carried.extend(proofs);
+            assert_eq!(frame.collection(), None);
+            carried.extend(roots);
         }
-        assert_eq!(carried, proofs);
+        assert_eq!(carried, entries);
+        assert!(grant_roots_frames(&[]).is_empty());
+    }
+
+    #[test]
+    fn retired_digest_kinds_are_skipped_and_grant_roots_decode() {
+        for kind in [0x02, 0x03, 0x04, 0x05] {
+            assert_eq!(Frame::decode(kind, &[1; 41]), Ok(None), "{kind:#x}");
+        }
+        // Positive control: the next frame of the same stream decodes.
+        let frame = Frame::GrantRoots(vec![(handle(3), summary(3))]);
+        let (kind, payload) = frame.encode();
+        assert_eq!(Frame::decode(kind, &payload), Ok(Some(frame)));
+    }
+
+    #[test]
+    fn a_grant_root_with_a_count_but_no_root_is_malformed() {
+        let entry = |root: [u8; 32], count: u64| {
+            let mut payload = handle(4).raw.to_vec();
+            payload.extend_from_slice(&root);
+            payload.extend_from_slice(&count.to_be_bytes());
+            payload
+        };
+        assert!(Frame::decode(FRAME_GRANT_ROOTS, &entry([0; 32], 3)).is_err());
+        assert!(Frame::decode(FRAME_GRANT_ROOTS, &entry([7; 32], 0)).is_err());
+        assert!(Frame::decode(FRAME_GRANT_ROOTS, &entry([7; 32], 3)[..71]).is_err());
+        assert_eq!(
+            Frame::decode(FRAME_GRANT_ROOTS, &entry([0; 32], 0)),
+            Ok(Some(Frame::GrantRoots(vec![(
+                handle(4),
+                PatchSummary::new(None, 0).unwrap()
+            )]))),
+            "an empty root with no count is a listed empty set"
+        );
     }
 
     #[test]
@@ -551,25 +566,6 @@ mod tests {
         }
         let trailing = [&request[..], &[0]].concat();
         assert!(Frame::decode(FRAME_PEER_REQUEST, &trailing).is_err());
-        let (_, digest) = Frame::ProofDigest(PatchSummary::new(Some([7; 32]), 3).unwrap()).encode();
-        let mut empty_with_root = digest.clone();
-        empty_with_root[0] = 0;
-        let mut root_without_count = digest.clone();
-        root_without_count[33..].fill(0);
-        let mut unknown_presence = digest.clone();
-        unknown_presence[0] = 2;
-        for payload in [
-            &digest[..40],
-            &[&digest[..], &[0]].concat(),
-            &empty_with_root,
-            &root_without_count,
-            &unknown_presence,
-        ] {
-            assert!(Frame::decode(FRAME_PROOF_DIGEST, payload).is_err());
-        }
-        assert!(Frame::decode(FRAME_PROOF_REQUEST, &[0]).is_err());
-        assert!(Frame::decode(FRAME_PROOFS_END, &[0]).is_err());
-        assert!(Frame::decode(FRAME_PROOFS, &[]).is_err());
         // The kinds announcements and pull walks had are unknown now.
         for kind in [0x20, 0x30, 0x31, 0x32, 0x7F] {
             assert_eq!(Frame::decode(kind, b"anything"), Ok(None));

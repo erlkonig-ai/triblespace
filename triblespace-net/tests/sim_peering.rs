@@ -615,11 +615,12 @@ fn a_writer_that_cannot_read_delivers_and_receives_nothing() {
 /// walked to its end and drawn again.
 ///
 /// Each of two readers asks for five of ten servers. Servers write but
-/// cannot read: nothing reaches them but the credentials of the readers that
-/// ask them, so a server's candidates are the policy root, which is never on
-/// the network, and its own group's reader. The partition puts each reader
-/// with five servers from the start, and its five asked-for neighbours are
-/// healthy servers of its own group. Its swaps walk its order to the end and
+/// cannot read; they take part in C through their WRITE grants, so every
+/// grant over C reaches them, the readers' among them, and a server's
+/// candidates are the policy root, which is never on the network, and the
+/// readers it learned of. The partition puts each reader with five servers
+/// from the start, and its neighbours, asked for or asking, are healthy
+/// servers of its own group. Its swaps walk its order to the end and
 /// draw it again, dialling every server of the other group at least twice.
 /// Once the partition heals, a reader's walk or its next swap brings in a
 /// server of the other group, and with it that group's new record.
@@ -715,15 +716,16 @@ fn two_neighbour_groups_merge_after_their_partition_heals() {
         let mut all = hosts.iter_mut().collect::<Vec<_>>();
         advance(&clock, &mut all, 60).await;
         for group in 0..2 {
-            let mut asked = peerings(&hosts[group])
+            let peered = peerings(&hosts[group])
                 .into_iter()
-                .filter(|peering| peering.peered && peering.asked)
+                .filter(|peering| peering.peered)
                 .map(|peering| peering.peer)
                 .collect::<Vec<_>>();
-            asked.sort_unstable();
-            let mut own = servers[group].iter().map(id).collect::<Vec<_>>();
-            own.sort_unstable();
-            assert_eq!(asked, own, "reader {group} asks the servers of its group");
+            let own = servers[group].iter().map(id).collect::<Vec<_>>();
+            assert!(
+                !peered.is_empty() && peered.iter().all(|peer| own.contains(peer)),
+                "reader {group} peers with servers of its group only: {peered:?}"
+            );
         }
 
         // A new record in each group, which every server of the group holds.

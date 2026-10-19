@@ -566,6 +566,19 @@ impl Peerings {
         })
     }
 
+    /// Every collection peered on each connection, by connection id.
+    pub(crate) fn peered(&self) -> Vec<(u64, CollectionHandle)> {
+        self.meshes
+            .iter()
+            .flat_map(|(raw, mesh)| {
+                mesh.peerings
+                    .iter()
+                    .filter(|(_, peering)| peering.peered())
+                    .map(|(id, _)| (*id, CollectionHandle::new(*raw)))
+            })
+            .collect()
+    }
+
     /// Whether this side replicates C in full.
     fn full(&self, collection: CollectionHandle) -> bool {
         self.snapshot
@@ -1068,8 +1081,9 @@ impl Peerings {
 /// pushes through `walks` when a collection's schedule fires, and publish
 /// what changed into `health`. A collection's DHT providers are looked up
 /// through `find_providers`. The pushes received here arrive on `received`,
-/// for the schedules. Received proofs and fetched definitions land through
-/// `admissions`.
+/// for the schedules, and what grant walks report on `walked`, for the grant
+/// exchange, which opens grant walks through `walks` too. Landed grants and
+/// fetched definitions go through `admissions`.
 pub(crate) async fn run<T: Transport, S: Service>(
     connections: ConnectionTable<T, S>,
     mut snapshots: tokio::sync::watch::Receiver<Option<Arc<StoreSnapshot>>>,
@@ -1083,7 +1097,7 @@ pub(crate) async fn run<T: Transport, S: Service>(
 ) {
     let mut peerings = Peerings::new(connections.transport().local_id());
     let mut grants = Grants::new(connections.transport().local_id());
-    let sink = Sink::new(connections.clone(), admissions);
+    let sink = Sink::new(connections.clone(), admissions, walks.clone());
     let mut schedules = Schedules::default();
     let (dialled_tx, mut dialled) = tokio::sync::mpsc::unbounded_channel();
     let mut lookups = FuturesUnordered::new();
@@ -1150,8 +1164,8 @@ pub(crate) async fn run<T: Transport, S: Service>(
         }
         if peerings.publish(&health) {
             schedules.neighbours(peerings.neighbours(), crate::clock::mono_now());
+            sink.apply(grants.peered(peerings.peered()));
         }
-        grants.publish(&health);
     }
 }
 

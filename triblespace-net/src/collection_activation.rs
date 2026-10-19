@@ -273,11 +273,6 @@ impl CollectionAuthorizationEvidencePatch {
         }
     }
 
-    /// The retained prefixes under the keys they name.
-    pub(crate) const fn subject_index(&self) -> &SubjectProofPatch {
-        &self.subjects
-    }
-
     /// Enumerate the retained prefixes that end at `subject`, in hash order.
     pub fn proofs_naming(&self, subject: VerifyingKey) -> impl Iterator<Item = &CapabilityProof> {
         let subject = subject.to_bytes();

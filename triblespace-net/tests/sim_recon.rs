@@ -748,7 +748,15 @@ fn a_peer_that_stops_reading_recon_loses_its_connection() {
         // Past the 60 s a writer waits for credit.
         advance(&clock, peers, 70).await;
         assert!(closed(&conn));
-        let closed = frames.next().now_or_never().unwrap().unwrap_err();
+        // Frames the host sent before it closed, its grant roots for C
+        // among them, are still read first.
+        let closed = loop {
+            match frames.next().now_or_never().unwrap() {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("the stream ended cleanly"),
+                Err(error) => break error,
+            }
+        };
         assert!(closed.to_string().contains("connection reset"), "{closed}");
         assert!(
             peers[0]
