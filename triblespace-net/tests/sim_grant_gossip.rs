@@ -1875,3 +1875,117 @@ fn a_failed_grant_walk_is_retried_on_the_same_connection() {
 fn a_grant_walk_that_does_not_fail_is_not_retried() {
     a_failed_grant_walk_is_retried(false, 0x6A47_0D80);
 }
+
+// ---------------------------------------------------------------------------
+// Scenario 10: a delegated grant that lands through a peering is completed.
+// ---------------------------------------------------------------------------
+
+/// W roots C, whose READ is Open and whose WRITE W holds; C's descriptor
+/// also binds a delegable WRITE definition P rooted at W. W holds the chain
+/// W -> X (P) -> Y (Q), where Q is an attenuated WRITE definition C does not
+/// bind; X and Y are never online. B holds C's descriptor and P, which
+/// travel together, but not Q, and is admitted to sync C by the Open READ
+/// alone: it is no root of C and no key on the chain, so the chain reaches
+/// it only because the connection is peered for C. The chain lands at B
+/// (positive control); B then fetches Q from W, indexes the chain, so its
+/// grants over C agree with W's, and admits Y as a writer of C, as W does.
+#[test]
+fn a_delegated_grant_landed_through_a_peering_is_completed_and_indexed() {
+    use triblespace_core::capability::capability_delegate_action;
+    use triblespace_core::collection::ACTION_WRITE;
+    for seed in 0..SEEDS {
+        run(async |clock| {
+            let net = SimNet::new(0x6A47_0E00 ^ seed, SimConfig::default());
+            let [w, b, x, y] = [0xA1, 0xA2, 0xA3, 0xA4].map(key);
+            let delegable = entity! {
+                capability_action: ACTION_WRITE,
+                capability_delegate_action: ACTION_WRITE,
+                metadata::name: "delegable write",
+            };
+            let p: CapabilityHandle =
+                IntoBlob::<SimpleArchive>::to_blob(delegable.facts().clone()).get_handle();
+            let attenuated = entity! {
+                capability_action: ACTION_WRITE,
+                metadata::name: "attenuated write",
+            }
+            .facts()
+            .clone();
+            let policy = CollectionPolicy::new(
+                AdmissionPolicy::Open,
+                AdmissionPolicy::direct(w.verifying_key()),
+            )
+            .with_capability(delegable, AdmissionPolicy::direct(w.verifying_key()));
+            let mut piles = [&w, &b].map(Pile::new);
+            let typed = piles[0].store.collection("delegated", policy.clone()).unwrap();
+            let collection = typed.handle();
+            assert_eq!(piles[1].hold("delegated", &policy), collection);
+            let q: CapabilityHandle = piles[0]
+                .store
+                .put::<SimpleArchive, _>(attenuated)
+                .unwrap();
+            let chain = grant(&w, p, &x, collection)
+                .delegate(&x, q, y.verifying_key())
+                .unwrap();
+            piles[0].insert(&[&chain]);
+            for pile in &mut piles {
+                pile.select(collection);
+            }
+            let [w_pile, b_pile] = piles;
+            let mut wh = bring_up(net.join(&w), &w, w_pile.store);
+            let mut bh = bring_up(net.join(&b), &b, b_pile.store);
+            for host in [&mut wh, &mut bh] {
+                host.activate_collection(collection);
+            }
+            let (w_id, p, q) = (
+                id(&w),
+                CollectionHandle::new(p.raw),
+                CollectionHandle::new(q.raw),
+            );
+            assert!(holds_blob(&mut bh, p), "B holds P with C's descriptor");
+            assert!(!holds_blob(&mut bh, q), "B does not hold Q");
+            let writes = |peer: &mut Peer<MemoryRepo>| {
+                matches!(
+                    typed.writer_is_admitted(&peer.snapshot().unwrap(), y.verifying_key()),
+                    Ok(true)
+                )
+            };
+            assert!(writes(&mut wh), "positive control: W admits Y");
+
+            until(
+                &clock,
+                &mut [&mut wh, &mut bh],
+                60,
+                "B peered with W for C",
+                |hosts| receives_from(hosts[1], w_id, collection),
+            )
+            .await;
+            until(
+                &clock,
+                &mut [&mut wh, &mut bh],
+                30,
+                "the chain landed at B through the peering",
+                |hosts| holds_proof(hosts[1], &chain),
+            )
+            .await;
+            let local = grant_health(&wh, collection).expect("W's grants over C").local;
+            assert_eq!(local.leaf_count(), 1);
+            let reached = until(
+                &clock,
+                &mut [&mut wh, &mut bh],
+                30,
+                "Q fetched and the chain indexed at B",
+                |hosts| {
+                    holds_blob(hosts[1], q)
+                        && grant_health(hosts[1], collection)
+                            .is_some_and(|grants| grants.local == local)
+                },
+            )
+            .await;
+            println!(
+                "delegated grant (seed {seed}): Q resident and the chain indexed at B \
+                 {reached:?} virtual time after it landed, in 100 ms steps"
+            );
+            assert!(writes(&mut bh), "seed {seed}: B admits Y");
+        });
+    }
+}

@@ -875,7 +875,10 @@ A pending grant has only R's descriptor fetched, over `blob/1` from its
 sender first. What a grant stored here still needs, R's descriptor (with R's
 name, once the descriptor is resident) and every definition it names, is
 fetched in one request, from the peers that listed R first, then from the
-grant's root and delegated keys among connected peers; a refused peering
+grant's root and delegated keys among connected peers, whenever a walk's gate
+would keep that grant: it names this node, this node takes part in R, or a
+connection is peered for R. What lands is therefore always completed, and a
+connection newly peered for R asks that peer first. A refused peering
 request's definitions are fetched the same way. So nothing a grant's steps
 name is fetched before it starts at one of R's roots. Definitions and
 descriptors are policy metadata, fetched under the same 1 MiB bound, so a key
