@@ -35,8 +35,7 @@
 //! Tokenization is deliberately outside this type.  Callers supply typed term
 //! values produced by their own explicit recipe.
 
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::fmt;
 use std::marker::PhantomData;
@@ -619,38 +618,21 @@ impl<D: InlineEncoding, T: InlineEncoding> PortableBM25View<D, T> {
 
     /// Prepare scoring under the entire logical corpus, not per-segment IDFs.
     ///
-    /// The first call scans the carriers' frequencies with a streaming max
-    /// join. Only the union document domain and lengths are retained; there is
-    /// no owning copy of the full frequency relation. Later queries reuse the
-    /// immutable statistics and join only the requested term postings.
+    /// The first call visits every posting of every carrier once, in each
+    /// carrier's own order, so it costs about what the carriers' own lengths
+    /// cost. Only the union document domain and lengths are retained; there is no
+    /// owning copy of the full frequency relation. A document held by one
+    /// carrier takes its length from that carrier alone. Only a document
+    /// several carriers hold needs the pointwise maximum per term, and only
+    /// its postings are joined. Later queries reuse the immutable statistics
+    /// and join only the requested term postings.
     pub fn query(&self) -> Result<PortableBM25Query<'_, D, T>, PortableBM25Error> {
         if let [segment] = self.segments.as_slice() {
             return segment.query();
         }
         let joined = self
             .statistics
-            .get_or_init(|| {
-                let mut lengths: BTreeMap<RawInline, u64> = self
-                    .segments
-                    .iter()
-                    .flat_map(|segment| segment.raw_document_keys())
-                    .map(|document| (document, 0))
-                    .collect();
-                for row in MergedFrequencies::new(&self.segments)? {
-                    let (document, _, frequency) = row?;
-                    let length = lengths
-                        .get_mut(&document)
-                        .expect("posting's checked document domain");
-                    *length = length.checked_add(u64::from(frequency)).ok_or_else(|| {
-                        PortableBM25Error::new("derived document length overflows u64")
-                    })?;
-                }
-                let (documents, doc_lens) = lengths.into_iter().unzip();
-                Ok(JoinedStatistics {
-                    documents,
-                    statistics: Statistics::new(doc_lens),
-                })
-            })
+            .get_or_init(|| joined_statistics(&self.segments))
             .as_ref()
             .map_err(Clone::clone)?;
         Ok(PortableBM25Query {
@@ -661,6 +643,100 @@ impl<D: InlineEncoding, T: InlineEncoding> PortableBM25View<D, T> {
             statistics: &joined.statistics,
         })
     }
+}
+
+/// Union document domain and exact lengths under pointwise-maximum TF.
+///
+/// A union length is the sum over terms of the largest frequency any carrier
+/// gives the pair. For a document exactly one carrier holds, that is the sum
+/// of its postings there, accumulated straight into its length. The postings
+/// of documents several carriers hold are joined by `(document, term)` first.
+fn joined_statistics<D: InlineEncoding, T: InlineEncoding>(
+    segments: &[PortableBM25Index<D, T>],
+) -> Result<JoinedStatistics, PortableBM25Error> {
+    let mut documents: Vec<RawInline> = segments
+        .iter()
+        .flat_map(|segment| segment.raw_document_keys())
+        .collect();
+    documents.sort_unstable();
+    // Count each document's carriers on the sorted, still repeated domain.
+    let mut holders: Vec<u32> = Vec::with_capacity(documents.len());
+    let mut write = 0;
+    for read in 0..documents.len() {
+        if write > 0 && documents[write - 1] == documents[read] {
+            holders[write - 1] += 1;
+        } else {
+            documents[write] = documents[read];
+            holders.push(1);
+            write += 1;
+        }
+    }
+    documents.truncate(write);
+    documents.shrink_to_fit();
+    // Union positions are stored as u32 codes below. One carrier is capped at
+    // u32::MAX documents by its layout, but a union of carriers is not.
+    if documents.len() > u32::MAX as usize {
+        return Err(PortableBM25Error::new(
+            "union document domain exceeds u32 document codes",
+        ));
+    }
+
+    let length_overflow = || PortableBM25Error::new("derived document length overflows u64");
+    let mut lengths = vec![0u64; documents.len()];
+    let mut joined: HashMap<(u32, RawInline), u32> = HashMap::new();
+    for segment in segments {
+        let codes: Vec<u32> = segment
+            .raw_document_keys()
+            .map(|document| {
+                documents
+                    .binary_search(&document)
+                    .expect("a carrier's document is in the union domain") as u32
+            })
+            .collect();
+        // Postings are term-major, so they visit documents in no useful
+        // order: keep the per-posting writes in this carrier's own, smaller
+        // document space and move each length to the union once.
+        let shared: Vec<bool> = codes
+            .iter()
+            .map(|&code| holders[code as usize] > 1)
+            .collect();
+        let mut local = vec![0u64; codes.len()];
+        for term in 0..segment.layout.term_count {
+            let mut raw_term = None;
+            for posting in segment.checked_posting_range(term)? {
+                let (document, frequency) = segment.checked_posting(posting)?;
+                let document = document as usize;
+                if shared[document] {
+                    let raw_term = *raw_term.get_or_insert_with(|| segment.term_raw(term));
+                    joined
+                        .entry((codes[document], raw_term))
+                        .and_modify(|old| *old = (*old).max(frequency))
+                        .or_insert(frequency);
+                } else {
+                    let length = &mut local[document];
+                    *length = length
+                        .checked_add(u64::from(frequency))
+                        .ok_or_else(length_overflow)?;
+                }
+            }
+        }
+        // A document only this carrier holds has exactly this length.
+        for (document, length) in local.into_iter().enumerate() {
+            if !shared[document] {
+                lengths[codes[document] as usize] = length;
+            }
+        }
+    }
+    for ((code, _), frequency) in joined {
+        let length = &mut lengths[code as usize];
+        *length = length
+            .checked_add(u64::from(frequency))
+            .ok_or_else(length_overflow)?;
+    }
+    Ok(JoinedStatistics {
+        documents,
+        statistics: Statistics::new(lengths),
+    })
 }
 
 enum QueryCorpus<'a, D: InlineEncoding, T: InlineEncoding> {
@@ -833,64 +909,6 @@ impl<D: InlineEncoding, T: InlineEncoding> Iterator for ExactFrequencies<'_, D, 
                 }
             }
         }
-    }
-}
-
-/// Stream the canonical frequency union with one cursor/head per carrier.
-/// The head keys carry term and document, not a second owning frequency index.
-struct MergedFrequencies<'a, D: InlineEncoding, T: InlineEncoding> {
-    inputs: Vec<ExactFrequencies<'a, D, T>>,
-    heads: BinaryHeap<Reverse<(RawInline, RawInline, usize, u32)>>,
-}
-
-impl<'a, D: InlineEncoding, T: InlineEncoding> MergedFrequencies<'a, D, T> {
-    fn new(indexes: &'a [PortableBM25Index<D, T>]) -> Result<Self, PortableBM25Error> {
-        let mut merged = Self {
-            inputs: indexes
-                .iter()
-                .map(|index| index.raw_exact_frequencies())
-                .collect(),
-            heads: BinaryHeap::new(),
-        };
-        for index in 0..merged.inputs.len() {
-            merged.advance(index)?;
-        }
-        Ok(merged)
-    }
-
-    fn advance(&mut self, index: usize) -> Result<(), PortableBM25Error> {
-        if let Some(row) = self.inputs[index].next() {
-            let (document, term, frequency) = row?;
-            self.heads.push(Reverse((term, document, index, frequency)));
-        }
-        Ok(())
-    }
-}
-
-impl<D: InlineEncoding, T: InlineEncoding> Iterator for MergedFrequencies<'_, D, T> {
-    type Item = Result<(RawInline, RawInline, u32), PortableBM25Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let Reverse((term, document, index, mut frequency)) = self.heads.pop()?;
-        if let Err(error) = self.advance(index) {
-            self.heads.clear();
-            return Some(Err(error));
-        }
-        while self
-            .heads
-            .peek()
-            .is_some_and(|Reverse((next_term, next_document, _, _))| {
-                *next_term == term && *next_document == document
-            })
-        {
-            let Reverse((_, _, index, next_frequency)) = self.heads.pop().expect("peeked head");
-            frequency = frequency.max(next_frequency);
-            if let Err(error) = self.advance(index) {
-                self.heads.clear();
-                return Some(Err(error));
-            }
-        }
-        Some(Ok((document, term, frequency)))
     }
 }
 
@@ -1425,6 +1443,87 @@ mod tests {
             .unwrap()
             .query_multi(&[value(0xa1)])
             .is_empty());
+    }
+
+    #[test]
+    fn a_document_several_carriers_hold_sums_its_per_term_maxima() {
+        // Document 1 is held by both carriers with different per-term
+        // frequencies. Its union length is the sum of per-term maxima
+        // (7 + 5 = 12), neither carrier's own length (7 or 8) nor their
+        // sum. Documents 2 and 3 are each held by one carrier only.
+        let left = TestIndex::from_exact_counts(
+            [value(1), value(2)],
+            [
+                (value(1), value(0xa1), 2),
+                (value(1), value(0xa2), 5),
+                (value(2), value(0xa1), 4),
+            ],
+        )
+        .unwrap();
+        let right = TestIndex::from_exact_counts(
+            [value(1), value(3)],
+            [
+                (value(1), value(0xa1), 7),
+                (value(1), value(0xa2), 1),
+                (value(3), value(0xa3), 9),
+            ],
+        )
+        .unwrap();
+        let canonical = TestIndex::merge([&left, &right]).unwrap();
+        let expected = canonical.query().unwrap();
+        let view = TestView::from_segments([right.clone(), left.clone()]);
+        let actual = view.query().unwrap();
+        assert_eq!(actual.doc_count(), 3);
+        assert_eq!(actual.doc_len(0), Some(12));
+        assert_eq!(actual.doc_len(1), Some(4));
+        assert_eq!(actual.doc_len(2), Some(9));
+        for code in 0..expected.doc_count() {
+            assert_eq!(actual.doc_len(code), expected.doc_len(code));
+        }
+        assert_eq!(
+            actual.avg_doc_len().to_bits(),
+            expected.avg_doc_len().to_bits()
+        );
+        let query = [value(0xa1), value(0xa2), value(0xa3)];
+        let bits = |hits: Vec<(Inline<UnknownInline>, f32)>| {
+            hits.into_iter()
+                .map(|(doc, score)| (doc.raw, score.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            bits(actual.query_multi(&query)),
+            bits(expected.query_multi(&query))
+        );
+    }
+
+    #[test]
+    fn a_shared_document_joins_by_term_value_not_by_carrier_term_position() {
+        // Document 1 is shared, but its terms sit at different positions in
+        // the two carriers' term tables: 0xa2 is the left carrier's only term,
+        // while the right carrier lists 0xa1 then 0xa2. Its union length is
+        // max(0, 4) + max(3, 1) = 7. Joining by term position would pair
+        // left's 0xa2 with right's 0xa1 and give 5. Document 2 is held by the
+        // left carrier alone and keeps its own length there.
+        let left = TestIndex::from_exact_counts(
+            [value(1), value(2)],
+            [(value(1), value(0xa2), 3), (value(2), value(0xa2), 6)],
+        )
+        .unwrap();
+        let right = TestIndex::from_exact_counts(
+            [value(1)],
+            [(value(1), value(0xa1), 4), (value(1), value(0xa2), 1)],
+        )
+        .unwrap();
+        let canonical = TestIndex::merge([&left, &right]).unwrap();
+        let expected = canonical.query().unwrap();
+        let view = TestView::from_segments([left.clone(), right.clone()]);
+        let actual = view.query().unwrap();
+        assert_eq!(actual.doc_count(), 2);
+        assert_eq!(actual.doc_len(0), Some(7));
+        assert_eq!(actual.doc_len(1), Some(6));
+        for code in 0..expected.doc_count() {
+            assert_eq!(actual.doc_len(code), expected.doc_len(code));
+        }
     }
 
     #[test]
