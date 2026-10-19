@@ -1077,6 +1077,7 @@ pub(crate) async fn run<T: Transport, S: Service>(
     mut find_providers: impl FnMut(CollectionHandle) -> BoxFuture<'static, Vec<PeerId>>,
     walks: WalksHandle,
     mut received: tokio::sync::mpsc::UnboundedReceiver<walk::Event>,
+    mut walked: tokio::sync::mpsc::UnboundedReceiver<crate::grants::GrantEvent>,
     health: Health,
     admissions: tokio::sync::mpsc::Sender<NetEventBatch>,
 ) {
@@ -1119,6 +1120,7 @@ pub(crate) async fn run<T: Transport, S: Service>(
                 peerings.event(event);
             }
             Some(event) = received.recv() => schedules.event(event, crate::clock::mono_now()),
+            Some(event) = walked.recv() => sink.apply(grants.walked(event)),
             () = push_due => {
                 for (peer, collection, kind) in schedules.poll(crate::clock::mono_now()) {
                     walks.open(peer, collection, kind);
@@ -2013,6 +2015,7 @@ mod tests {
                 // nowhere.
                 let (walks, _) = tokio::sync::mpsc::unbounded_channel();
                 let (_, received) = tokio::sync::mpsc::unbounded_channel();
+                let (_, walked) = tokio::sync::mpsc::unbounded_channel();
                 let peering = tokio::spawn(run(
                     table.clone(),
                     observed,
@@ -2020,6 +2023,7 @@ mod tests {
                     |_| futures::future::ready(Vec::new()).boxed(),
                     WalksHandle(walks),
                     received,
+                    walked,
                     health.clone(),
                     admissions,
                 ));

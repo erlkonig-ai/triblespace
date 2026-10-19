@@ -499,6 +499,193 @@ pub(crate) fn descriptor_policies(
         .unwrap_or_default()
 }
 
+/// What a grant walk tells the grant exchange.
+#[derive(Debug)]
+pub(crate) enum GrantEvent {
+    /// A walk with `peer` kept `proof`, but R's descriptor is not resident
+    /// here: it waits in memory until it is.
+    Pending { peer: PeerId, proof: CapabilityProof },
+}
+
+/// Bounds on the grants waiting in memory for their descriptor.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingLimits {
+    pub(crate) per_sender: usize,
+    pub(crate) total: usize,
+    pub(crate) bytes: usize,
+}
+
+/// Proofs every sender together keeps waiting, in bytes.
+const MAX_PENDING_BYTES: usize = 1 << 20;
+
+impl Default for PendingLimits {
+    fn default() -> Self {
+        Self {
+            per_sender: MAX_PENDING_PER_SENDER,
+            total: MAX_PENDING,
+            bytes: MAX_PENDING_BYTES,
+        }
+    }
+}
+
+/// Grants a walk kept whose resource descriptor is not resident here
+/// (design: land only after validation). They wait in memory, never in the
+/// pile, each charged to the sender that delivered it, until R's descriptor
+/// arrives: then each lands if it starts at one of R's roots and is dropped
+/// otherwise. At most [`PendingLimits`] wait, per sender, in all and in
+/// bytes; the oldest go first. A waiting grant neither admits anything nor
+/// names a participant, and a sender's leave with its last connection.
+#[derive(Default)]
+pub(crate) struct Pending {
+    limits: PendingLimits,
+    /// Arrival sequence | sender | proof id: arrival order.
+    proofs: PATCH<72, IdentitySchema, CapabilityProof>,
+    bytes: usize,
+    next: u64,
+}
+
+fn pending_key(seq: u64, sender: PeerId, id: CapabilityProofId) -> [u8; 72] {
+    let mut key = [0; 72];
+    key[..8].copy_from_slice(&seq.to_be_bytes());
+    key[8..40].copy_from_slice(&sender);
+    key[40..].copy_from_slice(&id.raw);
+    key
+}
+
+fn pending_sender(key: &[u8; 72]) -> PeerId {
+    key[8..40].try_into().unwrap()
+}
+
+impl Pending {
+    #[cfg(test)]
+    pub(crate) fn new(limits: PendingLimits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
+
+    /// Keep `proof` for `sender`. Returns the (sender, resource) of every
+    /// grant evicted to make room, `proof` itself when it can never fit.
+    pub(crate) fn insert(
+        &mut self,
+        sender: PeerId,
+        proof: CapabilityProof,
+    ) -> Vec<(PeerId, CollectionHandle)> {
+        if self.contains(sender, &proof) {
+            return Vec::new();
+        }
+        let size = proof.as_bytes().len();
+        let resource = CollectionHandle::new(proof.resource().into_bytes());
+        if size > self.limits.bytes || self.limits.per_sender == 0 || self.limits.total == 0 {
+            return vec![(sender, resource)];
+        }
+        let mut evicted = Vec::new();
+        while self.kept(sender) >= self.limits.per_sender {
+            evicted.extend(self.evict(|key| pending_sender(key) == sender));
+        }
+        while self.proofs.len() as usize >= self.limits.total
+            || self.bytes + size > self.limits.bytes
+        {
+            evicted.extend(self.evict(|_| true));
+        }
+        let key = pending_key(self.next, sender, proof.id());
+        self.next += 1;
+        self.bytes += size;
+        self.proofs.insert(&PatchEntry::with_value(&key, proof));
+        evicted
+    }
+
+    /// Drop the oldest grant `which` selects.
+    fn evict(&mut self, which: impl Fn(&[u8; 72]) -> bool) -> Option<(PeerId, CollectionHandle)> {
+        let key = *self.proofs.iter_ordered().find(|key| which(key))?;
+        Some(self.remove(&key))
+    }
+
+    fn remove(&mut self, key: &[u8; 72]) -> (PeerId, CollectionHandle) {
+        let proof = self.proofs.get(key).expect("a pending key holds its proof");
+        let resource = CollectionHandle::new(proof.resource().into_bytes());
+        self.bytes -= proof.as_bytes().len();
+        self.proofs.remove(key);
+        (pending_sender(key), resource)
+    }
+
+    /// Whether `sender`'s `proof` waits.
+    pub(crate) fn contains(&self, sender: PeerId, proof: &CapabilityProof) -> bool {
+        self.proofs
+            .iter()
+            .any(|key| pending_sender(key) == sender && key[40..] == proof.id().raw)
+    }
+
+    /// How many grants wait for `sender`.
+    pub(crate) fn kept(&self, sender: PeerId) -> usize {
+        self.proofs
+            .iter()
+            .filter(|key| pending_sender(key) == sender)
+            .count()
+    }
+
+    /// How many grants wait, and their bytes.
+    #[cfg(test)]
+    pub(crate) fn size(&self) -> (usize, usize) {
+        (self.proofs.len() as usize, self.bytes)
+    }
+
+    /// Drop every grant `sender` delivered.
+    pub(crate) fn forget(&mut self, sender: PeerId) {
+        let keys: Vec<[u8; 72]> = self
+            .proofs
+            .iter()
+            .filter(|key| pending_sender(key) == sender)
+            .copied()
+            .collect();
+        for key in keys {
+            self.remove(&key);
+        }
+    }
+
+    /// Settle every grant `judge` decides: `Some(true)` lands it,
+    /// `Some(false)` drops it, `None` keeps it waiting. Returns those to land.
+    pub(crate) fn settle(
+        &mut self,
+        mut judge: impl FnMut(&CapabilityProof) -> Option<bool>,
+    ) -> Vec<CapabilityProof> {
+        let mut land = Vec::new();
+        let decided: Vec<([u8; 72], bool)> = self
+            .proofs
+            .iter_ordered()
+            .filter_map(|key| judge(self.proofs.get(key).unwrap()).map(|lands| (*key, lands)))
+            .collect();
+        for (key, lands) in decided {
+            if lands {
+                let proof = self.proofs.get(&key).unwrap().clone();
+                if !land.iter().any(|landing: &CapabilityProof| landing.id() == proof.id()) {
+                    land.push(proof);
+                }
+            }
+            self.remove(&key);
+        }
+        land
+    }
+}
+
+/// Whether a waiting grant over R lands: `None` while R's descriptor is not
+/// resident in `snapshot`, else whether it starts at one of R's roots.
+/// `policies` caches each descriptor's policies for one observation.
+fn settles(
+    snapshot: &StoreSnapshot,
+    policies: &mut HashMap<RawHash, Vec<AdmissionPolicy>>,
+    proof: &CapabilityProof,
+) -> Option<bool> {
+    let resource = CollectionHandle::new(proof.resource().into_bytes());
+    if !policies.contains_key(&resource.raw) {
+        let bytes = snapshot.get_blob(&resource.raw)?;
+        policies.insert(resource.raw, descriptor_policies(bytes, resource));
+    }
+    let policies = policies[&resource.raw].iter().cloned();
+    Some(validate_proof_for_policies(resource, policies, proof).is_ok())
+}
+
 fn grant_key(resource: CollectionHandle, id: CapabilityProofId) -> [u8; 64] {
     let mut key = [0; 64];
     key[..32].copy_from_slice(&resource.raw);
@@ -578,6 +765,8 @@ pub(crate) struct Grants {
     dialled: HashSet<RawHash>,
     /// `pending` changed since it was last published.
     changed: bool,
+    /// Grants walks kept whose descriptor is not resident here.
+    waiting: Pending,
 }
 
 impl Grants {
@@ -593,7 +782,55 @@ impl Grants {
             exchanges: HashMap::new(),
             dialled: HashSet::new(),
             changed: false,
+            waiting: Pending::default(),
         }
+    }
+
+    /// Hear what a grant walk reports: a kept grant whose descriptor is not
+    /// resident waits in memory, and that descriptor and its definitions
+    /// are fetched from the sender first.
+    pub(crate) fn walked(&mut self, event: GrantEvent) -> Effects {
+        let mut effects = Effects::default();
+        match event {
+            GrantEvent::Pending { peer, proof } => {
+                // The descriptor may have landed since the walk judged it.
+                if let Some(snapshot) = self.snapshot.clone() {
+                    match settles(&snapshot, &mut HashMap::new(), &proof) {
+                        Some(true) => {
+                            effects.land.push(proof);
+                            return effects;
+                        }
+                        Some(false) => return effects,
+                        None => {}
+                    }
+                }
+                let resident = |handle: &RawHash| {
+                    self.snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.get_blob(handle).is_some())
+                };
+                let mut blobs = vec![proof.resource().into_bytes()];
+                blobs.extend(
+                    proof
+                        .capabilities()
+                        .map(|definition| definition.raw)
+                        .filter(|definition| !resident(definition))
+                        .collect::<BTreeSet<_>>(),
+                );
+                effects.fetch.push(Fetch {
+                    blobs,
+                    sources: sources(peer, std::slice::from_ref(&proof)),
+                });
+                self.waiting.insert(peer, proof);
+            }
+        }
+        effects
+    }
+
+    /// The grants walks kept that wait for their descriptor.
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> &Pending {
+        &self.waiting
     }
 
     /// Hear one connection event. Frames about a collection are the
@@ -627,6 +864,7 @@ impl Grants {
                     .any(|exchange| exchange.link.peer() == sender)
                 {
                     self.forget(sender);
+                    self.waiting.forget(sender);
                 }
                 Effects::default()
             }
@@ -919,6 +1157,14 @@ impl Grants {
         }
         self.own_from_received();
 
+        // Grants walks kept land once their descriptor is resident, if they
+        // start at one of its roots, and are dropped otherwise.
+        let snapshot = self.snapshot.clone().expect("observed");
+        let mut policies = HashMap::new();
+        effects
+            .land
+            .extend(self.waiting.settle(|proof| settles(&snapshot, &mut policies, proof)));
+
         let exchanges = self.exchanges.keys().copied().collect::<Vec<_>>();
         for id in exchanges {
             self.send_digest(id);
@@ -1108,6 +1354,10 @@ async fn fetch_blobs<T: Transport, S: Service>(
         fetching.lock().unwrap().remove(&handle);
     }
 }
+
+#[cfg(test)]
+#[path = "grant_listing_tests.rs"]
+mod grant_listing_tests;
 
 #[cfg(test)]
 mod tests {

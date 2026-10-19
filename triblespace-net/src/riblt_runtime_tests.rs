@@ -568,6 +568,7 @@ fn driven_with_writer(
         connections: ConnectionTable::new(harness.transport, NoRequests),
         snapshots: observed,
         landing,
+        grants: mpsc::unbounded_channel().0,
         commands,
         id: 1,
         peer: peer.id(),
@@ -1078,6 +1079,7 @@ async fn riblt_runtime_one_way_walks_use_prefix_and_refuse_incoming_riblt() {
         commands: WalksHandle(commands),
         landing,
         events,
+        grants: mpsc::unbounded_channel().0,
         running: HashMap::new(),
         next_id: 0,
     };
@@ -1247,6 +1249,7 @@ async fn riblt_runtime_simultaneous_open_tie_break_preserves_winners_explicit_al
                 commands: WalksHandle(commands),
                 landing,
                 events,
+                grants: mpsc::unbounded_channel().0,
                 running: HashMap::new(),
                 next_id: 778,
             };
@@ -1350,6 +1353,7 @@ async fn riblt_runtime_task_retains_prefix_agreement_but_releases_cached_source_
             commands: WalksHandle(commands),
             landing,
             events,
+            grants: mpsc::unbounded_channel().0,
             running: HashMap::new(),
             next_id: 1,
         };

@@ -74,6 +74,7 @@ use crate::connection::{
     Service, open_walk, read_frame, write_frame,
 };
 use crate::exchange::{Ended, Exchange, Out, Outcome, Pinned, Tree};
+use crate::grants::GrantEvent;
 use crate::health::Health;
 use crate::host::{CollectionSnapshot, StoreSnapshot};
 use crate::landing::{LandSlot, Landed};
@@ -885,17 +886,23 @@ pub(crate) enum Command {
 
 /// Run one node's walks: its landing task, and a task that opens exchanges,
 /// joins the exchanges its peers open and follows `snapshots`. Returns what
-/// opens exchanges, and where receives are reported for the scheduler.
+/// opens exchanges, where receives are reported for the scheduler, and
+/// where grant walks report to the grant exchange.
 pub(crate) fn spawn<T: Transport, S: Service>(
     connections: ConnectionTable<T, S>,
     snapshots: watch::Receiver<Option<Arc<StoreSnapshot>>>,
     walks: Walks,
     lander: LandSlot,
-) -> (WalksHandle, mpsc::UnboundedReceiver<Event>) {
+) -> (
+    WalksHandle,
+    mpsc::UnboundedReceiver<Event>,
+    mpsc::UnboundedReceiver<GrantEvent>,
+) {
     let (commands, commanded) = mpsc::unbounded_channel();
     let (landing, items) = mpsc::unbounded_channel();
     let (acks, landed) = mpsc::unbounded_channel();
     let (events, heard) = mpsc::unbounded_channel();
+    let (grants, walked) = mpsc::unbounded_channel();
     tokio::spawn(crate::landing::run(lander, items, acks));
     // The connections hand the walk/1 streams peers open to this task.
     connections.walks(WalksHandle(commands.clone()));
@@ -906,11 +913,12 @@ pub(crate) fn spawn<T: Transport, S: Service>(
         commands: WalksHandle(commands.clone()),
         landing,
         events,
+        grants,
         running: HashMap::new(),
         next_id: 0,
     };
     tokio::spawn(task.run(snapshots, commanded, landed));
-    (WalksHandle(commands), heard)
+    (WalksHandle(commands), heard, walked)
 }
 
 struct Task<T: Transport, S> {
@@ -922,6 +930,8 @@ struct Task<T: Transport, S> {
     /// Values for the landing task, by exchange.
     landing: mpsc::UnboundedSender<(u64, Vec<NetEvent>)>,
     events: mpsc::UnboundedSender<Event>,
+    /// What grant walks report to the grant exchange.
+    grants: mpsc::UnboundedSender<GrantEvent>,
     /// Exchanges running, by peer, collection and kind.
     running: HashMap<Key, Running>,
     next_id: u64,
@@ -1162,6 +1172,7 @@ impl<T: Transport, S: Service> Task<T, S> {
             connections: self.connections.clone(),
             snapshots: self.snapshots.clone(),
             landing: self.landing.clone(),
+            grants: self.grants.clone(),
             commands: self.commands.0.clone(),
             id,
             peer,
@@ -1283,6 +1294,8 @@ struct Driver<T: Transport, S> {
     connections: ConnectionTable<T, S>,
     snapshots: watch::Receiver<Option<Arc<StoreSnapshot>>>,
     landing: mpsc::UnboundedSender<(u64, Vec<NetEvent>)>,
+    /// Where a kept grant that cannot land yet goes.
+    grants: mpsc::UnboundedSender<GrantEvent>,
     commands: mpsc::UnboundedSender<Command>,
     id: u64,
     peer: PeerId,
@@ -1423,9 +1436,14 @@ async fn drive<T: Transport, S: Service>(
                 Out::Land(events) => {
                     let _ = driver.landing.send((driver.id, events));
                 }
-                // Never landed unchecked: dropped, and offered again by the
-                // next walk, which keeps no agreement.
-                Out::Pending(_) => {}
+                // Never landed unchecked: it waits in the grant exchange's
+                // bounded memory until its descriptor arrives.
+                Out::Pending(proof) => {
+                    let _ = driver.grants.send(GrantEvent::Pending {
+                        peer: driver.peer,
+                        proof,
+                    });
+                }
                 Out::Fetch(handle) => {
                     let connections = driver.connections.clone();
                     let fetches = fetches.clone();
@@ -2331,7 +2349,7 @@ pub(crate) mod tests {
                 });
                 let (slot, lands) = watch::channel(Some(lander.clone() as Arc<dyn Land>));
                 std::mem::forget(slot);
-                let (walks, events) = spawn(table.clone(), snapshot, walks, lands);
+                let (walks, events, _grants) = spawn(table.clone(), snapshot, walks, lands);
                 Self {
                     peer,
                     lander,
@@ -3043,6 +3061,7 @@ pub(crate) mod tests {
                 commands: hosted.walks.clone(),
                 landing,
                 events,
+                grants: mpsc::unbounded_channel().0,
                 running: HashMap::new(),
                 next_id: 0,
             };
@@ -3202,6 +3221,7 @@ pub(crate) mod tests {
                 commands: hosted.walks.clone(),
                 landing,
                 events,
+                grants: mpsc::unbounded_channel().0,
                 running: HashMap::new(),
                 next_id: 0,
             };
@@ -3256,6 +3276,7 @@ pub(crate) mod tests {
                 connections: hosted.table.clone(),
                 snapshots: hosted.lander.snapshots.subscribe(),
                 landing,
+                grants: mpsc::unbounded_channel().0,
                 commands,
                 id: 1,
                 peer: Node::new(228).id(),
@@ -3349,6 +3370,7 @@ pub(crate) mod tests {
                 connections: hosted.table.clone(),
                 snapshots: hosted.lander.snapshots.subscribe(),
                 landing,
+                grants: mpsc::unbounded_channel().0,
                 commands,
                 id: 1,
                 peer: Node::new(108).id(),
@@ -3446,6 +3468,7 @@ pub(crate) mod tests {
                 connections: hosted.table.clone(),
                 snapshots: hosted.lander.snapshots.subscribe(),
                 landing,
+                grants: mpsc::unbounded_channel().0,
                 commands,
                 id: 1,
                 peer: Node::new(104).id(),
@@ -3543,6 +3566,7 @@ pub(crate) mod tests {
                 connections: hosted.table.clone(),
                 snapshots: hosted.lander.snapshots.subscribe(),
                 landing,
+                grants: mpsc::unbounded_channel().0,
                 commands,
                 id: 1,
                 peer: Node::new(104).id(),

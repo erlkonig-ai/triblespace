@@ -1171,7 +1171,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
     // The walks task pushes this node's trees on walk/1 streams and lands
     // what its neighbours push through one task, which also reobserves the
     // store for appends made elsewhere.
-    let (walks, received) = crate::walk::spawn(
+    let (walks, received, walked) = crate::walk::spawn(
         connections.clone(),
         wiring.snapshot.clone(),
         crate::walk::Walks::new(wiring.health.clone()).with_algorithm(config.walk_algorithm),
@@ -1216,6 +1216,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
         },
         walks,
         received,
+        walked,
         wiring.health.clone(),
         wiring.evt_tx.clone(),
     ));
