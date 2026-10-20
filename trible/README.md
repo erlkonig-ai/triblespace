@@ -104,16 +104,17 @@ Run `trible <COMMAND>` to invoke a subcommand.
 #### Offline canonical assertion rewrite (source candidate)
 
 The one-time `/32` rewrite is separate from `clean`, `lattice-v3`, and
-`reframe`. Work only on an operator-frozen, retained source copy after quiescing
+`reframe`. Work only on an operator-frozen, retained source after quiescing
 its writers, and keep every input frozen for the entire command. It does not
-operate on live piles or switch a daemon. The Linux `/proc` and native macOS
-libproc opener guards are observational, not global no-writer proofs or
-immutability enforcement. macOS checks readable same-effective-UID vnode
-descriptor tables by device/inode, including hardlinks and read-only openers.
-It explicitly reports permission and process-churn exclusions and refuses
-incomplete observations within that scope; self, other users, fileports and
-mappings without open descriptors are not covered. See the
-[custody limits](../book/src/pile-format.md#offline-migration-custody-on-macos).
+operate on live piles or switch a daemon. Canonical migration and refresh do not
+enumerate host-wide process descriptors: another process holding an unchanged
+input open, read-only or read-write, is not itself evidence of a change.
+Retained-descriptor and path identity, length, modification time and full BLAKE3
+checks detect accidental input changes, including refresh inputs, before
+publication. These checks do not enforce immutability or make concurrent writes
+safe; operator-frozen custody remains a precondition. The separate historical
+`lattice-v3` opener observers are unchanged. See the
+[custody contract](../book/src/pile-format.md#offline-canonical-migration-custody).
 
 ```bash
 trible pile migrate SOURCE canonical-refresh --into OWN_REFRESH \

@@ -1,8 +1,9 @@
 //! One-time offline /32 conversion. Historical codecs never enter core replay.
 //! Original evidence remains in the operator-retained hash-bound source.
 //! Native retired signed equations are copied exactly as inert evidence only.
-//! The operator must freeze every input for the entire run. The opener check
-//! observes a platform-limited set of descriptors; it does not enforce custody.
+//! The operator must freeze every input for the entire run. Identity and full
+//! BLAKE3 checks detect accidental changes; they do not enforce immutability.
+//! Canonical conversion does not enumerate other processes' descriptors.
 use std::collections::BTreeSet; // One selector call's ephemeral scratch only.
 use std::fs::{File, Metadata};
 use std::io::Write;
@@ -42,7 +43,7 @@ pub struct Args {
     #[arg(long)]
     pub key: PathBuf,
     /// BLAKE3 of the complete operator-frozen source file (64 hex characters).
-    /// Keep all inputs frozen for the whole run; opener checks are observational.
+    /// Keep all inputs frozen for the whole run; hashes do not enforce custody.
     #[arg(long)]
     pub source_hash: String,
     /// Canonical native refresh pile. Only exact matching foundations are used.
@@ -67,7 +68,7 @@ pub struct RefreshArgs {
     #[arg(long)]
     pub key: PathBuf,
     /// BLAKE3 of the operator-frozen source; keep it frozen for the whole run.
-    /// The platform-limited opener check does not enforce immutability.
+    /// Identity/hash checks detect changes; they do not enforce immutability.
     #[arg(long)]
     pub source_hash: String,
     #[arg(long, conflicts_with = "dry_run")]
@@ -118,7 +119,6 @@ struct Source {
 }
 impl Source {
     fn open(path: &Path, expected: Option<[u8; 32]>) -> Result<Self> {
-        super::lattice_v3::refuse_if_open(path)?;
         let file = File::open(path).with_context(|| format!("open source {}", path.display()))?;
         let metadata = file.metadata()?;
         ensure!(metadata.is_file(), "source must be a regular frozen file");
@@ -169,8 +169,9 @@ fn same_file(a: &Metadata, b: &Metadata) -> bool {
 }
 #[cfg(not(unix))]
 fn same_file(_: &Metadata, _: &Metadata) -> bool {
+    // Fail closed until this platform has a source file identity comparison.
     false
-} // Opener guard already refuses unsupported platforms.
+}
 
 fn partial_path(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();

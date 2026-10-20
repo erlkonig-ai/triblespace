@@ -7,10 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- Add a native macOS observational opener guard for offline pile rewrites,
-  with explicit readable same-user descriptor scope and fail-closed incomplete
-  observations. Canonical migration/refresh still requires operator-frozen
-  inputs, retained originals, descriptor identity checks and source hashes.
+- Canonical migration/refresh relies on explicit operator-frozen input custody,
+  not a host-wide opener observation. Preserve source/refresh identity and full
+  BLAKE3 checks for accidental changes, original-author verification, audits and
+  no-replace publication. Accept unchanged inputs held open through read-only
+  or read-write hardlink descriptors. Hashes do not enforce immutability.
+  The historical `lattice-v3` Linux/macOS opener observers remain unchanged.
 
 - The offline canonical migration preserves already-native, signature-valid
   retired v8 MERGE/v9 DERIVE frames as exact inert copied-prefix evidence.

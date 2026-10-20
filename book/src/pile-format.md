@@ -550,31 +550,32 @@ foreign-author refresh. Their synthetic acceptance is not a live cutover:
 retained-source inventory, supported-history and refresh availability, an
 operator policy, rehearsal, and coordinated adoption preflight remain necessary.
 
-### Offline migration custody on macOS
+### Offline canonical migration custody
 
 The operator must independently freeze every canonical migration/refresh input
-for the entire command and retain the hash-bound original. The native macOS
-opener guard is **observational**, not a lock, global no-writer proof, or enforced
-immutability. It uses libproc to enumerate same-effective-UID processes, then
-compares vnode descriptor device/inode identity with the source (hardlinks
-included). Every observed opener, read-only or writable, refuses the operation.
+for the entire command and retain the hash-bound original. This is an explicit
+custody precondition, not a claim that the CLI can enforce immutability. The
+accidental-writer threat model detects evidence of input change; it does not
+require complete observation of all host processes. Canonical migration and
+refresh do not enumerate other processes' descriptors. An unchanged input may
+remain open in another process through a read-only or read-write descriptor,
+including a hardlink, without that fact alone refusing conversion.
 
-Its declared coverage is readable descriptor tables, excluding this process.
-Other users, initially permission-denied tables, Mach fileports, and mappings
-whose descriptor has closed are outside that scope. Diagnostics always state
-these limits, list denied PIDs, and count observed process/descriptor
-disappearances. Enumeration is not atomic: PID/FD reuse, new processes and new
-opens during or after the check remain possible. No privilege is requested.
-Initial table permission denial is an explicit exclusion; errors after entering
-a readable table, malformed/truncated lists, and incomplete vnode details
-refuse. ESRCH/EBADF disappearance is distinguished from permission failure.
-An observation with no readable other-process table also refuses.
+The retained read-only descriptor and source path must still name the same
+device/inode, length and modification time. The complete source BLAKE3 must
+match the explicit expected hash and the retained byte view. Each refresh input
+also retains its initial identity and full BLAKE3 for subsequent checks. Checks
+run before reading and again after conversion and immediately before no-replace
+destination publication. Detected changes refuse publication; partial output
+and reports remain evidence, not successful completion. Original-author
+verification, output audits and retained-original obligations are unchanged.
 
-The retained read-only descriptor, source path identity/length/time, and complete
-source BLAKE3 checks remain in place before reading and publishing. Those checks
-detect evidence of change but do not make concurrent mmap mutation safe; frozen
-input custody remains a precondition, as on Linux. The Linux `/proc` observer
-continues to see only the descriptor tables its user can read.
+These checks are not atomic with publication, do not stop a writer, and do not
+make concurrent mmap mutation safe. Hash equality is not enforced immutability;
+the operator must keep all inputs unchanged for the entire command. The
+separate historical `lattice-v3` migration retains its existing Linux `/proc`
+and native macOS observational opener checks and their platform-specific limits;
+canonical migration and refresh do not invoke them.
 
 The collection itself is identified by a canonical `SimpleArchive` descriptor.
 Its 32-byte blob handle is the sole `CollectionHandle`. Records carry this

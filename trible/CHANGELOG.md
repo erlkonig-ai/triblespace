@@ -8,10 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
-- Offline migration can observe native macOS vnode openers, including hardlinks
-  and read-only descriptors. Report permission and process-churn limits; refuse
-  incomplete observations within readable scope. This does not enforce input
-  immutability or replace operator-frozen custody and canonical source checks.
+- Canonical migration and refresh no longer require a host-wide opener check.
+  Keep inputs operator-frozen for the whole run; retained identity/full-BLAKE3
+  checks detect accidental changes but do not enforce immutability. Unchanged
+  read-only and read-write hardlink openers are accepted. Preserve original
+  authors, output audits, no-replace publication and source retention. Historical
+  `lattice-v3` opener behavior is unchanged.
 
 - `pile migrate canonical` strictly verifies already-native retired v8 MERGE
   and v9 DERIVE signatures and copies their exact frames as inert evidence,
