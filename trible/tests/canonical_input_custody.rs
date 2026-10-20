@@ -30,6 +30,7 @@ fn command(
     let mut command = Command::new(assert_cmd::cargo::cargo_bin!("trible"));
     command
         .env_clear()
+        .env("HOME", dir)
         .env("PATH", "/usr/bin:/bin")
         .current_dir(dir)
         .args(["pile", "migrate"])
