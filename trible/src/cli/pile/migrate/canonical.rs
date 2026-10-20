@@ -1,6 +1,8 @@
 //! One-time offline /32 conversion. Historical codecs never enter core replay.
 //! Original evidence remains in the operator-retained hash-bound source.
 //! Native retired signed equations are copied exactly as inert evidence only.
+//! The operator must freeze every input for the entire run. The opener check
+//! observes a platform-limited set of descriptors; it does not enforce custody.
 use std::collections::BTreeSet; // One selector call's ephemeral scratch only.
 use std::fs::{File, Metadata};
 use std::io::Write;
@@ -39,7 +41,8 @@ pub struct Args {
     /// One existing signing-key file. Only assertions by its exact author reseal.
     #[arg(long)]
     pub key: PathBuf,
-    /// BLAKE3 of the complete immutable source file (64 hex characters).
+    /// BLAKE3 of the complete operator-frozen source file (64 hex characters).
+    /// Keep all inputs frozen for the whole run; opener checks are observational.
     #[arg(long)]
     pub source_hash: String,
     /// Canonical native refresh pile. Only exact matching foundations are used.
@@ -63,6 +66,8 @@ pub struct RefreshArgs {
     pub into: PathBuf,
     #[arg(long)]
     pub key: PathBuf,
+    /// BLAKE3 of the operator-frozen source; keep it frozen for the whole run.
+    /// The platform-limited opener check does not enforce immutability.
     #[arg(long)]
     pub source_hash: String,
     #[arg(long, conflicts_with = "dry_run")]

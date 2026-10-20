@@ -860,11 +860,18 @@ fn other_openers(path: &Path) -> Result<Vec<u32>> {
     Ok(openers)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+#[path = "macos_openers.rs"]
+mod macos_openers;
+
+#[cfg(target_os = "macos")]
+use macos_openers::other_openers;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn other_openers(path: &Path) -> Result<Vec<u32>> {
     bail!(
         "cannot tell on this system whether another process holds {} open; the lattice v3 filter \
-         only runs where it can check (Linux /proc)",
+         only runs where it can check (Linux /proc or macOS libproc)",
         path.display()
     )
 }

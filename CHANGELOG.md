@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add a native macOS observational opener guard for offline pile rewrites,
+  with explicit readable same-user descriptor scope and fail-closed incomplete
+  observations. Canonical migration/refresh still requires operator-frozen
+  inputs, retained originals, descriptor identity checks and source hashes.
+
 - The offline canonical migration preserves already-native, signature-valid
   retired v8 MERGE/v9 DERIVE frames as exact inert copied-prefix evidence.
   Preserve physical duplicates, reject retired frames beyond that prefix,

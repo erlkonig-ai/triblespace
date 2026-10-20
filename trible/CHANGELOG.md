@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- Offline migration can observe native macOS vnode openers, including hardlinks
+  and read-only descriptors. Report permission and process-churn limits; refuse
+  incomplete observations within readable scope. This does not enforce input
+  immutability or replace operator-frozen custody and canonical source checks.
+
 - `pile migrate canonical` strictly verifies already-native retired v8 MERGE
   and v9 DERIVE signatures and copies their exact frames as inert evidence,
   with physical occurrence/byte reporting and a full copied-prefix audit bound.

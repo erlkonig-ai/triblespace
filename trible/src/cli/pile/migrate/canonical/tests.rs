@@ -106,6 +106,36 @@ fn current_assertions_keep_all_authors_and_exact_frames() {
 }
 
 #[test]
+fn source_identity_length_and_hash_checks_remain_independent_of_opener_observation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.pile");
+    fresh(&path, b"source bytes");
+    let mut source = Source::open(&path, None).unwrap();
+    source.check().unwrap();
+    // Model a mismatched retained byte view without violating mmap's immutable
+    // backing-file contract by overwriting or truncating a mapped file.
+    source.bytes = Bytes::from_source(b"changed view".to_vec());
+    assert!(format!("{:#}", source.check().unwrap_err()).contains("source bytes changed"));
+    drop(source);
+
+    let source = Source::open(&path, None).unwrap();
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"appended")
+        .unwrap();
+    assert!(format!("{:#}", source.check().unwrap_err()).contains("identity/length/time changed"));
+    drop(source);
+
+    let source = Source::open(&path, None).unwrap();
+    let replacement = dir.path().join("replacement.pile");
+    fresh(&replacement, b"source bytesappended");
+    std::fs::rename(&replacement, &path).unwrap();
+    assert!(format!("{:#}", source.check().unwrap_err()).contains("identity/length/time changed"));
+}
+
+#[test]
 fn missing_key_and_refresh_never_create_them_or_a_destination() {
     let dir = tempfile::tempdir().unwrap();
     let source = current_source(dir.path());

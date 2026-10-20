@@ -104,8 +104,16 @@ Run `trible <COMMAND>` to invoke a subcommand.
 #### Offline canonical assertion rewrite (source candidate)
 
 The one-time `/32` rewrite is separate from `clean`, `lattice-v3`, and
-`reframe`. Work only on an immutable, retained source copy after quiescing its
-writers. It does not operate on live piles or switch a daemon:
+`reframe`. Work only on an operator-frozen, retained source copy after quiescing
+its writers, and keep every input frozen for the entire command. It does not
+operate on live piles or switch a daemon. The Linux `/proc` and native macOS
+libproc opener guards are observational, not global no-writer proofs or
+immutability enforcement. macOS checks readable same-effective-UID vnode
+descriptor tables by device/inode, including hardlinks and read-only openers.
+It explicitly reports permission and process-churn exclusions and refuses
+incomplete observations within that scope; self, other users, fileports and
+mappings without open descriptors are not covered. See the
+[custody limits](../book/src/pile-format.md#offline-migration-custody-on-macos).
 
 ```bash
 trible pile migrate SOURCE canonical-refresh --into OWN_REFRESH \
@@ -122,8 +130,14 @@ foundations as an ordinary canonical native pile. It is **not** full migration
 completion. Classifiable unsupported frames and other authors' evidence remain
 in the source and are reported outside that export's scope. Framing errors or
 historical forms sharing a current parser variant can still refuse export;
-arbitrary historical source support is unproved. Exchange these refresh piles
-offline; never collect other authors' private keys.
+arbitrary historical source support is unproved. Normally exchange these refresh
+piles offline without collecting other authors' private keys. An exception
+requires explicit operator authorization for temporary custody of the original
+author's key for this offline migration, with an agreed restricted location and
+custody end. This is not permission to substitute another author or retain keys
+as migration evidence. Keep key contents out of reports, synced Files,
+repositories and command arguments; `--key` names an existing local file.
+These instructions themselves authorize no key transfer.
 
 `canonical` verifies old signatures before resealing under the same author.
 Every foreign COMMIT/DERIVE needs a strict-valid refresh matching its original
