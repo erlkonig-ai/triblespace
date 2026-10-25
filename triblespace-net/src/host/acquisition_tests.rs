@@ -1137,6 +1137,126 @@ async fn background_publication_retries_past_a_stale_issued_batch() {
     fixture.assert_no_control_effects();
 }
 
+/// A production directory handler whose request streams wait while its gate
+/// is closed: a responder fallen behind under load, over a connection that
+/// stays up.
+#[derive(Clone)]
+struct GatedHandler {
+    inner: SnapshotHandler,
+    gate: tokio::sync::watch::Receiver<bool>,
+}
+
+impl Service for GatedHandler {
+    async fn serve<W, R>(
+        &self,
+        peer: PeerId,
+        tag: u8,
+        send: &mut W,
+        recv: &mut R,
+    ) -> anyhow::Result<()>
+    where
+        W: SendStream,
+        R: RecvStream,
+    {
+        self.gate.clone().wait_for(|open| *open).await?;
+        self.inner.serve(peer, tag, send, recv).await
+    }
+
+    async fn recon(&self, event: ReconEvent) {
+        self.inner.recon(event).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn publication_resumes_over_a_live_connection_after_its_lookups_time_out() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let latency = Duration::from_millis(10);
+    let net = SimNet::new(
+        0xD47_5EED,
+        SimConfig {
+            latency: latency..latency,
+        },
+    );
+    let directory_key = SigningKey::from_bytes(&[95; 32]);
+    let directory = directory_key.verifying_key().to_bytes();
+    let client_key = SigningKey::from_bytes(&[96; 32]);
+    let my_id = client_key.verifying_key().to_bytes();
+    let (gate, gated) = tokio::sync::watch::channel(true);
+    let inner = SnapshotHandler::for_test(directory, RoutingTable::new(directory));
+    let directory_providers = inner.providers.clone();
+    let mut harness = net.join(&directory_key);
+    let connections = ConnectionTable::new(
+        harness.transport.clone(),
+        GatedHandler { inner, gate: gated },
+    );
+    let server = tokio::spawn(async move {
+        while let Some(incoming) = harness.incoming.recv().await {
+            assert_eq!(incoming.alpn, PILE_SYNC_ALPN);
+            connections.accept(incoming.conn);
+        }
+    });
+    // The client's only route is the connection it dials, as a daemon's is
+    // when its pile names one peer.
+    let client =
+        ProviderClient::for_test(net.join(&client_key).transport, RoutingTable::new(my_id));
+    client.connections.connect(directory).await.unwrap();
+    assert_eq!(
+        client.candidates.lock().unwrap().state(directory),
+        Some(crate::routing::RouteState::Verified)
+    );
+
+    let identity = [7; 32];
+    let key = blob_locator(identity);
+    let token = blob_provider_token(identity, my_id);
+    let now = crate::clock::mono_now();
+    let mut publisher = ProviderPublisher::new(now);
+    publisher.install(
+        ProviderObservation::from_blob_handles([identity]).into_set(),
+        now,
+    );
+    let work = publisher.next(now).expect("initial publication attempt");
+    assert_eq!(work.key, key);
+
+    // A burst outruns the directory: the lookup's whole background window
+    // passes unanswered while the connection stays up.
+    gate.send_replace(false);
+    let started = tokio::time::Instant::now();
+    let result = client.announce_key(key, token).await;
+    assert_eq!(started.elapsed(), BACKGROUND_LOOKUP_DEADLINE);
+    assert_eq!(result, PublicationResult::NoAuthenticatedRemoteReplica);
+    let completed = now + started.elapsed();
+    assert!(
+        publisher
+            .complete(work, result, completed)
+            .topology_outage_started
+    );
+    assert!(publisher.progress().topology_paused);
+    assert!(client.connections.current(directory).is_some());
+
+    // The directory catches up. The next topology probe reaches it over the
+    // same connection, and publication resumes without a new dial.
+    gate.send_replace(true);
+    let retry_at = completed + crate::provider::TOPOLOGY_BACKOFF_BASE;
+    let retry = publisher.next(retry_at).expect("topology retry probe");
+    let result = client.announce_key(retry.key, token).await;
+    assert_eq!(result, PublicationResult::Published);
+    assert!(
+        publisher
+            .complete(retry, result, retry_at)
+            .topology_recovered
+    );
+    assert!(!publisher.progress().topology_paused);
+    assert_eq!(net.dial_count(my_id, directory), 1);
+    assert!(
+        directory_providers
+            .lock()
+            .unwrap()
+            .get(key, crate::clock::mono_now())
+            .contains(&(my_id, token))
+    );
+    server.abort();
+}
+
 #[tokio::test(start_paused = true)]
 async fn resident_self_hint_needs_no_lease_or_payload_read() {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
