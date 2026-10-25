@@ -21,6 +21,11 @@ const BUCKET_COUNT: usize = std::mem::size_of::<PeerId>() * 8;
 const ROUTING_CAPACITY: usize = BUCKET_COUNT * K;
 const MAX_LOOKUP_QUERIES: usize = ROUTING_CAPACITY;
 const LEARNED_ROUTE_FAILURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often one cooling route may stand in as a fallback seed. It covers a
+/// whole lookup, the 10 s interactive budget included, so each cooling
+/// route carries at most one fallback request at a time, and a responder
+/// that catches up is found again within seconds, not a whole cooldown.
+const COOLING_FALLBACK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RouteState {
@@ -36,7 +41,15 @@ struct Bucket {
     entries: BTreeMap<PeerId, RouteState>,
     /// At most K recent local failures, independently of positive-route
     /// retention. Third-party referrals cannot erase or extend these deadlines.
-    failed_until: BTreeMap<PeerId, Mono>,
+    failed_until: BTreeMap<PeerId, Cooling>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Cooling {
+    until: Mono,
+    /// The earliest time a retained route may next serve as a fallback seed
+    /// while it cools; see [`RoutingTable::cooling_fallback`].
+    next_fallback: Mono,
 }
 
 /// A deterministic, hard-bounded Kademlia-style routing table.
@@ -100,12 +113,13 @@ impl RoutingTable {
     fn query_eligible(&self, peer: PeerId, now: Mono) -> bool {
         bucket_index(self.local, peer)
             .and_then(|bucket| self.buckets[bucket].failed_until.get(&peer))
-            .is_none_or(|until| now >= *until)
+            .is_none_or(|cooling| now >= cooling.until)
     }
 
     /// A peer whose connection outlived its failed request keeps its route
     /// and only cools: a slow or reset request says nothing against the
-    /// connection, and the route returns when the cooldown lapses.
+    /// connection, and the route returns when the cooldown lapses. A failed
+    /// fallback request extends the cooldown but not its fallback allowance.
     fn note_failure(&mut self, peer: PeerId, now: Mono, connected: bool) {
         if !connected {
             self.remove(peer);
@@ -117,12 +131,21 @@ impl RoutingTable {
         // Expiry work and eviction inspect at most K entries in this bucket,
         // never a process-wide peer inventory. Positive-route eviction does
         // not erase recent failure evidence, nor does referral insertion.
-        failures.retain(|_, until| now < *until);
-        failures.insert(peer, now + LEARNED_ROUTE_FAILURE_COOLDOWN);
+        let next_fallback = failures
+            .get(&peer)
+            .map_or(now, |cooling| cooling.next_fallback);
+        failures.retain(|_, cooling| now < cooling.until);
+        failures.insert(
+            peer,
+            Cooling {
+                until: now + LEARNED_ROUTE_FAILURE_COOLDOWN,
+                next_fallback,
+            },
+        );
         if failures.len() > K {
             let oldest = *failures
                 .iter()
-                .min_by_key(|(peer, until)| (**until, **peer))
+                .min_by_key(|(peer, cooling)| (cooling.until, **peer))
                 .expect("an overfull failure bucket is nonempty")
                 .0;
             failures.remove(&oldest);
@@ -182,16 +205,40 @@ impl RoutingTable {
         peers
     }
 
-    /// Restore every cooling route whose peer `connected` still vouches
-    /// for. With no eligible route left a lookup has no other start, and a
-    /// live authenticated connection outweighs a local failure.
-    pub(crate) fn recall(&mut self, connected: impl Fn(PeerId) -> bool) {
-        for bucket in &mut self.buckets {
-            let entries = &bucket.entries;
-            bucket
-                .failed_until
-                .retain(|peer, _| !(entries.contains_key(peer) && connected(*peer)));
+    /// Up to `limit` retained routes nearest `target` that are cooling but
+    /// whose peer `connected` still vouches for, each at most once per
+    /// [`COOLING_FALLBACK_INTERVAL`]. For a lookup with no eligible seed. The
+    /// routes keep cooling, so they are neither advertised nor offered by
+    /// [`Self::closest`] until a direct answer clears the cooldown.
+    pub(crate) fn cooling_fallback(
+        &mut self,
+        target: RoutingKey,
+        limit: usize,
+        now: Mono,
+        connected: impl Fn(PeerId) -> bool,
+    ) -> Vec<PeerId> {
+        let mut peers: Vec<_> = self
+            .buckets
+            .iter()
+            .flat_map(|bucket| {
+                bucket.failed_until.iter().filter_map(|(peer, cooling)| {
+                    (now < cooling.until
+                        && now >= cooling.next_fallback
+                        && bucket.entries.contains_key(peer))
+                    .then_some(*peer)
+                })
+            })
+            .filter(|peer| connected(*peer))
+            .collect();
+        peers.sort_unstable_by(|a, b| distance_cmp(target, *a, *b));
+        peers.truncate(limit);
+        for peer in &peers {
+            let bucket = bucket_index(self.local, *peer).expect("a retained route is not local");
+            if let Some(cooling) = self.buckets[bucket].failed_until.get_mut(peer) {
+                cooling.next_fallback = now + COOLING_FALLBACK_INTERVAL;
+            }
         }
+        peers
     }
 
     fn all(&self) -> Vec<PeerId> {
@@ -760,7 +807,7 @@ mod tests {
         for _ in 0..3 {
             assert!(!routes.note_candidate(peer));
             assert!(!routes.closest(peer, K).contains(&peer));
-            assert_eq!(routes.buckets[bucket].failed_until[&peer], until);
+            assert_eq!(routes.buckets[bucket].failed_until[&peer].until, until);
         }
         assert!(!routes.query_eligible(peer, now));
         assert!(!routes.query_eligible(
@@ -1129,10 +1176,65 @@ mod tests {
         assert_eq!(routes.state(id(2)), None);
         assert!(routes.closest(local, K).is_empty());
         assert!(routes.closest_verified(local, K).is_empty());
-        // Gossip cannot restore either; only the live connection can.
+        // Gossip cannot restore either.
         assert!(!routes.note_candidate(id(2)));
-        routes.recall(|peer| peer == id(1) || peer == id(2));
-        assert_eq!(routes.closest(local, K), vec![id(1)]);
+    }
+
+    #[test]
+    fn a_cooling_fallback_seed_is_not_advertised_until_it_answers() {
+        let now = crate::clock::mono_now();
+        let local = id(0);
+        let mut routes = RoutingTable::new(local);
+        for n in 1..=3 {
+            routes.promote_authenticated(id(n));
+            routes.note_failure(id(n), now, n != 3);
+        }
+        // Only retained routes of live connections stand in.
+        assert_eq!(
+            routes.cooling_fallback(local, K, now, |peer| peer != id(2)),
+            vec![id(1)]
+        );
+        assert!(routes.closest(local, K).is_empty());
+        assert!(routes.closest_verified(local, K).is_empty());
+        assert!(!routes.query_eligible(id(1), now));
+
+        let mut lookup = IterativeLookup::new(local, local, [id(1)]);
+        assert_eq!(lookup.next_batch(), vec![id(1)]);
+        assert!(lookup.record_authenticated_response(id(1), [], &mut routes));
+        assert_eq!(routes.closest_verified(local, K), vec![id(1)]);
+    }
+
+    #[test]
+    fn a_cooling_route_stands_in_once_per_fallback_interval() {
+        let now = crate::clock::mono_now();
+        let local = id(0);
+        let mut routes = RoutingTable::new(local);
+        routes.promote_authenticated(id(1));
+        routes.note_failure(id(1), now, true);
+        assert_eq!(
+            routes.cooling_fallback(local, K, now, |_| true),
+            vec![id(1)]
+        );
+        let second = std::time::Duration::from_secs(1);
+        assert!(
+            routes
+                .cooling_fallback(local, K, now + second, |_| true)
+                .is_empty()
+        );
+        // The fallback request failing again extends the cooldown, never the
+        // fallback allowance.
+        routes.note_failure(id(1), now + second, true);
+        let early = now + (COOLING_FALLBACK_INTERVAL - second);
+        assert!(
+            routes
+                .cooling_fallback(local, K, early, |_| true)
+                .is_empty()
+        );
+        let due = now + COOLING_FALLBACK_INTERVAL;
+        assert_eq!(
+            routes.cooling_fallback(local, K, due, |_| true),
+            vec![id(1)]
+        );
     }
 
     #[test]

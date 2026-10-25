@@ -1192,10 +1192,16 @@ only cools: a responder that has fallen behind under load is slow, not gone,
 and the route returns when the cooldown lapses. Routes otherwise come back
 only through a lookup, a provider PUT or fetch, or a newly dialled
 connection. So when a lookup finds no eligible route at all, the host first
-takes back the cooling routes of its live connections and notes its daemon
-again. Without that, a burst that timed out every route would leave
-provider publication paused until something dialled a new connection, while
-recon kept syncing over the connections that were still open.
+notes its daemon again, subject to the daemon's own cooldown. If there is
+still no seed, the cooling routes of its live connections are queried as
+fallback seeds, each at most once per ten seconds. A fallback route keeps
+cooling: it is not advertised in this host's replies and is not offered as
+an ordinary seed until it answers directly, which clears the cooldown. The
+fallback only uses routes the table already holds, so an accepted
+connection still makes no route. Without the fallback, a burst that timed
+out every route would leave provider publication paused until something
+dialled a new connection, while recon kept syncing over the connections
+that were still open.
 
 Endpoint addresses and relay URLs only provide iroh transport paths; they are
 not peering candidates, collection participants or collection rendezvous

@@ -1258,6 +1258,48 @@ async fn publication_resumes_over_a_live_connection_after_its_lookups_time_out()
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_second_fallback_inside_its_interval_does_not_requery_a_stalled_route() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let latency = Duration::from_millis(10);
+    let net = SimNet::new(
+        0xFA11_BAC4,
+        SimConfig {
+            latency: latency..latency,
+        },
+    );
+    let client_key = SigningKey::from_bytes(&[97; 32]);
+    let my_id = client_key.verifying_key().to_bytes();
+    let stalled = ScriptedReplica::new(&net, &SigningKey::from_bytes(&[98; 32]), Vec::new(), None);
+    let client =
+        ProviderClient::for_test(net.join(&client_key).transport, RoutingTable::new(my_id));
+    client.connections.connect(stalled.peer).await.unwrap();
+    let key = blob_locator([8; 32]);
+
+    // The first lookup's window passes unanswered; the route cools. The next
+    // lookup has no other seed, so the cooling route stands in once.
+    for queries in [1, 2] {
+        let started = tokio::time::Instant::now();
+        let _ = client.lookup(key, Some(BACKGROUND_LOOKUP_DEADLINE)).await;
+        assert_eq!(started.elapsed(), BACKGROUND_LOOKUP_DEADLINE);
+        assert_eq!(stalled.queries.load(Ordering::Relaxed), queries);
+    }
+    // Inside the fallback interval a burst of lookups leaves it alone.
+    for _ in 0..3 {
+        let started = tokio::time::Instant::now();
+        let (lookup, _) = client.lookup(key, Some(BACKGROUND_LOOKUP_DEADLINE)).await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert!(lookup.miss().is_err());
+    }
+    assert_eq!(stalled.queries.load(Ordering::Relaxed), 2);
+    assert!(client.connections.current(stalled.peer).is_some());
+    assert_eq!(
+        client.candidates.lock().unwrap().state(stalled.peer),
+        Some(crate::routing::RouteState::Verified)
+    );
+    assert_eq!(net.dial_count(my_id, stalled.peer), 1);
+}
+
+#[tokio::test(start_paused = true)]
 async fn resident_self_hint_needs_no_lease_or_payload_read() {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
     let mut fixture = Fixture::new(false);

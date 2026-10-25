@@ -1492,21 +1492,26 @@ impl<T: Transport> ProviderClient<T> {
         }
     }
 
-    /// The routes nearest `key` a lookup starts from. When failures have
-    /// left none eligible, the routes of live connections and the pile's
-    /// daemon are taken back first: routes otherwise return only through
-    /// a lookup, which then has nothing to start from.
+    /// The routes nearest `key` a lookup starts from. Routes return only
+    /// through a lookup, so when failures have left none eligible the
+    /// pile's daemon is noted again, and failing that, cooling routes of
+    /// live connections stand in, rate-limited and still cooling.
     fn seeds(&self, key: ProviderKey) -> Vec<PeerId> {
         let mut routes = self.candidates.lock().unwrap();
         let seeds = routes.closest(key, K);
         if !seeds.is_empty() {
             return seeds;
         }
-        routes.recall(|peer| self.connections.is_connected(peer));
         if let Some(daemon) = self.daemon {
             routes.note_candidate(daemon);
         }
-        routes.closest(key, K)
+        let seeds = routes.closest(key, K);
+        if !seeds.is_empty() {
+            return seeds;
+        }
+        routes.cooling_fallback(key, K, crate::clock::mono_now(), |peer| {
+            self.connections.is_connected(peer)
+        })
     }
 
     /// Look up the K replicas nearest `key` with one `FIND_VALUE` per hop,
