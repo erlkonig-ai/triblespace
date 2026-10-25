@@ -4374,12 +4374,34 @@ impl PileFile {
     /// pile, returning an error if the flush fails.
     pub fn close(mut self) -> Result<(), FlushError> {
         let res = self.flush_if_dirty();
+        self.release(true);
+        res
+    }
 
+    /// [`Self::close`] for a process about to exit: after a successful flush
+    /// the file is closed as usual, but the in-memory indexes are abandoned
+    /// instead of freed, leaf by leaf. See
+    /// [`Covered::close_for_process_exit`](crate::collection::covered::Covered::close_for_process_exit).
+    pub(crate) fn close_for_process_exit(mut self) -> Result<(), FlushError> {
+        let res = self.flush_if_dirty();
+        self.release(res.is_err());
+        res
+    }
+
+    /// Close the file, which releases its descriptor, then free the indexes
+    /// or, with `free_indexes` false, leave them to process exit. Nothing
+    /// past the file has a destructor with an effect outside this process's
+    /// memory: the indexes are PATCHes and vectors of heap leaves and
+    /// mmap-backed views.
+    fn release(self, free_indexes: bool) {
         let mut this = std::mem::ManuallyDrop::new(self);
         unsafe {
             std::ptr::drop_in_place(&mut this.record_origin);
             std::ptr::drop_in_place(&mut this.mmap);
             std::ptr::drop_in_place(&mut this.file);
+            if !free_indexes {
+                return;
+            }
             std::ptr::drop_in_place(&mut this.blobs);
             std::ptr::drop_in_place(&mut this.branches);
             std::ptr::drop_in_place(&mut this.collection_records);
@@ -4391,8 +4413,6 @@ impl PileFile {
             std::ptr::drop_in_place(&mut this.exact_frame_digests);
             std::ptr::drop_in_place(&mut this.wants);
         }
-
-        res
     }
 }
 
@@ -8246,6 +8266,48 @@ mod tests {
         assert!(retained_iterator.next().is_none());
         drop((proof, after_close, retained_iterator));
         assert!(original_mapping.upgrade().is_none());
+    }
+
+    #[test]
+    fn close_for_process_exit_persists_and_releases_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "process-exit.pile");
+        let mut pile = Pile::open(&path).unwrap();
+        let handle = pile
+            .put::<UnknownBlob, _>(Bytes::from_source(b"appended before exit".to_vec()))
+            .unwrap();
+        assert!(pile.dirty);
+        // A retained snapshot is what the close abandons; its mapping outlives it.
+        pile.snapshot().unwrap();
+        let mapping = Arc::downgrade(&pile.mmap);
+        // Where the platform lists them (Linux), count descriptors on the pile.
+        let open_descriptors = || {
+            Some(
+                std::fs::read_dir("/proc/self/fd")
+                    .ok()?
+                    .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+                    .filter(|target| target == &path)
+                    .count(),
+            )
+        };
+        assert!(matches!(open_descriptors(), None | Some(1)));
+
+        pile.close_for_process_exit().unwrap();
+
+        assert!(mapping.upgrade().is_some(), "the retained snapshot is abandoned, not freed");
+        assert!(
+            matches!(open_descriptors(), None | Some(0)),
+            "the pile's descriptor is closed"
+        );
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        file.try_lock().expect("no lock survives the close");
+        file.unlock().unwrap();
+        drop(file);
+
+        let mut reopened = Pile::open(&path).unwrap();
+        let bytes: Bytes = reopened.snapshot().unwrap().get::<Bytes, UnknownBlob>(handle).unwrap();
+        assert_eq!(bytes.as_ref(), b"appended before exit");
+        reopened.close().unwrap();
     }
 
     #[test]

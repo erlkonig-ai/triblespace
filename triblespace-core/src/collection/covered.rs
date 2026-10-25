@@ -377,6 +377,34 @@ impl<S: SnapshotSource + StorageClose> Covered<S> {
     }
 }
 
+impl Covered<crate::repo::pile::PileFile> {
+    /// Close a pile as the last act of a process that exits right after.
+    ///
+    /// The pile is flushed and its file closed exactly as by [`Self::close`],
+    /// which also releases its descriptor (no file lock is held between
+    /// operations). Only after that succeeds is the in-memory state
+    /// abandoned instead of freed: the pile's indexes, the retained snapshot
+    /// with its coverage memo, and the held-blob index. Freeing them visits
+    /// every heap leaf one by one, over a second on a large pile. What is
+    /// abandoned is memory and read-only mappings of the pile file, nothing
+    /// whose destructor reaches outside the process, and process exit
+    /// reclaims it. If the flush fails, everything is freed and the error
+    /// returned, as by [`Self::close`].
+    ///
+    /// Every call abandons its state for good, so a long-lived or reusable
+    /// owner, or a process that opens and closes a pile repeatedly, must
+    /// call [`Self::close`] instead.
+    pub fn close_for_process_exit(self) -> Result<(), crate::repo::pile::FlushError> {
+        let Self { inner, host: _, last, held } = self;
+        let result = inner.close_for_process_exit();
+        if result.is_ok() {
+            std::mem::forget(last);
+            std::mem::forget(held);
+        }
+        result
+    }
+}
+
 /// One immutable observation of a [`Covered`] store: the inner snapshot and
 /// the coverage index for exactly that prefix, decided one lineage at a time
 /// as readers ask. The index is a persistent root behind a lock shared by
