@@ -555,6 +555,8 @@ struct ProviderClient<T: Transport> {
     providers: Arc<Mutex<ProviderDirectory>>,
     candidates: RoutingCandidates,
     my_id: PeerId,
+    /// The pile's sync daemon, this host's first contact.
+    daemon: Option<PeerId>,
     /// Drawn once per requester and never sent; see [`provider_rank`].
     salt: [u8; 32],
 }
@@ -568,6 +570,7 @@ impl<T: Transport> ProviderClient<T> {
             providers: handler.providers.clone(),
             candidates: handler.candidates.clone(),
             my_id: handler.local_id,
+            daemon: None,
             salt: rand::random(),
             connections: ConnectionTable::new(transport, handler),
         }
@@ -1185,6 +1188,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
         providers: providers.clone(),
         candidates: candidates.clone(),
         my_id,
+        daemon: config.daemon.map(|daemon| daemon.to_bytes()),
         salt: rand::random(),
     };
     // Peerings ride the connections' recon/1 streams, and the push
@@ -1488,6 +1492,23 @@ impl<T: Transport> ProviderClient<T> {
         }
     }
 
+    /// The routes nearest `key` a lookup starts from. When failures have
+    /// left none eligible, the routes of live connections and the pile's
+    /// daemon are taken back first: routes otherwise return only through
+    /// a lookup, which then has nothing to start from.
+    fn seeds(&self, key: ProviderKey) -> Vec<PeerId> {
+        let mut routes = self.candidates.lock().unwrap();
+        let seeds = routes.closest(key, K);
+        if !seeds.is_empty() {
+            return seeds;
+        }
+        routes.recall(|peer| self.connections.is_connected(peer));
+        if let Some(daemon) = self.daemon {
+            routes.note_candidate(daemon);
+        }
+        routes.closest(key, K)
+    }
+
     /// Look up the K replicas nearest `key` with one `FIND_VALUE` per hop,
     /// keeping the hints each authenticated responder returns on the way.
     ///
@@ -1500,8 +1521,7 @@ impl<T: Transport> ProviderClient<T> {
         key: ProviderKey,
         limit: Option<std::time::Duration>,
     ) -> (ReplicaLookup, Vec<(PeerId, ProviderToken)>) {
-        let seeds = self.candidates.lock().unwrap().closest(key, K);
-        let mut lookup = ReplicaLookup::new(self.my_id, key, seeds, limit);
+        let mut lookup = ReplicaLookup::new(self.my_id, key, self.seeds(key), limit);
         let mut hints = Vec::new();
         let mut pending: FuturesUnordered<
             futures::future::BoxFuture<'_, (PeerId, anyhow::Result<FoundValue>)>,
@@ -1517,7 +1537,9 @@ impl<T: Transport> ProviderClient<T> {
                 Some(deadline) => match tokio::time::timeout_at(deadline, pending.next()).await {
                     Ok(reply) => reply,
                     Err(_) => {
-                        lookup.expire(&mut self.candidates.lock().unwrap());
+                        lookup.expire(&mut self.candidates.lock().unwrap(), |peer| {
+                            self.connections.is_connected(peer)
+                        });
                         break;
                     }
                 },
@@ -1526,7 +1548,11 @@ impl<T: Transport> ProviderClient<T> {
             let Some((peer, reply)) = reply else {
                 break;
             };
-            if let Some(found) = lookup.observe(peer, reply, &mut self.candidates.lock().unwrap()) {
+            if let Some(found) =
+                lookup.observe(peer, reply, &mut self.candidates.lock().unwrap(), |peer| {
+                    self.connections.is_connected(peer)
+                })
+            {
                 hints.extend(found);
             }
             if lookup.machine.is_finished() && pending.is_empty() {
@@ -1689,8 +1715,7 @@ impl<T: Transport> ProviderClient<T> {
         }
 
         let key = blob_locator(hash);
-        let seeds = self.candidates.lock().unwrap().closest(key, K);
-        let mut lookup = ReplicaLookup::new(self.my_id, key, seeds, lookup_limit);
+        let mut lookup = ReplicaLookup::new(self.my_id, key, self.seeds(key), lookup_limit);
         let mut routing: FuturesUnordered<
             futures::future::BoxFuture<'_, (PeerId, anyhow::Result<FoundValue>)>,
         > = FuturesUnordered::new();
@@ -1714,7 +1739,9 @@ impl<T: Transport> ProviderClient<T> {
                     .is_some_and(|deadline| tokio::time::Instant::now() >= deadline);
                 if expired || lookup.machine.is_finished() {
                     if expired {
-                        lookup.expire(&mut self.candidates.lock().unwrap());
+                        lookup.expire(&mut self.candidates.lock().unwrap(), |peer| {
+                            self.connections.is_connected(peer)
+                        });
                         routing.clear();
                     }
                     routing_closed = true;
@@ -1787,7 +1814,9 @@ impl<T: Transport> ProviderClient<T> {
                 Progress::RoutingExpired => {}
                 Progress::Routing(peer, reply) => {
                     if let Some(hints) =
-                        lookup.observe(peer, reply, &mut self.candidates.lock().unwrap())
+                        lookup.observe(peer, reply, &mut self.candidates.lock().unwrap(), |peer| {
+                            self.connections.is_connected(peer)
+                        })
                     {
                         candidates.observe(hints);
                     }
@@ -1840,12 +1869,14 @@ impl ReplicaLookup {
     }
 
     /// Record one `FIND_VALUE` outcome. Returns the reply's hints when it
-    /// answers a request this lookup issued.
+    /// answers a request this lookup issued. A failed request's route
+    /// survives while `connected` reports the peer's connection alive.
     fn observe(
         &mut self,
         peer: PeerId,
         reply: anyhow::Result<FoundValue>,
         routes: &mut RoutingTable,
+        connected: impl Fn(PeerId) -> bool,
     ) -> Option<Vec<(PeerId, ProviderToken)>> {
         match reply {
             Ok((referrals, hints)) => {
@@ -1864,15 +1895,18 @@ impl ReplicaLookup {
             }
             Err(error) => {
                 debug!(%error, "DHT lookup request failed");
-                self.machine.record_failure(peer, routes);
+                self.machine.record_failure(peer, routes, connected(peer));
                 self.failure.get_or_insert(error);
                 None
             }
         }
     }
 
-    fn expire(&mut self, routes: &mut RoutingTable) {
-        let timed_out = self.machine.record_timeouts(routes);
+    /// Close the routing window. An unanswered request over a connection
+    /// that is still alive cools its route rather than removing it: a
+    /// responder behind under load is slow, not gone.
+    fn expire(&mut self, routes: &mut RoutingTable, connected: impl Fn(PeerId) -> bool) {
+        let timed_out = self.machine.record_timeouts(routes, connected);
         debug!(timed_out, "DHT lookup routing window exhausted");
         if timed_out != 0 {
             self.failure.get_or_insert_with(|| {
@@ -2882,7 +2916,7 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_secs(5)).await;
         assert!(
             lookup
-                .observe(first, Ok((vec![], vec![])), &mut routes)
+                .observe(first, Ok((vec![], vec![])), &mut routes, |_| false)
                 .is_some()
         );
         let deadline = lookup.deadline.unwrap();
@@ -2893,7 +2927,7 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
         assert!(
             lookup
-                .observe(second, Ok((vec![], vec![])), &mut routes)
+                .observe(second, Ok((vec![], vec![])), &mut routes, |_| false)
                 .is_some()
         );
         assert_eq!(lookup.deadline, Some(deadline));
@@ -2905,7 +2939,7 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
         assert!(
             background
-                .observe(first, Ok((vec![], vec![])), &mut routes)
+                .observe(first, Ok((vec![], vec![])), &mut routes, |_| false)
                 .is_some()
         );
         assert_eq!(background.deadline, Some(deadline));

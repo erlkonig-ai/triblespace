@@ -1185,6 +1185,18 @@ the addresses the daemon recorded (*Where the sync daemon listens*), which
 addresses recorded, iroh's discovery finds the daemon by key. From there the
 daemon's DHT replies lead on.
 
+A lookup request that fails or goes unanswered within the routing window
+removes its route and cools the identity for a minute, so gossip cannot
+restore it at once. If the connection to that peer is still up, the route
+only cools: a responder that has fallen behind under load is slow, not gone,
+and the route returns when the cooldown lapses. Routes otherwise come back
+only through a lookup, a provider PUT or fetch, or a newly dialled
+connection. So when a lookup finds no eligible route at all, the host first
+takes back the cooling routes of its live connections and notes its daemon
+again. Without that, a burst that timed out every route would leave
+provider publication paused until something dialled a new connection, while
+recon kept syncing over the connections that were still open.
+
 Endpoint addresses and relay URLs only provide iroh transport paths; they are
 not peering candidates, collection participants or collection rendezvous
 identities. DHT referrals and the peers a host reaches itself may become live

@@ -689,6 +689,15 @@ impl<T: Transport, S: Service> ConnectionTable<T, S> {
         self.shared.table.lock().unwrap().current(peer)
     }
 
+    /// Whether `peer` has a connection streams can be opened on.
+    pub(crate) fn is_connected(&self, peer: PeerId) -> bool {
+        let table = self.shared.table.lock().unwrap();
+        table
+            .current
+            .get(&peer)
+            .is_some_and(|id| table.connections.contains_key(id))
+    }
+
     /// Live connections, including undecided and draining ones.
     pub fn len(&self) -> usize {
         self.shared.table.lock().unwrap().connections.len()

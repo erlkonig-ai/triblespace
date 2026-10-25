@@ -158,7 +158,7 @@ fn lookup(
                 ));
             } else {
                 observed.failed += 1;
-                assert!(machine.record_failure(peer, routes));
+                assert!(machine.record_failure(peer, routes, false));
             }
         }
         // Admission remains subject to the same lookup bounds and local
@@ -207,7 +207,7 @@ fn warm_start_roundtrip_is_bounded_candidate_only_and_not_a_lease() {
     before.promote_authenticated(live);
     before.note_candidate(referral);
     before.promote_authenticated(failed);
-    before.note_failure(failed, crate::clock::mono_now());
+    before.note_failure(failed, crate::clock::mono_now(), false);
     let cache = freeze(&before);
     assert_eq!(cache.bytes.as_ref(), live);
 
@@ -227,7 +227,7 @@ fn warm_start_roundtrip_is_bounded_candidate_only_and_not_a_lease() {
         "disk hints are not self-refreshing liveness"
     );
 
-    after.note_failure(live, crate::clock::mono_now());
+    after.note_failure(live, crate::clock::mono_now(), false);
     restore(&mut after, cache.bytes.as_ref()).unwrap();
     assert_eq!(
         after.state(live),

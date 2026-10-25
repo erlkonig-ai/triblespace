@@ -103,8 +103,13 @@ impl RoutingTable {
             .is_none_or(|until| now >= *until)
     }
 
-    fn note_failure(&mut self, peer: PeerId, now: Mono) {
-        self.remove(peer);
+    /// A peer whose connection outlived its failed request keeps its route
+    /// and only cools: a slow or reset request says nothing against the
+    /// connection, and the route returns when the cooldown lapses.
+    fn note_failure(&mut self, peer: PeerId, now: Mono, connected: bool) {
+        if !connected {
+            self.remove(peer);
+        }
         let Some(bucket) = bucket_index(self.local, peer) else {
             return;
         };
@@ -161,6 +166,7 @@ impl RoutingTable {
     /// Like [`Self::closest`], but excludes identities that have never
     /// answered this process directly.
     pub(crate) fn closest_verified(&self, target: RoutingKey, limit: usize) -> Vec<PeerId> {
+        let now = crate::clock::mono_now();
         let mut peers: Vec<_> =
             self.buckets
                 .iter()
@@ -169,10 +175,23 @@ impl RoutingTable {
                         (*state == RouteState::Verified).then_some(*peer)
                     })
                 })
+                .filter(|peer| self.query_eligible(*peer, now))
                 .collect();
         peers.sort_unstable_by(|a, b| distance_cmp(target, *a, *b));
         peers.truncate(limit);
         peers
+    }
+
+    /// Restore every cooling route whose peer `connected` still vouches
+    /// for. With no eligible route left a lookup has no other start, and a
+    /// live authenticated connection outweighs a local failure.
+    pub(crate) fn recall(&mut self, connected: impl Fn(PeerId) -> bool) {
+        for bucket in &mut self.buckets {
+            let entries = &bucket.entries;
+            bucket
+                .failed_until
+                .retain(|peer, _| !(entries.contains_key(peer) && connected(*peer)));
+        }
     }
 
     fn all(&self) -> Vec<PeerId> {
@@ -375,28 +394,38 @@ impl IterativeLookup {
         true
     }
 
-    /// Complete one in-flight request as failed, remove its stale route, and
-    /// retain bounded local failure evidence across subsequent referrals.
-    pub(crate) fn record_failure(&mut self, peer: PeerId, routes: &mut RoutingTable) -> bool {
+    /// Complete one in-flight request as failed, remove its stale route
+    /// unless the caller still holds a connection to the peer, and retain
+    /// bounded local failure evidence across subsequent referrals.
+    pub(crate) fn record_failure(
+        &mut self,
+        peer: PeerId,
+        routes: &mut RoutingTable,
+        connected: bool,
+    ) -> bool {
         if self.shortlist.get(&peer) != Some(&LookupState::InFlight) {
             return false;
         }
         self.shortlist.remove(&peer);
-        routes.note_failure(peer, crate::clock::mono_now());
+        routes.note_failure(peer, crate::clock::mono_now(), connected);
         self.trim_shortlist();
         true
     }
 
     /// Fail issued requests still pending when the routing deadline expires.
     /// Unissued candidates and authenticated responders retain their evidence.
-    pub(crate) fn record_timeouts(&mut self, routes: &mut RoutingTable) -> usize {
+    pub(crate) fn record_timeouts(
+        &mut self,
+        routes: &mut RoutingTable,
+        connected: impl Fn(PeerId) -> bool,
+    ) -> usize {
         let in_flight: Vec<_> = self
             .shortlist
             .iter()
             .filter_map(|(peer, state)| (*state == LookupState::InFlight).then_some(*peer))
             .collect();
         for peer in &in_flight {
-            self.record_failure(*peer, routes);
+            self.record_failure(*peer, routes, connected(*peer));
         }
         in_flight.len()
     }
@@ -509,7 +538,7 @@ mod tests {
                         &mut routes
                     ));
                 } else {
-                    assert!(lookup.record_failure(peer, &mut routes));
+                    assert!(lookup.record_failure(peer, &mut routes, false));
                 }
             }
         }
@@ -725,7 +754,7 @@ mod tests {
         let peer = id(2);
         let mut routes = RoutingTable::new(local);
         routes.promote_authenticated(peer);
-        routes.note_failure(peer, now);
+        routes.note_failure(peer, now, false);
         let until = now + LEARNED_ROUTE_FAILURE_COOLDOWN;
         let bucket = bucket_index(local, peer).unwrap();
         for _ in 0..3 {
@@ -746,7 +775,7 @@ mod tests {
         let now = crate::clock::mono_now();
         let peer = id(2);
         let mut routes = RoutingTable::new(id(0));
-        routes.note_failure(peer, now);
+        routes.note_failure(peer, now, false);
         assert!(!routes.query_eligible(peer, now));
         assert!(routes.promote_authenticated(peer));
         assert!(routes.query_eligible(peer, now));
@@ -772,7 +801,7 @@ mod tests {
         assert_eq!(first.next_batch(), vec![seed]);
         assert!(first.record_authenticated_response(seed, [named], &mut routes));
         assert_eq!(first.next_batch(), vec![named]);
-        assert!(first.record_failure(named, &mut routes));
+        assert!(first.record_failure(named, &mut routes, false));
         assert_eq!(routes.state(named), None);
 
         // The same referral cannot bypass actual local failure evidence just
@@ -802,6 +831,7 @@ mod tests {
             routes.note_failure(
                 id(0x8000 + n),
                 now + std::time::Duration::from_nanos(u64::from(n)),
+                false,
             );
             assert!(routes.buckets[bucket].failed_until.len() <= K);
         }
@@ -812,6 +842,7 @@ mod tests {
         routes.note_failure(
             id(0xA000),
             now + LEARNED_ROUTE_FAILURE_COOLDOWN + std::time::Duration::from_secs(1),
+            false,
         );
         assert_eq!(routes.buckets[bucket].failed_until.len(), 1);
         assert_eq!(
@@ -969,7 +1000,7 @@ mod tests {
             assert!(batch.len() <= ALPHA);
             contacted += batch.len();
             for peer in batch {
-                assert!(lookup.record_failure(peer, &mut routes));
+                assert!(lookup.record_failure(peer, &mut routes, false));
             }
         }
         assert_eq!(contacted, K);
@@ -989,7 +1020,7 @@ mod tests {
         assert!(lookup.next_batch_up_to(0).is_empty());
         assert!(lookup.queried.is_empty());
         assert!(!lookup.is_finished());
-        assert_eq!(lookup.record_timeouts(&mut routes), 0);
+        assert_eq!(lookup.record_timeouts(&mut routes, |_| false), 0);
         assert!((1..=4).all(|n| routes.state(id(n)) == Some(RouteState::Verified)));
         assert_eq!(lookup.next_batch(), vec![id(1), id(2), id(3)]);
     }
@@ -1006,7 +1037,7 @@ mod tests {
         assert_eq!(lookup.next_batch_up_to(1), vec![id(1)]);
         assert!(lookup.next_batch_up_to(0).is_empty());
         assert_eq!(lookup.queried, BTreeSet::from([id(1)]));
-        assert_eq!(lookup.record_timeouts(&mut routes), 1);
+        assert_eq!(lookup.record_timeouts(&mut routes, |_| false), 1);
         assert_eq!(routes.state(id(1)), None);
         assert!((2..=5).all(|n| routes.state(id(n)) == Some(RouteState::Verified)));
 
@@ -1015,7 +1046,7 @@ mod tests {
         assert_eq!(lookup.next_batch_up_to(1), vec![id(4)]);
         assert!(!lookup.queried.contains(&id(5)));
         assert!(!lookup.record_authenticated_response(id(5), [], &mut routes));
-        assert_eq!(lookup.record_timeouts(&mut routes), 2);
+        assert_eq!(lookup.record_timeouts(&mut routes, |_| false), 2);
         assert_eq!(routes.state(id(5)), Some(RouteState::Verified));
         assert_eq!(lookup.next_batch_up_to(ALPHA), vec![id(5)]);
     }
@@ -1035,7 +1066,7 @@ mod tests {
         assert!(lookup.next_batch_up_to(usize::MAX).is_empty());
         assert!(lookup.record_authenticated_response(id(2), [], &mut routes));
         assert_eq!(lookup.next_batch(), vec![id(5)]);
-        assert_eq!(lookup.record_timeouts(&mut routes), ALPHA);
+        assert_eq!(lookup.record_timeouts(&mut routes, |_| false), ALPHA);
         assert_eq!(lookup.queried, (1..=5).map(id).collect::<BTreeSet<_>>());
         assert_eq!(lookup.next_batch_up_to(usize::MAX), vec![id(6)]);
     }
@@ -1058,7 +1089,7 @@ mod tests {
         assert!(!lookup.is_finished());
         assert!(!lookup.queried.contains(&id(2)));
         assert!(!lookup.queried.contains(&id(3)));
-        assert_eq!(lookup.record_timeouts(&mut routes), 1);
+        assert_eq!(lookup.record_timeouts(&mut routes, |_| false), 1);
         assert!(lookup.is_finished());
     }
 
@@ -1073,14 +1104,35 @@ mod tests {
         assert_eq!(lookup.next_batch(), vec![id(1), id(2), id(3)]);
         assert!(lookup.record_authenticated_response(id(1), [], &mut routes));
 
-        assert_eq!(lookup.record_timeouts(&mut routes), 2);
+        assert_eq!(lookup.record_timeouts(&mut routes, |_| false), 2);
         assert_eq!(routes.state(id(1)), Some(RouteState::Verified));
         assert_eq!(routes.state(id(2)), None);
         assert_eq!(routes.state(id(3)), None);
         assert_eq!(routes.state(id(4)), Some(RouteState::Verified));
         assert_eq!(lookup.closest_authenticated_responders(), &[id(1)]);
-        assert_eq!(lookup.record_timeouts(&mut routes), 0);
+        assert_eq!(lookup.record_timeouts(&mut routes, |_| false), 0);
         assert_eq!(lookup.next_batch(), vec![id(4)]);
+    }
+
+    #[test]
+    fn routing_timeout_cools_a_connected_route_without_forgetting_it() {
+        let local = id(0);
+        let mut routes = RoutingTable::new(local);
+        for n in 1..=2 {
+            routes.promote_authenticated(id(n));
+        }
+        let mut lookup = IterativeLookup::new(local, local, routes.closest(local, K));
+        assert_eq!(lookup.next_batch(), vec![id(1), id(2)]);
+
+        assert_eq!(lookup.record_timeouts(&mut routes, |peer| peer == id(1)), 2);
+        assert_eq!(routes.state(id(1)), Some(RouteState::Verified));
+        assert_eq!(routes.state(id(2)), None);
+        assert!(routes.closest(local, K).is_empty());
+        assert!(routes.closest_verified(local, K).is_empty());
+        // Gossip cannot restore either; only the live connection can.
+        assert!(!routes.note_candidate(id(2)));
+        routes.recall(|peer| peer == id(1) || peer == id(2));
+        assert_eq!(routes.closest(local, K), vec![id(1)]);
     }
 
     #[test]
