@@ -21,10 +21,11 @@ const BUCKET_COUNT: usize = std::mem::size_of::<PeerId>() * 8;
 const ROUTING_CAPACITY: usize = BUCKET_COUNT * K;
 const MAX_LOOKUP_QUERIES: usize = ROUTING_CAPACITY;
 const LEARNED_ROUTE_FAILURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
-/// How often one cooling route may stand in as a fallback seed. It covers a
-/// whole lookup, the 10 s interactive budget included, so each cooling
-/// route carries at most one fallback request at a time, and a responder
-/// that catches up is found again within seconds, not a whole cooldown.
+/// How often one cooling route may be selected as a fallback seed. This
+/// spaces selections; it is not single-flight, since a blob fetch or a
+/// lookup waiting for its first response can outlast it. A responder that
+/// catches up is found again within about this interval, not a whole
+/// cooldown.
 const COOLING_FALLBACK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -209,7 +210,8 @@ impl RoutingTable {
     /// whose peer `connected` still vouches for, each at most once per
     /// [`COOLING_FALLBACK_INTERVAL`]. For a lookup with no eligible seed. The
     /// routes keep cooling, so they are neither advertised nor offered by
-    /// [`Self::closest`] until a direct answer clears the cooldown.
+    /// [`Self::closest`] until a direct answer clears the cooldown or the
+    /// ordinary cooldown lapses.
     pub(crate) fn cooling_fallback(
         &mut self,
         target: RoutingKey,

@@ -1194,9 +1194,13 @@ only through a lookup, a provider PUT or fetch, or a newly dialled
 connection. So when a lookup finds no eligible route at all, the host first
 notes its daemon again, subject to the daemon's own cooldown. If there is
 still no seed, the cooling routes of its live connections are queried as
-fallback seeds, each at most once per ten seconds. A fallback route keeps
-cooling: it is not advertised in this host's replies and is not offered as
-an ordinary seed until it answers directly, which clears the cooldown. The
+fallback seeds; each route is selected as a fallback at most once per ten
+seconds. That spaces selections, not requests: a fetch or a lookup waiting
+for its first response can outlast ten seconds, so two fallback requests to
+one route may overlap. A fallback route keeps cooling: it is not advertised
+in this host's replies and is not offered as an ordinary seed until it
+answers directly, which clears the cooldown, or until its ordinary 60 s
+cooldown lapses. The
 fallback only uses routes the table already holds, so an accepted
 connection still makes no route. Without the fallback, a burst that timed
 out every route would leave provider publication paused until something
