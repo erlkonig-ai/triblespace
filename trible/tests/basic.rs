@@ -2,7 +2,11 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 
 fn help(args: &[&str]) -> String {
-    let output = Command::cargo_bin("trible")
+    help_of("trible", args)
+}
+
+fn help_of(binary: &str, args: &[&str]) -> String {
+    let output = Command::cargo_bin(binary)
         .unwrap()
         .args(args)
         .arg("--help")
@@ -32,7 +36,12 @@ fn legacy_mutation_commands_are_absent() {
             "removed pile command {removed:?} remains in help:\n{pile}"
         );
     }
-    for retained in ["blob", "collection", "compact", "migrate", "net"] {
+    // Migration moved to its own binary, `trible-migrate`.
+    assert!(
+        !has_command(&pile, "migrate"),
+        "pile migrate should live in trible-migrate:\n{pile}"
+    );
+    for retained in ["blob", "collection", "compact", "net"] {
         assert!(
             has_command(&pile, retained),
             "retained pile command {retained:?} is missing from help:\n{pile}"
@@ -43,25 +52,26 @@ fn legacy_mutation_commands_are_absent() {
     assert!(!has_command(&store, "branch"));
     assert!(has_command(&store, "blob"));
 
-    let migrate = help(&["pile", "migrate", "unused.pile"]);
+    let migrate = help_of("trible-migrate", &["unused.pile"]);
     assert!(has_command(&migrate, "branch-to-collection"));
     assert!(has_command(&migrate, "reframe"));
-    let branch_to_collection = help(&["pile", "migrate", "unused.pile", "branch-to-collection"]);
+    let branch_to_collection =
+        help_of("trible-migrate", &["unused.pile", "branch-to-collection"]);
     assert!(branch_to_collection.contains("--collection-name"));
     assert!(branch_to_collection.contains("--authority"));
     assert!(branch_to_collection.contains("--signing-key"));
     assert!(!branch_to_collection.contains("--namespace"));
     assert!(!branch_to_collection.contains("--proof"));
     assert!(!branch_to_collection.contains("--team-root"));
-    let run = help(&["pile", "migrate", "unused.pile", "run"]);
+    let run = help_of("trible-migrate", &["unused.pile", "run"]);
     assert!(run.contains("monotone-wants"));
     assert!(run.contains("record-kind-descriptions"));
     assert!(!run.contains("branch-metadata-name"));
     assert!(!run.contains("no-rename-duplicates"));
 
-    Command::cargo_bin("trible")
+    Command::cargo_bin("trible-migrate")
         .unwrap()
-        .args(["pile", "migrate", "unused.pile", "run"])
+        .args(["unused.pile", "run"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("<MIGRATION>"));

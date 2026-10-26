@@ -1,4 +1,4 @@
-//! `trible pile migrate SRC clean --into DST`: the lattice v2 clean-pile
+//! `trible-migrate SRC clean --into DST`: the lattice v2 clean-pile
 //! migration (spec D8).
 //!
 //! It writes a NEW pile holding what the new lattice needs and nothing it

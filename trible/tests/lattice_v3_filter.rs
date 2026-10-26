@@ -1,4 +1,4 @@
-//! `trible pile migrate SRC lattice-v3` over synthetic piles.
+//! `trible-migrate SRC lattice-v3` over synthetic piles.
 //!
 //! The fixture registers one root and one derived collection of every kind
 //! the pre-v3 lattice derived: Succinct, Rank9, EntityIdSet, latest states,
@@ -94,6 +94,17 @@ type Raw = [u8; 32];
 
 fn trible() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_trible"));
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name == "PILE" || name.starts_with("TRIBLESPACE_") {
+            command.env_remove(key);
+        }
+    }
+    command
+}
+
+fn trible_migrate() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_trible-migrate"));
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
         if name == "PILE" || name.starts_with("TRIBLESPACE_") {
@@ -596,8 +607,7 @@ impl Fixture {
     }
 
     fn run(&self, source: &Path, extra: &[&str]) -> Output {
-        trible()
-            .args(["pile", "migrate"])
+        trible_migrate()
             .arg(source)
             .arg("lattice-v3")
             .args(extra)

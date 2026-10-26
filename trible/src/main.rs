@@ -5,9 +5,9 @@ use clap_complete::Shell;
 use std::io;
 use tracing_subscriber::EnvFilter;
 
-mod cli;
-use cli::pile::PileCommand;
-use cli::store::StoreCommand;
+use trible::cli;
+use trible::cli::pile::PileCommand;
+use trible::cli::store::StoreCommand;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]

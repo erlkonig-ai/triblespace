@@ -10,7 +10,7 @@ pub mod blob;
 pub mod collection;
 mod compact;
 mod diagnose;
-mod migrate;
+pub mod migrate;
 pub mod net;
 mod path_text;
 mod signing;
@@ -126,13 +126,6 @@ pub enum PileCommand {
         /// from becoming an unexamined destructive command.
         #[arg(long, value_name = "BYTE_OFFSET")]
         truncate_to: usize,
-    },
-    /// Migrate legacy pile metadata to the current schemas.
-    Migrate {
-        /// Path to the pile file to modify
-        pile: PathBuf,
-        #[command(subcommand)]
-        cmd: migrate::Command,
     },
     /// Distributed pile sync over iroh (p2p QUIC connections).
     Net {
@@ -330,6 +323,5 @@ pub fn run(cmd: PileCommand) -> Result<()> {
             }
             Ok(())
         }
-        PileCommand::Migrate { pile, cmd } => migrate::run(pile, cmd),
     }
 }

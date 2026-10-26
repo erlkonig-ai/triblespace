@@ -58,7 +58,7 @@ change that fails loudly with the new value rather than silently reframing the
 pile.
 
 `Pile::publish_record_kind_descriptions` (exposed as
-`trible pile migrate <PILE> run record-kind-descriptions`) stores those description
+`trible-migrate <PILE> run record-kind-descriptions`) stores those description
 archives for every kind the current binary writes, which makes those kinds
 resolvable *there*. Content addressing makes the call idempotent, and the
 migration's census distinguishes "already resident" from "left to store" so a
@@ -133,7 +133,7 @@ shipped: the V3 record family, the three generations of collection records,
 the retired WANT logs, retired team state, retired local cells, and the 36-byte
 legacy envelope. None of it is a writable compatibility commitment. The
 current reader still recognizes each exact historical boundary so old piles
-can be inspected or migrated without guessing. `trible pile migrate <pile>
+can be inspected or migrated without guessing. `trible-migrate <pile>
 reframe --into <dest>` re-encodes the whole pile into the current framing and
 drops only explicitly disposable inert records. Retired unsigned equations are
 preserved exactly; genuinely unknown kinds fail a full preflight before any
@@ -141,7 +141,7 @@ destination write.
 
 WANT has a cheaper in-place cutover when a whole-file reframe is unnecessary:
 before first starting a current binary on a pre-cutover pile, explicitly run
-`trible pile migrate <pile> run monotone-wants`. It scans the retired log,
+`trible-migrate <pile> run monotone-wants`. It scans the retired log,
 resolves its final active set once, and appends only missing current positives.
 The operation is additive and idempotent. It is deliberately excluded from any
 implicit migration run because it promotes retired history into live demand;
@@ -544,7 +544,7 @@ This is not migration or deployment. Old native kinds remain opaque (or
 explicit retired evidence); they never become current assertions around old
 signatures. In particular old COMMIT frames lose active typed visibility while
 their bytes remain preserved. Old dense wrappers are rejected even by trusted
-ObjectStore decoding. The offline `pile migrate canonical` and
+ObjectStore decoding. The offline `trible-migrate canonical` and
 `canonical-refresh` commands provide explicit own-key re-attestation and exact
 foreign-author refresh. Their synthetic acceptance is not a live cutover:
 retained-source inventory, supported-history and refresh availability, an

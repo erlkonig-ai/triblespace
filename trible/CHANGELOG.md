@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- Migration moved out of `trible` into its own binary, `trible-migrate`,
+  built from the same package. `trible pile migrate <PILE> <SUBCOMMAND>` is
+  now `trible-migrate <PILE> <SUBCOMMAND>`, with the same subcommands and
+  arguments. The command implementations now live in the library, and each
+  binary references only its own commands, so `trible` no longer carries the
+  migration code (about 1 MB smaller in a default release build).
+- `trible-migrate <PILE> list` also counts records of each retired or legacy
+  kind, unknown kinds (which `reframe` refuses), and legacy branch heads.
+  `branch-to-collection` leaves a branch's head in place, so that count does
+  not fall after migrating.
 - Canonical migration and refresh no longer require a host-wide opener check.
   Keep inputs operator-frozen for the whole run; retained identity/full-BLAKE3
   checks detect accidental changes but do not enforce immutability. Unchanged

@@ -1,4 +1,4 @@
-//! `trible pile migrate <PILE> shortstring-to-utf8`: give old short-text facts their
+//! `trible-migrate <PILE> shortstring-to-utf8`: give old short-text facts their
 //! blob-text twins.
 //!
 //! Text attributes used to be declared with the 32-byte inline `ShortString`
@@ -152,7 +152,7 @@ pub(crate) fn anchored_id(anchor: Id, encoding: Id) -> Id {
 /// Decode the retired ShortString layout from its raw 32 bytes: UTF-8, NUL
 /// terminated and zero padded, or all 32 bytes when there is no NUL. Mirrors
 /// the encoding's own validation (and the legacy branch-name reader in
-/// `pile migrate`).
+/// `trible-migrate`).
 pub(crate) fn decode_short_string(raw: &[u8; 32]) -> Result<&str, String> {
     let len = raw.iter().position(|&byte| byte == 0).unwrap_or(raw.len());
     if raw[len..].iter().any(|&byte| byte != 0) {

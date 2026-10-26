@@ -61,7 +61,7 @@ use triblespace_core::trible::TribleSet;
 use super::{open_refreshed, open_refreshed_as};
 
 mod adopt;
-use trible::maintenance::{telemetry as maintenance_telemetry, SuccinctBackend};
+use crate::maintenance::{telemetry as maintenance_telemetry, SuccinctBackend};
 pub(crate) mod v3_mappings;
 
 /// Hex characters shown for a handle or key when the full value is not asked
@@ -2236,8 +2236,8 @@ mod tests {
     }
 }
 
-fn print_maintenance_event(event: trible::maintenance::Event) {
-    use trible::maintenance::Event;
+fn print_maintenance_event(event: crate::maintenance::Event) {
+    use crate::maintenance::Event;
     match event {
         Event::HopFinished {
             collection,
@@ -2280,7 +2280,7 @@ fn print_maintenance_event(event: trible::maintenance::Event) {
 async fn maintenance_loop(
     pile: &mut Pile,
     signer: &SigningKey,
-    driver: &mut trible::maintenance::Driver<PileSnapshot>,
+    driver: &mut crate::maintenance::Driver<PileSnapshot>,
     watch: bool,
     interval: Duration,
 ) -> Result<()> {
@@ -2347,7 +2347,7 @@ fn run_maintain(
         None => None,
     };
     let mut driver =
-        trible::maintenance::Driver::from_references(references, dependencies, succinct_backend)?;
+        crate::maintenance::Driver::from_references(references, dependencies, succinct_backend)?;
     if let Some(telemetry) = telemetry.take() {
         driver = driver.with_telemetry(telemetry);
     }

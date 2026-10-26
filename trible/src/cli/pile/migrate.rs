@@ -197,7 +197,8 @@ fn list_migrations(pile_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-/// Records of retired or legacy kinds, and legacy branches still live, as the
+/// Records of retired or legacy kinds, and legacy branches whose last pin is a
+/// head rather than a tombstone, as the
 /// raw record reader decodes them. Descriptive only: what `reframe` carries,
 /// projects or drops is its own report, so this never second-guesses it.
 #[derive(Default)]
@@ -271,11 +272,12 @@ fn print_legacy_census(census: &LegacyCensus) {
         );
     }
     if census.live_branches == 0 {
-        println!("- legacy branches: none live");
+        println!("- legacy branch heads: none");
     } else {
         println!(
-            "- legacy branches: {} live (each becomes a native collection through \
-             `branch-to-collection`, which appends to the pile it reads)",
+            "- legacy branch heads: {} (`branch-to-collection` copies a branch into a native \
+             collection and appends to the pile it reads; it leaves the head in place, so this \
+             count does not fall once a branch is migrated)",
             census.live_branches
         );
     }

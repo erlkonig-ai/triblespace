@@ -454,9 +454,8 @@ fn monotone_want_migration_is_explicit_additive_and_idempotent() {
     drop(before_snapshot);
     before.close().unwrap();
 
-    Command::cargo_bin("trible")
+    Command::cargo_bin("trible-migrate")
         .unwrap()
-        .args(["pile", "migrate"])
         .arg(&source_path)
         .args(["run", "monotone-wants", "--dry-run"])
         .assert()
@@ -466,9 +465,8 @@ fn monotone_want_migration_is_explicit_additive_and_idempotent() {
         ));
     assert_eq!(std::fs::read(&source_path).unwrap(), bytes);
 
-    Command::cargo_bin("trible")
+    Command::cargo_bin("trible-migrate")
         .unwrap()
-        .args(["pile", "migrate"])
         .arg(&source_path)
         .args(["run", "monotone-wants"])
         .assert()
@@ -479,9 +477,8 @@ fn monotone_want_migration_is_explicit_additive_and_idempotent() {
     let migrated_len = std::fs::metadata(&source_path).unwrap().len();
     assert_eq!(migrated_len, bytes.len() as u64 + 256);
 
-    Command::cargo_bin("trible")
+    Command::cargo_bin("trible-migrate")
         .unwrap()
-        .args(["pile", "migrate"])
         .arg(&source_path)
         .args(["run", "monotone-wants"])
         .assert()
@@ -1999,9 +1996,9 @@ fn corrupt_source_fails_loud_without_truncation() {
     };
 
     // migrate (in-place rewrite): still refuses to open a corrupt pile.
-    Command::cargo_bin("trible")
+    Command::cargo_bin("trible-migrate")
         .unwrap()
-        .args(["pile", "migrate", src_path.to_str().unwrap(), "list"])
+        .args([src_path.to_str().unwrap(), "list"])
         .assert()
         .failure()
         .stderr(fail_loud());
@@ -2037,9 +2034,9 @@ fn unsupported_record_marker_never_recommends_or_performs_amputation() {
             .and(predicate::str::contains("trible pile amputate").not())
     };
 
-    Command::cargo_bin("trible")
+    Command::cargo_bin("trible-migrate")
         .unwrap()
-        .args(["pile", "migrate", path.to_str().unwrap(), "list"])
+        .args([path.to_str().unwrap(), "list"])
         .assert()
         .failure()
         .stderr(unsupported_without_repair_hint());
@@ -2137,16 +2134,15 @@ fn migrate_list_counts_retired_kinds_and_live_legacy_branches() {
 
     let empty = dir.path().join("empty.pile");
     std::fs::write(&empty, b"").unwrap();
-    Command::cargo_bin("trible")
+    Command::cargo_bin("trible-migrate")
         .unwrap()
-        .args(["pile", "migrate"])
         .arg(&empty)
         .arg("list")
         .assert()
         .success()
         .stdout(
             predicate::str::contains("- retired record kinds: none")
-                .and(predicate::str::contains("- legacy branches: none live"))
+                .and(predicate::str::contains("- legacy branch heads: none"))
                 .and(predicate::str::contains("unknown record kinds").not()),
         );
 
@@ -2170,9 +2166,8 @@ fn migrate_list_counts_retired_kinds_and_live_legacy_branches() {
     bytes.extend_from_slice(&legacy_pin_record(TOMBSTONE, [0x12; 16], None));
     std::fs::write(&path, &bytes).unwrap();
 
-    Command::cargo_bin("trible")
+    Command::cargo_bin("trible-migrate")
         .unwrap()
-        .args(["pile", "migrate"])
         .arg(&path)
         .arg("list")
         .assert()
@@ -2181,7 +2176,7 @@ fn migrate_list_counts_retired_kinds_and_live_legacy_branches() {
             predicate::str::contains("1 legacy V3 collection")
                 .and(predicate::str::contains("2 retired WANT log"))
                 .and(predicate::str::contains("reframe --into <dest>"))
-                .and(predicate::str::contains("- legacy branches: 1 live"))
+                .and(predicate::str::contains("- legacy branch heads: 1 "))
                 .and(predicate::str::contains("branch-to-collection")),
         );
     // Listing is read-only.

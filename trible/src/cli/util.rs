@@ -9,7 +9,7 @@ pub fn parse_blob_handle(handle: &str) -> Result<triblespace_core::inline::Inlin
     handle.try_to_inline().map_err(|e| anyhow::anyhow!("{e:?}"))
 }
 
-pub(super) use trible::process::process_cpu_ns;
+pub(super) use crate::process::process_cpu_ns;
 
 /// Construct while entered into the command's Tokio runtime, before opening
 /// its writable store. Unix handlers are installed now, not at the first poll.

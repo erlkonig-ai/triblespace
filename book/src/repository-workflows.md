@@ -766,7 +766,7 @@ readers retain an immutable `PinSnapshot` and legacy decoders so operators can
 inspect and migrate that evidence without restoring the old publication API.
 
 ```text
-trible pile migrate data.pile branch-to-collection \
+trible-migrate data.pile branch-to-collection \
   --branch legacy-events \
   --collection-name events \
   --signing-key ./writer.key
@@ -787,7 +787,7 @@ The migration-only `--authority` option instead uses another trust root for
 both direct policies:
 
 ```text
-trible pile migrate data.pile branch-to-collection \
+trible-migrate data.pile branch-to-collection \
   --branch legacy-events \
   --collection-name events \
   --authority <64-hex-character-ed25519-public-key> \

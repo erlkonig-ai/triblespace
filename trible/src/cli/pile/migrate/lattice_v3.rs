@@ -1,4 +1,4 @@
-//! `trible pile migrate SRC lattice-v3 --into DST`: the lattice v3 cutover
+//! `trible-migrate SRC lattice-v3 --into DST`: the lattice v3 cutover
 //! filter.
 //!
 //! A stop-the-world compaction writing a fresh copy of a pile that keeps

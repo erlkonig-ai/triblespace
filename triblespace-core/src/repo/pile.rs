@@ -4434,7 +4434,7 @@ impl PileFile {
     /// This is not done automatically on every append. A pile is a log, and
     /// silently interleaving the description-blob cohort into someone else's
     /// write would be a surprise; publishing is an explicit act, performed
-    /// once per pile — `trible pile migrate <PILE> run record-kind-descriptions` does
+    /// once per pile — `trible-migrate <PILE> run record-kind-descriptions` does
     /// it.
     pub fn publish_record_kind_descriptions(&mut self) -> Result<usize, InsertError> {
         let mut stored = 0usize;

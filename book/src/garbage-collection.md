@@ -164,7 +164,7 @@ immutable source snapshot for a subsequent consume-once `write_into`, without
 evaluating a stateful filter or walking the blob closure again. Later source
 appends are outside that prefix. Whole-file tools must still quiesce writers
 and check source length; this is a frozen observation, not a reusable recipe.
-The lattice v3 cutover (`trible pile migrate SRC lattice-v3`) is this rewrite
+The lattice v3 cutover (`trible-migrate SRC lattice-v3`) is this rewrite
 with only the roots its operator names: it drops every MERGE, since each host
 folds and rebuilds only its own, the DERIVEs of mappings that became attached
 indexes or were deleted, and every blob only those reached, including the

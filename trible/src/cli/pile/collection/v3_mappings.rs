@@ -5,7 +5,7 @@
 //! frontier nodes of its parent, which never replicates and holds no DERIVE
 //! records), deleted, or still derived (a collection of DERIVE leaves that
 //! replicates because not every reader can compute it). The migration filter
-//! (`trible pile migrate SRC lattice-v3`) leaves behind the DERIVE records of
+//! (`trible-migrate SRC lattice-v3`) leaves behind the DERIVE records of
 //! collections whose mappings are all attached or deleted, and keeps the rest.
 //! An algorithm missing from this table is unrecognised, and its records are
 //! kept: open world, the conservative direction.

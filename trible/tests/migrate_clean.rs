@@ -1,4 +1,4 @@
-//! `trible pile migrate SRC clean --into DST` over synthetic piles.
+//! `trible-migrate SRC clean --into DST` over synthetic piles.
 //!
 //! One fixture holds every case the clean-pile migration decides: a payload
 //! committed by two admitted signers, its owner's second metadata, an
@@ -121,6 +121,17 @@ impl DeriveMapping for LegacyRank9 {
 
 fn trible() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_trible"));
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        if name == "PILE" || name == "PERSONA" || name.starts_with("TRIBLESPACE_") {
+            command.env_remove(key);
+        }
+    }
+    command
+}
+
+fn trible_migrate() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_trible-migrate"));
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
         if name == "PILE" || name == "PERSONA" || name.starts_with("TRIBLESPACE_") {
@@ -589,9 +600,8 @@ impl Fixture {
     /// Without the fixture's `--discard`.
     fn clean_unguarded(&self, source: &Path, into: &Path, extra: &[&str], keys: &[&Path]) -> Output {
         let report = into.with_extension("json");
-        let mut command = trible();
+        let mut command = trible_migrate();
         command
-            .args(["pile", "migrate"])
             .arg(source)
             .args(["clean", "--into"])
             .arg(into)
@@ -1073,8 +1083,7 @@ fn refusals_leave_no_destination() {
         fixture.path("fresh.pile.partial"),
         fixture.roots_file.clone(),
     ] {
-        let output = trible()
-            .args(["pile", "migrate"])
+        let output = trible_migrate()
             .arg(&fixture.src)
             .args(["clean", "--into"])
             .arg(&fresh)
@@ -1107,8 +1116,7 @@ fn refusals_leave_no_destination() {
     // A derived collection is not a root.
     let roots = fixture.path("derived-roots.txt");
     std::fs::write(&roots, handle_line(fixture.succinct.raw)).unwrap();
-    let output = trible()
-        .args(["pile", "migrate"])
+    let output = trible_migrate()
         .arg(&fixture.src)
         .args(["clean", "--into"])
         .arg(&dst)
@@ -1288,8 +1296,7 @@ fn a_leaf_over_an_absent_payload_keeps_what_its_image_names() {
     std::fs::write(&roots_file, handle_line(root.handle().raw)).unwrap();
     let dst = dir.path().join("clean.pile");
     let report_path = dir.path().join("clean.json");
-    let output = trible()
-        .args(["pile", "migrate"])
+    let output = trible_migrate()
         .arg(&src)
         .args(["clean", "--into"])
         .arg(&dst)

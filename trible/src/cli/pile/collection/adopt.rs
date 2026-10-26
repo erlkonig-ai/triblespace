@@ -25,7 +25,7 @@
 //! anything the source admitted is missing. It stands alone, so a migration
 //! somebody else ran months ago can be checked today.
 //!
-//! Not to be confused with `trible pile migrate`, which converts a pile's
+//! Not to be confused with `trible-migrate`, which converts a pile's
 //! *format*. This one moves a collection's content.
 
 use std::collections::BTreeSet;

@@ -95,8 +95,11 @@ Run `trible <COMMAND>` to invoke a subcommand.
   in a fresh copy, not authority revocation or semantic retraction. Sync may
   restore excluded records. Existing `--drop-drained RETIRED=CURRENT` may be
   combined and retains its drain-validation rules.
-- `pile migrate <PILE> list` — list known migrations and whether they are needed for this pile.
-- `pile migrate <PILE> run <MIGRATION>` — run one explicitly named migration.
+Migration lives in a separate binary, `trible-migrate`, built from this package
+alongside `trible`:
+
+- `trible-migrate <PILE> list` — list known migrations and whether they are needed for this pile.
+- `trible-migrate <PILE> run <MIGRATION>` — run one explicitly named migration.
   Pass `--dry-run` to preview changes. In particular, `monotone-wants` is a
   deliberate one-time projection of retired demand history and is never part
   of an implicit run-all operation.
@@ -117,9 +120,9 @@ safe; operator-frozen custody remains a precondition. The separate historical
 [custody contract](../book/src/pile-format.md#offline-canonical-migration-custody).
 
 ```bash
-trible pile migrate SOURCE canonical-refresh --into OWN_REFRESH \
+trible-migrate SOURCE canonical-refresh --into OWN_REFRESH \
   --key EXISTING_KEY --source-hash SOURCE_BLAKE3 --report NEW_EXPORT_REPORT
-trible pile migrate SOURCE canonical --into DESTINATION \
+trible-migrate SOURCE canonical --into DESTINATION \
   --key EXISTING_KEY --source-hash SOURCE_BLAKE3 \
   --refresh OTHER_AUTHOR_REFRESH --report NEW_REWRITE_REPORT
 ```
@@ -183,7 +186,7 @@ accounting only to stdout; it conflicts with `--report`.
 Legacy piles can also be migrated directly into native collections:
 
 ```bash
-trible pile migrate <PILE> branch-to-collection \
+trible-migrate <PILE> branch-to-collection \
   --branch <LEGACY_BRANCH> \
   --collection-name <NAME> \
   [--authority <TRUST_ROOT>] \

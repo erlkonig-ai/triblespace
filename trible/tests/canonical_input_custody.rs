@@ -27,13 +27,12 @@ fn command(
     key: &Path,
     source_hash: &str,
 ) -> Command {
-    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("trible"));
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("trible-migrate"));
     command
         .env_clear()
         .env("HOME", dir)
         .env("PATH", "/usr/bin:/bin")
         .current_dir(dir)
-        .args(["pile", "migrate"])
         .arg(source)
         .arg(mode)
         .arg("--into")
