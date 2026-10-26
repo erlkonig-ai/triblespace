@@ -11,6 +11,7 @@ mod canonical;
 mod clean;
 mod lattice_v3;
 mod shortstring_to_utf8;
+mod upgrade;
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Migration {
@@ -30,6 +31,14 @@ pub enum Command {
     CanonicalRefresh(canonical::RefreshArgs),
     /// List known migrations and whether they are needed for this pile.
     List,
+    /// Bring this pile to the current format by running to a fixpoint.
+    ///
+    /// Runs every step that needs no choice, stops at the first that does
+    /// and prints exactly what to record, and on a rerun reads what is left
+    /// from the piles themselves. The source is only read; everything is
+    /// written into `--into`. Exit status 0: nothing left; 2: a choice is
+    /// needed; 3: the pile holds frames with no path forward.
+    Upgrade(upgrade::UpgradeArgs),
     /// Re-encode a whole pile into the current record framing.
     ///
     /// Only the markers released in v0.46.4 are a writable compatibility
@@ -136,6 +145,13 @@ pub fn run(pile_path: PathBuf, cmd: Command) -> Result<()> {
         Command::Canonical(args) => canonical::run(pile_path, args),
         Command::CanonicalRefresh(args) => canonical::export(pile_path, args),
         Command::List => list_migrations(&pile_path),
+        Command::Upgrade(args) => {
+            let status = upgrade::run(&pile_path, args)?;
+            if status != 0 {
+                std::process::exit(status);
+            }
+            Ok(())
+        }
         Command::Reframe { into } => reframe(&pile_path, &into),
         Command::Clean(args) => clean::run(pile_path, args),
         Command::LatticeV3(args) => lattice_v3::run(pile_path, args),

@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- `trible-migrate <SOURCE> upgrade --into <DEST> [--decisions <FILE>]` runs
+  migration to a fixpoint. It runs every step that needs no choice, stops at
+  the first that does and prints what to record, and on a rerun reads what is
+  left from the piles themselves, never from a record of earlier runs. A pile
+  with no opaque frames is reframed, given its record-kind descriptions, and
+  each live legacy branch becomes a collection once the decisions file names
+  it (or skips it); a rerun with the same answers leaves the pile
+  byte-identical. A deployed /32 pile is sent to `canonical` with what it
+  needs; any other opaque frame stops with the kinds that have no path. The
+  source is only read. Exit status 0 nothing left, 2 a choice is needed, 3 no
+  path.
 - Migration moved out of `trible` into its own binary, `trible-migrate`,
   built from the same package. `trible pile migrate <PILE> <SUBCOMMAND>` is
   now `trible-migrate <PILE> <SUBCOMMAND>`, with the same subcommands and
