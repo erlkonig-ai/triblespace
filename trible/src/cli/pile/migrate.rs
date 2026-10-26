@@ -299,6 +299,44 @@ fn print_legacy_census(census: &LegacyCensus) {
     }
 }
 
+/// Refuse a source that holds frames of the deployed /32 collection kinds.
+///
+/// `clean` and `lattice-v3` were written for lattice v2 and v3 piles, before
+/// /33 made the /32 COMMIT, MERGE, DERIVE and MAP kinds opaque. Given such a
+/// pile they would not convert those frames: `lattice-v3` carries /32 MERGEs
+/// and MAPs past its frame filter, and `clean --drop-unknown` drops every /32
+/// COMMIT. A /32 pile's path is `canonical`. This runs before either command
+/// opens a destination, so a refusal writes nothing.
+fn refuse_deployed32(source: &std::path::Path, command: &str) -> Result<()> {
+    use triblespace_core::repo::pile::{OpaqueKind, PileRecordContent, PileRecords};
+
+    let mut found = 0usize;
+    let records =
+        PileRecords::open(source).map_err(|error| super::pile_read_error(source, error))?;
+    for record in records {
+        let record = record.map_err(|error| super::pile_read_error(source, error))?;
+        if let PileRecordContent::Opaque {
+            kind: OpaqueKind::Described(raw),
+        } = record.content
+        {
+            if canonical::frame::supported(raw) {
+                found += 1;
+            }
+        }
+    }
+    if found != 0 {
+        anyhow::bail!(
+            "{command} refuses {}: it holds {found} frame(s) of the deployed /32 collection \
+             kinds (COMMIT, MERGE, DERIVE, MAP). {command} predates /33, which made those kinds \
+             opaque, so it would carry or drop them instead of converting them. A /32 pile goes \
+             through `trible-migrate <FROZEN COPY> canonical --into <DEST> ...`, which may still \
+             refuse history it does not support. The source was only read and nothing was written",
+            source.display()
+        );
+    }
+    Ok(())
+}
+
 /// Project the retired LWW WANT log into the fresh grow-only set in place.
 ///
 /// New replay deliberately ignores the old records, so this migration must be

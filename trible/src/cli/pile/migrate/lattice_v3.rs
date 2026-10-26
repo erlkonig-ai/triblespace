@@ -1011,6 +1011,7 @@ pub fn run(source_path: PathBuf, args: LatticeV3Args) -> Result<()> {
         }
     }
     refuse_if_open(&source_path)?;
+    super::refuse_deployed32(&source_path, "lattice-v3")?;
     let stable_len = std::fs::metadata(&source_path)
         .with_context(|| format!("stat {}", source_path.display()))?
         .len();

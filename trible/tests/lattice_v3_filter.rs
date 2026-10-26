@@ -1496,3 +1496,44 @@ fn both_runs_count_the_bytes_of_the_occurrence_the_copy_takes() {
     drop(snapshot);
     pile.close().unwrap();
 }
+
+/// One structurally valid frame of a deployed /32 collection kind.
+fn deployed32_frame(kind: &str) -> Vec<u8> {
+    let mut record = vec![0u8; 256];
+    record[..28].copy_from_slice(
+        &hex::decode("0371B249F0626B2ABDDB80E23EA969059D9656A5EA5A497320351F3B")
+            .expect("envelope marker"),
+    );
+    record[28..32].copy_from_slice(&1u32.to_le_bytes());
+    record[32..64].copy_from_slice(&hex::decode(kind).expect("/32 kind"));
+    record
+}
+
+#[test]
+fn deployed_32_frames_are_refused_before_anything_is_written() {
+    // /32 MERGE and MAP: exactly the frames the filter would otherwise carry.
+    const MERGE: &str = "3C1B4C0D0A71AB17D079AC528576B6BD2E6A514E461E7F0C3D1EA4C8F0BC019E";
+    const MAP: &str = "32E0D7333FD2AD1F567AE9A030814F95CA8F7F4A87C0DEAA275FB9DD8FC5F408";
+    let fixture = Fixture::new(false);
+    let mixed = fixture.path("mixed.pile");
+    let mut mixed_bytes = std::fs::read(&fixture.src).unwrap();
+    mixed_bytes.extend(deployed32_frame(MERGE));
+    mixed_bytes.extend(deployed32_frame(MAP));
+    std::fs::write(&mixed, &mixed_bytes).unwrap();
+    let pure = fixture.path("pure.pile");
+    std::fs::write(&pure, deployed32_frame(MERGE)).unwrap();
+
+    for (label, source) in [("mixed", &mixed), ("pure", &pure)] {
+        let before = std::fs::read(source).unwrap();
+        let into = fixture.path(&format!("{label}-out.pile"));
+        for extra in [vec!["--into", into.to_str().unwrap()], vec!["--dry-run"]] {
+            let output = fixture.run(source, &extra);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{label} {extra:?}: {stderr}");
+            assert!(stderr.contains("deployed /32"), "{label} {extra:?}: {stderr}");
+            assert!(stderr.contains("canonical"), "{label} {extra:?}: {stderr}");
+            assert!(!into.exists(), "{label} {extra:?}: destination written");
+            assert_eq!(std::fs::read(source).unwrap(), before, "{label} {extra:?}");
+        }
+    }
+}

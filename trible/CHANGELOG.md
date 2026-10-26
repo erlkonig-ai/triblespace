@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- `trible-migrate clean` and `trible-migrate lattice-v3` refuse a source that
+  holds frames of the deployed /32 collection kinds (COMMIT, MERGE, DERIVE,
+  MAP), before writing anything and whatever `--drop-unknown` or `--dry-run`
+  say. Both predate /33, which made those kinds opaque: `lattice-v3` would
+  carry /32 MERGEs and MAPs, and `clean --drop-unknown` would drop every /32
+  COMMIT. The refusal names `canonical` as the /32 path. Generic unknown
+  frames keep `clean`'s own refusal and `--drop-unknown` behaviour.
 - `trible-migrate <SOURCE> upgrade --into <DEST> [--decisions <FILE>]` runs
   migration to a fixpoint. It runs every step that needs no choice, stops at
   the first that does and prints what to record, and on a rerun reads what is

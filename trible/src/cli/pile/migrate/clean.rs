@@ -189,6 +189,7 @@ pub fn run(source: PathBuf, args: CleanArgs) -> Result<()> {
     if let Some(report) = &args.report {
         check_report_path(report, &source, &args.into)?;
     }
+    super::refuse_deployed32(&source, "clean")?;
 
     let mut src = PileFile::open_read_only(&source)
         .map_err(|error| super::super::pile_read_error(&source, error))?;

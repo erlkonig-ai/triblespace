@@ -1627,3 +1627,65 @@ fn an_equation_output_whose_input_is_gone_is_not_dropped_silently() {
     assert_eq!(sole["examples"][0]["kind"], "merge_v8");
     assert_eq!(sole["examples"][0]["output"], hex::encode(result.raw).as_str());
 }
+
+/// One structurally valid frame of the deployed /32 COMMIT kind.
+fn deployed32_commit_frame() -> Vec<u8> {
+    let mut record = vec![0u8; 256];
+    record[..28].copy_from_slice(
+        &hex::decode("0371B249F0626B2ABDDB80E23EA969059D9656A5EA5A497320351F3B")
+            .expect("envelope marker"),
+    );
+    record[28..32].copy_from_slice(&1u32.to_le_bytes());
+    record[32..64].copy_from_slice(
+        &hex::decode("A1322BB3F5214287C314D42AFCC1A97CB264FACD9A22B4938838BE78DB31AA59")
+            .expect("/32 COMMIT kind"),
+    );
+    record
+}
+
+#[test]
+fn deployed_32_frames_are_refused_before_anything_is_written() {
+    let fixture = Fixture::new();
+    let mixed = fixture.path("mixed.pile");
+    let mut mixed_bytes = std::fs::read(&fixture.src).unwrap();
+    mixed_bytes.extend(deployed32_commit_frame());
+    std::fs::write(&mixed, &mixed_bytes).unwrap();
+    let pure = fixture.path("pure.pile");
+    std::fs::write(&pure, deployed32_commit_frame()).unwrap();
+
+    for (label, source) in [("mixed", &mixed), ("pure", &pure)] {
+        let before = std::fs::read(source).unwrap();
+        for (mode, extra) in [
+            ("plain", &[][..]),
+            ("drop-unknown", &["--drop-unknown"][..]),
+            ("dry-run", &["--dry-run"][..]),
+        ] {
+            let into = fixture.path(&format!("{label}-{mode}.pile"));
+            let output = fixture.clean(source, &into, extra, &[&fixture.key_a]);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{label} {mode}: {stderr}");
+            assert!(stderr.contains("deployed /32"), "{label} {mode}: {stderr}");
+            assert!(stderr.contains("canonical"), "{label} {mode}: {stderr}");
+            assert!(!into.exists(), "{label} {mode}: destination written");
+            assert!(!into.with_extension("json").exists(), "{label} {mode}: report written");
+            assert_eq!(std::fs::read(source).unwrap(), before, "{label} {mode}: source changed");
+        }
+    }
+}
+
+#[test]
+fn a_generic_unknown_frame_keeps_its_own_refusal() {
+    let fixture = Fixture::new();
+    let source = fixture.path("unknown.pile");
+    let mut bytes = std::fs::read(&fixture.src).unwrap();
+    let mut unknown = deployed32_commit_frame();
+    unknown[32..64].fill(0xA5);
+    bytes.extend(unknown);
+    std::fs::write(&source, &bytes).unwrap();
+    let into = fixture.path("unknown-out.pile");
+    let output = fixture.clean(&source, &into, &[], &[&fixture.key_a]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(!stderr.contains("deployed /32"), "{stderr}");
+    assert!(!into.exists());
+}
