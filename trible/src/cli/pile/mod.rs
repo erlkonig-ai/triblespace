@@ -271,12 +271,29 @@ pub fn run(cmd: PileCommand) -> Result<()> {
                 fs::create_dir_all(parent)?;
             }
 
-            // Pile::open no longer auto-creates files (v0.32.1), so we
-            // explicitly touch the path first. Fine if the file already
-            // exists — fs::File::create truncates empty-or-not, and
-            // piles are append-only so an empty file is the initial
-            // state.
-            fs::File::create(&path)?;
+            // Pile::open no longer auto-creates files (v0.32.1), so the
+            // path is created here, but never truncated: `File::create`
+            // used to empty an existing pile, destroying its append-only
+            // history. An existing empty file is already the initial state
+            // and is accepted; an existing nonempty one is refused.
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let len = fs::metadata(&path)?.len();
+                    if len != 0 {
+                        return Err(anyhow!(
+                            "{} already exists and holds {len} bytes; `pile create` never \
+                             truncates a pile. Open it as it is, or choose a new path",
+                            path.display()
+                        ));
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
 
             let pile: Pile = Pile::open(&path)?;
             // Explicit close makes the empty pile durable and avoids Drop warnings.

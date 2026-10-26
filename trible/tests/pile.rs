@@ -2182,3 +2182,35 @@ fn migrate_list_counts_retired_kinds_and_live_legacy_branches() {
     // Listing is read-only.
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
 }
+
+#[test]
+fn pile_create_never_truncates_an_existing_pile() {
+    let dir = tempdir().unwrap();
+    let fresh = dir.path().join("nested/fresh.pile");
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "create"])
+        .arg(&fresh)
+        .assert()
+        .success();
+    assert_eq!(std::fs::metadata(&fresh).unwrap().len(), 0);
+    // Creating an empty pile again is idempotent.
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "create"])
+        .arg(&fresh)
+        .assert()
+        .success();
+
+    let existing = dir.path().join("existing.pile");
+    let bytes = legacy_v3_definition_followed_by_blob();
+    std::fs::write(&existing, &bytes).unwrap();
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "create"])
+        .arg(&existing)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("never truncates"));
+    assert_eq!(std::fs::read(&existing).unwrap(), bytes);
+}
