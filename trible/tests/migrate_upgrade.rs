@@ -63,6 +63,7 @@ fn a_released_pile_reaches_its_fixpoint_and_stays_there() {
     assert!(text.contains("Reframed into"), "{text}");
     assert!(text.contains("1 live legacy branch(es) need a choice"), "{text}");
     assert!(text.contains(BRANCH), "{text}");
+    assert!(text.contains("named \"legacy\""), "{text}");
     assert!(into.exists());
 
     // Second run with the choice recorded: the branch becomes a collection.

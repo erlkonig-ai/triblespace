@@ -242,6 +242,13 @@ pub fn run(source: &Path, args: UpgradeArgs) -> Result<i32> {
              a different trust root. Record them in the decisions file and rerun:",
             pending.len()
         );
+        let names = super::branch_to_collection::active_branch_names(&into).unwrap_or_default();
+        for id in &pending {
+            match names.get(id) {
+                Some(name) => println!("  branch {id}, named {name:?}"),
+                None => println!("  branch {id} (its name could not be read)"),
+            }
+        }
         let template: serde_json::Map<String, Value> = pending
             .iter()
             .map(|id| {

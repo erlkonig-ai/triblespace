@@ -192,6 +192,53 @@ fn resolve_branch(
     }
 }
 
+/// Names of the active legacy branches, keyed by upper-hex branch id, for an
+/// operator choosing what each becomes. A branch whose name cannot be read
+/// (absent, ambiguous or undecodable metadata) is simply left out.
+pub(super) fn active_branch_names(
+    pile_path: &std::path::Path,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut pile = super::super::open_refreshed(pile_path)?;
+    let result = (|| -> Result<std::collections::BTreeMap<String, String>> {
+        let pins = pile
+            .snapshot_pin_heads()
+            .context("snapshot active legacy branch pins")?;
+        let snapshot = pile.snapshot().context("snapshot legacy pile")?;
+        let mut names = std::collections::BTreeMap::new();
+        for raw in pins.iter_ordered() {
+            let id = Id::new(*raw).expect("pin snapshot contains a nil id");
+            let handle = *pins.get(raw).expect("iterated pin has a value");
+            let Ok((_, facts)) = read_archive(&snapshot, handle, "legacy branch metadata") else {
+                continue;
+            };
+            let Ok(subject) = repo::branch::branch_entity(&facts, id) else {
+                continue;
+            };
+            let current: Vec<Inline<Handle<UTF8String>>> = facts
+                .iter()
+                .filter(|fact| fact.e() == &subject && fact.a() == &metadata::name.id())
+                .map(|fact| *fact.v::<Handle<UTF8String>>())
+                .collect();
+            let name = match current.as_slice() {
+                [one] => snapshot
+                    .get::<triblespace::prelude::View<str>, _>(*one)
+                    .ok()
+                    .map(|text| text.to_string()),
+                [] => legacy_branch_name(&facts, id).ok().flatten(),
+                _ => None,
+            };
+            if let Some(name) = name {
+                names.insert(format!("{id:X}"), name);
+            }
+        }
+        Ok(names)
+    })();
+    let close = pile.close().map_err(|error| anyhow!("close pile: {error}"));
+    let names = result?;
+    close?;
+    Ok(names)
+}
+
 /// Read the pre-UTF8-blob branch name used by old repository versions.
 ///
 /// This is intentionally local to the one-way migration. Keeping the decoder
