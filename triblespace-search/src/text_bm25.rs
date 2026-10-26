@@ -18,6 +18,11 @@
 //! The same maximum is what makes a reader's cover of attachments answer
 //! alike whatever its granularity: a document present in two nodes' images
 //! is one document, its frequencies the pointwise maximum, never a sum.
+//! An unmerged cover ([`crate::portable_bm25::PortableBM25View`]) takes such a
+//! document's length from one carrier rather than recomputing it, so it scores
+//! like the merged carrier only while every member holding an entity holds
+//! all of that entity's texts; an entity whose texts are split across members
+//! scores with the largest single-member length until the members are merged.
 //!
 //! A text handle that cannot be read is a missing dependency, never a
 //! silently shorter document. Exact gets through an acquiring reader may
@@ -446,6 +451,7 @@ mod tests {
         view.query()
             .unwrap()
             .query_multi(&hash_tokens(query))
+            .unwrap()
             .into_iter()
             .map(|(document, score)| (document.raw, (f64::from(score) * 1e4).round() as i64))
             .collect()
@@ -456,6 +462,12 @@ mod tests {
     /// attachment present at random nodes and the residual built in memory,
     /// the attached cover scores every query exactly as the index of the
     /// union of every foundation does.
+    ///
+    /// Each commit names its own entities, so every node holding an entity
+    /// holds all of its texts: the whole-document premise of
+    /// [`crate::portable_bm25::PortableBM25View`]. Merged nodes still overlap.
+    /// An entity whose texts are split across members would take one
+    /// member's length in the cover (see the module docs).
     #[test]
     fn attached_covers_answer_like_the_index_of_the_union() {
         use ed25519_dalek::SigningKey;
@@ -492,11 +504,12 @@ mod tests {
                     let words: Vec<&str> = (0..1 + random.below(4))
                         .map(|_| WORDS[random.below(WORDS.len() as u64) as usize])
                         .collect();
-                    // Real distinct foundations, while document IDs still overlap.
+                    // Real distinct foundations; documents overlap only
+                    // through merged nodes, never by splitting an entity.
                     let text = store
                         .put::<UTF8String, _>(format!("{} node{index}", words.join(" ")))
                         .unwrap();
-                    rows.push((1 + random.below(5) as u8, text));
+                    rows.push((1 + 5 * index as u8 + random.below(5) as u8, text));
                 }
                 let facts = text_facts(attribute.id(), rows);
                 union += facts.clone();

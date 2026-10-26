@@ -6,6 +6,21 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+- `PortableBM25Blob` stores each document's length (`u64 lengths[D]`, after
+  the document keys), so scoring no longer visits every posting to derive
+  lengths. The grammar change mints encoding
+  `166008918008AFF1028D28E36ECF8F6B` (minted with `trible genid` on
+  2026-10-26), replacing `A5B5F53351B46DECAED496E567D12F4F`; the old grammar is
+  not read, and carriers must be rebuilt. `PortableBM25View::query` builds its
+  union domain from the carriers' `(key, length)` tables alone (a sort over the
+  documents they hold, no posting visits and no `(document, term)` map), which
+  assumes a document's postings are identical in every carrier holding it; a
+  partial document takes the largest stored length and may score differently
+  from the merged carrier. Term postings are bounds-checked when queried, so
+  `PortableBM25Query::{query_term, query_multi, score, matches}` now return
+  `Result`, and `PortableBM25Query` no longer implements `BM25Queryable`.
+  `validate_canonical` checks each stored length against its frequency sum.
+
 - `bm25_tokenizer` and `semantic_compute` store their names as
   `Handle<UTF8String>` (ids derived anew from the same anchors), so BM25 and
   semantic descriptors get new identities and derived indexes need a rebuild.

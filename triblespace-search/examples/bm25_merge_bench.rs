@@ -189,11 +189,13 @@ fn main() {
     let resident_expected = resident
         .query()
         .expect("resident scoring")
-        .query_multi(&query);
+        .query_multi(&query)
+        .expect("resident query");
     let reattached_expected = reattached
         .query()
         .expect("reattached scoring")
-        .query_multi(&query);
+        .query_multi(&query)
+        .expect("reattached query");
     assert_eq!(
         resident_expected
             .iter()
@@ -209,14 +211,22 @@ fn main() {
     let resident_scoring = resident.query().expect("resident scoring");
     let resident_query_started = Instant::now();
     for _ in 0..QUERY_ITERATIONS {
-        black_box(resident_scoring.query_multi(black_box(&query)));
+        black_box(
+            resident_scoring
+                .query_multi(black_box(&query))
+                .expect("resident query"),
+        );
     }
     let resident_query = average(resident_query_started.elapsed(), QUERY_ITERATIONS);
 
     let reattached_scoring = reattached.query().expect("reattached scoring");
     let reattached_started = Instant::now();
     for _ in 0..QUERY_ITERATIONS {
-        black_box(reattached_scoring.query_multi(black_box(&query)));
+        black_box(
+            reattached_scoring
+                .query_multi(black_box(&query))
+                .expect("reattached query"),
+        );
     }
     let reattached_query = average(reattached_started.elapsed(), QUERY_ITERATIONS);
 
@@ -229,7 +239,8 @@ fn main() {
             one_shot
                 .query()
                 .expect("one-shot scoring")
-                .query_multi(black_box(&query)),
+                .query_multi(black_box(&query))
+                .expect("one-shot query"),
         );
     }
     let one_shot_query = average(one_shot_started.elapsed(), ONE_SHOT_ITERATIONS);

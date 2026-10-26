@@ -62,6 +62,7 @@ little-endian grammar:
 
 ```text
 [documents]  D x 32-byte keys, strictly increasing
+[lengths]    D x u64, the sum of each document's frequencies
 [terms]      T x 32-byte terms, strictly increasing
 [postings]   P x (u32 document ordinal, u32 exact frequency), term-major
 [ends]       T x u64 cumulative posting ends
@@ -69,10 +70,13 @@ little-endian grammar:
 ```
 
 Every term has at least one posting, every frequency is positive, and posting
-document ordinals are strictly increasing within a term. There is no magic,
-in-band version, native `usize`, padding, persisted float, score, document
-length, or query-accelerator metadata. An incompatible grammar gets a new blob
-encoding identity rather than a compatibility reader.
+document ordinals are strictly increasing within a term, and each stored
+length equals its document's frequency sum. There is no magic, in-band
+version, native `usize`, padding, persisted float, score, or query-accelerator
+metadata. An incompatible grammar gets a new blob encoding identity rather
+than a compatibility reader: storing lengths minted
+`166008918008AFF1028D28E36ECF8F6B` (2026-10-26), replacing
+`A5B5F53351B46DECAED496E567D12F4F`.
 
 The logical join is:
 
@@ -82,12 +86,18 @@ The logical join is:
 ```
 
 This preserves empty documents and makes segment merge associative,
-commutative, idempotent, and byte-canonical. Attachment exact-validates the
-grammar, retains its bytes, and derives only document lengths and average
-length in memory. `PortableBM25Index::merge` materializes the canonical join;
-collection consumers supply their own domain projection and exact-cover
-evidence. Repeated-query servers should retain the merged portable view so the
-all-postings pass is amortized.
+commutative, idempotent, and byte-canonical; merge recomputes lengths from the
+joined frequencies. Attachment checks framing only and retains the bytes;
+scoring reads the stored lengths, derives the average in one pass over them,
+and bounds-checks a term's postings when that term is queried, so no query
+visits postings it does not score. `PortableBM25View` scores a cover of
+carriers without merging them: its union domain is the sorted union of the
+carriers' `(key, length)` tables. That assumes whole documents, i.e. a
+document's postings are the same in every carrier holding it (true when terms
+are a function of a content-addressed key); otherwise the view takes one
+carrier's length and may score differently from the merged carrier.
+`PortableBM25Index::merge` materializes the canonical join; collection
+consumers supply their own domain projection and exact-cover evidence.
 
 ## `SuccinctBM25Index` — SB25 blob layout
 

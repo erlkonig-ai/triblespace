@@ -8,10 +8,11 @@ architecture-independent; the native query accelerators are loaded zero-copy
 via [anybytes] and [jerky]:
 
 - **`PortableBM25Index`** — architecture-independent lexical / associative
-  retrieval carrier. Its canonical bytes carry sorted document and term
-  domains plus positive exact `u32` frequencies; document lengths, IDF, and
-  scores are derived after attachment. Portable merge is document union plus
-  pointwise maximum frequency.
+  retrieval carrier. Its canonical bytes carry the sorted document domain
+  with each document's exact length, the sorted term domain, and positive
+  exact `u32` frequencies; average length, IDF, and scores are derived after
+  attachment. Portable merge is document union plus pointwise maximum
+  frequency, with lengths recomputed from the joined frequencies.
 - **`SuccinctBM25Index`** (SB25 blob) — lexical / associative
   retrieval for direct native callers. Terms are 32-byte triblespace
   `Inline`s, so the index handles text search, entity co-occurrence, and tag
@@ -58,11 +59,14 @@ remaining open items are perf/encoding refinements, not architecture.
   `idx.score(&doc, terms)` to recompute precise scores after
   the engine filters.
 * **`PortableBM25Index`**: strict, canonical exact-TF carrier. Its bytes
-  contain no native `usize`, padding, Jerky arena, persisted float, score, or
-  redundant document-length table. Attachment retains the encoded backing;
-  `index.query()` prepares the omitted scoring statistics and speaks the
-  constraint surface. `PortableBM25View` does the same over a shared-member
-  cover without constructing a serialized union.
+  contain no native `usize`, padding, Jerky arena, persisted float, or score;
+  each document's length is stored beside its key. Attachment retains the
+  encoded backing; `index.query()` reads the stored lengths without visiting
+  postings and speaks the constraint surface, checking a term's postings when
+  it is queried (so term queries return `Result`). `PortableBM25View` does the
+  same over a shared-member cover without constructing a serialized union,
+  assuming whole documents: a document's postings are identical in every
+  carrier that holds it.
 * **`SuccinctBM25Index`**: jerky-backed zero-copy view — doc
   keys via `CompressedUniverse`, terms as a typed
   `View<[[u8; 32]]>` row table, doc-lengths + postings via
@@ -88,7 +92,8 @@ remaining open items are perf/encoding refinements, not architecture.
   Every backend freezes native order and duplicate occurrences at constraint
   construction.
 * **Shared constraint traits** `CosineSimilarity` (HNSW, Flat,
-  SuccinctHNSW) + `BM25Queryable` (naive + portable + succinct BM25).
+  SuccinctHNSW) + `BM25Queryable` (naive + succinct BM25; the portable
+  query has its own fallible `matches` / `score`).
 * **`matches_text(doc, text, floor)`** + **`score_text(doc, text)`**:
   word-hash-keyed sugar over `matches` and `score` — tokenises the
   query string with `hash_tokens` internally, available on indexes

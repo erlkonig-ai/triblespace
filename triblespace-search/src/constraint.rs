@@ -49,10 +49,11 @@ use crate::schemas::Embedding;
 /// Minimum surface a BM25 index must expose for the
 /// [`BM25Filter`] constraint to work against it. Implemented
 /// for both the naive [`crate::bm25::BM25Index`] and the
-/// succinct [`crate::succinct::SuccinctBM25Index`], as well as the portable
-/// exact-TF [`crate::portable_bm25::PortableBM25Query`], so each
+/// succinct [`crate::succinct::SuccinctBM25Index`], so each
 /// can plug into `find!` / `pattern!` without changes at the
-/// engine layer.
+/// engine layer. The portable exact-TF
+/// [`crate::portable_bm25::PortableBM25Query`] checks posting bounds on use,
+/// so its term queries are fallible and it has its own fallible `matches`.
 pub trait BM25Queryable {
     /// Iterate `(key, score)` for the posting list of `term`.
     /// Keys are 32-byte triblespace `RawInline`s — the caller's
@@ -75,21 +76,6 @@ impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::I
         // — the typed API inside the index expects `&Inline<T>`.
         let term_val = Inline::<T>::new(*term);
         Box::new(self.query_term(&term_val).map(|(v, s)| (v.raw, s)))
-    }
-}
-
-impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::InlineEncoding>
-    BM25Queryable for crate::portable_bm25::PortableBM25Query<'_, D, T>
-{
-    fn query_term_boxed<'a>(
-        &'a self,
-        term: &RawInline,
-    ) -> Box<dyn Iterator<Item = (RawInline, f32)> + 'a> {
-        let term_val = Inline::<T>::new(*term);
-        Box::new(
-            self.query_term(&term_val)
-                .map(|(value, score)| (value.raw, score)),
-        )
     }
 }
 
@@ -262,6 +248,11 @@ fn aggregate_above<I: BM25Queryable + ?Sized>(
             *acc.entry(doc).or_insert(0.0) += score;
         }
     }
+    above_floor(acc, score_floor)
+}
+
+/// The summed-score map's documents at or above `score_floor`.
+fn above_floor(acc: std::collections::HashMap<RawInline, f32>, score_floor: f32) -> Vec<RawInline> {
     let out: Vec<RawInline> = acc
         .into_iter()
         .filter_map(|(doc, sum)| (sum >= score_floor).then_some(doc))
@@ -281,28 +272,41 @@ impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::I
     crate::portable_bm25::PortableBM25Query<'_, D, T>
 {
     /// Build a query-engine filter from this portable exact-TF corpus.
+    ///
+    /// Fails when a query term's postings are out of bounds.
     pub fn matches(
         &self,
         doc: Variable<D>,
         terms: &[Inline<T>],
         score_floor: f32,
-    ) -> BM25Filter<D> {
-        let raw_terms: Vec<RawInline> = terms.iter().map(|term| term.raw).collect();
-        BM25Filter::from_entries(doc, aggregate_above(self, &raw_terms, score_floor))
+    ) -> Result<BM25Filter<D>, crate::portable_bm25::PortableBM25Error> {
+        let mut acc: std::collections::HashMap<RawInline, f32> = std::collections::HashMap::new();
+        for term in terms {
+            for (candidate, score) in self.query_term(term)? {
+                *acc.entry(candidate.raw).or_insert(0.0) += score;
+            }
+        }
+        Ok(BM25Filter::from_entries(doc, above_floor(acc, score_floor)))
     }
 
     /// Summed BM25 score for one document across the supplied typed terms.
-    pub fn score(&self, doc: &Inline<D>, terms: &[Inline<T>]) -> f32 {
+    ///
+    /// Fails when a query term's postings are out of bounds.
+    pub fn score(
+        &self,
+        doc: &Inline<D>,
+        terms: &[Inline<T>],
+    ) -> Result<f32, crate::portable_bm25::PortableBM25Error> {
         let mut sum = 0.0;
         for term in terms {
-            for (candidate, score) in self.query_term(term) {
+            for (candidate, score) in self.query_term(term)? {
                 if candidate.raw == doc.raw {
                     sum += score;
                     break;
                 }
             }
         }
-        sum
+        Ok(sum)
     }
 }
 

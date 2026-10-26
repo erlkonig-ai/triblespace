@@ -2784,6 +2784,7 @@ fn run_search(
                     .query()
                     .map_err(|error| anyhow!("prepare BM25 scoring: {error}"))?
                     .query_multi(&bigram_tokens(&query))
+                    .map_err(|error| anyhow!("BM25 scoring: {error}"))?
             }
             Bm25Tokenizer::Word | Bm25Tokenizer::Code => {
                 let index: PortableBM25View<GenId, WordHash> = view
@@ -2798,6 +2799,7 @@ fn run_search(
                     .query()
                     .map_err(|error| anyhow!("prepare BM25 scoring: {error}"))?
                     .query_multi(&terms)
+                    .map_err(|error| anyhow!("BM25 scoring: {error}"))?
             }
         };
         let mut hits = hits;
