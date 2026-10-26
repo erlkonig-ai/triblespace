@@ -2113,3 +2113,77 @@ fn amputate_requires_and_matches_the_current_reader_boundary() {
 
 // Canonical but deliberately uninserted COMMIT witnesses keep these
 // physical-storage fixtures independent of ancestor arrival order.
+
+fn legacy_pin_record(kind: &str, branch: [u8; 16], head: Option<[u8; 32]>) -> Vec<u8> {
+    let mut record = vec![0u8; 256];
+    record[..28].copy_from_slice(
+        &hex::decode("0371B249F0626B2ABDDB80E23EA969059D9656A5EA5A497320351F3B")
+            .expect("envelope marker"),
+    );
+    record[28..32].copy_from_slice(&1u32.to_le_bytes());
+    record[32..64].copy_from_slice(&hex::decode(kind).expect("legacy pin kind"));
+    record[64..80].copy_from_slice(&branch);
+    if let Some(head) = head {
+        record[96..128].copy_from_slice(&head);
+    }
+    record
+}
+
+#[test]
+fn migrate_list_counts_retired_kinds_and_live_legacy_branches() {
+    const HEAD: &str = "2BC0B9FE0EFDB0BC53654E17BB9D06E01259F36AF93EEE54AD5D557B12DF706D";
+    const TOMBSTONE: &str = "8D9F27E76D3620EEC29B781F841E9EF77F2607B40DC702FE3DAED007E9228CA5";
+    let dir = tempdir().unwrap();
+
+    let empty = dir.path().join("empty.pile");
+    std::fs::write(&empty, b"").unwrap();
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "migrate"])
+        .arg(&empty)
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("- retired record kinds: none")
+                .and(predicate::str::contains("- legacy branches: none live"))
+                .and(predicate::str::contains("unknown record kinds").not()),
+        );
+
+    let path = dir.path().join("legacy.pile");
+    let mut bytes = legacy_v3_definition_followed_by_blob();
+    bytes.extend_from_slice(&retired_team_record(
+        "327FFCAAA3F5A10424DC2059E3A7A3517F837E7E56A3C850979EFA9F5E3A1ED7",
+        &[1, 2],
+    ));
+    bytes.extend_from_slice(&retired_blob_want_record(
+        Inline::<Handle<UnknownBlob>>::new([0x81; 32]),
+        true,
+    ));
+    bytes.extend_from_slice(&retired_blob_want_record(
+        Inline::<Handle<UnknownBlob>>::new([0x81; 32]),
+        false,
+    ));
+    // Two branches get heads; the second is then tombstoned.
+    bytes.extend_from_slice(&legacy_pin_record(HEAD, [0x11; 16], Some([0x21; 32])));
+    bytes.extend_from_slice(&legacy_pin_record(HEAD, [0x12; 16], Some([0x22; 32])));
+    bytes.extend_from_slice(&legacy_pin_record(TOMBSTONE, [0x12; 16], None));
+    std::fs::write(&path, &bytes).unwrap();
+
+    Command::cargo_bin("trible")
+        .unwrap()
+        .args(["pile", "migrate"])
+        .arg(&path)
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("1 legacy V3 collection")
+                .and(predicate::str::contains("2 retired WANT log"))
+                .and(predicate::str::contains("reframe --into <dest>"))
+                .and(predicate::str::contains("- legacy branches: 1 live"))
+                .and(predicate::str::contains("branch-to-collection")),
+        );
+    // Listing is read-only.
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}

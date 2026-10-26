@@ -188,12 +188,97 @@ fn list_migrations(pile_path: &PathBuf) -> Result<()> {
                  blob(s) missing)"
             );
         }
+        print_legacy_census(&legacy_census(pile_path)?);
         Ok(())
     })();
 
     let close_res = pile.close().map_err(|e| anyhow::anyhow!("{e:?}"));
     res.and(close_res)?;
     Ok(())
+}
+
+/// Records of retired or legacy kinds, and legacy branches still live, as the
+/// raw record reader decodes them. Descriptive only: what `reframe` carries,
+/// projects or drops is its own report, so this never second-guesses it.
+#[derive(Default)]
+struct LegacyCensus {
+    kinds: std::collections::BTreeMap<&'static str, usize>,
+    opaque: usize,
+    live_branches: usize,
+}
+
+fn legacy_census(pile_path: &PathBuf) -> Result<LegacyCensus> {
+    use triblespace_core::repo::pile::{PileRecordContent, PileRecords};
+
+    let mut census = LegacyCensus::default();
+    let mut branches = std::collections::HashMap::new();
+    let records =
+        PileRecords::open(pile_path).map_err(|error| super::pile_read_error(pile_path, error))?;
+    for record in records {
+        let record = record.map_err(|error| super::pile_read_error(pile_path, error))?;
+        let kind = match record.content {
+            PileRecordContent::Branch { branch_id, .. } => {
+                branches.insert(branch_id, true);
+                continue;
+            }
+            PileRecordContent::BranchTombstone { branch_id } => {
+                branches.insert(branch_id, false);
+                continue;
+            }
+            PileRecordContent::Opaque { .. } => {
+                census.opaque += 1;
+                continue;
+            }
+            PileRecordContent::RetiredWantAssert { .. }
+            | PileRecordContent::RetiredWantRetract { .. } => "retired WANT log",
+            PileRecordContent::LegacyCollectionV3 { .. } => "legacy V3 collection",
+            PileRecordContent::LegacyUnsignedCollectionEquation { .. } => {
+                "legacy unsigned equation"
+            }
+            PileRecordContent::RetiredCollectionEquation { .. } => "retired v8/v9 equation",
+            PileRecordContent::RetiredCollectionDeriveV4 => "retired V4 derive",
+            PileRecordContent::RetiredCapabilityProof => "retired capability proof",
+            PileRecordContent::RetiredPeerEvidenceV1 => "retired PEER",
+            PileRecordContent::RetiredStoreScopeV1 => "retired STORE_SCOPE",
+            PileRecordContent::RetiredArtifactOfferV1 => "retired artifact offer",
+            _ => continue,
+        };
+        *census.kinds.entry(kind).or_default() += 1;
+    }
+    census.live_branches = branches.values().filter(|live| **live).count();
+    Ok(census)
+}
+
+fn print_legacy_census(census: &LegacyCensus) {
+    if census.kinds.is_empty() {
+        println!("- retired record kinds: none");
+    } else {
+        let kinds: Vec<String> = census
+            .kinds
+            .iter()
+            .map(|(kind, count)| format!("{count} {kind}"))
+            .collect();
+        println!(
+            "- retired record kinds: {} (`reframe --into <dest>` rewrites the pile in the \
+             current framing and reports what it carries, projects and drops)",
+            kinds.join(", ")
+        );
+    }
+    if census.opaque != 0 {
+        println!(
+            "- unknown record kinds: {} (reframe refuses them; `pile diagnose census` lists their markers)",
+            census.opaque
+        );
+    }
+    if census.live_branches == 0 {
+        println!("- legacy branches: none live");
+    } else {
+        println!(
+            "- legacy branches: {} live (each becomes a native collection through \
+             `branch-to-collection`, which appends to the pile it reads)",
+            census.live_branches
+        );
+    }
 }
 
 /// Project the retired LWW WANT log into the fresh grow-only set in place.
