@@ -1443,11 +1443,52 @@ where
         range.map(move |position| self.decode_ave_value_entity(position))
     }
 
-    fn decode_ave_value_entity(&self, position: usize) -> (RawInline, Id) {
+    /// [`Self::iter_attribute_value_entities`], starting at the attribute's
+    /// first fact whose raw value is at least `from`.
+    ///
+    /// The attribute's AVE run is ordered by value code, and codes follow raw
+    /// value order, so the start is a partition point of the run: O(log n)
+    /// probes of one value code each, nothing decoded before it. Iterating
+    /// from there costs what [`Self::iter_attribute_value_entities`] costs.
+    pub fn iter_attribute_value_entities_from<'a>(
+        &'a self,
+        attribute: &Id,
+        from: &RawInline,
+    ) -> impl DoubleEndedIterator<Item = (RawInline, Id)> + ExactSizeIterator + 'a {
+        self.attribute_value_range_from(attribute, from)
+            .map(move |position| self.decode_ave_value_entity(position))
+    }
+
+    /// AVE positions of `attribute`'s facts whose raw value is at least `from`.
+    pub(crate) fn attribute_value_range_from(
+        &self,
+        attribute: &Id,
+        from: &RawInline,
+    ) -> std::ops::Range<usize> {
+        let range = base_range(&self.domain, &self.a_a, &id_into_value(attribute));
+        let first_code = self.domain.search_lower(from);
+        let (mut low, mut high) = (range.start, range.end);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.ave_codes(middle).0 < first_code {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        low..range.end
+    }
+
+    /// The `(value, entity)` codes at one AVE position.
+    fn ave_codes(&self, position: usize) -> (usize, usize) {
         let entity_code = self.ave_c.access(position).unwrap();
         let eav_position = self.e_a.select1(entity_code).unwrap() - entity_code
             + self.ave_c.rank(position, entity_code).unwrap();
-        let value_code = self.eav_c.access(eav_position).unwrap();
+        (self.eav_c.access(eav_position).unwrap(), entity_code)
+    }
+
+    fn decode_ave_value_entity(&self, position: usize) -> (RawInline, Id) {
+        let (value_code, entity_code) = self.ave_codes(position);
 
         let value = self.domain.access(value_code);
         let entity = self.domain.access(entity_code);
@@ -4009,6 +4050,60 @@ mod tests {
 
         assert_eq!(
             archive.iter_attribute_value_entities(&ordered_id(99)).len(),
+            0
+        );
+    }
+
+    #[test]
+    fn seeked_attribute_iteration_starts_at_the_first_value_at_or_above_the_bound() {
+        let attribute = ordered_id(10);
+        let other_attribute = ordered_id(11);
+        let mut set = TribleSet::new();
+        for (entity, value) in [
+            (1, 0x10),
+            (2, 0x10),
+            (3, 0x20),
+            (4, 0x30),
+            (5, 0x30),
+            (6, 0x50),
+        ] {
+            set.insert(&Trible::force(
+                &ordered_id(entity),
+                &attribute,
+                &ordered_value(value),
+            ));
+        }
+        // Values of another attribute share the domain and fall between ours.
+        for (entity, value) in [(7, 0x08), (8, 0x28), (9, 0x60)] {
+            set.insert(&Trible::force(
+                &ordered_id(entity),
+                &other_attribute,
+                &ordered_value(value),
+            ));
+        }
+        let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
+        for bound in 0u8..=0x70 {
+            let from = [bound; 32];
+            let expected = archive
+                .iter_attribute_value_entities(&attribute)
+                .filter(|(value, _)| *value >= from)
+                .collect_vec();
+            let seeked = archive.iter_attribute_value_entities_from(&attribute, &from);
+            assert_eq!(seeked.len(), expected.len(), "bound {bound:#x}");
+            assert_eq!(seeked.collect_vec(), expected, "bound {bound:#x}");
+            assert_eq!(
+                archive
+                    .iter_attribute_value_entities_from(&attribute, &from)
+                    .rev()
+                    .collect_vec(),
+                expected.iter().copied().rev().collect_vec(),
+                "bound {bound:#x}"
+            );
+        }
+        assert_eq!(
+            archive
+                .iter_attribute_value_entities_from(&ordered_id(99), &[0; 32])
+                .len(),
             0
         );
     }
