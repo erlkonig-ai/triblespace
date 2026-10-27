@@ -64,7 +64,7 @@ use anybytes::View;
 use ed25519_dalek::VerifyingKey;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::sync::{mpsc, oneshot, watch};
-use tracing::debug;
+use tracing::{debug, info};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::Blob;
 use triblespace_core::capability::{CapabilityProof, QuorumOutcome};
@@ -1574,7 +1574,13 @@ async fn drive<T: Transport, S: Service>(
         match exchange.outcome() {
             Some(Outcome::Confirmed) => break false,
             Some(Outcome::Failed(failure)) => {
-                debug!(?failure, "walk/1 exchange failed");
+                info!(
+                    ?failure,
+                    peer = %hex::encode(&driver.peer[..8]),
+                    collection = %hex::encode(&driver.collection.raw[..8]),
+                    kind = ?driver.kind,
+                    "walk/1 exchange failed"
+                );
                 break true;
             }
             None => {}
