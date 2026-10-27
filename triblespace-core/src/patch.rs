@@ -1337,7 +1337,7 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Head<KEY_LEN,
     }
 
     #[inline]
-    fn is_archive_singleton_pair(&self, other: &Self) -> bool {
+    fn is_archive_singleton_pair<OV>(&self, other: &Head<KEY_LEN, O, OV, H>) -> bool {
         matches!(
             (self.tag(), other.tag()),
             (HeadTag::LocalLeaf, HeadTag::Leaf | HeadTag::LocalLeaf)
@@ -1350,7 +1350,10 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Head<KEY_LEN,
     /// key, while a Branch's count is cached; all pairs without a `LocalLeaf`
     /// retain the existing fingerprint path unchanged.
     #[inline]
-    fn local_leaf_cardinality_allows_equality(&self, other: &Self) -> bool {
+    fn local_leaf_cardinality_allows_equality<OV>(
+        &self,
+        other: &Head<KEY_LEN, O, OV, H>,
+    ) -> bool {
         match (self.tag(), other.tag()) {
             (HeadTag::LocalLeaf, _) => other.count() == 1,
             (_, HeadTag::LocalLeaf) => self.count() == 1,
@@ -1425,9 +1428,9 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Head<KEY_LEN,
     /// natural bound for comparing two heads. Returns `Some((depth, a, b))`
     /// where `a` and `b` are the differing bytes at that depth, or `None`
     /// if no divergence is found in the range.
-    pub(crate) fn first_divergence(
+    pub(crate) fn first_divergence<OV>(
         &self,
-        other: &Self,
+        other: &Head<KEY_LEN, O, OV, H>,
         start_depth: usize,
     ) -> Option<(usize, u8, u8)> {
         let limit = std::cmp::min(std::cmp::min(self.end_depth(), other.end_depth()), KEY_LEN);
@@ -2081,10 +2084,15 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Head<KEY_LEN,
     /// [`parallel_union::ParUnionCtx`] and delegates to
     /// [`Self::par_difference_with_ctx`].
     #[cfg(feature = "parallel")]
-    pub(crate) fn par_difference(&self, other: &Self, at_depth: usize) -> Option<Self>
+    pub(crate) fn par_difference<OV>(
+        &self,
+        other: &Head<KEY_LEN, O, OV, H>,
+        at_depth: usize,
+    ) -> Option<Self>
     where
         O: Send + Sync,
         V: Send + Sync,
+        OV: Send + Sync,
     {
         let ctx = parallel_union::ParUnionCtx::new();
         self.par_difference_with_ctx(other, at_depth, &ctx)
@@ -2095,15 +2103,16 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Head<KEY_LEN,
     /// other" branch where we clone `self_child` unchanged into
     /// the resolved array (no recursive work).
     #[cfg(feature = "parallel")]
-    pub(crate) fn par_difference_with_ctx(
+    pub(crate) fn par_difference_with_ctx<OV>(
         &self,
-        other: &Self,
+        other: &Head<KEY_LEN, O, OV, H>,
         at_depth: usize,
         ctx: &parallel_union::ParUnionCtx,
     ) -> Option<Self>
     where
         O: Send + Sync,
         V: Send + Sync,
+        OV: Send + Sync,
     {
         if self.is_archive_singleton_pair(other) {
             return self.difference(other, at_depth);
@@ -2576,8 +2585,13 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Head<KEY_LEN,
 
     /// Returns the difference between self and other.
     /// This is the set of elements that are in self but not in other.
-    /// If the difference is empty, None is returned.
-    pub(crate) fn difference(&self, other: &Self, at_depth: usize) -> Option<Self> {
+    /// If the difference is empty, None is returned. Values never take part,
+    /// so `other` may carry any value type.
+    pub(crate) fn difference<OV>(
+        &self,
+        other: &Head<KEY_LEN, O, OV, H>,
+        at_depth: usize,
+    ) -> Option<Self> {
         if self.is_archive_singleton_pair(other) {
             return if self.first_divergence(other, at_depth).is_none() {
                 None
@@ -3923,11 +3937,25 @@ where
         O: Send + Sync,
         V: Send + Sync,
     {
+        self.difference_keys(other)
+    }
+
+    /// [`Self::difference`] against a PATCH with any value type.
+    ///
+    /// Values never take part in key-set identity, so a key-only PATCH (for
+    /// example one built with [`PATCH::from_keys`]) can remove its keys from
+    /// a valued PATCH in one structural pass: every touched branch is rebuilt
+    /// and summarized once, instead of once per removed key.
+    pub fn difference_keys<OV>(&self, other: &PATCH<KEY_LEN, O, OV, H>) -> Self
+    where
+        O: Send + Sync,
+        V: Send + Sync,
+        OV: Send + Sync,
+    {
         let guard = self.owner_guard();
         // SAFETY: difference can only reuse LocalLeaves from its left source.
         unsafe { self.difference_with_guard(other, &guard) }
     }
-
 
     /// Subtract under a left-owner receipt already combined by an aggregate.
     ///
@@ -3935,10 +3963,15 @@ where
     ///
     /// `guard` must retain every archive allocation retained by `self`.
     /// Difference never introduces a LocalLeaf from `other`.
-    pub(crate) unsafe fn difference_with_guard(&self, other: &Self, guard: &PATCHOwnerGuard) -> Self
+    pub(crate) unsafe fn difference_with_guard<OV>(
+        &self,
+        other: &PATCH<KEY_LEN, O, OV, H>,
+        guard: &PATCHOwnerGuard,
+    ) -> Self
     where
         O: Send + Sync,
         V: Send + Sync,
+        OV: Send + Sync,
     {
         #[cfg(debug_assertions)]
         debug_assert!(
@@ -7762,6 +7795,39 @@ mod tests {
         // left only has d
         assert_eq!(res.len(), 1);
         assert!(res.get(&d).is_some());
+    }
+
+    #[test]
+    fn difference_keys_matches_per_key_removal_of_a_valued_patch() {
+        let key = |n: u32| {
+            let h = n.wrapping_mul(0x9E37_79B9);
+            let mut k = [0u8; 16];
+            k[..4].copy_from_slice(&h.to_be_bytes());
+            k[4..8].copy_from_slice(&n.to_le_bytes());
+            k
+        };
+        let mut valued = PATCH::<16, IdentitySchema, u32, Blake3Merkle>::new();
+        for n in 0..4096 {
+            valued.insert(&Entry::with_value(&key(n), n));
+        }
+        // Removed keys, some absent from the valued side.
+        let removed: Vec<_> = (0..6000).filter(|n| n % 3 == 0).map(key).collect();
+        let keys = PATCH::<16, IdentitySchema, (), Blake3Merkle>::from_keys(removed.clone());
+        let mut expected = valued.clone();
+        for k in &removed {
+            expected.remove(k);
+        }
+        let got = valued.difference_keys(&keys);
+        assert_eq!(got, expected);
+        assert_eq!(got.merkle_root(), expected.merkle_root());
+        assert_eq!(got.len(), expected.len());
+        for n in 0..4096 {
+            assert_eq!(got.get(&key(n)).copied(), (n % 3 != 0).then_some(n));
+        }
+        let all = PATCH::<16, IdentitySchema, (), Blake3Merkle>::from_keys((0..4096).map(key));
+        assert!(valued.difference_keys(&all).is_empty());
+        let none = PATCH::<16, IdentitySchema, (), Blake3Merkle>::new();
+        assert_eq!(valued.difference_keys(&none), valued);
     }
 
     #[test]

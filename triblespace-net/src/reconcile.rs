@@ -10,6 +10,7 @@
 //! Optional shallow/full hydration is local acquisition policy over selected
 //! structural records, not semantic admission or another Peer protocol.
 
+use std::any::Any;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
@@ -18,13 +19,13 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::collection::{
     CollectionHandle, CollectionRead, CollectionRecordSelector, CollectionStore, HeldRead,
-    HeldStore,
+    HeldStore, RecordViewChanges,
 };
 use triblespace_core::inline::Inline;
 use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
 use triblespace_core::repo::{
     BlobChildren, BlobStore, BlobStoreGet, CapabilityProofStore, SnapshotSource, StorageFlush,
-    StoreRead, WantRead, WantRequest, WantStore,
+    StoreChanges, StoreDependencies, StoreRead, WantRead, WantRequest, WantStore,
 };
 
 use crate::peer::{Peer, PeerSnapshot};
@@ -171,7 +172,8 @@ impl ServiceTurn {
     }
 }
 
-/// Retry/traversal state only. Durable demand and all answers remain in the store.
+/// Retry/traversal state, plus the last hydration observation memoised on the
+/// store snapshot it answers. Durable demand and all answers remain in the store.
 pub struct Reconciler {
     states: HashMap<RawHash, WantState>,
     initial_backoff: Duration,
@@ -184,6 +186,130 @@ pub struct Reconciler {
     want_round: ExactRound,
     root_round: ExactRound,
     next_service: ServiceTurn,
+    /// A [`Hydration`] over the snapshot type of the store last ticked. It is
+    /// type-erased only so the reconciler stays independent of its store; a
+    /// different store type, a selection change, or a failed observation
+    /// discards it, and the next tick derives it again from scratch.
+    hydration: Option<Box<dyn Any + Send + Sync>>,
+}
+
+/// The selected direct roots as of one store snapshot, and the subset of them
+/// that snapshot cannot read.
+///
+/// This is a memo of one query answer, keyed on the snapshot it answers. It is
+/// advanced to a later snapshot only through that snapshot's own change
+/// evidence: `changes_for` says whether the selected records or the blob view
+/// moved at all, `select_record_view_changes` supplies the selected records
+/// that were added, and `blobs_diff` in reverse names blobs that went away.
+/// Anything the evidence cannot express as pure addition -- a semantic record
+/// removal, a replaced or truncated source, a failed enumeration -- discards
+/// the memo and derives it again from the current snapshot.
+///
+/// A root once read stays readable in a later snapshot unless it left the blob
+/// view. That holds for an append-only pile, whose occurrence validations are
+/// themselves cached across snapshots, and for an in-memory store, where
+/// membership is retrievability. Bytes rotting under an already validated
+/// occurrence were therefore not rediscovered here before either; the serving
+/// path validates every read it hands out.
+struct Hydration<T> {
+    snapshot: T,
+    roots: BTreeSet<RawHash>,
+    missing: BTreeSet<RawHash>,
+}
+
+impl<T: StoreRead> Hydration<T> {
+    /// Derive every selected root from `snapshot` and read each one.
+    fn derive(snapshot: &T, collections: &[CollectionHandle]) -> Result<Self, T::RecordsError> {
+        #[cfg(test)]
+        tests::DERIVATIONS.with(|count| count.set(count.get() + 1));
+        let mut roots = BTreeSet::new();
+        // One indexed read per selection. COMMIT signatures are checked once,
+        // before physical union.
+        for &collection in collections {
+            roots.extend(direct_roots(snapshot, collection)?);
+        }
+        let missing = roots
+            .iter()
+            .copied()
+            .filter(|&handle| !readable(snapshot, handle))
+            .collect();
+        Ok(Self {
+            snapshot: snapshot.clone(),
+            roots,
+            missing,
+        })
+    }
+
+    /// The same answer for `snapshot`, reading only what changed since
+    /// `self.snapshot`: added selected records, the still-missing roots, and
+    /// roots whose blobs left the view.
+    fn advance(
+        mut self,
+        snapshot: &T,
+        collections: &[CollectionHandle],
+    ) -> Result<Self, T::RecordsError> {
+        let selectors: BTreeSet<_> = collections
+            .iter()
+            .map(|&collection| CollectionRecordSelector::Foundations(collection))
+            .collect();
+        let read_set = StoreDependencies {
+            records: selectors.clone(),
+            all_blobs: true,
+            ..StoreDependencies::default()
+        };
+        let changes = snapshot.changes_for(&self.snapshot, &read_set);
+        let mut added = Vec::new();
+        if changes.contains(StoreChanges::COLLECTION_RECORDS) {
+            let views = match snapshot.select_record_view_changes(&self.snapshot, &selectors)? {
+                RecordViewChanges::Append(views) => views,
+                RecordViewChanges::Delta { added, removed } if removed.is_empty() => added,
+                // A removed record may have been the only one naming a root.
+                RecordViewChanges::Delta { .. } | RecordViewChanges::Rebuild => {
+                    return Self::derive(snapshot, collections);
+                }
+            };
+            for view in views {
+                for handle in view.to_record().blob_references() {
+                    if self.roots.insert(handle.raw) {
+                        added.push(handle.raw);
+                    }
+                }
+            }
+        }
+        if changes.contains(StoreChanges::BLOBS) {
+            // An arrival, or another occurrence beside an unreadable one.
+            self.missing.retain(|&handle| !readable(snapshot, handle));
+            // What was here before and is not now; empty for an append-only pile.
+            for gone in self.snapshot.blobs_diff(snapshot) {
+                let Ok(gone) = gone else {
+                    return Self::derive(snapshot, collections);
+                };
+                let handle = gone.handle.raw;
+                if self.roots.contains(&handle)
+                    && !self.missing.contains(&handle)
+                    && !readable(snapshot, handle)
+                {
+                    self.missing.insert(handle);
+                }
+            }
+        }
+        for handle in added {
+            if !readable(snapshot, handle) {
+                self.missing.insert(handle);
+            }
+        }
+        self.snapshot = snapshot.clone();
+        Ok(self)
+    }
+}
+
+/// Whether `snapshot` hands out bytes for `handle`. A physical occurrence
+/// alone can be corrupt, so this is the validated read rather than
+/// `contains_blob`/`blob_info`.
+fn readable<R: BlobStoreGet>(snapshot: &R, handle: RawHash) -> bool {
+    #[cfg(test)]
+    tests::READS.with(|count| count.set(count.get() + 1));
+    BlobStoreGet::get::<Bytes, UnknownBlob>(snapshot, Inline::new(handle)).is_ok()
 }
 
 pub const RECONCILE_FETCH_DEADLINE: Duration = Duration::from_secs(30);
@@ -224,6 +350,7 @@ impl Reconciler {
             want_round: ExactRound::default(),
             root_round: ExactRound::default(),
             next_service: ServiceTurn::default(),
+            hydration: None,
         }
     }
 
@@ -261,6 +388,7 @@ impl Reconciler {
         }
         self.root_round = ExactRound::default();
         self.next_service = ServiceTurn::default();
+        self.hydration = None;
         for state in self.states.values_mut() {
             state.root_since = None;
             state.first_root_attempt = false;
@@ -421,57 +549,36 @@ impl Reconciler {
             .iter()
             .filter_map(|request| request.blob_handle().map(|handle| handle.raw))
             .collect();
-        let mut roots_observed = true;
-        let selected_roots = if self.mode == ReplicationMode::Demand {
-            Vec::new()
+        let (roots_observed, root_count, missing_roots) = if self.mode == ReplicationMode::Demand {
+            self.hydration = None;
+            (true, 0, BTreeSet::new())
         } else {
-            // One indexed read per selection retains membership only for this
-            // tick. COMMIT signatures are checked once, before physical union.
-            let observed = self
-                .selected()
-                .map(|collection| direct_roots(&snapshot, collection))
-                .collect::<Result<Vec<_>, _>>();
-            match observed {
-                Ok(roots) => roots,
+            match self.observe_roots(&*snapshot) {
+                Ok((count, missing)) => (true, count, missing),
                 Err(error) => {
                     tracing::warn!(
                         ?error,
                         "hydration record observation failed; skipping roots"
                     );
-                    roots_observed = false;
-                    Vec::new()
+                    (false, 0, BTreeSet::new())
                 }
             }
         };
-        let roots: BTreeSet<_> = selected_roots.iter().flatten().copied().collect();
-        stats.replication.roots = roots.len();
-        let exact_handles: BTreeSet<_> = wanted_blob_handles.union(&roots).copied().collect();
-        // This is a pure observation of the selected inputs for this tick,
-        // not a retained answer catalogue. A physical occurrence alone can be
-        // corrupt, so keep the existing readable-blob test rather than treating
-        // contains_blob/blob_info as proof that imported bytes are usable.
-        let mut visible_blobs: HashSet<_> = exact_handles
-            .iter()
-            .copied()
-            .filter(|handle| {
-                BlobStoreGet::get::<Bytes, UnknownBlob>(&snapshot, Inline::new(*handle)).is_ok()
-            })
-            .collect();
-
+        stats.replication.roots = root_count;
         let missing_wanted: BTreeSet<_> = wanted_blob_handles
             .iter()
-            .filter(|handle| !visible_blobs.contains(*handle))
             .copied()
-            .collect();
-        let missing_roots: BTreeSet<_> = roots
-            .iter()
-            .filter(|handle| !visible_blobs.contains(*handle))
-            .copied()
+            .filter(|&handle| !readable(&snapshot, handle))
             .collect();
         stats.missing = missing_wanted.len();
+        // A handle keeps retry state exactly while it is wanted or a root and
+        // this snapshot cannot read it.
         self.states
-            .retain(|handle, _| exact_handles.contains(handle) && !visible_blobs.contains(handle));
+            .retain(|handle, _| missing_wanted.contains(handle) || missing_roots.contains(handle));
         self.observe_missing(&missing_wanted, &missing_roots);
+        // Only this tick's completion delta; the next tick observes the actual
+        // store again, including bad imports.
+        let mut arrived = HashSet::new();
 
         let started = crate::clock::mono_now();
         let deadline = tokio::time::Instant::now() + self.fetch_budget;
@@ -491,7 +598,7 @@ impl Reconciler {
                     let Some(handle) = handles.next() else {
                         break;
                     };
-                    if visible_blobs.contains(&handle) || !in_flight.insert(handle) {
+                    if arrived.contains(&handle) || !in_flight.insert(handle) {
                         continue;
                     }
                     self.begin_attempt(turn, handle);
@@ -531,14 +638,13 @@ impl Reconciler {
                 stats.landed += 1;
                 stats.received_bytes = stats.received_bytes.saturating_add(bytes);
                 // A successful put is visible before an optional durability
-                // boundary. Keep only this tick's completion delta; the next
-                // tick observes the actual store again, including bad imports.
-                visible_blobs.insert(handle);
+                // boundary.
+                arrived.insert(handle);
                 self.states.remove(&handle);
                 if is_want {
                     stats.fulfilled += 1;
                 }
-                if roots.contains(&handle) {
+                if missing_roots.contains(&handle) {
                     stats.replication.acquired += 1;
                 }
             }
@@ -551,21 +657,43 @@ impl Reconciler {
                 self.record_unavailable(handle);
             }
         }
-        stats.pending = wanted_blob_handles
-            .iter()
-            .filter(|handle| !visible_blobs.contains(*handle))
-            .count();
-        stats.replication.pending = roots
-            .iter()
-            .filter(|handle| !visible_blobs.contains(*handle))
-            .count();
-        stats.pending_blobs = roots_observed.then(|| {
-            exact_handles
+        let unlanded = |handles: &BTreeSet<RawHash>| {
+            handles
                 .iter()
-                .filter(|handle| !visible_blobs.contains(*handle))
+                .filter(|handle| !arrived.contains(*handle))
+                .count()
+        };
+        stats.pending = unlanded(&missing_wanted);
+        stats.replication.pending = unlanded(&missing_roots);
+        stats.pending_blobs = roots_observed.then(|| {
+            missing_wanted
+                .union(&missing_roots)
+                .filter(|handle| !arrived.contains(*handle))
                 .count()
         });
         stats
+    }
+
+    /// The selected root count and the roots `snapshot` cannot read, advanced
+    /// from the previous tick's [`Hydration`] when there is one for this store
+    /// type and selection, and derived from scratch otherwise.
+    fn observe_roots<T: StoreRead>(
+        &mut self,
+        snapshot: &T,
+    ) -> Result<(usize, BTreeSet<RawHash>), T::RecordsError> {
+        let collections: Vec<_> = self.selected().collect();
+        let previous = self
+            .hydration
+            .take()
+            .and_then(|memo| memo.downcast::<Hydration<T>>().ok());
+        // Taken before the read: a failure leaves no memo behind.
+        let hydration = match previous {
+            Some(previous) => previous.advance(snapshot, &collections)?,
+            None => Hydration::derive(snapshot, &collections)?,
+        };
+        let observed = (hydration.roots.len(), hydration.missing.clone());
+        self.hydration = Some(Box::new(hydration));
+        Ok(observed)
     }
 
     fn remaining(&self, started: crate::clock::Mono) -> Duration {
@@ -626,6 +754,18 @@ mod tests {
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::repo::pile::{Pile, PileRecordContent, PileRecords};
     use triblespace_core::repo::{BlobStoreList, BlobStorePut, StorageClose};
+
+    std::thread_local! {
+        /// Validated blob reads made by the reconciler on this thread.
+        pub(super) static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// From-scratch hydration derivations made on this thread.
+        pub(super) static DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Reset both counters, returning their previous `(reads, derivations)`.
+    fn take_counts() -> (usize, usize) {
+        (READS.replace(0), DERIVATIONS.replace(0))
+    }
 
     // Scheduling tokens only; no record or blob is published by these tests.
     fn scheduled_handle(class: u8, ordinal: u32) -> RawHash {
@@ -1805,5 +1945,370 @@ mod tests {
             );
             peer.close().unwrap();
         }
+    }
+
+    fn commit_record(descriptor: RawHash, data: RawHash, metadata: RawHash) -> CollectionRecord {
+        CollectionRecord::Commit(CollectionCommit::sign(
+            &SigningKey::from_bytes(&[7; 32]),
+            Inline::new(descriptor),
+            Inline::new(data),
+            Inline::new(metadata),
+        ))
+    }
+
+    /// Roots and pending roots as a reconciler without any memo sees them.
+    async fn derived_from_scratch<S>(
+        peer: &mut Peer<S>,
+        collections: impl IntoIterator<Item = CollectionHandle>,
+    ) -> (usize, usize)
+    where
+        S: BlobStore
+            + CollectionStore
+            + CapabilityProofStore
+            + WantStore
+            + StorageFlush
+            + HeldStore
+            + Send
+            + 'static,
+        S::Snapshot: StoreRead + BlobChildren + HeldRead,
+    {
+        let mut fresh = Reconciler::new()
+            .with_replication(ReplicationMode::Shallow, collections)
+            .with_fetch_budget(Duration::ZERO);
+        let stats = fresh.tick_snapshot(peer.snapshot().unwrap()).await;
+        (stats.replication.roots, stats.replication.pending)
+    }
+
+    #[tokio::test]
+    async fn unchanged_store_tick_reads_no_roots() {
+        let mut store = MemoryRepo::default();
+        let descriptor = put(&mut store, b"steady descriptor".to_vec());
+        let metadata = put(&mut store, Vec::new());
+        for ordinal in 0..32 {
+            let data = put(&mut store, format!("steady data {ordinal}").into_bytes());
+            raw_commit(&mut store, descriptor, data, metadata);
+        }
+        // One root that no provider answers stays missing across ticks.
+        raw_commit(&mut store, descriptor, [0xee; 32], metadata);
+        let (mut peer, fetches, _) = controlled_peer(store, BTreeMap::new(), BTreeSet::new());
+        let mut reconciler = Reconciler::new()
+            .with_replication(ReplicationMode::Shallow, [Inline::new(descriptor)])
+            .with_fetch_budget(Duration::ZERO);
+        take_counts();
+        let first = reconciler.tick(&mut peer).await;
+        assert_eq!(first.replication.roots, 35);
+        assert_eq!(first.replication.pending, 1);
+        assert_eq!(first.pending_blobs, Some(1));
+        assert_eq!(take_counts(), (35, 1));
+        for _ in 0..3 {
+            let steady = reconciler.tick(&mut peer).await;
+            assert_eq!(steady, first);
+            assert_eq!(take_counts(), (0, 0), "an unchanged store reads no root");
+        }
+        assert!(fetches.trace.lock().unwrap().calls.is_empty());
+        assert_eq!(
+            derived_from_scratch(&mut peer, [Inline::new(descriptor)]).await,
+            (35, 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn new_records_and_arriving_blobs_are_read_incrementally() {
+        let mut store = MemoryRepo::default();
+        let descriptor = put(&mut store, b"incremental descriptor".to_vec());
+        let metadata = put(&mut store, Vec::new());
+        let first_data = put(&mut store, b"first data".to_vec());
+        raw_commit(&mut store, descriptor, first_data, metadata);
+        let (mut peer, _, _) = controlled_peer(store, BTreeMap::new(), BTreeSet::new());
+        let selection = [Inline::new(descriptor)];
+        let mut reconciler = Reconciler::new()
+            .with_replication(ReplicationMode::Shallow, selection)
+            .with_fetch_budget(Duration::ZERO);
+        let first = reconciler.tick(&mut peer).await;
+        assert_eq!((first.replication.roots, first.replication.pending), (3, 0));
+
+        // A new record naming one new, absent root and two known ones.
+        let late = Blob::<UnknownBlob>::new(Bytes::from_source(b"late data".to_vec()));
+        let late_handle = late.get_handle().raw;
+        peer.store()
+            .insert(commit_record(descriptor, late_handle, metadata))
+            .unwrap();
+        take_counts();
+        let named = reconciler.tick(&mut peer).await;
+        assert_eq!((named.replication.roots, named.replication.pending), (4, 1));
+        assert_eq!(take_counts(), (1, 0), "only the newly named root is read");
+        assert_eq!(derived_from_scratch(&mut peer, selection).await, (4, 1));
+        assert!(reconciler.states[&late_handle].first_root_attempt);
+
+        // Its blob arrives by another path. This store's blob view has no
+        // indexed difference, so the forgotten-blob check lists every blob;
+        // the pile test below pins the per-change read count.
+        peer.store().put::<UnknownBlob, _>(late).unwrap();
+        take_counts();
+        let arrived = reconciler.tick(&mut peer).await;
+        assert_eq!(
+            (arrived.replication.roots, arrived.replication.pending),
+            (4, 0)
+        );
+        assert_eq!(arrived.pending_blobs, Some(0));
+        assert_eq!(take_counts().1, 0, "an arrival advances, never rederives");
+        assert!(reconciler.states.is_empty());
+        assert_eq!(derived_from_scratch(&mut peer, selection).await, (4, 0));
+    }
+
+    #[tokio::test]
+    async fn selection_changes_rederive_roots() {
+        let mut store = MemoryRepo::default();
+        let first = put(&mut store, b"first selected descriptor".to_vec());
+        let second = put(&mut store, b"second selected descriptor".to_vec());
+        let metadata = put(&mut store, Vec::new());
+        for ordinal in 0..3 {
+            let data = put(
+                &mut store,
+                format!("first collection {ordinal}").into_bytes(),
+            );
+            raw_commit(&mut store, first, data, metadata);
+        }
+        raw_commit(&mut store, second, [0xdd; 32], metadata);
+        let (mut peer, _, _) = controlled_peer(store, BTreeMap::new(), BTreeSet::new());
+        let mut reconciler = Reconciler::new()
+            .with_replication(ReplicationMode::Shallow, [Inline::new(first)])
+            .with_fetch_budget(Duration::ZERO);
+        let stats = reconciler.tick(&mut peer).await;
+        assert_eq!((stats.replication.roots, stats.replication.pending), (5, 0));
+
+        reconciler.set_replication(ReplicationMode::Shallow, [Inline::new(second)]);
+        take_counts();
+        let stats = reconciler.tick(&mut peer).await;
+        assert_eq!((stats.replication.roots, stats.replication.pending), (3, 1));
+        assert_eq!(take_counts(), (3, 1), "a new selection derives afresh");
+
+        reconciler.set_replication(
+            ReplicationMode::Full,
+            [Inline::new(first), Inline::new(second)],
+        );
+        let stats = reconciler.tick(&mut peer).await;
+        assert_eq!((stats.replication.roots, stats.replication.pending), (7, 1));
+        assert_eq!(take_counts().1, 1);
+
+        reconciler.set_replication(ReplicationMode::Demand, [Inline::new(first)]);
+        let stats = reconciler.tick(&mut peer).await;
+        assert_eq!((stats.replication.roots, stats.replication.pending), (0, 0));
+        assert_eq!(stats.pending_blobs, Some(0));
+        assert!(reconciler.hydration.is_none());
+        assert!(reconciler.states.is_empty());
+    }
+
+    /// A blob that leaves the view returns its root to the missing set, even
+    /// when no selected record changed.
+    #[test]
+    fn forgotten_root_blob_returns_to_missing() {
+        let descriptor = Blob::<UnknownBlob>::new(Bytes::from_source(b"kept".to_vec()));
+        let forgotten = Blob::<UnknownBlob>::new(Bytes::from_source(b"forgotten".to_vec()));
+        let collection = descriptor.get_handle().raw;
+        let record = commit_record(collection, forgotten.get_handle().raw, collection);
+        let mut held = MemoryRepo::default();
+        let mut lost = MemoryRepo::default();
+        for store in [&mut held, &mut lost] {
+            store.put::<UnknownBlob, _>(descriptor.clone()).unwrap();
+            store.insert(record).unwrap();
+        }
+        held.put::<UnknownBlob, _>(forgotten.clone()).unwrap();
+        let held = held.snapshot().unwrap();
+        let lost = lost.snapshot().unwrap();
+        let selection = [Inline::new(collection)];
+        let hydration = Hydration::derive(&held, &selection).unwrap();
+        assert_eq!(hydration.roots.len(), 2);
+        assert!(hydration.missing.is_empty());
+        take_counts();
+        let hydration = hydration.advance(&lost, &selection).unwrap();
+        assert_eq!(take_counts().1, 0);
+        assert_eq!(
+            hydration.missing,
+            BTreeSet::from([forgotten.get_handle().raw])
+        );
+        let hydration = hydration.advance(&held, &selection).unwrap();
+        assert!(hydration.missing.is_empty());
+        assert_eq!(take_counts().1, 0);
+    }
+
+    /// Concatenating a pile that repeats our records and adds new ones is an
+    /// append: the repeated records fold idempotently and only new roots are
+    /// read.
+    #[tokio::test]
+    async fn concatenated_pile_is_advanced_without_rederiving() {
+        use std::io::Write;
+
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut pile = Pile::open(path.path()).unwrap();
+        let descriptor = put_pile(&mut pile, b"merged descriptor".to_vec());
+        let metadata = put_pile(&mut pile, b"merged metadata".to_vec());
+        for ordinal in 0..4 {
+            let data = put_pile(&mut pile, format!("ours {ordinal}"));
+            pile.insert(commit_record(descriptor, data, metadata))
+                .unwrap();
+        }
+        pile.close().unwrap();
+        // Theirs: a copy of ours plus three records, one naming an absent root.
+        let theirs = tempfile::NamedTempFile::new().unwrap();
+        std::fs::copy(path.path(), theirs.path()).unwrap();
+        let mut other = Pile::open(theirs.path()).unwrap();
+        for ordinal in 0..2 {
+            let data = put_pile(&mut other, format!("theirs {ordinal}"));
+            other
+                .insert(commit_record(descriptor, data, metadata))
+                .unwrap();
+        }
+        let late = Blob::<UnknownBlob>::new(Bytes::from_source(b"late merged data".to_vec()));
+        let late_handle = late.get_handle().raw;
+        other
+            .insert(commit_record(descriptor, late_handle, metadata))
+            .unwrap();
+        other.close().unwrap();
+
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let (sender, receiver, _wiring) =
+            crate::host::wire(crate::identity::iroh_secret(&key).public().into());
+        let mut peer = Peer::with_wiring(Pile::open(path.path()).unwrap(), sender, receiver);
+        let selection = [Inline::new(descriptor)];
+        let mut reconciler = Reconciler::new()
+            .with_replication(ReplicationMode::Shallow, selection)
+            .with_fetch_budget(Duration::ZERO);
+        let before = reconciler.tick(&mut peer).await;
+        assert_eq!(
+            (before.replication.roots, before.replication.pending),
+            (6, 0)
+        );
+
+        let appended = std::fs::read(theirs.path()).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path.path())
+            .unwrap()
+            .write_all(&appended)
+            .unwrap();
+        take_counts();
+        let after = reconciler.tick(&mut peer).await;
+        assert_eq!((after.replication.roots, after.replication.pending), (9, 1));
+        assert_eq!(
+            take_counts(),
+            (3, 0),
+            "a concatenation is an append: only its three new roots are read"
+        );
+        assert_eq!(derived_from_scratch(&mut peer, selection).await, (9, 1));
+
+        // The missing blob arrives: one reread, nothing else.
+        peer.store().put::<UnknownBlob, _>(late).unwrap();
+        take_counts();
+        let arrived = reconciler.tick(&mut peer).await;
+        assert_eq!(
+            (arrived.replication.roots, arrived.replication.pending),
+            (9, 0)
+        );
+        assert_eq!(take_counts(), (1, 0), "only the missing root is reread");
+        assert!(reconciler.states.is_empty());
+
+        // An unrelated blob moves the blob view without naming a root.
+        put_pile(&mut *peer.store(), b"unrelated".to_vec());
+        take_counts();
+        assert_eq!(reconciler.tick(&mut peer).await, arrived);
+        assert_eq!(take_counts(), (0, 0));
+        assert_eq!(derived_from_scratch(&mut peer, selection).await, (9, 0));
+        peer.close().unwrap();
+    }
+
+    fn put_pile(pile: &mut Pile, bytes: impl Into<Vec<u8>>) -> RawHash {
+        pile.put::<UnknownBlob, _>(Bytes::from_source(bytes.into()))
+            .unwrap()
+            .raw
+    }
+
+    async fn timed_tick(
+        label: &str,
+        reconciler: &mut Reconciler,
+        peer: &mut Peer<Pile>,
+    ) -> ReconcileStats {
+        let observed = std::time::Instant::now();
+        let snapshot = peer.snapshot().unwrap();
+        let observed = observed.elapsed();
+        take_counts();
+        let ticked = std::time::Instant::now();
+        let stats = reconciler.tick_snapshot(snapshot).await;
+        let ticked = ticked.elapsed();
+        let (reads, derivations) = take_counts();
+        eprintln!(
+            "probe: {label:<24} tick_snapshot {ticked:>12?}  peer.snapshot {observed:>10?}  \
+             roots {} pending {}  reads {reads} derivations {derivations}",
+            stats.replication.roots, stats.replication.pending,
+        );
+        stats
+    }
+
+    /// Per-tick cost with ~500k resident roots over 36 selected collections,
+    /// in a pile. Run with
+    /// `cargo test --release -p triblespace-net hydration_tick_timing_probe -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "timing probe"]
+    async fn hydration_tick_timing_probe() {
+        const COLLECTIONS: usize = 36;
+        const ROOTS: usize = 500_000;
+        const COMMITS: usize = ROOTS - 2 * COLLECTIONS;
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let built = std::time::Instant::now();
+        let mut pile = Pile::open(path.path()).unwrap();
+        let collections: Vec<_> = (0..COLLECTIONS)
+            .map(|ordinal| {
+                (
+                    put_pile(&mut pile, format!("probe descriptor {ordinal}")),
+                    put_pile(&mut pile, format!("probe metadata {ordinal}")),
+                )
+            })
+            .collect();
+        for ordinal in 0..COMMITS {
+            let (descriptor, metadata) = collections[ordinal % COLLECTIONS];
+            let data = put_pile(&mut pile, format!("probe data {ordinal}"));
+            pile.insert(commit_record(descriptor, data, metadata))
+                .unwrap();
+        }
+        pile.close().unwrap();
+        eprintln!("probe: built {COMMITS} commits in {:?}", built.elapsed());
+
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let (sender, receiver, _wiring) =
+            crate::host::wire(crate::identity::iroh_secret(&key).public().into());
+        let mut peer = Peer::with_wiring(Pile::open(path.path()).unwrap(), sender, receiver);
+        let mut reconciler = Reconciler::new().with_replication(
+            ReplicationMode::Shallow,
+            collections
+                .iter()
+                .map(|&(descriptor, _)| Inline::new(descriptor)),
+        );
+        let first = timed_tick("first (cold)", &mut reconciler, &mut peer).await;
+        assert_eq!(
+            (first.replication.roots, first.replication.pending),
+            (ROOTS, 0)
+        );
+        for _ in 0..3 {
+            let stats = timed_tick("unchanged", &mut reconciler, &mut peer).await;
+            assert_eq!(stats, first);
+        }
+        for _ in 0..3 {
+            reconciler.hydration = None;
+            let stats = timed_tick("forced full derivation", &mut reconciler, &mut peer).await;
+            assert_eq!(stats, first);
+        }
+        for ordinal in 0..3 {
+            let (descriptor, metadata) = collections[ordinal];
+            let data = put_pile(&mut *peer.store(), format!("probe late {ordinal}"));
+            peer.store()
+                .insert(commit_record(descriptor, data, metadata))
+                .unwrap();
+            let stats = timed_tick("one new record + blob", &mut reconciler, &mut peer).await;
+            assert_eq!(
+                (stats.replication.roots, stats.replication.pending),
+                (ROOTS + ordinal + 1, 0)
+            );
+        }
+        peer.close().unwrap();
     }
 }
