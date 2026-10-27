@@ -88,11 +88,19 @@ impl<T: Record> Records<T> {
         Ok(())
     }
 
-    /// Grow to `len` records; the new ones are zero. On error nothing new is
-    /// published, and any chunk already mapped stays zero beyond `len`.
+    /// Grow to `len` records; the new ones are zero. All or nothing: on
+    /// error the chunks this call mapped are dropped again, so a failed growth
+    /// leaves no unpublished file reserved.
     pub(crate) fn resize(&mut self, len: usize) -> io::Result<()> {
+        let mapped = self.chunks.len();
         while self.chunks.len() * CHUNK < len {
-            self.chunks.push(chunk(None, CHUNK * T::BYTES)?);
+            match chunk(None, CHUNK * T::BYTES) {
+                Ok(chunk) => self.chunks.push(chunk),
+                Err(error) => {
+                    self.chunks.truncate(mapped);
+                    return Err(error);
+                }
+            }
         }
         self.len = self.len.max(len);
         Ok(())
@@ -132,9 +140,28 @@ impl<T: Record> Records<T> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static CHUNKS_LEFT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only failure injection: on this thread, let `left` more chunk
+/// allocations succeed and fail every later one, or (`None`) never fail.
+#[cfg(test)]
+pub(crate) fn fail_chunks_after(left: Option<usize>) {
+    CHUNKS_LEFT.with(|cell| cell.set(left));
+}
+
 /// One chunk file of `bytes`, holding `contents` or zeros, mapped writable.
 fn chunk(contents: Option<&[u8]>, bytes: usize) -> io::Result<MmapMut> {
     static ZEROS: [u8; 64 * 1024] = [0; 64 * 1024];
+    #[cfg(test)]
+    if let Some(left) = CHUNKS_LEFT.with(|cell| cell.get()) {
+        if left == 0 {
+            return Err(io::Error::new(io::ErrorKind::StorageFull, "injected"));
+        }
+        CHUNKS_LEFT.with(|cell| cell.set(Some(left - 1)));
+    }
     let mut file = tempfile::tempfile()?;
     match contents {
         Some(contents) => file.write_all(contents)?,

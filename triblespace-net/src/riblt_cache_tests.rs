@@ -278,6 +278,34 @@ fn riblt_cache_grows_past_the_retired_cell_budget_in_file_backed_chunks() {
 }
 
 #[test]
+fn riblt_cache_failed_growth_reserves_no_unpublished_chunks() {
+    let generation = Generation::advance(
+        CollectionHandle::new([27; 32]),
+        WalkKind::References,
+        references(0..8),
+        None,
+    )
+    .unwrap();
+    generation.cell(0).unwrap();
+    let prepared = generation.prepared().unwrap();
+    let bytes = generation.retained_bytes().unwrap();
+    assert_eq!(bytes, CHUNK * std::mem::size_of::<Cell>());
+    // Doubling to 4 * CHUNK needs three more chunks; the second one fails.
+    crate::riblt_store::fail_chunks_after(Some(1));
+    let failed = generation.cell(3 * CHUNK);
+    crate::riblt_store::fail_chunks_after(None);
+    assert_eq!(failed.unwrap_err(), CacheError::Storage);
+    assert_eq!(generation.prepared().unwrap(), prepared);
+    assert_eq!(
+        generation.retained_bytes().unwrap(),
+        bytes,
+        "the chunk mapped before the failure is dropped again"
+    );
+    exact_prefix(&generation, 4 * CHUNK);
+    assert_eq!(generation.prepared().unwrap(), 4 * CHUNK);
+}
+
+#[test]
 fn riblt_cache_collection_and_component_profiles_do_not_reuse_each_other() {
     let collection = CollectionHandle::new([21; 32]);
     let generation =

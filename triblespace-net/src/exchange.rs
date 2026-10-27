@@ -464,7 +464,10 @@ pub(crate) struct Exchange {
     offers: Option<Offers>,
     collection: CollectionHandle,
     kind: WalkKind,
-    pinned: Pinned,
+    /// The pinned `kind` tree only. Holding the whole pin would keep its
+    /// collection snapshot, and with it the snapshot's RIBLT generations and
+    /// their mapped cells, alive for the exchange's whole life.
+    pinned: Tree,
     /// What a grant walk keeps of what it receives.
     gate: Option<Gate>,
     /// Peer keys accounted for but not kept here: skipped, or pending. They
@@ -508,9 +511,10 @@ pub(crate) struct Exchange {
 
 /// Per-exchange residual decoder only: no full encoder or copied cell prefix.
 /// The peer membership proof is the existing native `Exchange::peer` PATCH.
-/// Once discovery stops, the generation lease is released and the decoder
-/// keeps only its recovered windows: the fetch/landing and peer-FIN stages
-/// have no frame deadline, so they must not pin per-cell state.
+/// `cache` is the exchange's only lease on its generation (`pinned` keeps
+/// just the tree). Once discovery stops it is released and the decoder keeps
+/// only its recovered windows: the fetch/landing and peer-FIN stages have no
+/// frame deadline, so they must not pin per-cell state.
 struct Riblt {
     cache: Option<Arc<Generation>>,
     decoder: ResidualDecoder,
@@ -553,7 +557,7 @@ impl Exchange {
             offers: None,
             collection,
             kind,
-            pinned,
+            pinned: mine,
             gate,
             excluded: PATCH::new(),
             skipped: 0,
@@ -954,7 +958,7 @@ impl Exchange {
             receives: self.receives,
             confirmed: self.landed_received,
             landed: self.landed_sent,
-            root: self.pinned.tree(self.kind).summary(),
+            root: self.pinned.summary(),
             peer_root,
             // A grant walk keeps no agreement: a key one side skipped or
             // holds pending would otherwise never be offered again on this
@@ -1160,8 +1164,7 @@ impl Exchange {
                 } else if self.agreed.as_ref().and_then(|tree| tree.at(&prefix)) == Some(declared) {
                     self.agreed.as_deref().cloned()
                 } else {
-                    let pinned = self.pinned.tree(self.kind);
-                    (pinned.at(&prefix) == Some(declared)).then_some(pinned)
+                    (self.pinned.at(&prefix) == Some(declared)).then(|| self.pinned.clone())
                 };
                 if let Some(held) = held {
                     self.peer.include_at(&held, &prefix);
@@ -3491,5 +3494,59 @@ pub(crate) mod tests {
             Some(Outcome::Failed(Failure::ResourceLimit))
         );
         assert!(local.pinned(collection).cache(kind).prepared().unwrap() <= 2 * bound);
+    }
+
+    #[test]
+    fn completed_cached_discovery_releases_its_generation() {
+        let mut local = Node::new(233);
+        let mut peer = Node::new(234);
+        let kind = WalkKind::References;
+        let held = |numbers: std::ops::Range<u64>| {
+            let mut patch = PATCH::<32, IdentitySchema, (), Blake3Merkle>::new();
+            for number in numbers {
+                let mut key = [0; 32];
+                key[..8].copy_from_slice(&number.to_be_bytes());
+                patch.insert(&Entry::new(&key));
+            }
+            patch
+        };
+        let collection = local.hold("riblt-generation-release", open());
+        assert_eq!(peer.hold("riblt-generation-release", open()), collection);
+        local.observe();
+        peer.observe();
+        // Private snapshots: nothing but the exchanges may hold them.
+        let a_pin = local.pinned(collection).with_inventory(held(0..40));
+        let b_pin = peer.pinned(collection).with_inventory(held(20..60));
+        let a_cache = Arc::downgrade(&a_pin.cache(kind));
+        let b_cache = Arc::downgrade(&b_pin.cache(kind));
+        let mut a = Exchange::start_riblt(collection, kind, a_pin);
+        let mut b = Exchange::start_riblt(collection, kind, b_pin);
+        let (a_snapshot, b_snapshot) = (local.snapshot(), peer.snapshot());
+        let (mut a_sent, mut b_sent) = (0, 0);
+        while !(a.discovery_stopped() && b.discovery_stopped()) {
+            assert!(a_cache.upgrade().is_some() && b_cache.upgrade().is_some());
+            let frame = a.next_delta().expect("a frame before discovery stops");
+            if matches!(frame, Frame::RibltCell { .. }) {
+                a_sent += 1;
+                a.on_written(a_sent);
+            } else {
+                a.on_root_written();
+            }
+            b.on_frame(frame, Some(b_snapshot.clone()));
+            let frame = b.next_delta().expect("a frame before discovery stops");
+            if matches!(frame, Frame::RibltCell { .. }) {
+                b_sent += 1;
+                b.on_written(b_sent);
+            } else {
+                b.on_root_written();
+            }
+            a.on_frame(frame, Some(a_snapshot.clone()));
+            assert_eq!((a.outcome(), b.outcome()), (None, None));
+        }
+        // Fetches and FIN remain, but no exchange pins cells any longer.
+        assert!(!a.ready_to_finish() && !b.ready_to_finish());
+        assert!(a_cache.upgrade().is_none(), "local generation released");
+        assert!(b_cache.upgrade().is_none(), "peer generation released");
+        assert_eq!(a.end().root.leaf_count(), 40);
     }
 }
