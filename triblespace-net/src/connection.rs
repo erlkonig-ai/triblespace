@@ -1330,9 +1330,12 @@ async fn recon<T: Transport, S: Service>(
         Err(FrameError::Transport(error)) => {
             // At info, with the connection's age and silence: on 2026-10-27
             // every walk on a connection ended at once under this reason,
-            // and the error saying why was only visible at debug.
+            // and the error saying why was only visible at debug. Debug
+            // form, because the Display of a lost stream is only "connection
+            // lost": the cause (timed out, reset, closed by the peer and its
+            // reason) is the inner error.
             info!(
-                %error,
+                ?error,
                 peer = %hex::encode(&state.peer[..8]),
                 dialled = state.dialled,
                 age = ?state.epoch.elapsed(),

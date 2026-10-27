@@ -116,7 +116,9 @@ pub(super) async fn drive<T: Transport, S: Service>(
                 }
                 Ok(Some(Ok(Some(frame)))) => {
                     heard_at = tokio::time::Instant::now();
-                    exchange.on_frame(frame, driver.snapshots.borrow().clone())
+                    // The guard drops here, not after on_frame: see walk.rs.
+                    let snapshot = driver.snapshots.borrow().clone();
+                    exchange.on_frame(frame, snapshot)
                 }
                 Ok(Some(Ok(None))) => {
                     peer_fin = true;
