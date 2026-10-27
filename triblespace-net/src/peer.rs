@@ -565,17 +565,22 @@ where
         let mut full = ActiveCollections::new();
         if mode == ReplicationMode::Full {
             if !self.held_driven {
-                // `None`: another driver already builds this store's sets.
+                // `None`: another driver builds this store's sets now. Only a
+                // started thread marks this peer driven, so a later Full
+                // selection asks again once that driver is gone or a failed
+                // spawn can be retried.
                 let work = self.store().drive_held();
-                self.held_driven = true;
                 if let Some(mut work) = work {
                     // A thread that cannot start drops the work, which hands
                     // the building back to snapshots.
                     let spawned = std::thread::Builder::new()
                         .name("held-sets".into())
                         .spawn(move || while work.step(HELD_STEP, HELD_IDLE) {});
-                    if let Err(error) = spawned {
-                        tracing::warn!(%error, "held sets are built by snapshots: no thread");
+                    match spawned {
+                        Ok(_) => self.held_driven = true,
+                        Err(error) => {
+                            tracing::warn!(%error, "held sets are built by snapshots: no thread")
+                        }
                     }
                 }
             }
@@ -1293,6 +1298,32 @@ mod tests {
         let lander = Lander(Arc::downgrade(&peer.serving));
         assert_eq!(lander.land(vec![NetEvent::Blob(blob)]), [true]);
         assert!(peer.last_event_at() > before);
+    }
+
+    /// A Full selection made while another driver builds the store's held
+    /// sets leaves the peer undriven, and a later one starts its thread once
+    /// that driver is gone: the peer is not left to snapshots for good.
+    #[tokio::test]
+    async fn full_replication_drives_held_sets_once_another_driver_is_gone() {
+        use triblespace_core::collection::HeldStore;
+        let key = SigningKey::from_bytes(&[87; 32]);
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(
+                "held-set driver retry",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap()
+            .handle();
+        let (sender, receiver, _wiring) =
+            host::wire(crate::identity::iroh_secret(&key).public().into());
+        let mut peer = Peer::with_wiring(store, sender, receiver);
+        let external = peer.store().drive_held().expect("the first driver");
+        peer.set_replication(ReplicationMode::Full, [collection]);
+        assert!(!peer.held_driven, "another driver owns the store");
+        drop(external);
+        peer.set_replication(ReplicationMode::Full, [collection]);
+        assert!(peer.held_driven, "the peer drives once the other is gone");
     }
 
     /// Full replication builds a collection's first closure on the peer's
