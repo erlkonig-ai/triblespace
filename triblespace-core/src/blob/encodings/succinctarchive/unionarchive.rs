@@ -113,6 +113,26 @@ where
     ) -> impl Iterator<Item = (RawInline, Id)> + 'a {
         UnionArchiveAttributeValueEntities::new(&self.segments, attribute, true)
     }
+
+    /// [`Self::iter_attribute_value_entities`], starting at the first fact
+    /// whose raw value is at least `from`.
+    ///
+    /// Each shard seeks its own start in O(log n), so the facts below `from`
+    /// are neither decoded nor merged.
+    pub fn iter_attribute_value_entities_from<'a>(
+        &'a self,
+        attribute: &Id,
+        from: &RawInline,
+    ) -> impl Iterator<Item = (RawInline, Id)> + 'a {
+        UnionArchiveAttributeValueEntities::with_ranges(
+            &self.segments,
+            self.segments
+                .iter()
+                .map(|segment| segment.attribute_value_range_from(attribute, from))
+                .collect(),
+            false,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -242,7 +262,7 @@ where
     U: Universe,
 {
     fn new(segments: &'a [SuccinctArchive<U>], attribute: &Id, descending: bool) -> Self {
-        let mut ranges: Vec<_> = segments
+        let ranges = segments
             .iter()
             .map(|segment| {
                 super::base_range(
@@ -252,6 +272,15 @@ where
                 )
             })
             .collect();
+        Self::with_ranges(segments, ranges, descending)
+    }
+
+    /// One cursor per shard over its AVE positions in `ranges`.
+    fn with_ranges(
+        segments: &'a [SuccinctArchive<U>],
+        mut ranges: Vec<Range<usize>>,
+        descending: bool,
+    ) -> Self {
         let mut heap = BinaryHeap::new();
         for (index, (segment, range)) in segments.iter().zip(&mut ranges).enumerate() {
             let position = if descending {
@@ -492,6 +521,55 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected.iter().copied().rev().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn seeked_attribute_iteration_agrees_with_the_filtered_unseeked_union() {
+        let attribute = ufoid();
+        let other_attribute = ufoid();
+        let entities: Vec<_> = (0..12).map(|_| ufoid()).collect();
+        let value = |first: u8| Inline::<UnknownInline>::new([first; 32]);
+
+        // Three overlapping shards, each with its own local domain, and
+        // another attribute's values interleaved with ours.
+        let mut shards = vec![TribleSet::new(), TribleSet::new(), TribleSet::new()];
+        for (index, entity) in entities.iter().enumerate() {
+            let fact = Trible::force(entity, &attribute, &value(0x10 + 0x08 * (index as u8 % 7)));
+            shards[index % 3].insert(&fact);
+            if index % 4 == 0 {
+                shards[(index + 1) % 3].insert(&fact);
+            }
+            shards[(index + 2) % 3].insert(&Trible::force(
+                entity,
+                &other_attribute,
+                &value(0x14 + 0x08 * (index as u8 % 5)),
+            ));
+        }
+        let union = UnionArchive::new(
+            shards
+                .iter()
+                .map(SuccinctArchive::<OrderedUniverse>::from)
+                .collect::<Vec<_>>(),
+        );
+
+        for bound in 0u8..=0x60 {
+            let from = [bound; 32];
+            let expected: Vec<_> = union
+                .iter_attribute_value_entities(&attribute)
+                .filter(|(value, _)| *value >= from)
+                .collect();
+            let seeked: Vec<_> = union
+                .iter_attribute_value_entities_from(&attribute, &from)
+                .collect();
+            assert_eq!(seeked, expected, "bound {bound:#x}");
+            if let Some(first) = seeked.first() {
+                assert!(first.0 >= from);
+                assert!(union
+                    .iter_attribute_value_entities(&attribute)
+                    .take_while(|pair| pair != first)
+                    .all(|(value, _)| value < from));
+            }
+        }
     }
 
     #[test]
