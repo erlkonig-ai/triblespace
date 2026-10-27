@@ -232,6 +232,81 @@ fn an_unknown_kind_is_kept_verbatim_and_counted() {
     check(&a, &b, &c).success();
 }
 
+const PIN_HEAD: &str = "2BC0B9FE0EFDB0BC53654E17BB9D06E01259F36AF93EEE54AD5D557B12DF706D";
+const PIN_TOMBSTONE: &str = "8D9F27E76D3620EEC29B781F841E9EF77F2607B40DC702FE3DAED007E9228CA5";
+
+/// One legacy pin record: a head when `head` is given, else a tombstone.
+fn legacy_pin(branch: [u8; 16], head: Option<[u8; 32]>) -> Vec<u8> {
+    let mut frame = vec![0u8; 256];
+    frame[..28].copy_from_slice(&hex::decode(FRAME_MAGIC).unwrap());
+    frame[28..32].copy_from_slice(&1u32.to_le_bytes());
+    let kind = if head.is_some() { PIN_HEAD } else { PIN_TOMBSTONE };
+    frame[32..64].copy_from_slice(&hex::decode(kind).unwrap());
+    frame[64..80].copy_from_slice(&branch);
+    if let Some(head) = head {
+        frame[96..128].copy_from_slice(&head);
+    }
+    frame
+}
+
+/// Head, tombstone, the same head again: last write wins, so the pin ends
+/// pointing at the head. Dropping the repeat would end it deleted.
+fn repeated_pin_log() -> Vec<u8> {
+    let mut log = legacy_pin([0x31; 16], Some([0x41; 32]));
+    log.extend_from_slice(&legacy_pin([0x31; 16], None));
+    log.extend_from_slice(&legacy_pin([0x31; 16], Some([0x41; 32])));
+    log
+}
+
+#[test]
+fn a_repeated_legacy_pin_log_is_kept_in_full_and_in_order() {
+    let dir = tempdir().unwrap();
+    let (a, b, c) = (
+        dir.path().join("a.pile"),
+        dir.path().join("b.pile"),
+        dir.path().join("c.pile"),
+    );
+    append(&b, &["shared"], &[50]);
+    std::fs::copy(&b, &a).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&a)
+        .unwrap()
+        .write_all(&repeated_pin_log())
+        .unwrap();
+
+    subtract(&a, &b, &c).success();
+    assert_eq!(std::fs::read(&c).unwrap(), repeated_pin_log());
+    check(&a, &b, &c).success();
+}
+
+#[test]
+fn check_refuses_a_difference_whose_pin_log_lost_its_order() {
+    let dir = tempdir().unwrap();
+    let (a, b, c) = (
+        dir.path().join("a.pile"),
+        dir.path().join("b.pile"),
+        dir.path().join("c.pile"),
+    );
+    append(&b, &["shared"], &[51]);
+    std::fs::copy(&b, &a).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&a)
+        .unwrap()
+        .write_all(&repeated_pin_log())
+        .unwrap();
+
+    // Every identity is present, but the final repeat of the head is gone.
+    let mut deduplicated = legacy_pin([0x31; 16], Some([0x41; 32]));
+    deduplicated.extend_from_slice(&legacy_pin([0x31; 16], None));
+    std::fs::write(&c, &deduplicated).unwrap();
+
+    check(&a, &b, &c)
+        .failure()
+        .stderr(predicate::str::contains("order-sensitive"));
+}
+
 #[test]
 fn check_names_what_the_difference_is_missing() {
     let dir = tempdir().unwrap();
