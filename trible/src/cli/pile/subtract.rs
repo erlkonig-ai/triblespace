@@ -4,7 +4,10 @@
 //! the mainline pile: `cat MINUS DIFF` then holds everything SOURCE held. The
 //! difference is every frame of SOURCE whose content MINUS does not already
 //! hold, copied byte-for-byte in SOURCE order; a frame repeated inside SOURCE
-//! is written once. Neither input is opened for writing.
+//! is written once. Legacy pin heads and tombstones and retired WANT logs are
+//! the exception: their meaning is their file order, so every occurrence is
+//! kept, and `--check` compares their sequence. Neither input is opened for
+//! writing.
 //!
 //! Each frame kind is compared by the identity the core gives it. A blob is
 //! present only when MINUS holds a hash-valid occurrence, checked through the
@@ -81,6 +84,8 @@ enum Item {
     Record {
         identity: Identity,
         opaque: bool,
+        /// A log whose meaning is its file order: every occurrence is kept.
+        ordered: bool,
     },
 }
 
@@ -90,6 +95,12 @@ fn classify(record: &PileRecord, frame: &[u8]) -> (&'static str, Item) {
     let known = |identity| Item::Record {
         identity,
         opaque: false,
+        ordered: false,
+    };
+    let logged = |identity| Item::Record {
+        identity,
+        opaque: false,
+        ordered: true,
     };
     match record.content {
         PileRecordContent::Blob {
@@ -123,14 +134,14 @@ fn classify(record: &PileRecord, frame: &[u8]) -> (&'static str, Item) {
         PileRecordContent::Want { request } => ("WANT", known(Identity::Want(request))),
         PileRecordContent::Branch { branch_id, head } => (
             "legacy pin head",
-            known(Identity::PinHead(branch_id.into(), head.raw)),
+            logged(Identity::PinHead(branch_id.into(), head.raw)),
         ),
         PileRecordContent::BranchTombstone { branch_id } => (
             "legacy pin tombstone",
-            known(Identity::PinTombstone(branch_id.into())),
+            logged(Identity::PinTombstone(branch_id.into())),
         ),
         PileRecordContent::RetiredWantAssert { .. }
-        | PileRecordContent::RetiredWantRetract { .. } => ("retired WANT log", known(exact())),
+        | PileRecordContent::RetiredWantRetract { .. } => ("retired WANT log", logged(exact())),
         PileRecordContent::LegacyUnsignedCollectionEquation { .. } => {
             ("legacy unsigned equation", known(exact()))
         }
@@ -149,6 +160,7 @@ fn classify(record: &PileRecord, frame: &[u8]) -> (&'static str, Item) {
             Item::Record {
                 identity: exact(),
                 opaque: true,
+                ordered: false,
             },
         ),
         // A variant newer than this command: carried by its exact bytes.
@@ -157,6 +169,7 @@ fn classify(record: &PileRecord, frame: &[u8]) -> (&'static str, Item) {
             Item::Record {
                 identity: exact(),
                 opaque: true,
+                ordered: false,
             },
         ),
     }
@@ -168,6 +181,8 @@ struct Side {
     path: PathBuf,
     len: usize,
     records: HashSet<Identity>,
+    /// Order-sensitive log frames, in file order.
+    logged: Vec<Identity>,
     snapshot: PileFileSnapshot,
     file: PileFile,
 }
@@ -180,11 +195,15 @@ impl Side {
             PileRecords::open(path).map_err(|error| super::pile_read_error(path, error))?;
         let bytes = scan.bytes().clone();
         let mut records = HashSet::new();
+        let mut logged = Vec::new();
         while let Some(record) = scan.next() {
             let record = record.map_err(|error| super::pile_read_error(path, error))?;
             if !matches!(record.content, PileRecordContent::Blob { .. }) {
                 let frame = &bytes[record.offset..record.offset + record.len];
-                if let (_, Item::Record { identity, .. }) = classify(&record, frame) {
+                if let (_, Item::Record { identity, ordered, .. }) = classify(&record, frame) {
+                    if ordered {
+                        logged.push(identity);
+                    }
                     records.insert(identity);
                 }
             }
@@ -209,6 +228,7 @@ impl Side {
             path: path.to_path_buf(),
             len,
             records,
+            logged,
             snapshot,
             file,
         })
@@ -379,7 +399,20 @@ fn subtract(source: &Path, minus: &Path, into: &Path, allow_corrupt: bool) -> Re
                         false
                     }
                 }
-                Item::Record { identity, opaque } => {
+                Item::Record {
+                    ordered: true,
+                    opaque,
+                    ..
+                } => {
+                    if opaque {
+                        opaque_kept.0 += 1;
+                        opaque_kept.1 += frame.len() as u64;
+                    }
+                    true
+                }
+                Item::Record {
+                    identity, opaque, ..
+                } => {
                     if kept_records.contains(&identity) {
                         count.repeated += 1;
                         false
@@ -529,6 +562,7 @@ fn check_against(source: &Path, minus: &Side, diff: &Side, allow_corrupt: bool) 
     let mut corrupt = 0u64;
     let mut frames = 0u64;
     let mut stopped = None;
+    let mut logged = Vec::new();
     const LISTED: u64 = 100;
 
     while let Some(record) = scan.next() {
@@ -576,7 +610,12 @@ fn check_against(source: &Path, minus: &Side, diff: &Side, allow_corrupt: bool) 
                     format!("blob {}", hex::encode_upper(hash)),
                 )
             }
-            Item::Record { identity, .. } => {
+            Item::Record {
+                identity, ordered, ..
+            } => {
+                if ordered {
+                    logged.push(identity);
+                }
                 let in_minus = minus.records.contains(&identity);
                 let in_diff = !in_minus && diff.records.contains(&identity);
                 (in_minus, in_diff, identity.to_string())
@@ -627,6 +666,21 @@ fn check_against(source: &Path, minus: &Side, diff: &Side, allow_corrupt: bool) 
         println!(
             "WARNING: the scan of {} stopped early ({error}); later bytes were not checked",
             source.display()
+        );
+    }
+    let log_matches = logged == diff.logged;
+    println!(
+        "order-sensitive log frames: {} in SOURCE, {} in DIFF, sequence {}",
+        logged.len(),
+        diff.logged.len(),
+        if log_matches { "identical" } else { "DIFFERS" }
+    );
+    if !log_matches {
+        bail!(
+            "the order-sensitive log (legacy pins, retired WANTs) of {} is not reproduced \
+             in order by {}: replaying the difference would end in a different state",
+            source.display(),
+            diff.path.display()
         );
     }
     if missing > 0 {
