@@ -4,7 +4,7 @@
 //! renew them at their K closest DHT nodes; directory nodes receive neither raw
 //! blob handles nor collection membership.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::Duration;
 
 use rand::rngs::StdRng;
@@ -26,6 +26,10 @@ mod directory_model;
 #[cfg(test)]
 #[path = "provider/patch_directory.rs"]
 mod patch_directory;
+
+#[cfg(test)]
+#[path = "provider/btree_directory.rs"]
+mod btree_directory;
 
 /// Opaque rendezvous key for one exact bearer identity.
 pub(crate) type ProviderKey = [u8; 32];
@@ -523,25 +527,98 @@ impl ProviderPublisher {
 /// Secret-salted rank of one exact membership; see [`ProviderDirectory`].
 type ProviderRank = [u8; 32];
 /// A membership's place: its key's XOR distance from this node, then its rank.
+#[cfg(test)]
 type RankedMembership = ([u8; 32], ProviderRank, PeerId);
 
-/// Receiver-local exact soft directory. The ranked map owns every lease and
-/// orders it by its key's XOR responsibility and then by rank, so one key's
-/// members form one contiguous rank range that a request walks without
-/// further lookups. The deadline index orders expiry.
+/// One stored membership. Its key is the group it sits in, its provider an
+/// index into the directory's [`PeerTable`], and its rank is recomputed from
+/// both whenever an order is needed, so none of them is stored here.
+#[derive(Clone, Copy)]
+struct Member {
+    token: ProviderToken,
+    expires_at: Mono,
+    provider: u32,
+}
+
+/// Interned provider identities. A directory holds millions of memberships
+/// from comparatively few publishers, so each membership names its provider
+/// by a four-byte index. An index is reused once its last membership leaves.
+#[derive(Default)]
+struct PeerTable {
+    /// Each slot's identity and how many memberships name it; zero is free.
+    slots: Vec<(PeerId, u32)>,
+    index: HashMap<PeerId, u32>,
+    free: Vec<u32>,
+}
+
+impl PeerTable {
+    fn find(&self, peer: PeerId) -> Option<u32> {
+        self.index.get(&peer).copied()
+    }
+
+    fn peer(&self, index: u32) -> PeerId {
+        self.slots[index as usize].0
+    }
+
+    /// Count one more membership of `peer`.
+    fn acquire(&mut self, peer: PeerId) -> u32 {
+        if let Some(index) = self.find(peer) {
+            self.slots[index as usize].1 += 1;
+            return index;
+        }
+        let index = match self.free.pop() {
+            Some(index) => {
+                self.slots[index as usize] = (peer, 1);
+                index
+            }
+            None => {
+                self.slots.push((peer, 1));
+                u32::try_from(self.slots.len() - 1).expect("memberships are bounded below 2^32")
+            }
+        };
+        self.index.insert(peer, index);
+        index
+    }
+
+    /// Count one membership of `index` fewer, freeing it with the last.
+    fn release(&mut self, index: u32) {
+        let slot = &mut self.slots[index as usize];
+        slot.1 -= 1;
+        if slot.1 == 0 {
+            self.index.remove(&slot.0);
+            self.free.push(index);
+        }
+    }
+}
+
+/// Receiver-local exact soft directory. Memberships are grouped by key; the
+/// groups are ordered by the key's XOR responsibility and each group by rank,
+/// so one key's members form one contiguous rank-ordered slice that a request
+/// walks without further lookups, and the last member of the last group is
+/// the farthest membership. The deadline index orders expiry.
 ///
 /// Each key keeps a bottom-k sample of its publishers: the members with the
 /// smallest `keyed(salt; key || provider)`, under a salt drawn once per
 /// directory. Arrival order does not matter, renewals keep their place, and
 /// replicas sample independently. The salt never leaves this node, so a
 /// publisher cannot grind identities into its sample.
+///
+/// The layout stores what cannot be derived and nothing else: per membership
+/// its token, its deadline and a provider index; per key its distance once;
+/// per distinct (deadline, key) one index entry. Ranks are recomputed, and
+/// equal deadlines of one key are told apart by provider at prune time, which
+/// keeps the `(deadline, key, provider)` prune order exact.
 pub(crate) struct ProviderDirectory {
     local_id: PeerId,
     salt: [u8; 32],
     sampler: StdRng,
-    ranked: BTreeMap<RankedMembership, (Mono, ProviderToken)>,
-    members_per_key: BTreeMap<ProviderKey, usize>,
-    deadlines: BTreeSet<(Mono, ProviderKey, PeerId)>,
+    /// Key XOR local id → that key's members, smallest (rank, provider) first.
+    /// A group is never empty.
+    groups: BTreeMap<[u8; 32], Box<[Member]>>,
+    memberships: usize,
+    /// Every (deadline, key) that some member of the key holds.
+    deadlines: BTreeSet<(Mono, ProviderKey)>,
+    peers: PeerTable,
     limits: DirectoryLimits,
 }
 
@@ -568,9 +645,10 @@ impl ProviderDirectory {
             local_id,
             salt: sampler.r#gen(),
             sampler,
-            ranked: BTreeMap::new(),
-            members_per_key: BTreeMap::new(),
+            groups: BTreeMap::new(),
+            memberships: 0,
             deadlines: BTreeSet::new(),
+            peers: PeerTable::default(),
             limits: DirectoryLimits {
                 lease: PROVIDER_LEASE_LIFETIME,
                 memberships: MAX_PROVIDER_MEMBERSHIPS,
@@ -580,7 +658,7 @@ impl ProviderDirectory {
 
     /// O(1) retained soft-state counts; expired entries may await bounded prune.
     pub(crate) fn retained_counts(&self) -> (usize, usize) {
-        (self.ranked.len(), self.members_per_key.len())
+        (self.memberships, self.groups.len())
     }
 
     /// Install or renew one exact membership. A renewal keeps its place and
@@ -595,36 +673,69 @@ impl ProviderDirectory {
     ) -> bool {
         self.prune_expired(now);
         let full = self.fit_key(key, now);
-        let place = self.place(key, provider);
-        if let Some((previous, _)) = self.ranked.get(&place).copied() {
-            self.deadlines.remove(&(previous, key, provider));
-        } else {
-            if full {
-                let (largest, _) = self
-                    .key_range(key)
-                    .next_back()
-                    .expect("a key at its stored cap has members");
-                let largest = *largest;
-                if place >= largest {
-                    return false;
-                }
-                self.remove_membership(key, largest.2);
-            } else if self.ranked.len() >= self.limits.memberships {
-                let Some((&farthest, _)) = self.ranked.last_key_value() else {
-                    return false;
-                };
-                if place >= farthest {
-                    return false;
-                }
-                // XOR with the local id is its own inverse.
-                self.remove_membership(self.distance(farthest.0), farthest.2);
+        let distance = self.distance(key);
+        let rank = self.rank(key, provider);
+        let expires_at = now + self.limits.lease;
+        if let Ok(position) = self.search(key, rank, provider) {
+            let group = self
+                .groups
+                .get_mut(&distance)
+                .expect("a found member has a group");
+            let previous = group[position].expires_at;
+            group[position].expires_at = expires_at;
+            group[position].token = token;
+            self.forget_deadline(key, previous);
+            self.deadlines.insert((expires_at, key));
+            return true;
+        }
+        if full {
+            let largest = self.peers.peer(
+                self.members(key)
+                    .last()
+                    .expect("a key at its stored cap has members")
+                    .provider,
+            );
+            if (rank, provider) >= (self.rank(key, largest), largest) {
+                return false;
             }
-            *self.members_per_key.entry(key).or_default() += 1;
+            self.remove_membership(key, largest);
+        } else if self.memberships >= self.limits.memberships {
+            let Some((&farthest, group)) = self.groups.last_key_value() else {
+                return false;
+            };
+            let farthest_peer = self
+                .peers
+                .peer(group.last().expect("groups are nonempty").provider);
+            // XOR with the local id is its own inverse.
+            let farthest_key = self.distance(farthest);
+            if (distance, rank, provider)
+                >= (
+                    farthest,
+                    self.rank(farthest_key, farthest_peer),
+                    farthest_peer,
+                )
+            {
+                return false;
+            }
+            self.remove_membership(farthest_key, farthest_peer);
         }
 
-        let expires_at = now + self.limits.lease;
-        self.ranked.insert(place, (expires_at, token));
-        self.deadlines.insert((expires_at, key, provider));
+        let position = self
+            .search(key, rank, provider)
+            .expect_err("a newcomer is not yet a member");
+        let member = Member {
+            token,
+            expires_at,
+            provider: self.peers.acquire(provider),
+        };
+        let group = self.groups.entry(distance).or_default();
+        let mut grown = Vec::with_capacity(group.len() + 1);
+        grown.extend_from_slice(&group[..position]);
+        grown.push(member);
+        grown.extend_from_slice(&group[position..]);
+        *group = grown.into_boxed_slice();
+        self.memberships += 1;
+        self.deadlines.insert((expires_at, key));
         true
     }
 
@@ -632,13 +743,12 @@ impl ProviderDirectory {
     /// never less than one full reply nor more than the per-key ceiling. It
     /// shrinks as memberships and keys grow.
     fn stored_cap(&self) -> usize {
-        (self.limits.memberships.saturating_sub(self.ranked.len())
-            / self.members_per_key.len().max(1))
-        .clamp(MAX_PROVIDERS_PER_REPLY, MAX_PROVIDERS_STORED_PER_KEY)
+        (self.limits.memberships.saturating_sub(self.memberships) / self.groups.len().max(1))
+            .clamp(MAX_PROVIDERS_PER_REPLY, MAX_PROVIDERS_STORED_PER_KEY)
     }
 
     fn key_len(&self, key: ProviderKey) -> usize {
-        self.members_per_key.get(&key).copied().unwrap_or(0)
+        self.members(key).len()
     }
 
     /// Bring one key within its stored cap, which may have shrunk since the
@@ -651,19 +761,22 @@ impl ProviderDirectory {
             return false;
         }
         let expired = self
-            .key_range(key)
-            .filter(|(_, (expires_at, _))| *expires_at <= now)
-            .map(|((_, _, provider), _)| *provider)
+            .members(key)
+            .iter()
+            .filter(|member| member.expires_at <= now)
+            .map(|member| self.peers.peer(member.provider))
             .collect::<Vec<_>>();
         for provider in expired {
             self.remove_membership(key, provider);
         }
         while self.key_len(key) > self.stored_cap() {
-            let ((_, _, largest), _) = self
-                .key_range(key)
-                .next_back()
-                .expect("a key above its stored cap has members");
-            self.remove_membership(key, *largest);
+            let largest = self.peers.peer(
+                self.members(key)
+                    .last()
+                    .expect("a key above its stored cap has members")
+                    .provider,
+            );
+            self.remove_membership(key, largest);
         }
         self.key_len(key) >= self.stored_cap()
     }
@@ -675,9 +788,10 @@ impl ProviderDirectory {
         self.prune_expired(now);
         self.fit_key(key, now);
         let mut live = self
-            .key_range(key)
-            .filter(|(_, (expires_at, _))| *expires_at > now)
-            .map(|((_, _, provider), (_, token))| (*provider, *token))
+            .members(key)
+            .iter()
+            .filter(|member| member.expires_at > now)
+            .map(|member| (self.peers.peer(member.provider), member.token))
             .collect::<Vec<_>>();
         live.sort_unstable_by_key(|(provider, _)| *provider);
         if live.len() > MAX_PROVIDERS_PER_REPLY {
@@ -714,23 +828,28 @@ impl ProviderDirectory {
         hints
     }
 
+    /// Remove expired memberships in `(deadline, key, provider)` order, at
+    /// most a bounded number per call.
     fn prune_expired(&mut self, now: Mono) {
         for _ in 0..MAX_EXPIRED_PROVIDER_MEMBERSHIPS_PER_CALL {
-            let Some((expires_at, key, provider)) = self.deadlines.first().copied() else {
+            let Some(&(expires_at, key)) = self.deadlines.first() else {
                 break;
             };
             if expires_at > now {
                 break;
             }
-            self.deadlines.remove(&(expires_at, key, provider));
-            if self
-                .ranked
-                .get(&self.place(key, provider))
-                .is_none_or(|(deadline, _)| *deadline != expires_at)
-            {
-                continue;
+            let provider = self
+                .members(key)
+                .iter()
+                .filter(|member| member.expires_at == expires_at)
+                .map(|member| self.peers.peer(member.provider))
+                .min();
+            match provider {
+                Some(provider) => self.remove_membership(key, provider),
+                None => {
+                    self.deadlines.remove(&(expires_at, key));
+                }
             }
-            self.remove_membership(key, provider);
         }
     }
 
@@ -745,36 +864,82 @@ impl ProviderDirectory {
         *blake3::keyed_hash(&self.salt, &block).as_bytes()
     }
 
-    fn place(&self, key: ProviderKey, provider: PeerId) -> RankedMembership {
-        (self.distance(key), self.rank(key, provider), provider)
+    /// One key's members, smallest rank first.
+    fn members(&self, key: ProviderKey) -> &[Member] {
+        self.groups
+            .get(&self.distance(key))
+            .map_or(&[], |group| &group[..])
     }
 
-    /// One key's ranked members with their leases, smallest rank first.
-    fn key_range(
+    /// Where `(rank, provider)` sits among the key's members: `Ok` when it is
+    /// one, otherwise where it would be inserted.
+    fn search(
         &self,
         key: ProviderKey,
-    ) -> impl DoubleEndedIterator<Item = (&RankedMembership, &(Mono, ProviderToken))> {
-        let distance = self.distance(key);
-        self.ranked
-            .range((distance, [0; 32], [0; 32])..=(distance, [u8::MAX; 32], [u8::MAX; 32]))
+        rank: ProviderRank,
+        provider: PeerId,
+    ) -> Result<usize, usize> {
+        self.members(key).binary_search_by(|member| {
+            let peer = self.peers.peer(member.provider);
+            (self.rank(key, peer), peer).cmp(&(rank, provider))
+        })
+    }
+
+    /// Drop the `(deadline, key)` index entry once no member of the key holds
+    /// that deadline.
+    fn forget_deadline(&mut self, key: ProviderKey, deadline: Mono) {
+        if !self
+            .members(key)
+            .iter()
+            .any(|member| member.expires_at == deadline)
+        {
+            self.deadlines.remove(&(deadline, key));
+        }
     }
 
     fn remove_membership(&mut self, key: ProviderKey, provider: PeerId) {
-        let Some((deadline, _)) = self.ranked.remove(&self.place(key, provider)) else {
+        let Some(index) = self.peers.find(provider) else {
             return;
         };
-        self.deadlines.remove(&(deadline, key, provider));
-        let remove_key = {
-            let members = self
-                .members_per_key
-                .get_mut(&key)
-                .expect("stored membership counts toward its exact key");
-            *members -= 1;
-            *members == 0
+        let distance = self.distance(key);
+        let Some(group) = self.groups.get_mut(&distance) else {
+            return;
         };
-        if remove_key {
-            self.members_per_key.remove(&key);
+        let Some(position) = group.iter().position(|member| member.provider == index) else {
+            return;
+        };
+        let removed = group[position];
+        if group.len() == 1 {
+            self.groups.remove(&distance);
+        } else {
+            let mut shrunk = Vec::with_capacity(group.len() - 1);
+            shrunk.extend_from_slice(&group[..position]);
+            shrunk.extend_from_slice(&group[position + 1..]);
+            *group = shrunk.into_boxed_slice();
         }
+        self.memberships -= 1;
+        self.peers.release(index);
+        self.forget_deadline(key, removed.expires_at);
+    }
+
+    /// One key's ranked members with their leases, smallest rank first.
+    #[cfg(test)]
+    fn key_range(
+        &self,
+        key: ProviderKey,
+    ) -> std::vec::IntoIter<(RankedMembership, (Mono, ProviderToken))> {
+        let distance = self.distance(key);
+        self.members(key)
+            .iter()
+            .map(|member| {
+                let provider = self.peers.peer(member.provider);
+                (
+                    (distance, self.rank(key, provider), provider),
+                    (member.expires_at, member.token),
+                )
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     #[cfg(test)]
@@ -1014,7 +1179,7 @@ mod tests {
     fn stored(directory: &ProviderDirectory, key: ProviderKey) -> BTreeSet<PeerId> {
         directory
             .key_range(key)
-            .map(|((_, _, provider), _)| *provider)
+            .map(|((_, _, provider), _)| provider)
             .collect()
     }
 
@@ -1055,7 +1220,7 @@ mod tests {
         assert_eq!(stored(&forward, key), expected);
         assert_eq!(stored(&reverse, key), expected);
 
-        let (_, largest_rank, largest) = *forward.key_range(key).next_back().unwrap().0;
+        let (_, largest_rank, largest) = forward.key_range(key).next_back().unwrap().0;
         let mut fresh = (1024..).map(publisher);
         let outranked = fresh
             .find(|provider| forward.rank(key, *provider) > largest_rank)
@@ -1152,7 +1317,7 @@ mod tests {
         assert_eq!(directory.key_len(key), 200);
 
         let expected = bottom_k(&directory, key, &publishers, MAX_PROVIDERS_PER_REPLY);
-        let largest = *directory.key_range(key).next_back().unwrap().0;
+        let largest = directory.key_range(key).next_back().unwrap().0;
         assert!(!expected.contains(&largest.2));
         assert!(!directory.put(key, largest.2, [2; 32], now));
         assert_eq!(stored(&directory, key), expected);
@@ -1305,7 +1470,7 @@ mod tests {
             key[..4].copy_from_slice(&index.to_be_bytes());
             assert!(directory.put(key, provider, [8; 32], now));
         }
-        assert_eq!(directory.ranked.len(), 2048);
+        assert_eq!(directory.retained_counts().0, 2048);
     }
 
     #[test]
@@ -1736,13 +1901,13 @@ mod tests {
         assert!(directory.put(other, [65; 32], [66; 32], now));
 
         assert!(directory.get(key, now + Duration::from_secs(1)).is_empty());
-        assert_eq!(directory.ranked.len(), 1);
+        assert_eq!(directory.retained_counts().0, 1);
         assert!(
             directory
                 .get(other, now + Duration::from_secs(1))
                 .is_empty()
         );
-        assert!(directory.ranked.is_empty());
+        assert_eq!(directory.retained_counts().0, 0);
     }
 
     #[test]
@@ -1999,7 +2164,7 @@ mod tests {
         let floor_get = started.elapsed() / ROUNDS as u32;
         println!(
             "provider_ceiling memberships={} ceiling_get_micros={:.1} ceiling_renewal_micros={:.1} shrink_get_micros={:.1} floor_get_micros={:.1}",
-            directory.ranked.len(),
+            directory.retained_counts().0,
             get.as_secs_f64() * 1e6,
             renewal.as_secs_f64() * 1e6,
             shrink.as_secs_f64() * 1e6,

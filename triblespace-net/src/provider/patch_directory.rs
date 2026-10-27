@@ -6,6 +6,7 @@
 //! policy. Nothing here persists leases, changes trust, or changes live host
 //! behavior.
 
+use super::btree_directory::BTreeDirectory;
 use super::*;
 
 triblespace_core::key_segmentation!(MembershipSegments, 64, [32, 32]);
@@ -26,7 +27,7 @@ struct PatchDirectory {
 }
 
 impl PatchDirectory {
-    /// The salt is the sampler's first draw, as in [`ProviderDirectory`].
+    /// The salt is the sampler's first draw, as in [`BTreeDirectory`].
     fn new(local_id: PeerId, limits: DirectoryLimits, mut sampler: StdRng) -> Self {
         Self {
             local_id,
@@ -210,7 +211,7 @@ impl PatchDirectory {
     }
 }
 
-fn same_state(reference: &ProviderDirectory, candidate: &PatchDirectory) {
+fn same_state(reference: &BTreeDirectory, candidate: &PatchDirectory) {
     assert_eq!(reference.retained_counts(), candidate.retained_counts());
     let members = candidate
         .members
@@ -262,9 +263,9 @@ fn patch_directory_matches_capacity_renewal_expiry_and_removal() {
             memberships: capacity,
         };
         let seed = rng.r#gen();
-        let mut reference = ProviderDirectory {
+        let mut reference = BTreeDirectory {
             limits,
-            ..ProviderDirectory::with_sampler(local, StdRng::seed_from_u64(seed))
+            ..BTreeDirectory::with_sampler(local, StdRng::seed_from_u64(seed))
         };
         let mut candidate = PatchDirectory::new(local, limits, StdRng::seed_from_u64(seed));
         let mut now = crate::clock::mono_now();
@@ -304,9 +305,9 @@ fn patch_directory_keeps_exact_prune_ties_and_full_key_renewal() {
         lease: Duration::from_secs(10),
         memberships: 256,
     };
-    let mut reference = ProviderDirectory {
+    let mut reference = BTreeDirectory {
         limits,
-        ..ProviderDirectory::with_sampler(local, StdRng::seed_from_u64(182))
+        ..BTreeDirectory::with_sampler(local, StdRng::seed_from_u64(182))
     };
     let mut candidate = PatchDirectory::new(local, limits, StdRng::seed_from_u64(182));
     let now = crate::clock::mono_now();
@@ -353,9 +354,9 @@ fn patch_directory_matches_the_per_key_ceiling() {
         lease: PROVIDER_LEASE_LIFETIME,
         memberships: MAX_PROVIDER_MEMBERSHIPS,
     };
-    let mut reference = ProviderDirectory {
+    let mut reference = BTreeDirectory {
         limits,
-        ..ProviderDirectory::with_sampler(local, StdRng::seed_from_u64(184))
+        ..BTreeDirectory::with_sampler(local, StdRng::seed_from_u64(184))
     };
     let mut candidate = PatchDirectory::new(local, limits, StdRng::seed_from_u64(184));
     let locator = rng.r#gen();
@@ -457,9 +458,9 @@ fn patch_directory_scale_probe() {
     }
     match mode.as_str() {
         "patch" => measure!(PatchDirectory::new(local, limits, StdRng::seed_from_u64(0))),
-        "btree" => measure!(ProviderDirectory {
+        "btree" => measure!(BTreeDirectory {
             limits,
-            ..ProviderDirectory::new(local)
+            ..BTreeDirectory::new(local)
         }),
         _ => panic!("choose patch or btree"),
     }
