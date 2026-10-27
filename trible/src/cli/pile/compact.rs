@@ -26,6 +26,17 @@
 //! is append-only, the result is the compaction of a copy of those `L`
 //! bytes without making the copy. `L` must be a record boundary.
 //!
+//! `--dropped-into DROPPED` keeps what the compaction drops. After the
+//! destination is written and closed, every frame of the source the
+//! destination does not hold is written to DROPPED by `pile subtract`'s own
+//! [`super::subtract::write_difference`], with the source bounded to exactly
+//! the bytes the compaction read. Difference files kept beside an older
+//! mainline stay complete only while the mainline keeps what they left out;
+//! a compaction can drop such a frame, so its dropped set is the next
+//! difference generation, written as exhaust of the run that drops it. If
+//! DROPPED cannot be written the destination is removed: a compacted pile
+//! without its dropped frames is the one result that must not look finished.
+//!
 //! The record census is lock-free. On a source a writer is appending to it
 //! can map an append still in flight; when the file grew while the census
 //! read it, the failure says so instead of advising repair.
@@ -221,13 +232,25 @@ impl CollectionFrameFilter for ExcludeCollections<'_> {
     }
 }
 
-pub(super) fn run(
-    source_path: PathBuf,
-    destination_path: PathBuf,
-    drop_drained: Vec<String>,
-    drop_collection: Vec<String>,
-    source_prefix: Option<u64>,
-) -> Result<()> {
+/// What `pile compact` is asked to do.
+pub(super) struct Request {
+    pub source: PathBuf,
+    pub into: PathBuf,
+    pub drop_drained: Vec<String>,
+    pub drop_collection: Vec<String>,
+    pub source_prefix: Option<u64>,
+    pub dropped_into: Option<PathBuf>,
+}
+
+pub(super) fn run(request: Request) -> Result<()> {
+    let Request {
+        source: source_path,
+        into: destination_path,
+        drop_drained,
+        drop_collection,
+        source_prefix,
+        dropped_into,
+    } = request;
     let drained = drop_drained
         .iter()
         .map(|pair| {
@@ -245,6 +268,20 @@ pub(super) fn run(
             "destination {} already exists; compact writes a fresh pile",
             destination_path.display()
         );
+    }
+    if let Some(dropped) = &dropped_into {
+        if *dropped == destination_path || *dropped == source_path {
+            bail!(
+                "--dropped-into {} names the same path as the {}; it must be a third file",
+                dropped.display(),
+                if *dropped == source_path {
+                    "source"
+                } else {
+                    "destination"
+                }
+            );
+        }
+        super::subtract::refuse_existing(dropped).context("--dropped-into")?;
     }
 
     eprintln!("Compaction: scanning source record headers...");
@@ -345,6 +382,14 @@ pub(super) fn run(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create destination directory {}", parent.display()))?;
     }
+    if let Some(parent) = dropped_into
+        .as_deref()
+        .and_then(Path::parent)
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create --dropped-into directory {}", parent.display()))?;
+    }
     let destination_file = create_fresh_destination(&destination_path)
         .with_context(|| format!("create fresh destination {}", destination_path.display()))?;
     let mut destination = match Pile::open(&destination_path) {
@@ -393,6 +438,44 @@ pub(super) fn run(
     }
     drop(destination_file);
 
+    // The compaction is not finished until what it dropped is kept.
+    let dropped = match &dropped_into {
+        None => None,
+        Some(dropped_path) => {
+            eprintln!(
+                "Compaction: writing the frames it dropped into {}...",
+                dropped_path.display()
+            );
+            match super::subtract::write_difference(
+                &source_path,
+                &destination_path,
+                dropped_path,
+                false,
+                // Exactly the bytes the compaction read.
+                Some(stable_source_len),
+            ) {
+                Ok(difference) => Some(difference),
+                Err(error) => {
+                    let state = if std::fs::symlink_metadata(dropped_path).is_ok() {
+                        "exists but the run failed after publishing it; inspect it"
+                    } else {
+                        "was not created"
+                    };
+                    let error = error.context(format!(
+                        "could not keep the compaction's dropped frames in {} ({} {state}); \
+                         the destination {} is removed, because a compacted pile without \
+                         its dropped frames would lose what older difference files left out. \
+                         The source is unchanged; fix the cause and rerun",
+                        dropped_path.display(),
+                        dropped_path.display(),
+                        destination_path.display(),
+                    ));
+                    return Err(cleanup_incomplete_destination(&destination_path, error));
+                }
+            }
+        }
+    };
+
     println!(
         "Compacted {} into {}:\n  bytes: {} -> {}\n  blob records: {} -> {}\n  collection records: {} -> {}\n  capability proofs: {} -> {}\n  retired capability proofs: {} -> {} (carried exactly)\n  current WANT records: {} -> {}\n  retired WANT log records: {} -> {} (dropped)\n  retired team records: {} -> {} (dropped)\n  frames of unknown kind: {} ({} bytes) -> {} ({} bytes) (carried exactly)\n  active wants: {}\n  active legacy pins: {}",
         source_path.display(),
@@ -436,6 +519,10 @@ pub(super) fn run(
         "  retired v8/v9 equations carried for the clean-pile migration: {}",
         stats.retired_equations
     );
+    if let Some(difference) = dropped {
+        println!("Dropped frames kept (source minus destination):");
+        difference.print();
+    }
     Ok(())
 }
 

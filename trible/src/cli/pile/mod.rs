@@ -93,6 +93,17 @@ pub enum PileCommand {
         /// of that prefix.
         #[arg(long = "source-prefix", value_name = "BYTES")]
         source_prefix: Option<u64>,
+        /// Keep what the compaction drops: after writing the destination,
+        /// write every frame of the source (or of its --source-prefix) that
+        /// the destination does not hold into this fresh file, exactly as
+        /// `pile subtract SOURCE --minus DESTINATION [--source-prefix BYTES]`
+        /// would. `cat DESTINATION DROPPED` then holds everything the source
+        /// held. It must not exist; it is written to a hidden sibling, synced,
+        /// and published by hard link. If it cannot be written, the
+        /// destination is removed and the command fails, so a compaction
+        /// without its dropped frames never looks like a finished one.
+        #[arg(long = "dropped-into", value_name = "DROPPED")]
+        dropped_into: Option<PathBuf>,
     },
     /// Write SOURCE minus MINUS as a fresh difference pile, read-only on both.
     ///
@@ -130,6 +141,9 @@ pub enum PileCommand {
     /// With --check, nothing is written: every blob and record of SOURCE is
     /// looked up in MINUS or DIFF by the same identities, anything missing
     /// is listed, and the command exits 1 if any is.
+    ///
+    /// --source-prefix bounds SOURCE to its first BYTES bytes, for both the
+    /// difference and --check, as `pile compact --source-prefix` does.
     Subtract {
         /// Pile to subtract from; opened read-only.
         source: PathBuf,
@@ -155,6 +169,11 @@ pub enum PileCommand {
         /// reported.
         #[arg(long)]
         allow_corrupt: bool,
+        /// Read SOURCE as exactly its first BYTES bytes, read-only, while
+        /// writers may keep appending. BYTES must be a record boundary; bytes
+        /// at or past it are never read.
+        #[arg(long = "source-prefix", value_name = "BYTES")]
+        source_prefix: Option<u64>,
     },
     /// Diagnostic helpers for inspecting and repairing piles.
     Diagnose {
@@ -376,7 +395,15 @@ pub fn run(cmd: PileCommand) -> Result<()> {
             drop_drained,
             drop_collection,
             source_prefix,
-        } => compact::run(source, into, drop_drained, drop_collection, source_prefix),
+            dropped_into,
+        } => compact::run(compact::Request {
+            source,
+            into,
+            drop_drained,
+            drop_collection,
+            source_prefix,
+            dropped_into,
+        }),
         PileCommand::Subtract {
             source,
             minus,
@@ -384,6 +411,7 @@ pub fn run(cmd: PileCommand) -> Result<()> {
             check,
             diff,
             allow_corrupt,
+            source_prefix,
         } => subtract::run(subtract::Request {
             source,
             minus,
@@ -391,6 +419,7 @@ pub fn run(cmd: PileCommand) -> Result<()> {
             check,
             diff,
             allow_corrupt,
+            source_prefix,
         }),
         PileCommand::Net { cmd } => net::run(cmd),
         PileCommand::Diagnose { cmd } => diagnose::run(cmd),

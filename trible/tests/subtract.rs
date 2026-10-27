@@ -446,3 +446,77 @@ fn a_corrupt_blob_refuses_unless_explicitly_skipped() {
     assert!(diff.blobs.is_empty());
     assert_eq!(diff.records, BTreeSet::from([commit(50).to_bytes()]));
 }
+
+fn with_prefix(mut command: Command, prefix: u64) -> assert_cmd::assert::Assert {
+    command
+        .args(["--source-prefix", &prefix.to_string()])
+        .assert()
+}
+
+#[test]
+fn source_prefix_bounds_subtract_and_check_to_the_first_bytes() {
+    let dir = tempdir().unwrap();
+    let (a, b, c) = (
+        dir.path().join("a.pile"),
+        dir.path().join("b.pile"),
+        dir.path().join("c.pile"),
+    );
+    append(&b, &["shared"], &[60]);
+    std::fs::copy(&b, &a).unwrap();
+    let extra = append(&a, &["inside the prefix"], &[61]);
+    let prefix = std::fs::metadata(&a).unwrap().len();
+    append(&a, &["past the prefix"], &[62]);
+    // A torn tail past the prefix is never read.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&a)
+        .unwrap()
+        .write_all(&[0xFF; 8])
+        .unwrap();
+    let copy = dir.path().join("copy.pile");
+    std::fs::write(&copy, &std::fs::read(&a).unwrap()[..prefix as usize]).unwrap();
+
+    let mut bounded = Command::cargo_bin("trible").unwrap();
+    bounded
+        .args(["pile", "subtract"])
+        .arg(&a)
+        .arg("--minus")
+        .arg(&b)
+        .arg("--into")
+        .arg(&c);
+    with_prefix(bounded, prefix).success();
+    let expected = dir.path().join("expected.pile");
+    subtract(&copy, &b, &expected).success();
+    assert_eq!(std::fs::read(&c).unwrap(), std::fs::read(&expected).unwrap());
+    let diff = content(&c);
+    assert_eq!(diff.blobs, BTreeSet::from([extra[0].raw]));
+    assert_eq!(diff.records, BTreeSet::from([commit(61).to_bytes()]));
+
+    let mut checked = Command::cargo_bin("trible").unwrap();
+    checked
+        .args(["pile", "subtract", "--check"])
+        .arg(&a)
+        .arg("--minus")
+        .arg(&b)
+        .arg("--diff")
+        .arg(&c);
+    with_prefix(checked, prefix)
+        .success()
+        .stdout(predicate::str::contains("missing: 0"));
+    // Unbounded, the same check reads past the prefix and refuses.
+    check(&a, &b, &c).failure();
+
+    let cut = dir.path().join("cut.pile");
+    let mut inside = Command::cargo_bin("trible").unwrap();
+    inside
+        .args(["pile", "subtract"])
+        .arg(&a)
+        .arg("--minus")
+        .arg(&b)
+        .arg("--into")
+        .arg(&cut);
+    with_prefix(inside, prefix - 8)
+        .failure()
+        .stderr(predicate::str::contains("not a record boundary"));
+    assert!(!cut.exists());
+}

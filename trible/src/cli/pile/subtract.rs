@@ -14,6 +14,13 @@
 //! same snapshot read that serves ordinary blob reads; a blob is copied only
 //! after its own payload is checked against its header. Frames this reader
 //! cannot interpret are never dropped: they are compared by their exact bytes.
+//!
+//! `--source-prefix L` bounds SOURCE to its first `L` bytes, read-only, the
+//! way `pile compact --source-prefix` does: writers may keep appending and
+//! nothing at or past `L` is read. `pile compact --dropped-into` writes its
+//! dropped frames through [`write_difference`] with the compaction's source
+//! bounded the same way, so a compaction's exhaust is exactly this command's
+//! output for SOURCE minus the compacted pile.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -41,6 +48,7 @@ pub(super) struct Request {
     pub check: bool,
     pub diff: Option<PathBuf>,
     pub allow_corrupt: bool,
+    pub source_prefix: Option<u64>,
 }
 
 /// The identity a non-blob frame is compared by.
@@ -311,14 +319,56 @@ pub(super) fn run(request: Request) -> Result<()> {
             .diff
             .as_deref()
             .ok_or_else(|| anyhow!("--check needs --diff <DIFF>"))?;
-        check(&request.source, &request.minus, diff, request.allow_corrupt)
+        check(
+            &request.source,
+            &request.minus,
+            diff,
+            request.allow_corrupt,
+            request.source_prefix,
+        )
     } else {
         let into = request
             .into
             .as_deref()
             .ok_or_else(|| anyhow!("subtract needs --into <DESTINATION>"))?;
-        subtract(&request.source, &request.minus, into, request.allow_corrupt)
+        write_difference(
+            &request.source,
+            &request.minus,
+            into,
+            request.allow_corrupt,
+            request.source_prefix,
+        )?
+        .print();
+        Ok(())
     }
+}
+
+/// A raw scan of SOURCE, or of exactly its first `prefix` bytes.
+fn open_source(source: &Path, prefix: Option<u64>) -> Result<PileRecords> {
+    match prefix {
+        Some(prefix) => PileRecords::open_prefix(source, prefix),
+        None => PileRecords::open(source),
+    }
+    .map_err(|error| super::pile_read_error(source, error))
+}
+
+/// How much of SOURCE a scan covered, for the reports.
+fn extent(bytes: usize, prefix: Option<u64>) -> String {
+    match prefix {
+        Some(_) => format!("first {bytes} bytes (fixed prefix)"),
+        None => format!("{bytes} observed bytes"),
+    }
+}
+
+/// Refuse a difference destination that already exists, before any work.
+pub(super) fn refuse_existing(into: &Path) -> Result<()> {
+    if fs::symlink_metadata(into).is_ok() {
+        bail!(
+            "refusing: destination {} already exists; subtract never overwrites",
+            into.display()
+        );
+    }
+    Ok(())
 }
 
 fn temporary_sibling(into: &Path) -> Result<PathBuf> {
@@ -331,23 +381,57 @@ fn temporary_sibling(into: &Path) -> Result<PathBuf> {
     Ok(into.with_file_name(temporary))
 }
 
-fn subtract(source: &Path, minus: &Path, into: &Path, allow_corrupt: bool) -> Result<()> {
-    if fs::symlink_metadata(into).is_ok() {
-        bail!(
-            "refusing: destination {} already exists; subtract never overwrites",
-            into.display()
-        );
-    }
+/// What one written difference holds, for the report.
+pub(super) struct Difference {
+    source: PathBuf,
+    minus: PathBuf,
+    into: PathBuf,
+    source_prefix: Option<u64>,
+    frames: u64,
+    source_bytes: usize,
+    minus_bytes: usize,
+    counts: BTreeMap<&'static str, KindCounts>,
+    opaque_kept: (u64, u64),
+    corrupt: usize,
+    written: u64,
+    stopped: Option<String>,
+}
+
+/// Write SOURCE (or its first `source_prefix` bytes) minus MINUS into the
+/// fresh file `into`: written to a hidden sibling, synced, and published by
+/// hard link, so `into` either does not exist or holds the whole difference.
+pub(super) fn write_difference(
+    source: &Path,
+    minus: &Path,
+    into: &Path,
+    allow_corrupt: bool,
+    source_prefix: Option<u64>,
+) -> Result<Difference> {
+    refuse_existing(into)?;
     require_distinct(&[source, minus])?;
 
     let minus_side = Side::open(minus)?;
-    let mut scan =
-        PileRecords::open(source).map_err(|error| super::pile_read_error(source, error))?;
+    let mut scan = match open_source(source, source_prefix) {
+        Ok(scan) => scan,
+        Err(error) => {
+            let _ = minus_side.close();
+            return Err(error);
+        }
+    };
     let bytes = scan.bytes().clone();
 
-    let temporary = temporary_sibling(into)?;
-    let file = super::compact::create_fresh_destination(&temporary)
-        .with_context(|| format!("create {}", temporary.display()))?;
+    let created = temporary_sibling(into).and_then(|temporary| {
+        let file = super::compact::create_fresh_destination(&temporary)
+            .with_context(|| format!("create {}", temporary.display()))?;
+        Ok((temporary, file))
+    });
+    let (temporary, file) = match created {
+        Ok(created) => created,
+        Err(error) => {
+            let _ = minus_side.close();
+            return Err(error);
+        }
+    };
     let mut out = BufWriter::with_capacity(8 << 20, file);
 
     let mut counts: BTreeMap<&'static str, KindCounts> = BTreeMap::new();
@@ -495,50 +579,77 @@ fn subtract(source: &Path, minus: &Path, into: &Path, allow_corrupt: bool) -> Re
         });
     }
 
-    println!(
-        "subtract {} minus {} -> {}",
-        source.display(),
-        minus.display(),
-        into.display()
-    );
-    println!(
-        "scope: {frames} frames of {}'s {} observed bytes, against {}'s {} bytes \
-         (blob presence hash-verified there; records by identity, see --help)",
-        source.display(),
-        bytes.len(),
-        minus.display(),
-        minus_side.len,
-    );
-    row(
-        "kind",
-        ["read", "kept", "in MINUS", "repeated"].map(String::from),
-    );
-    for (kind, count) in &counts {
-        row(
-            kind,
-            [count.read, count.kept, count.present, count.repeated].map(|n| n.to_string()),
-        );
-    }
-    println!(
-        "opaque/unknown frames kept: {} ({} bytes)",
-        opaque_kept.0, opaque_kept.1
-    );
-    println!("corrupt blob frames skipped: {}", corrupt.len());
-    println!("bytes written: {written}");
-    if let Some(error) = stopped {
-        let warning = format!(
-            "WARNING: the scan of {} stopped early ({error}); everything after that byte is \
-             NOT represented in {}",
-            source.display(),
-            into.display()
-        );
-        println!("{warning}");
-        eprintln!("{warning}");
-    }
-    minus_side.close()
+    let minus_bytes = minus_side.len;
+    minus_side.close()?;
+    Ok(Difference {
+        source: source.to_path_buf(),
+        minus: minus.to_path_buf(),
+        into: into.to_path_buf(),
+        source_prefix,
+        frames,
+        source_bytes: bytes.len(),
+        minus_bytes,
+        counts,
+        opaque_kept,
+        corrupt: corrupt.len(),
+        written,
+        stopped,
+    })
 }
 
-fn check(source: &Path, minus: &Path, diff: &Path, allow_corrupt: bool) -> Result<()> {
+impl Difference {
+    pub(super) fn print(&self) {
+        println!(
+            "subtract {} minus {} -> {}",
+            self.source.display(),
+            self.minus.display(),
+            self.into.display()
+        );
+        println!(
+            "scope: {} frames of {}'s {}, against {}'s {} bytes \
+             (blob presence hash-verified there; records by identity, see --help)",
+            self.frames,
+            self.source.display(),
+            extent(self.source_bytes, self.source_prefix),
+            self.minus.display(),
+            self.minus_bytes,
+        );
+        row(
+            "kind",
+            ["read", "kept", "in MINUS", "repeated"].map(String::from),
+        );
+        for (kind, count) in &self.counts {
+            row(
+                kind,
+                [count.read, count.kept, count.present, count.repeated].map(|n| n.to_string()),
+            );
+        }
+        println!(
+            "opaque/unknown frames kept: {} ({} bytes)",
+            self.opaque_kept.0, self.opaque_kept.1
+        );
+        println!("corrupt blob frames skipped: {}", self.corrupt);
+        println!("bytes written: {}", self.written);
+        if let Some(error) = &self.stopped {
+            let warning = format!(
+                "WARNING: the scan of {} stopped early ({error}); everything after that byte is \
+                 NOT represented in {}",
+                self.source.display(),
+                self.into.display()
+            );
+            println!("{warning}");
+            eprintln!("{warning}");
+        }
+    }
+}
+
+fn check(
+    source: &Path,
+    minus: &Path,
+    diff: &Path,
+    allow_corrupt: bool,
+    source_prefix: Option<u64>,
+) -> Result<()> {
     require_distinct(&[source, minus, diff])?;
     let minus_side = Side::open(minus)?;
     let diff_side = match Side::open(diff) {
@@ -548,14 +659,25 @@ fn check(source: &Path, minus: &Path, diff: &Path, allow_corrupt: bool) -> Resul
             return Err(error);
         }
     };
-    let result = check_against(source, &minus_side, &diff_side, allow_corrupt);
+    let result = check_against(
+        source,
+        source_prefix,
+        &minus_side,
+        &diff_side,
+        allow_corrupt,
+    );
     let closed = minus_side.close().and(diff_side.close());
     result.and(closed)
 }
 
-fn check_against(source: &Path, minus: &Side, diff: &Side, allow_corrupt: bool) -> Result<()> {
-    let mut scan =
-        PileRecords::open(source).map_err(|error| super::pile_read_error(source, error))?;
+fn check_against(
+    source: &Path,
+    source_prefix: Option<u64>,
+    minus: &Side,
+    diff: &Side,
+    allow_corrupt: bool,
+) -> Result<()> {
+    let mut scan = open_source(source, source_prefix)?;
     let bytes = scan.bytes().clone();
     let mut counts: BTreeMap<&'static str, CheckCounts> = BTreeMap::new();
     let mut missing = 0u64;
@@ -644,9 +766,9 @@ fn check_against(source: &Path, minus: &Side, diff: &Side, allow_corrupt: bool) 
         diff.path.display()
     );
     println!(
-        "scope: {frames} frames of {}'s {} observed bytes; {} observed as {} bytes, {} as {} bytes",
+        "scope: {frames} frames of {}'s {}; {} observed as {} bytes, {} as {} bytes",
         source.display(),
-        bytes.len(),
+        extent(bytes.len(), source_prefix),
         minus.path.display(),
         minus.len,
         diff.path.display(),
