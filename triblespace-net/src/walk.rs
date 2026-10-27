@@ -260,8 +260,10 @@ impl Walks {
     }
 
     /// Start an exchange of C's `kind` tree with `peer`, against what they
-    /// agreed on: none when C is not selected and active here, or this side neither
-    /// sends C to the peer nor receives C from it. [`Walks::ended`] ends it.
+    /// agreed on: none when C is not selected and active here, this side neither
+    /// sends C to the peer nor receives C from it, or `kind` is
+    /// [`WalkKind::References`] and C's held set is unknown here (an incoming
+    /// exchange is refused alike). [`Walks::ended`] ends it.
     pub(crate) fn start(
         &self,
         peer: PeerId,
@@ -292,7 +294,7 @@ impl Walks {
             return Some(exchange.peered(peered));
         }
         self.selected.get(&collection.raw)?;
-        let pinned = self.local(collection)?;
+        let pinned = self.exchangeable(collection, kind)?;
         let sends = self.sends(peer, &pinned);
         let receives = self.receives(peer, &pinned);
         if !sends && !receives {
@@ -351,7 +353,7 @@ impl Walks {
             return Some(exchange.peered(peered));
         }
         self.selected.get(&collection.raw)?;
-        let pinned = self.local(collection)?;
+        let pinned = self.exchangeable(collection, kind)?;
         let sends = self.sends(peer, &pinned);
         let receives = self.receives(peer, &pinned);
         if !sends && !receives {
@@ -508,6 +510,20 @@ impl Walks {
 
     fn local(&self, collection: CollectionHandle) -> Option<Arc<CollectionSnapshot>> {
         self.snapshot.as_ref()?.collection(collection)
+    }
+
+    /// C's serving snapshot, if its `kind` tree can be exchanged: a
+    /// references tree only once the store published C's held set. Until
+    /// then the set is unknown, and this side neither opens nor joins an
+    /// exchange of it, so neither side computes a difference against an
+    /// emptiness that only means "not counted yet".
+    fn exchangeable(
+        &self,
+        collection: CollectionHandle,
+        kind: WalkKind,
+    ) -> Option<Arc<CollectionSnapshot>> {
+        self.local(collection)
+            .filter(|pinned| kind != WalkKind::References || pinned.held_known())
     }
 
     /// R's grants from the latest grant index, empty when R has no entry
@@ -1628,7 +1644,12 @@ async fn drive<T: Transport, S: Service>(
             frame = next_frame(&mut framed, deadline), if exchange.want_read() => match frame {
                 Some(Ok(frame)) => {
                     heard_at = tokio::time::Instant::now();
-                    exchange.on_frame(frame, driver.snapshots.borrow().clone())
+                    // Clone out and let the watch guard drop before the
+                    // frame is handled: held across a long on_frame, it made
+                    // the next publish wait, and every reader queued behind
+                    // that writer blocked its worker thread.
+                    let snapshot = driver.snapshots.borrow().clone();
+                    exchange.on_frame(frame, snapshot)
                 }
                 Some(Err(code)) => {
                     duplicate = code == Some(RESET_WALK_DUPLICATE);
@@ -2245,6 +2266,41 @@ pub(crate) mod tests {
         });
         assert!(node.walks.sends(peer, &pinned));
         assert!(!node.walks.receives(peer, &pinned));
+    }
+
+    /// A held set the store has not published is unknown, not empty: this
+    /// side neither opens nor joins an exchange of C's references tree until
+    /// it is published, in either algorithm. The records trees are not held
+    /// sets and exchange as before.
+    #[test]
+    fn an_unpublished_held_set_is_never_exchanged() {
+        use crate::walk_stream::Algorithm;
+        use triblespace_core::collection::HeldStore;
+        let mut node = Node::new(111);
+        let collection = node.hold("held set unknown", open());
+        node.commit(collection, 1);
+        node.observe();
+        let peer = Node::new(112).id();
+        assert!(!node.pinned(collection).held_known());
+        let refused = |node: &Node, kind| {
+            node.walks.start(peer, collection, kind).is_none()
+                && [Algorithm::Prefix, Algorithm::CachedRiblt]
+                    .into_iter()
+                    .all(|algorithm| {
+                        node.walks
+                            .start_incoming(peer, collection, kind, algorithm, None)
+                            .is_none()
+                    })
+        };
+        assert!(refused(&node, WalkKind::References));
+        for kind in [WalkKind::Commit, WalkKind::Derive] {
+            assert!(!refused(&node, kind), "{kind:?} is no held set");
+        }
+
+        node.store.track_held([collection]);
+        node.observe();
+        assert!(node.pinned(collection).held_known());
+        assert!(!refused(&node, WalkKind::References));
     }
 
     #[test]

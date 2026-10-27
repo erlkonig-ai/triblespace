@@ -4,7 +4,7 @@ use super::tests::walking::{Node, open};
 use super::*;
 use crate::exchange::Failure;
 use crate::walk_stream::Algorithm;
-use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy};
+use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, HeldStore};
 
 #[test]
 fn default_two_way_walks_use_cached_riblt_and_explicit_prefix_still_works() {
@@ -12,6 +12,8 @@ fn default_two_way_walks_use_cached_riblt_and_explicit_prefix_still_works() {
     let peer = Node::new(182);
     let collection = local.hold("default two-way selection", open());
     local.commit(collection, 7);
+    // A references tree is exchanged only once its held set is published.
+    local.store.track_held([collection]);
     local.observe();
     let mut walks = Walks::new(local.health.clone());
     walks.observe(local.snapshot());
@@ -90,6 +92,7 @@ fn default_one_way_walks_use_prefix_without_disclosing_receive_only_holdings() {
         };
         let collection = local.hold("default one-way selection", policy);
         let private_key = local.commit(collection, 9).fingerprint().raw();
+        local.store.track_held([collection]);
         local.observe();
         let mut walks = Walks::new(local.health.clone());
         walks.observe(local.snapshot());

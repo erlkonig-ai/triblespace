@@ -47,7 +47,7 @@ use crate::repo::{
 };
 
 use super::coverage::{Coverage, CoverageIndex, StoreWriters};
-use super::held::{HeldBlobs, HeldIndex, HeldRead, HeldSource, HeldStore, HeldView};
+use super::held::{HeldBlobs, HeldIndex, HeldRead, HeldSource, HeldStore, HeldView, HeldWork};
 use super::{
     CollectionHandle, CollectionRead, CollectionRecord,
     CollectionRecordSelector, CollectionStore, CoverageRead,
@@ -250,9 +250,9 @@ where
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
         let now = self.inner.snapshot()?;
         let memo = self.carry_forward(&now);
-        // The publication barrier: the closures of what arrived since the
-        // last snapshot are computed against this one before it is handed
-        // out. Nothing is tracked, nothing is paid.
+        // The publication barrier: for every built collection, the closures
+        // of what arrived since the last snapshot are computed against this
+        // one before it is handed out. Nothing is tracked, nothing is paid.
         let held = self.held.observe(&now);
         self.last = Some((now.clone(), std::sync::Arc::clone(&memo)));
         Ok(CoveredSnapshot {
@@ -263,13 +263,21 @@ where
     }
 }
 
-impl<S: SnapshotSource> HeldStore for Covered<S> {
+impl<S> HeldStore for Covered<S>
+where
+    S: SnapshotSource,
+    S::Snapshot: HeldSource + Send + 'static,
+{
     fn track_held(&mut self, collections: impl IntoIterator<Item = CollectionHandle>) {
         self.held.track(collections);
     }
 
     fn note_held(&mut self, collection: CollectionHandle, handle: Inline<Handle<UnknownBlob>>) {
         self.held.note(collection, handle.raw);
+    }
+
+    fn drive_held(&mut self) -> Option<HeldWork> {
+        self.held.drive().then(|| self.held.work())
     }
 }
 
