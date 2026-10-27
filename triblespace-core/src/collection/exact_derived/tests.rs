@@ -5149,6 +5149,140 @@ mod lattice_v2 {
         assert!(missing(&mut store).is_empty());
     }
 
+    /// Review question, 2026-09-29: from a store that cannot fetch, a blob
+    /// an own foundation's mapping needs and does not find holds back that
+    /// foundation alone. Another foundation whose leaf's output is not here
+    /// still waits for it, and nothing is derived when it arrives.
+    #[test]
+    fn a_store_that_cannot_fetch_holds_back_only_the_foundation_a_missing_dependency_blocks() {
+        reset_mapping_calls();
+        let (mut store, root, first, _) = collections();
+        let needing = own_commit(&mut store, root, 41, 0);
+        let needed = archive(77, 77);
+        FIRST_MAP_NEEDS.with_borrow_mut(|needs| needs.insert(needing, data(&needed)));
+        let leafed = payload(41, 1);
+        own_commit(&mut store, root, 41, 1);
+        let (record, image) = leaf_of(first, 42, &leafed, 7);
+        store.insert(record).unwrap();
+
+        let result = block_on(store.maintain(first, &key(41)));
+        assert!(
+            matches!(
+                &result,
+                Err(CollectionRealizationError::Unmappable { blocked })
+                    if blocked.iter().map(|(member, _)| *member).collect::<Vec<_>>()
+                        == vec![needing]
+            ),
+            "{:?}",
+            result.err()
+        );
+        assert!(
+            !FIRST_MAP_LOG.with_borrow(|log| log.contains(&data(&leafed))),
+            "the leafed foundation waits for its output"
+        );
+        assert!(leaves_by(&mut store, first, 41).is_empty());
+
+        // Both arrive: the needing foundation maps, the leaf counts.
+        store.put::<SimpleArchive, _>(needed).unwrap();
+        store.put::<FirstEncoding, _>(image).unwrap();
+        drop(block_on(store.maintain(first, &key(41))).unwrap());
+        assert!(!FIRST_MAP_LOG.with_borrow(|log| log.contains(&data(&leafed))));
+        assert_eq!(
+            leaves_by(&mut store, first, 41)
+                .iter()
+                .map(|leaf| leaf.input())
+                .collect::<Vec<_>>(),
+            vec![SourceLocator::of(needing.raw)]
+        );
+    }
+
+    /// The same, when the blob the mapping needs is also the output another
+    /// foundation's leaf names. A store that cannot fetch says only that the
+    /// blob is not here ([`AsyncBlobStoreAcquire::acquires_remotely`]), in
+    /// either role: no holder was asked, so the leaf still counts and its
+    /// foundation waits, as it does when the blob is only a leaf's output.
+    #[test]
+    fn a_needed_blob_a_store_cannot_fetch_is_no_unavailable_leaf_output() {
+        reset_mapping_calls();
+        let (mut store, root, first, _) = collections();
+        // Another owner's foundation, here, whose admitted leaf names the
+        // blob as its output.
+        let leafed = payload(42, 1);
+        own_commit(&mut store, root, 42, 1);
+        let (record, shared) = leaf_of(first, 42, &leafed, 7);
+        store.insert(record).unwrap();
+        // An own foundation, here, that maps only once that blob is here.
+        let needing = own_commit(&mut store, root, 41, 0);
+        FIRST_MAP_NEEDS.with_borrow_mut(|needs| needs.insert(needing, data(&shared)));
+
+        let result = block_on(store.maintain(first, &key(41)));
+        assert!(
+            matches!(
+                &result,
+                Err(CollectionRealizationError::Unmappable { blocked })
+                    if blocked.iter().map(|(member, _)| *member).collect::<Vec<_>>()
+                        == vec![needing]
+            ),
+            "{:?}",
+            result.err()
+        );
+        assert!(
+            !FIRST_MAP_LOG.with_borrow(|log| log.contains(&data(&leafed))),
+            "a local miss is no reason to derive again"
+        );
+        assert!(leaves_by(&mut store, first, 41).is_empty());
+
+        // The blob arrives: the own foundation maps, and the other's leaf
+        // counts.
+        store.put::<FirstEncoding, _>(shared).unwrap();
+        drop(block_on(store.maintain(first, &key(41))).unwrap());
+        assert!(!FIRST_MAP_LOG.with_borrow(|log| log.contains(&data(&leafed))));
+        assert_eq!(
+            leaves_by(&mut store, first, 41)
+                .iter()
+                .map(|leaf| leaf.input())
+                .collect::<Vec<_>>(),
+            vec![SourceLocator::of(needing.raw)]
+        );
+    }
+
+    /// The control: through a store that asks other holders, a needed blob
+    /// no holder hands over is an answer about elsewhere, in either role.
+    /// The leaf naming it does not count, and its foundation is mapped
+    /// again.
+    #[test]
+    fn a_needed_blob_no_holder_hands_over_is_an_unavailable_leaf_output() {
+        reset_mapping_calls();
+        let (mut inner, root, first, _) = collections();
+        let leafed = payload(42, 1);
+        own_commit(&mut inner, root, 42, 1);
+        let (record, shared) = leaf_of(first, 42, &leafed, 7);
+        inner.insert(record).unwrap();
+        let needing = own_commit(&mut inner, root, 41, 0);
+        FIRST_MAP_NEEDS.with_borrow_mut(|needs| needs.insert(needing, data(&shared)));
+        let mut store = GuardStore::new(inner);
+
+        let result = block_on(store.maintain(first, &key(41)));
+        assert!(
+            matches!(
+                &result,
+                Err(CollectionRealizationError::Unmappable { blocked })
+                    if blocked.iter().map(|(member, _)| *member).collect::<Vec<_>>()
+                        == vec![needing]
+            ),
+            "{:?}",
+            result.err()
+        );
+        assert_eq!(store.acquired, vec![data(&shared)], "asked for once");
+        assert_eq!(
+            leaves_by(&mut store.inner, first, 41)
+                .iter()
+                .map(|leaf| leaf.input())
+                .collect::<Vec<_>>(),
+            vec![SourceLocator::of(data(&leafed).raw)]
+        );
+    }
+
     /// Review finding, 2026-09-28 (test gap): another owner's foundation
     /// whose payload is not here costs nothing, not even a fetch of an output
     /// its leaf names.
