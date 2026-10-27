@@ -84,6 +84,10 @@ use prefix_offer::Offers;
 #[path = "prefix_offer_tests.rs"]
 mod prefix_offer_tests;
 
+#[cfg(test)]
+#[path = "riblt_completion_tests.rs"]
+mod riblt_completion_tests;
+
 /// Missing leaves awaiting a value beyond which the exchange fails.
 pub(crate) const FLOOD_WANTED: usize = 32 * 1024;
 /// Grow-on-demand frontier and delta-proof budget, independent of value waits.
@@ -149,15 +153,28 @@ impl Tree {
             Self::Derive(patch) => crate::riblt_proof::union_summary(patch, keys),
             Self::References(patch) => crate::riblt_proof::union_summary(patch, keys),
             Self::Authorization(collection, patch) => {
-                let mut absolute = PATCH::<64, IdentitySchema, (), Blake3Merkle>::new();
-                for key in keys.iter() {
-                    let mut full = [0; 64];
-                    full[..32].copy_from_slice(&collection.raw);
-                    full[32..].copy_from_slice(key);
-                    absolute.insert(&Entry::new(&full));
-                }
+                let absolute = PATCH::<64, IdentitySchema, (), Blake3Merkle>::from_keys(
+                    keys.iter().map(|key| absolute_key(collection, *key)),
+                );
                 crate::riblt_proof::union_summary(patch, &absolute)
             }
+        }
+    }
+
+    /// This tree without `keys`, by one structural difference: each touched
+    /// branch is rebuilt and summarized once, not once per removed key.
+    pub(crate) fn without_keys(&self, keys: impl IntoIterator<Item = [u8; KEY_BYTES]>) -> Self {
+        let relative = |keys| PATCH::<KEY_BYTES, IdentitySchema, (), Blake3Merkle>::from_keys(keys);
+        match self {
+            Self::Commit(patch) => Self::Commit(patch.difference_keys(&relative(keys))),
+            Self::Derive(patch) => Self::Derive(patch.difference_keys(&relative(keys))),
+            Self::Authorization(collection, patch) => {
+                let absolute = PATCH::<64, IdentitySchema, (), Blake3Merkle>::from_keys(
+                    keys.into_iter().map(|key| absolute_key(collection, key)),
+                );
+                Self::Authorization(*collection, patch.difference_keys(&absolute))
+            }
+            Self::References(patch) => Self::References(patch.difference(&relative(keys))),
         }
     }
 
@@ -276,33 +293,10 @@ impl Tree {
                 patch.insert(&Entry::with_value(&key, record));
             }
             (Self::Authorization(collection, patch), Value::Proof(proof)) => {
-                let mut absolute = [0; 64];
-                absolute[..KEY_BYTES].copy_from_slice(&collection.raw);
-                absolute[KEY_BYTES..].copy_from_slice(&key);
-                patch.insert(&Entry::with_value(&absolute, proof));
+                patch.insert(&Entry::with_value(&absolute_key(collection, key), proof));
             }
             (Self::References(patch), Value::Handle) => patch.insert(&Entry::new(&key)),
             _ => unreachable!("a value of another kind"),
-        }
-    }
-
-    fn remove(&mut self, key: [u8; KEY_BYTES]) {
-        match self {
-            Self::Commit(patch) => {
-                patch.remove(&key);
-            }
-            Self::Derive(patch) => {
-                patch.remove(&key);
-            }
-            Self::Authorization(collection, patch) => {
-                let mut absolute = [0; 64];
-                absolute[..32].copy_from_slice(&collection.raw);
-                absolute[32..].copy_from_slice(&key);
-                patch.remove(&absolute);
-            }
-            Self::References(patch) => {
-                patch.remove(&key);
-            }
         }
     }
 
@@ -346,6 +340,66 @@ impl Tree {
             }
             _ => unreachable!("one agreement contains one kind"),
         }
+    }
+}
+
+/// A grant's key in its collection-scoped authorization tree.
+fn absolute_key(collection: &CollectionHandle, key: [u8; KEY_BYTES]) -> [u8; 64] {
+    let mut absolute = [0; 64];
+    absolute[..KEY_BYTES].copy_from_slice(&collection.raw);
+    absolute[KEY_BYTES..].copy_from_slice(&key);
+    absolute
+}
+
+/// Sort `keys` and report whether each occurs once.
+fn distinct(keys: &mut [[u8; KEY_BYTES]]) -> bool {
+    keys.sort_unstable();
+    keys.windows(2).all(|pair| pair[0] != pair[1])
+}
+
+/// Cached decode completion. Every recovered local key must be in the
+/// advertised source and every remote key outside it, each exactly once.
+/// Returns the native summary of `delta \ local ∪ remote`, which must be the
+/// peer's ROOT: one structural difference and one sparse union summary, so the
+/// cost follows the touched structure, not keys × path × branch rehash.
+fn decoded_summary(
+    delta: &Tree,
+    local: impl IntoIterator<Item = [u8; KEY_BYTES]>,
+    remote: impl IntoIterator<Item = [u8; KEY_BYTES]>,
+) -> Result<PatchSummary, Failure> {
+    let mut removed = Vec::new();
+    for key in local {
+        if delta.at(&key).is_none() {
+            return Err(Failure::BadNode);
+        }
+        removed.push(key);
+    }
+    let mut additions = Vec::new();
+    for key in remote {
+        if delta.at(&key).is_some() {
+            return Err(Failure::BadNode);
+        }
+        additions.push(key);
+    }
+    if !distinct(&mut removed) || !distinct(&mut additions) {
+        return Err(Failure::BadNode);
+    }
+    let additions = PATCH::<KEY_BYTES, IdentitySchema, (), Blake3Merkle>::from_keys(additions);
+    Ok(delta.without_keys(removed).summary_with_keys(&additions))
+}
+
+/// Drop newly recovered local-only keys from the peer membership proof in one
+/// structural difference. A key outside `delta` fails the exchange; the keys
+/// recovered before it are still dropped.
+fn drop_local(peer: &mut Tree, delta: &Tree, local: &[[u8; KEY_BYTES]]) -> Result<(), Failure> {
+    let bad = local.iter().position(|key| delta.at(key).is_none());
+    let held = &local[..bad.unwrap_or(local.len())];
+    if !held.is_empty() {
+        *peer = peer.without_keys(held.iter().copied());
+    }
+    match bad {
+        Some(_) => Err(Failure::BadNode),
+        None => Ok(()),
     }
 }
 
@@ -938,11 +992,8 @@ impl Exchange {
     pub(crate) fn end(self) -> Ended {
         let confirmed = self.outcome == Some(Outcome::Confirmed);
         let next = confirmed.then(|| {
-            let mut union = self.union_tree();
-            for key in self.excluded.iter() {
-                union.remove(*key);
-            }
-            union
+            self.union_tree()
+                .without_keys(self.excluded.iter().copied())
         });
         let peer_root = self.peer_root.map(|_| {
             let mut peer = self
@@ -1054,36 +1105,17 @@ impl Exchange {
                     r.decoder.finish();
                 }
                 if r.decoded_at.is_some() {
-                    let mut retained = self.delta.clone();
-                    let mut removed = PATCH::<32, IdentitySchema>::new();
-                    for item in r.decoder.local().iter() {
-                        let key = item.symbol.0;
-                        if self.delta.at(&key).is_none() || removed.get(&key).is_some() {
-                            return Err(Failure::BadNode);
-                        }
-                        removed.insert(&Entry::new(&key));
-                        retained.remove(key);
-                    }
-                    let mut additions = PATCH::<32, IdentitySchema, (), Blake3Merkle>::new();
-                    for item in r.decoder.remote().iter() {
-                        let key = item.symbol.0;
-                        if self.delta.at(&key).is_some() || additions.get(&key).is_some() {
-                            return Err(Failure::BadNode);
-                        }
-                        additions.insert(&Entry::new(&key));
-                    }
-                    if Some(retained.summary_with_keys(&additions)) != self.peer_root {
+                    let summary = decoded_summary(
+                        &self.delta,
+                        r.decoder.local().iter().map(|item| item.symbol.0),
+                        r.decoder.remote().iter().map(|item| item.symbol.0),
+                    )?;
+                    if Some(summary) != self.peer_root {
                         return Err(Failure::CountMismatch);
                     }
                     r.proven = true;
                 }
-                for key in local {
-                    if self.delta.at(&key).is_none() {
-                        return Err(Failure::BadNode);
-                    }
-                    self.peer.remove(key);
-                }
-                Ok(())
+                drop_local(&mut self.peer, &self.delta, &local)
             }
             Frame::Subtree {
                 prefix,
