@@ -110,15 +110,19 @@ pub(super) async fn drive<T: Transport, S: Service>(
                     }
                 },
             frame = next(&mut framed, deadline), if !peer_fin && exchange.want_read() => match frame {
-                Some(Ok(Some(frame))) => {
+                Err(_) => {
+                    stopped = Some(("no frame within the walk deadline", None));
+                    break 'drive true;
+                }
+                Ok(Some(Ok(Some(frame)))) => {
                     heard_at = tokio::time::Instant::now();
                     exchange.on_frame(frame, driver.snapshots.borrow().clone())
                 }
-                Some(Ok(None)) => {
+                Ok(Some(Ok(None))) => {
                     peer_fin = true;
                     exchange.on_fin()
                 }
-                Some(Err(code)) => {
+                Ok(Some(Err(code))) => {
                     duplicate = code == Some(RESET_WALK_DUPLICATE);
                     stopped = Some(match code {
                         Some(_) => ("peer reset the stream", code),
@@ -126,7 +130,7 @@ pub(super) async fn drive<T: Transport, S: Service>(
                     });
                     break 'drive true;
                 }
-                None => {
+                Ok(None) => {
                     stopped = Some(("reader ended", None));
                     break 'drive true;
                 }
@@ -219,14 +223,15 @@ pub(super) async fn drive<T: Transport, S: Service>(
 
 type Incoming = Result<Option<Frame>, Option<u32>>;
 
+/// `Err` when the deadline passes first: the peer went quiet while the walk
+/// awaited it, which is not the same fact as the stream failing.
 async fn next(
     frames: &mut mpsc::Receiver<Incoming>,
     deadline: Option<tokio::time::Instant>,
-) -> Option<Incoming> {
+) -> Result<Option<Incoming>, tokio::time::error::Elapsed> {
     match deadline {
-        Some(deadline) => tokio::time::timeout_at(deadline, frames.recv())
-            .await.unwrap_or(Some(Err(None))),
-        None => frames.recv().await,
+        Some(deadline) => tokio::time::timeout_at(deadline, frames.recv()).await,
+        None => Ok(frames.recv().await),
     }
 }
 

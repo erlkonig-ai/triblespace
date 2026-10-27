@@ -54,7 +54,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::time::Instant;
-use tracing::{Instrument as _, debug, debug_span, info_span, warn};
+use tracing::{Instrument as _, debug, debug_span, info, info_span, warn};
 
 use triblespace_core::collection::CollectionHandle;
 
@@ -1328,7 +1328,17 @@ async fn recon<T: Transport, S: Service>(
         Ok(()) => "recon/1 ended",
         Err(FrameError::Violation(broken)) => return violation(&conn, broken),
         Err(FrameError::Transport(error)) => {
-            debug!(%error, "recon/1 stream failed");
+            // At info, with the connection's age and silence: on 2026-10-27
+            // every walk on a connection ended at once under this reason,
+            // and the error saying why was only visible at debug.
+            info!(
+                %error,
+                peer = %hex::encode(&state.peer[..8]),
+                dialled = state.dialled,
+                age = ?state.epoch.elapsed(),
+                silent = ?state.last_frame().elapsed(),
+                "recon/1 stream failed"
+            );
             "recon/1 failed"
         }
         Err(FrameError::Stalled) => "recon/1 got no credit",
