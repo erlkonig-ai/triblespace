@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, DuplexStream, ReadBuf, duplex};
-use triblespace_core::repo::memoryrepo::MemoryRepo;
+use triblespace_core::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
 use triblespace_core::repo::{BlobStorePut, SnapshotSource};
 
 use crate::protocol::{OP_FIND_VALUE, TAG_DHT, recv_find_value_response, send_hash};
@@ -65,7 +65,7 @@ impl RecvStream for Pipe {
 /// accept loop finishes it.
 #[derive(Clone)]
 struct PipeConn {
-    handler: SnapshotHandler,
+    handler: SnapshotHandler<CountedBlobReader<MemoryRepoSnapshot>>,
     requester: VerifyingKey,
 }
 
@@ -100,15 +100,27 @@ impl Conn for PipeConn {
     fn close(&self, _code: u32, _reason: &[u8]) {}
 }
 
-struct CountedBlobReader {
-    inner: Arc<dyn BlobSnapshotReader>,
+/// Counts the exact-GET reads of the store snapshot it wraps.
+#[derive(Clone)]
+struct CountedBlobReader<R> {
+    inner: R,
     reads: Arc<AtomicUsize>,
 }
 
-impl BlobSnapshotReader for CountedBlobReader {
-    fn get_blob(&self, hash: RawHash) -> Option<Bytes> {
+impl<R: BlobStoreGet> BlobStoreGet for CountedBlobReader<R> {
+    type GetError<E: std::error::Error + Send + Sync + 'static> = R::GetError<E>;
+
+    fn get<T, S>(
+        &self,
+        handle: Inline<Handle<S>>,
+    ) -> Result<T, Self::GetError<<T as triblespace_core::blob::TryFromBlob<S>>::Error>>
+    where
+        S: triblespace_core::blob::BlobEncoding + 'static,
+        T: triblespace_core::blob::TryFromBlob<S>,
+        Handle<S>: triblespace_core::inline::InlineEncoding,
+    {
         self.reads.fetch_add(1, Ordering::Relaxed);
-        self.inner.get_blob(hash)
+        self.inner.get(handle)
     }
 }
 
@@ -136,7 +148,8 @@ async fn find_value_answers_routes_and_provider_hints_in_one_reply() {
         .put::<UnknownBlob, _>(Bytes::from_source(b"resident directory blob".to_vec()))
         .unwrap()
         .raw;
-    let mut snapshot = StoreSnapshot::from_store_changes(
+    let blob_reads = Arc::new(AtomicUsize::new(0));
+    let snapshot = StoreSnapshot::from_store_changes(
         store.snapshot().unwrap(),
         &ActiveCollections::new(),
         provider_key.verifying_key(),
@@ -144,10 +157,9 @@ async fn find_value_answers_routes_and_provider_hints_in_one_reply() {
         None,
         StoreChanges::ALL,
     )
-    .unwrap();
-    let blob_reads = Arc::new(AtomicUsize::new(0));
-    snapshot.blobs = Arc::new(CountedBlobReader {
-        inner: snapshot.blobs,
+    .unwrap()
+    .map_blobs(|inner| CountedBlobReader {
+        inner,
         reads: blob_reads.clone(),
     });
     let (_publisher, snapshot) = tokio::sync::watch::channel(Some(snapshot));

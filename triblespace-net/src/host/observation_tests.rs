@@ -333,7 +333,9 @@ fn serving_handoff_keeps_only_the_latest_coherent_observation() {
         )
         .unwrap();
         sender.update_snapshot(serving, &selected);
-        retired.push(Arc::downgrade(&sender.current_snapshot().unwrap().blobs));
+        retired.push(Arc::downgrade(
+            &sender.current_snapshot().unwrap().observation.0,
+        ));
     }
     assert!(retired[0].upgrade().is_none());
     assert!(retired[1].upgrade().is_none());
@@ -452,7 +454,10 @@ async fn landing_publishes_one_observation_that_the_connection_table_serves() {
     let client = net.join(&SigningKey::from_bytes(&[103; 32])).transport;
     let client_id = client.local_id();
     let routes = RoutingTable::new(client_id);
-    let client = ConnectionTable::new(client, SnapshotHandler::for_test(client_id, routes));
+    let client = ConnectionTable::new(
+        client,
+        SnapshotHandler::<MemoryRepoSnapshot>::for_test(client_id, routes),
+    );
     let connection = client.connect(local).await.unwrap();
     let bytes = Bytes::from_source(b"landed by a walk".to_vec());
     let blob = Blob::<UnknownBlob>::new(bytes.clone());
@@ -487,7 +492,7 @@ async fn landing_publishes_one_observation_that_the_connection_table_serves() {
             .get(fixture.pending.fingerprint())
             .is_some()
     );
-    let retired = Arc::downgrade(&before.blobs);
+    let retired = Arc::downgrade(&before.observation.0);
     drop((before, old));
     assert!(
         retired.upgrade().is_none(),
@@ -964,8 +969,14 @@ impl ScopedFixture {
     fn observe(
         &mut self,
         selected: &ActiveCollections,
-        previous: Option<&(CountedSnapshot<PileSnapshot>, StoreSnapshot)>,
-    ) -> (CountedSnapshot<PileSnapshot>, StoreSnapshot) {
+        previous: Option<&(
+            CountedSnapshot<PileSnapshot>,
+            StoreSnapshot<CountedSnapshot<PileSnapshot>>,
+        )>,
+    ) -> (
+        CountedSnapshot<PileSnapshot>,
+        StoreSnapshot<CountedSnapshot<PileSnapshot>>,
+    ) {
         let snapshot = CountedSnapshot {
             inner: self.store.snapshot().unwrap(),
             enumerations: self.enumerations.clone(),

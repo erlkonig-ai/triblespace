@@ -2,10 +2,11 @@
 use super::*;
 use crate::walk::tests::walking::{Node, open};
 use triblespace_core::collection::CollectionStore;
+use triblespace_core::repo::memoryrepo::MemoryRepoSnapshot;
 
 struct Side {
     node: Node,
-    exchange: Exchange,
+    exchange: Exchange<MemoryRepoSnapshot>,
     replies: VecDeque<Frame>,
     sent: Vec<Frame>,
     held: Vec<Vec<NetEvent>>,

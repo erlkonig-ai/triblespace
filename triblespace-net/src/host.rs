@@ -157,7 +157,8 @@ where
     }
 }
 
-/// A clone of one resident snapshot behind the host's existing erased reader.
+/// A clone of one resident snapshot, erased so the collection overlays that
+/// read capability definitions through it name no store type.
 /// Point reads never fetch, record demand, or copy a catalogue of its blobs.
 #[derive(Clone)]
 pub(crate) struct ResidentBlobReader(Arc<dyn BlobSnapshotReader>);
@@ -306,15 +307,21 @@ type CollectionSnapshotIndex = PATCH<32, IdentitySchema, Arc<CollectionObservati
 /// Each value pins record, native authorization-evidence, and positive resident
 /// blob PATCHes. There is no global team or plaintext payload inventory.
 ///
+/// `R` is the store snapshot the observation was built from and that exact
+/// GET reads through. Its type says what backs the observation and so how a
+/// read behaves: an in-memory repository, a pile, and an object store answer
+/// the same read differently.
+///
 /// Shared by value: every field is a PATCH, a copy-on-write snapshot, or
 /// `Copy`, so a clone is O(1) and shares no mutable state. Watch channels
 /// carry it and their readers clone it out of the borrow guard, so never add
 /// a field that is expensive to clone.
 #[derive(Clone)]
-pub(crate) struct StoreSnapshot {
+pub(crate) struct StoreSnapshot<R> {
     collections: CollectionSnapshotIndex,
     local: VerifyingKey,
-    blobs: Arc<dyn BlobSnapshotReader>,
+    /// The store snapshot itself, a copy-on-write observation.
+    blobs: R,
     bearer_locators: BearerLocatorIndex,
     /// This pile's configuration collection, where its sync selection lives.
     config: TribleSet,
@@ -324,10 +331,14 @@ pub(crate) struct StoreSnapshot {
     /// Every grant this host holds, over any resource, with each resource's
     /// participants: the one AUTH index (see [`GrantIndex`]).
     grants: GrantIndex,
+    /// This observation's identity in tests: the erased reader its
+    /// collection overlays share, created once per construction.
+    #[cfg(test)]
+    observation: ResidentBlobReader,
 }
 
-impl StoreSnapshot {
-    pub(crate) fn from_store_changes<R>(
+impl<R> StoreSnapshot<R> {
+    pub(crate) fn from_store_changes(
         snapshot: R,
         active: &ActiveCollections,
         local: VerifyingKey,
@@ -483,11 +494,13 @@ impl StoreSnapshot {
         Ok(Self {
             collections,
             local,
-            blobs: reader.0,
+            blobs: snapshot,
             bearer_locators,
             config,
             full: ActiveCollections::new(),
             grants,
+            #[cfg(test)]
+            observation: reader,
         })
     }
 
@@ -542,10 +555,6 @@ impl StoreSnapshot {
             .filter_map(move |key| self.collections.get(key)?.value.clone())
     }
 
-    pub(crate) fn get_blob(&self, hash: &RawHash) -> Option<Bytes> {
-        self.blobs.get_blob(*hash)
-    }
-
     fn bearer_handle(&self, locator: RawHash) -> Option<RawHash> {
         self.bearer_locators.get(&locator).copied()
     }
@@ -558,11 +567,35 @@ impl StoreSnapshot {
     /// construction erases its own blob reader.
     #[cfg(test)]
     pub(crate) fn same_observation(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.blobs, &other.blobs)
+        Arc::ptr_eq(&self.observation.0, &other.observation.0)
+    }
+
+    /// This observation over a different reader of the same store, such as
+    /// one that counts reads. The collection overlays keep their own.
+    #[cfg(test)]
+    pub(crate) fn map_blobs<B>(self, map: impl FnOnce(R) -> B) -> StoreSnapshot<B> {
+        StoreSnapshot {
+            collections: self.collections,
+            local: self.local,
+            blobs: map(self.blobs),
+            bearer_locators: self.bearer_locators,
+            config: self.config,
+            full: self.full,
+            grants: self.grants,
+            observation: self.observation,
+        }
     }
 }
 
-type SnapshotSlot = tokio::sync::watch::Receiver<Option<StoreSnapshot>>;
+impl<R: BlobStoreGet> StoreSnapshot<R> {
+    pub(crate) fn get_blob(&self, hash: &RawHash) -> Option<Bytes> {
+        self.blobs
+            .get::<Bytes, UnknownBlob>(Inline::<Handle<UnknownBlob>>::new(*hash))
+            .ok()
+    }
+}
+
+type SnapshotSlot<R> = tokio::sync::watch::Receiver<Option<StoreSnapshot<R>>>;
 
 /// The async capability cloned into lazy readers.
 /// Implementations return Blobs constructed from the received bytes, with the
@@ -578,8 +611,8 @@ pub(crate) trait NetCapability: Send + Sync {
 type RoutingCandidates = Arc<Mutex<RoutingTable>>;
 
 #[derive(Clone)]
-struct ProviderClient<T: Transport> {
-    connections: ConnectionTable<T, SnapshotHandler>,
+struct ProviderClient<T: Transport, R> {
+    connections: ConnectionTable<T, SnapshotHandler<R>>,
     providers: Arc<Mutex<ProviderDirectory>>,
     candidates: RoutingCandidates,
     my_id: PeerId,
@@ -590,7 +623,10 @@ struct ProviderClient<T: Transport> {
 }
 
 #[cfg(test)]
-impl<T: Transport> ProviderClient<T> {
+impl<T: Transport, R> ProviderClient<T, R>
+where
+    R: BlobStoreGet + Clone + Send + Sync + 'static,
+{
     /// A client whose own connections serve an empty snapshot.
     fn for_test(transport: T, routes: RoutingTable) -> Self {
         let handler = SnapshotHandler::for_test(transport.local_id(), routes);
@@ -605,11 +641,14 @@ impl<T: Transport> ProviderClient<T> {
     }
 }
 
-struct NetCap<T: Transport> {
-    client: ProviderClient<T>,
+struct NetCap<T: Transport, R> {
+    client: ProviderClient<T, R>,
 }
 
-impl<T: Transport> NetCapability for NetCap<T> {
+impl<T: Transport, R> NetCapability for NetCap<T, R>
+where
+    R: BlobStoreGet + Clone + Send + Sync + 'static,
+{
     fn fetch_blob(
         &self,
         hash: RawHash,
@@ -637,9 +676,11 @@ impl<T: Transport> NetCapability for NetCap<T> {
 /// Default end-to-end budget for an interactive exact blob read.
 pub const INTERACTIVE_FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The store side's handle on a host. `R` is the store snapshot type the
+/// serving observations are built from (see [`StoreSnapshot`]).
 #[derive(Clone)]
-pub struct NetSender {
-    snapshot: tokio::sync::watch::Sender<Option<StoreSnapshot>>,
+pub struct NetSender<R> {
+    snapshot: tokio::sync::watch::Sender<Option<StoreSnapshot<R>>>,
     cap: tokio::sync::watch::Receiver<Option<Arc<dyn NetCapability>>>,
     /// Where the store side installs the landing of what walks receive.
     lander: tokio::sync::watch::Sender<Option<Arc<dyn Land>>>,
@@ -647,7 +688,7 @@ pub struct NetSender {
     health: Health,
 }
 
-impl NetSender {
+impl<R> NetSender<R> {
     pub fn id(&self) -> EndpointId {
         self.id
     }
@@ -686,7 +727,10 @@ impl NetSender {
         });
     }
 
-    pub(crate) fn current_snapshot(&self) -> Option<StoreSnapshot> {
+    pub(crate) fn current_snapshot(&self) -> Option<StoreSnapshot<R>>
+    where
+        R: Clone,
+    {
         self.snapshot.borrow().clone()
     }
 
@@ -695,7 +739,10 @@ impl NetSender {
         self.lander.send_replace(Some(lander));
     }
 
-    pub(crate) fn update_snapshot(&self, snapshot: StoreSnapshot, active: &ActiveCollections) {
+    pub(crate) fn update_snapshot(&self, snapshot: StoreSnapshot<R>, active: &ActiveCollections)
+    where
+        R: Clone,
+    {
         self.observe_active_collections(active);
         // Serving and the coordinator observe exactly the same generation.
         // Slow consumers skip obsolete observations, never authenticated data.
@@ -802,16 +849,16 @@ impl NetReceiver {
     }
 }
 
-pub struct HostWiring {
+pub struct HostWiring<R> {
     evt_tx: tokio::sync::mpsc::Sender<NetEventBatch>,
-    snapshot: SnapshotSlot,
+    snapshot: SnapshotSlot<R>,
     cap_tx: tokio::sync::watch::Sender<Option<Arc<dyn NetCapability>>>,
     lander: LandSlot,
     health: Health,
 }
 
 #[cfg(test)]
-impl HostWiring {
+impl<R> HostWiring<R> {
     pub(crate) async fn send_admission(&self, batch: NetEventBatch) {
         self.evt_tx.send(batch).await.unwrap();
     }
@@ -821,7 +868,7 @@ impl HostWiring {
     }
 }
 
-pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
+pub fn wire<R>(id: EndpointId) -> (NetSender<R>, NetReceiver, HostWiring<R>) {
     let (evt_tx, evt_rx) = tokio::sync::mpsc::channel(crate::channel::MAX_ADMISSION_BRIDGE_BATCHES);
     let (snapshot_tx, snapshot) = tokio::sync::watch::channel(None);
     let (cap_tx, cap_rx) = tokio::sync::watch::channel(None);
@@ -846,17 +893,26 @@ pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
     )
 }
 
-pub async fn run_host<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring: HostWiring) {
+pub async fn run_host<T: Transport, R>(
+    harness: Harness<T>,
+    config: PeerConfig,
+    wiring: HostWiring<R>,
+) where
+    R: BlobStoreGet + Clone + Send + Sync + 'static,
+{
     host_loop(harness, config, wiring).await;
 }
 
 /// Start a production host. `daemon_addresses` are the addresses
 /// [`PeerConfig::daemon`] recorded in the pile's configuration.
-pub fn spawn(
+pub fn spawn<R>(
     key: SigningKey,
     config: PeerConfig,
     daemon_addresses: Vec<SocketAddr>,
-) -> anyhow::Result<(NetSender, NetReceiver, HostStarted)> {
+) -> anyhow::Result<(NetSender<R>, NetReceiver, HostStarted)>
+where
+    R: BlobStoreGet + Clone + Send + Sync + 'static,
+{
     let id: EndpointId = iroh_secret(&key).public().into();
     let (sender, receiver, wiring) = wire(id);
     let started = start(key, config, daemon_addresses, wiring)?;
@@ -867,12 +923,15 @@ pub fn spawn(
 ///
 /// Separating this boundary from [`wire`] lets a local store defer the thread,
 /// runtime, endpoint, and discovery services until a live acquisition needs them.
-pub(crate) fn start(
+pub(crate) fn start<R>(
     key: SigningKey,
     config: PeerConfig,
     daemon_addresses: Vec<SocketAddr>,
-    wiring: HostWiring,
-) -> anyhow::Result<HostStarted> {
+    wiring: HostWiring<R>,
+) -> anyhow::Result<HostStarted>
+where
+    R: BlobStoreGet + Clone + Send + Sync + 'static,
+{
     let secret = iroh_secret(&key);
     let (startup_tx, startup_rx) = mpsc::sync_channel(1);
     let (shutdown, mut stopping) = tokio::sync::watch::channel(false);
@@ -1170,7 +1229,13 @@ impl ProviderPublicationBudget {
     }
 }
 
-async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wiring: HostWiring) {
+async fn host_loop<T: Transport, R>(
+    harness: Harness<T>,
+    config: PeerConfig,
+    mut wiring: HostWiring<R>,
+) where
+    R: BlobStoreGet + Clone + Send + Sync + 'static,
+{
     let Harness {
         transport,
         mut incoming,
@@ -1277,7 +1342,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
 
     // Retain the last observation accounted for, not a second catalog.
     // ProviderPublisher separately retains genuinely pending work.
-    let mut processed_snapshot: Option<StoreSnapshot> = None;
+    let mut processed_snapshot: Option<StoreSnapshot<R>> = None;
     let empty_collections = CollectionSnapshotIndex::new();
     let mut descriptor_fetches = DescriptorFetches::default();
     let mut next_warmup = crate::clock::mono_now();
@@ -1501,7 +1566,10 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
 /// provider hints, whose tokens only the requester can check.
 type FoundValue = (Vec<PeerId>, Vec<(PeerId, ProviderToken)>);
 
-impl<T: Transport> ProviderClient<T> {
+impl<T: Transport, R> ProviderClient<T, R>
+where
+    R: BlobStoreGet + Clone + Send + Sync + 'static,
+{
     async fn find_value(&self, peer: PeerId, key: ProviderKey) -> anyhow::Result<FoundValue> {
         let connection = self.connections.connect(peer).await?;
         let response = tokio::time::timeout(OP_DEADLINE, op_find_value(&connection, &key))
@@ -2065,8 +2133,8 @@ fn canonical_provider_subset(
 }
 
 #[derive(Clone)]
-struct SnapshotHandler {
-    snapshot: SnapshotSlot,
+struct SnapshotHandler<R> {
+    snapshot: SnapshotSlot<R>,
     health: Health,
     candidates: RoutingCandidates,
     providers: Arc<Mutex<ProviderDirectory>>,
@@ -2076,7 +2144,7 @@ struct SnapshotHandler {
 }
 
 #[cfg(test)]
-impl SnapshotHandler {
+impl<R> SnapshotHandler<R> {
     /// A handler serving an empty snapshot and an empty directory.
     fn for_test(local_id: PeerId, routes: RoutingTable) -> Self {
         Self {
@@ -2092,17 +2160,20 @@ impl SnapshotHandler {
 
 /// The request streams of every connection, answered from the current
 /// serving snapshot.
-impl Service for SnapshotHandler {
-    async fn serve<W, R>(
+impl<R> Service for SnapshotHandler<R>
+where
+    R: BlobStoreGet + Clone + Send + Sync + 'static,
+{
+    async fn serve<W, V>(
         &self,
         peer: PeerId,
         tag: u8,
         send: &mut W,
-        recv: &mut R,
+        recv: &mut V,
     ) -> anyhow::Result<()>
     where
         W: SendStream,
-        R: RecvStream,
+        V: RecvStream,
     {
         let peer = VerifyingKey::from_bytes(&peer)
             .map_err(|error| anyhow::anyhow!("invalid transport peer key: {error}"))?;
@@ -2160,17 +2231,17 @@ impl Service for SnapshotHandler {
     }
 }
 
-impl SnapshotHandler {
+impl<R> SnapshotHandler<R> {
     /// Serve one `dht/1` operation.
-    async fn serve_dht<W, R>(
+    async fn serve_dht<W, V>(
         &self,
         peer: VerifyingKey,
         send: &mut W,
-        recv: &mut R,
+        recv: &mut V,
     ) -> anyhow::Result<()>
     where
         W: SendStream,
-        R: RecvStream,
+        V: RecvStream,
     {
         let op = recv_u8(recv).await?;
         tracing::trace!(target: "triblespace_net::handoff", op = op_name(op), "host received DHT operation");
@@ -2686,6 +2757,7 @@ mod tests {
         use crate::transport::Conn;
         use crate::transport::sim::{SimConfig, SimNet};
         use tokio::io::AsyncReadExt as _;
+        use triblespace_core::repo::memoryrepo::MemoryRepoSnapshot;
         // Its two ordinary receives hold process-wide receive credit that
         // other tests' budget assertions would otherwise observe.
         let _guard = crate::protocol::exact_blob_receive_test_guard();
@@ -2725,7 +2797,7 @@ mod tests {
                 });
             }
         });
-        let client = super::ProviderClient::for_test(
+        let client = super::ProviderClient::<_, MemoryRepoSnapshot>::for_test(
             requester_harness.transport,
             super::RoutingTable::with_candidates(requester, [provider]),
         );

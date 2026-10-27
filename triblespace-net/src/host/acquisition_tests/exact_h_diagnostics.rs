@@ -470,7 +470,7 @@ impl Node {
     fn new(
         net: &SimNet,
         key: &SigningKey,
-        snapshot: Option<StoreSnapshot>,
+        snapshot: Option<StoreSnapshot<ProviderReader>>,
         gate: Option<Arc<Gate>>,
     ) -> Self {
         let peer = key.verifying_key().to_bytes();
@@ -528,7 +528,7 @@ impl Drop for Node {
 
 struct ThreeNodes {
     net: SimNet,
-    client: ProviderClient<TracedTransport>,
+    client: ProviderClient<TracedTransport, MemoryRepoSnapshot>,
     holder: Node,
     other: Node,
     store: MemoryRepo,
@@ -562,7 +562,8 @@ impl ThreeNodes {
         let bytes = Bytes::from_source(vec![0x5a_u8; BODY_BYTES]);
         assert_eq!(bytes.len(), BODY_BYTES);
         let hash = store.put::<UnknownBlob, _>(bytes.clone()).unwrap().raw;
-        let mut snapshot = StoreSnapshot::from_store_changes(
+        let reads = Arc::new(AtomicUsize::new(0));
+        let snapshot = StoreSnapshot::from_store_changes(
             store.snapshot().unwrap(),
             &ActiveCollections::new(),
             holder_key.verifying_key(),
@@ -570,12 +571,8 @@ impl ThreeNodes {
             None,
             StoreChanges::ALL,
         )
-        .unwrap();
-        let reads = Arc::new(AtomicUsize::new(0));
-        snapshot.blobs = Arc::new(CountedBlobReader {
-            inner: snapshot.blobs,
-            reads: reads.clone(),
-        });
+        .unwrap()
+        .map_blobs(|blobs| CountedBlobReader::new(blobs, &reads));
         let holder = Node::new(&net, &holder_key, Some(snapshot), holder_gate);
         let other = Node::new(&net, &other_key, None, other_gate);
         if advertise {

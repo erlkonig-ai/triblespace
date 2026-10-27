@@ -14,6 +14,7 @@ use crate::connection::{
 use crate::protocol::{OP_FIND_VALUE, TAG_DHT, TAG_RECON, op_find_value, send_hash};
 use crate::recon::FRAME_PEER_REQUEST;
 use crate::transport::sim::{SimConfig, SimConn, SimNet, SimTransport};
+use triblespace_core::repo::memoryrepo::MemoryRepoSnapshot;
 
 use super::*;
 
@@ -40,8 +41,8 @@ async fn settle() {
 /// A node whose table dials, accepts and serves an empty snapshot.
 struct Node {
     peer: PeerId,
-    client: ProviderClient<SimTransport>,
-    table: ConnectionTable<SimTransport, SnapshotHandler>,
+    client: ProviderClient<SimTransport, MemoryRepoSnapshot>,
+    table: ConnectionTable<SimTransport, SnapshotHandler<MemoryRepoSnapshot>>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -834,7 +835,7 @@ fn listening(
     key: &SigningKey,
     events: usize,
 ) -> (
-    ConnectionTable<SimTransport, SnapshotHandler>,
+    ConnectionTable<SimTransport, SnapshotHandler<MemoryRepoSnapshot>>,
     tokio::sync::mpsc::Receiver<ReconEvent>,
     tokio::task::JoinHandle<()>,
 ) {

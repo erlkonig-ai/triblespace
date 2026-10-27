@@ -479,7 +479,11 @@ impl Gate {
     /// cheap checks come first, and each kept proof's signatures are
     /// verified once: by admission's predicate where R's descriptor is
     /// resident, on their own where it is not.
-    pub(crate) fn admit(&mut self, snapshot: &StoreSnapshot, proof: CapabilityProof) -> Gated {
+    pub(crate) fn admit<R: BlobStoreGet>(
+        &mut self,
+        snapshot: &StoreSnapshot<R>,
+        proof: CapabilityProof,
+    ) -> Gated {
         if proof.resource().into_bytes() != self.resource.raw {
             return Gated::Skip;
         }
@@ -504,7 +508,10 @@ impl Gate {
     }
 
     /// R's grant policies, once its descriptor is resident.
-    fn policies(&mut self, snapshot: &StoreSnapshot) -> Option<&[AdmissionPolicy]> {
+    fn policies<R: BlobStoreGet>(
+        &mut self,
+        snapshot: &StoreSnapshot<R>,
+    ) -> Option<&[AdmissionPolicy]> {
         if self.policies.is_none() {
             let bytes = snapshot.get_blob(&self.resource.raw)?;
             self.policies = Some(descriptor_policies(bytes, self.resource));
@@ -801,8 +808,8 @@ impl Pending {
 /// Whether a waiting grant over R lands: `None` while R's descriptor is not
 /// resident in `snapshot`, else whether it starts at one of R's roots.
 /// `policies` caches each descriptor's policies for one observation.
-fn settles(
-    snapshot: &StoreSnapshot,
+fn settles<R: BlobStoreGet>(
+    snapshot: &StoreSnapshot<R>,
     policies: &mut HashMap<RawHash, Vec<AdmissionPolicy>>,
     proof: &CapabilityProof,
 ) -> Option<bool> {
@@ -1025,9 +1032,9 @@ impl Listing {
 /// first, and R's name with them once its descriptor is resident; the same
 /// happens for a waiting grant whenever a peer lists its R or a connection
 /// becomes peered for it.
-pub(crate) struct Grants {
+pub(crate) struct Grants<R> {
     local: PeerId,
-    snapshot: Option<StoreSnapshot>,
+    snapshot: Option<StoreSnapshot<R>>,
     /// By connection id.
     listings: HashMap<u64, Listing>,
     /// Grants walks kept whose descriptor is not resident here.
@@ -1039,7 +1046,7 @@ pub(crate) struct Grants {
     changed: bool,
 }
 
-impl Grants {
+impl<R: BlobStoreGet + Clone> Grants<R> {
     pub(crate) fn new(local: PeerId) -> Self {
         Self {
             local,
@@ -1650,7 +1657,7 @@ impl Grants {
     /// descriptor arrived and that start at one of its roots, dropping the
     /// rest of those, fetch what newly waiting stored grants need, and list
     /// changed roots on every connection.
-    pub(crate) fn observe(&mut self, snapshot: StoreSnapshot) -> Effects {
+    pub(crate) fn observe(&mut self, snapshot: StoreSnapshot<R>) -> Effects {
         let mut effects = Effects::default();
         let previous = self.snapshot.replace(snapshot.clone());
         self.changed = true;

@@ -148,13 +148,14 @@ enum HostState {
 }
 
 /// One lazy endpoint shared by the writer and its snapshot blob readers.
-struct SharedHost {
+/// `R` is the store snapshot type its serving observations are built from.
+struct SharedHost<R> {
     state: HostState,
-    sender: NetSender,
+    sender: NetSender<R>,
     started: Option<HostStarted>,
 }
 
-impl SharedHost {
+impl<R> SharedHost<R> {
     fn start(&mut self) -> Result<(), PeerOpenError> {
         match &self.state {
             HostState::Running => return Ok(()),
@@ -209,7 +210,7 @@ impl<S> DerefMut for StoreGuard<'_, S> {
 /// the publication observes the store and publishes.
 struct Serving<S: SnapshotSource> {
     store: Arc<Mutex<Option<S>>>,
-    sender: NetSender,
+    sender: NetSender<S::Snapshot>,
     publication: Mutex<Publication<S::Snapshot>>,
     /// When evidence passed outside walks was last drained, or values a
     /// walk received last landed.
@@ -395,9 +396,9 @@ where
     S::Snapshot: StoreRead + BlobChildren + HeldRead,
 {
     store: Arc<Mutex<Option<S>>>,
-    sender: NetSender,
+    sender: NetSender<S::Snapshot>,
     receiver: NetReceiver,
-    host: Arc<Mutex<SharedHost>>,
+    host: Arc<Mutex<SharedHost<S::Snapshot>>>,
     serving: Arc<Serving<S>>,
     /// Local retry/cursor state; demand and residency are observed in the store.
     reconciler: Reconciler,
@@ -471,13 +472,13 @@ where
 
     /// Attach a store to a caller-owned host, most commonly the deterministic
     /// simulator.
-    pub fn with_wiring(store: S, sender: NetSender, receiver: NetReceiver) -> Self {
+    pub fn with_wiring(store: S, sender: NetSender<S::Snapshot>, receiver: NetReceiver) -> Self {
         Self::assemble(store, sender, receiver, None, HostState::Running)
     }
 
     fn assemble(
         store: S,
-        sender: NetSender,
+        sender: NetSender<S::Snapshot>,
         receiver: NetReceiver,
         started: Option<HostStarted>,
         host: HostState,
@@ -488,7 +489,7 @@ where
 
     fn assemble_shared(
         store: Arc<Mutex<Option<S>>>,
-        sender: NetSender,
+        sender: NetSender<S::Snapshot>,
         receiver: NetReceiver,
         started: Option<HostStarted>,
         host: HostState,

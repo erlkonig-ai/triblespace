@@ -6,6 +6,7 @@ use anybytes::Bytes;
 use std::sync::Mutex;
 use tokio::io::{AsyncReadExt, DuplexStream, ReadHalf, WriteHalf};
 use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy};
+use triblespace_core::repo::memoryrepo::MemoryRepoSnapshot;
 
 use crate::exchange::Failure;
 use crate::riblt_cache::CacheError;
@@ -127,7 +128,7 @@ fn cell(node: &Node, collection: CollectionHandle, index: usize) -> Frame {
     }
 }
 
-fn receiver(node: &Node, collection: CollectionHandle) -> Exchange {
+fn receiver(node: &Node, collection: CollectionHandle) -> Exchange<MemoryRepoSnapshot> {
     Exchange::start_riblt(collection, WalkKind::Commit, node.pinned(collection))
 }
 
@@ -541,7 +542,7 @@ struct Driven {
     acked: mpsc::UnboundedSender<(u64, u64)>,
     landings: mpsc::UnboundedReceiver<(u64, Vec<NetEvent>)>,
     reset: Arc<Mutex<Option<u32>>>,
-    _snapshots: watch::Sender<Option<StoreSnapshot>>,
+    _snapshots: watch::Sender<Option<StoreSnapshot<MemoryRepoSnapshot>>>,
 }
 
 fn driven(local: &Node, peer: &Node, collection: CollectionHandle) -> Driven {

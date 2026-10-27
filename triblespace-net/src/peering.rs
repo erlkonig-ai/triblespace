@@ -51,6 +51,7 @@ use futures::{FutureExt as _, StreamExt as _};
 use rand::seq::SliceRandom as _;
 use triblespace_core::capability::{CapabilityHandle, CapabilityProof, QuorumOutcome};
 use triblespace_core::collection::CollectionHandle;
+use triblespace_core::repo::BlobStoreGet;
 
 use crate::channel::NetEventBatch;
 use crate::clock::Mono;
@@ -166,9 +167,9 @@ struct Mesh {
 }
 
 /// Every collection's peerings on every connection of one node.
-pub(crate) struct Peerings {
+pub(crate) struct Peerings<R> {
     local: PeerId,
-    snapshot: Option<StoreSnapshot>,
+    snapshot: Option<StoreSnapshot<R>>,
     links: HashMap<u64, Link>,
     meshes: HashMap<RawHash, Mesh>,
     changed: bool,
@@ -376,7 +377,7 @@ fn credential_digest(
     *hasher.finalize().as_bytes()
 }
 
-impl Peerings {
+impl<R: BlobStoreGet + Clone> Peerings<R> {
     pub(crate) fn new(local: PeerId) -> Self {
         Self {
             local,
@@ -472,7 +473,7 @@ impl Peerings {
     /// Take a new store observation: end the peerings of collections no
     /// longer selected, revisit admissions whose evidence or selection
     /// changed, and send this side's credentials where they changed.
-    pub(crate) fn observe(&mut self, snapshot: StoreSnapshot) {
+    pub(crate) fn observe(&mut self, snapshot: StoreSnapshot<R>) {
         let previous = self.snapshot.replace(snapshot.clone());
         let local = VerifyingKey::from_bytes(&self.local).ok();
         let collections = self.meshes.keys().copied().collect::<Vec<_>>();
@@ -1281,9 +1282,9 @@ impl Peerings {
 /// for the schedules, and what grant walks report on `walked`, for the grant
 /// exchange, which opens grant walks through `walks` too. Landed grants and
 /// fetched definitions go through `admissions`.
-pub(crate) async fn run<T: Transport, S: Service>(
+pub(crate) async fn run<T: Transport, S: Service, R>(
     connections: ConnectionTable<T, S>,
-    mut snapshots: tokio::sync::watch::Receiver<Option<StoreSnapshot>>,
+    mut snapshots: tokio::sync::watch::Receiver<Option<StoreSnapshot<R>>>,
     mut events: tokio::sync::mpsc::Receiver<ReconEvent>,
     mut find_providers: impl FnMut(CollectionHandle) -> BoxFuture<'static, Vec<PeerId>>,
     walks: WalksHandle,
@@ -1291,7 +1292,9 @@ pub(crate) async fn run<T: Transport, S: Service>(
     mut walked: tokio::sync::mpsc::UnboundedReceiver<crate::grants::GrantEvent>,
     health: Health,
     admissions: tokio::sync::mpsc::Sender<NetEventBatch>,
-) {
+) where
+    R: BlobStoreGet + Clone + Send + Sync + 'static,
+{
     let mut peerings = Peerings::new(connections.transport().local_id());
     let mut grants = Grants::new(connections.transport().local_id());
     let (failed_tx, mut failed) = tokio::sync::mpsc::unbounded_channel();
@@ -1399,7 +1402,7 @@ mod tests {
     use triblespace_core::metadata;
     use triblespace_core::patch::Entry as PatchEntry;
     use triblespace_core::prelude::entity;
-    use triblespace_core::repo::memoryrepo::MemoryRepo;
+    use triblespace_core::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
     use triblespace_core::repo::{
         BlobStorePut, CapabilityProofStore, SnapshotSource, StoreChanges,
     };
@@ -1485,7 +1488,7 @@ mod tests {
             .unwrap();
         }
 
-        fn snapshot(&mut self) -> StoreSnapshot {
+        fn snapshot(&mut self) -> StoreSnapshot<MemoryRepoSnapshot> {
             StoreSnapshot::from_store_changes(
                 self.store.snapshot().unwrap(),
                 &self.active,
@@ -1504,7 +1507,7 @@ mod tests {
     struct Node {
         pile: Pile,
         key: SigningKey,
-        peerings: Peerings,
+        peerings: Peerings<MemoryRepoSnapshot>,
     }
 
     impl Node {
@@ -2391,7 +2394,7 @@ mod tests {
         struct Host {
             pile: Pile,
             table: ConnectionTable<SimTransport, Forward>,
-            snapshots: watch::Sender<Option<StoreSnapshot>>,
+            snapshots: watch::Sender<Option<StoreSnapshot<MemoryRepoSnapshot>>>,
             health: Health,
             tasks: Vec<tokio::task::JoinHandle<()>>,
         }

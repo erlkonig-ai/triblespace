@@ -39,7 +39,7 @@ use crate::protocol::RawHash;
 pub struct PeerSnapshot<S: SnapshotSource> {
     pub(super) frozen: S::Snapshot,
     pub(super) store: Arc<Mutex<Option<S>>>,
-    pub(super) host: Weak<Mutex<SharedHost>>,
+    pub(super) host: Weak<Mutex<SharedHost<S::Snapshot>>>,
 }
 
 impl<S: SnapshotSource> Clone for PeerSnapshot<S> {

@@ -4,14 +4,17 @@
 
 use super::*;
 
-pub(super) async fn drive<T: Transport, S: Service>(
-    driver: &Driver<T, S>,
-    mut exchange: Exchange,
+pub(super) async fn drive<T: Transport, S: Service, R>(
+    driver: &Driver<T, S, R>,
+    mut exchange: Exchange<R>,
     mut send: Box<dyn SendStream>,
     recv: Box<dyn RecvStream>,
     mut acked: mpsc::UnboundedReceiver<(u64, u64)>,
     mut replaced: oneshot::Receiver<()>,
-) -> (Ended, bool) {
+) -> (Ended, bool)
+where
+    R: BlobStoreGet + Clone + Send + Sync + 'static,
+{
     let (frames, mut framed) = mpsc::channel(1);
     let reader = tokio::spawn(read(recv, frames));
     let (outgoing, queued) = mpsc::channel(1);

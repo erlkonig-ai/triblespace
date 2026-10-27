@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use triblespace_core::collection::CollectionRead;
-use triblespace_core::repo::memoryrepo::MemoryRepo;
+use triblespace_core::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
 use triblespace_core::repo::{BlobStorePut, SnapshotSource, WantRead};
 
 use tokio::io::AsyncWriteExt as _;
@@ -23,25 +23,56 @@ use super::*;
 mod exact_h_diagnostics;
 mod request_backpressure;
 
-struct CountedBlobReader {
-    inner: Arc<dyn BlobSnapshotReader>,
+/// Counts the exact-GET reads of the store snapshot it wraps and, once
+/// armed, signals the first read to return.
+#[derive(Clone)]
+struct CountedBlobReader<R> {
+    inner: R,
     reads: Arc<AtomicUsize>,
+    started: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 }
 
-impl BlobSnapshotReader for CountedBlobReader {
-    fn get_blob(&self, hash: RawHash) -> Option<Bytes> {
-        self.reads.fetch_add(1, Ordering::Relaxed);
-        self.inner.get_blob(hash)
+impl<R> CountedBlobReader<R> {
+    fn new(inner: R, reads: &Arc<AtomicUsize>) -> Self {
+        Self {
+            inner,
+            reads: reads.clone(),
+            started: Arc::default(),
+        }
     }
 }
 
+impl<R: BlobStoreGet> BlobStoreGet for CountedBlobReader<R> {
+    type GetError<E: std::error::Error + Send + Sync + 'static> = R::GetError<E>;
+
+    fn get<T, S>(
+        &self,
+        handle: Inline<Handle<S>>,
+    ) -> Result<T, Self::GetError<<T as triblespace_core::blob::TryFromBlob<S>>::Error>>
+    where
+        S: triblespace_core::blob::BlobEncoding + 'static,
+        T: triblespace_core::blob::TryFromBlob<S>,
+        Handle<S>: triblespace_core::inline::InlineEncoding,
+    {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        let read = self.inner.get(handle);
+        if let Some(started) = self.started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        read
+    }
+}
+
+/// What the fixture's provider serves from.
+type ProviderReader = CountedBlobReader<MemoryRepoSnapshot>;
+
 struct Fixture {
     net: SimNet,
-    client: ProviderClient<SimTransport>,
-    sender: NetSender,
+    client: ProviderClient<SimTransport, MemoryRepoSnapshot>,
+    sender: NetSender<MemoryRepoSnapshot>,
     provider: PeerId,
     provider_routes: Arc<Mutex<RoutingTable>>,
-    provider_snapshot: tokio::sync::watch::Sender<Option<StoreSnapshot>>,
+    provider_snapshot: tokio::sync::watch::Sender<Option<StoreSnapshot<ProviderReader>>>,
     provider_directory: Arc<Mutex<ProviderDirectory>>,
     provider_health: Health,
     blob_reads: Arc<AtomicUsize>,
@@ -86,7 +117,8 @@ impl Fixture {
 
         let mut store = MemoryRepo::default();
         let hash = store.put::<UnknownBlob, _>(bytes.clone()).unwrap().raw;
-        let mut snapshot = StoreSnapshot::from_store_changes(
+        let blob_reads = Arc::new(AtomicUsize::new(0));
+        let snapshot = StoreSnapshot::from_store_changes(
             store.snapshot().unwrap(),
             &ActiveCollections::new(),
             provider_key.verifying_key(),
@@ -94,12 +126,8 @@ impl Fixture {
             None,
             StoreChanges::ALL,
         )
-        .unwrap();
-        let blob_reads = Arc::new(AtomicUsize::new(0));
-        snapshot.blobs = Arc::new(CountedBlobReader {
-            inner: snapshot.blobs,
-            reads: blob_reads.clone(),
-        });
+        .unwrap()
+        .map_blobs(|blobs| CountedBlobReader::new(blobs, &blob_reads));
         let mut providers = ProviderDirectory::new(provider);
         if advertise {
             assert!(providers.put(
@@ -168,7 +196,10 @@ struct RecoveryNode {
 }
 
 impl RecoveryNode {
-    fn new(net: &SimNet, key: &SigningKey, snapshot: Option<StoreSnapshot>) -> Self {
+    fn new<R>(net: &SimNet, key: &SigningKey, snapshot: Option<StoreSnapshot<R>>) -> Self
+    where
+        R: BlobStoreGet + Clone + Send + Sync + 'static,
+    {
         let peer = key.verifying_key().to_bytes();
         let mut harness = net.join(key);
         let directory = Arc::new(Mutex::new(ProviderDirectory::new(peer)));
@@ -281,7 +312,7 @@ impl Drop for ScriptedReplica {
     }
 }
 
-impl<T: Transport> ProviderClient<T> {
+impl<T: Transport> ProviderClient<T, MemoryRepoSnapshot> {
     /// The hints one peer's FIND_VALUE returns for `key`.
     async fn hints(&self, peer: PeerId, key: ProviderKey) -> Vec<(PeerId, ProviderToken)> {
         self.find_value(peer, key).await.unwrap().1
@@ -334,7 +365,11 @@ async fn later_lookup_hint_recovers_from_a_stalled_first_provider() {
 async fn later_lookup_hint_case(stalled: bool) {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
     let mut fixture = Fixture::new(false);
-    let missing = RecoveryNode::new(&fixture.net, &SigningKey::from_bytes(&[134; 32]), None);
+    let missing = RecoveryNode::new::<MemoryRepoSnapshot>(
+        &fixture.net,
+        &SigningKey::from_bytes(&[134; 32]),
+        None,
+    );
     let first = ScriptedReplica::new(
         &fixture.net,
         &SigningKey::from_bytes(&[135; 32]),
@@ -446,7 +481,11 @@ async fn progressive_fetch_distinguishes_an_empty_lookup_from_an_incomplete_one(
 async fn progressive_fetch_preserves_unavailable_and_failed_provider_outcomes() {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
     let mut fixture = Fixture::new(false);
-    let absent = RecoveryNode::new(&fixture.net, &SigningKey::from_bytes(&[139; 32]), None);
+    let absent = RecoveryNode::new::<MemoryRepoSnapshot>(
+        &fixture.net,
+        &SigningKey::from_bytes(&[139; 32]),
+        None,
+    );
     let directory = ScriptedReplica::new(
         &fixture.net,
         &SigningKey::from_bytes(&[140; 32]),
@@ -510,7 +549,7 @@ async fn stale_provider_lease_survives_loss_alternate_fetch_and_same_endpoint_re
     // These deterministic endpoint seeds are test-only, not protocol IDs.
     let directory_key = SigningKey::from_bytes(&[101; 32]);
     let alternate_key = SigningKey::from_bytes(&[102; 32]);
-    let directory = RecoveryNode::new(&fixture.net, &directory_key, None);
+    let directory = RecoveryNode::new::<MemoryRepoSnapshot>(&fixture.net, &directory_key, None);
     *fixture.client.candidates.lock().unwrap() =
         RoutingTable::with_candidates(fixture.client.my_id, [directory.peer]);
     directory.advertise(fixture.hash, fixture.provider);
@@ -633,7 +672,7 @@ async fn cancelled_discovered_provider_dial_leaves_a_same_client_retry_usable() 
     let _guard = crate::protocol::exact_blob_receive_test_guard();
     let mut fixture = Fixture::new(false);
     let directory_key = SigningKey::from_bytes(&[103; 32]);
-    let directory = RecoveryNode::new(&fixture.net, &directory_key, None);
+    let directory = RecoveryNode::new::<MemoryRepoSnapshot>(&fixture.net, &directory_key, None);
     directory.advertise(fixture.hash, fixture.provider);
     *fixture.client.candidates.lock().unwrap() =
         RoutingTable::with_candidates(fixture.client.my_id, [directory.peer]);
@@ -694,7 +733,7 @@ async fn alternate_provider_success_cancels_a_stalled_discovered_dial() {
     let mut fixture = Fixture::new(false);
     let directory_key = SigningKey::from_bytes(&[104; 32]);
     let stalled_key = SigningKey::from_bytes(&[105; 32]);
-    let directory = RecoveryNode::new(&fixture.net, &directory_key, None);
+    let directory = RecoveryNode::new::<MemoryRepoSnapshot>(&fixture.net, &directory_key, None);
     let stalled = stalled_key.verifying_key().to_bytes();
     let _stalled_harness = fixture.net.join(&stalled_key);
     fixture.net.stall_dials(stalled);
@@ -727,21 +766,6 @@ async fn alternate_provider_success_cancels_a_stalled_discovered_dial() {
     fixture.assert_no_control_effects();
 }
 
-struct SignallingBlobReader {
-    inner: Arc<dyn BlobSnapshotReader>,
-    started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-}
-
-impl BlobSnapshotReader for SignallingBlobReader {
-    fn get_blob(&self, hash: RawHash) -> Option<Bytes> {
-        let bytes = self.inner.get_blob(hash);
-        if let Some(started) = self.started.lock().unwrap().take() {
-            let _ = started.send(());
-        }
-        bytes
-    }
-}
-
 #[tokio::test(start_paused = true)]
 async fn mid_transfer_crash_rejects_old_bytes_after_restart_and_allows_fresh_retry() {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
@@ -752,10 +776,7 @@ async fn mid_transfer_crash_rejects_old_bytes_after_restart_and_allows_fresh_ret
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     fixture.provider_snapshot.send_modify(|slot| {
         let snapshot = slot.as_mut().unwrap();
-        snapshot.blobs = Arc::new(SignallingBlobReader {
-            inner: snapshot.blobs.clone(),
-            started: Mutex::new(Some(started_tx)),
-        });
+        *snapshot.blobs.started.lock().unwrap() = Some(started_tx);
     });
     let sender = fixture.sender.clone();
     let hash = fixture.hash;
@@ -1141,7 +1162,7 @@ async fn background_publication_retries_past_a_stale_issued_batch() {
 /// stays up.
 #[derive(Clone)]
 struct GatedHandler {
-    inner: SnapshotHandler,
+    inner: SnapshotHandler<MemoryRepoSnapshot>,
     gate: tokio::sync::watch::Receiver<bool>,
 }
 
@@ -1196,8 +1217,10 @@ async fn publication_resumes_over_a_live_connection_after_its_lookups_time_out()
     });
     // The client's only route is the connection it dials, as a daemon's is
     // when its pile names one peer.
-    let client =
-        ProviderClient::for_test(net.join(&client_key).transport, RoutingTable::new(my_id));
+    let client = ProviderClient::<_, MemoryRepoSnapshot>::for_test(
+        net.join(&client_key).transport,
+        RoutingTable::new(my_id),
+    );
     client.connections.connect(directory).await.unwrap();
     assert_eq!(
         client.candidates.lock().unwrap().state(directory),
@@ -1269,8 +1292,10 @@ async fn a_second_fallback_inside_its_interval_does_not_requery_a_stalled_route(
     let client_key = SigningKey::from_bytes(&[97; 32]);
     let my_id = client_key.verifying_key().to_bytes();
     let stalled = ScriptedReplica::new(&net, &SigningKey::from_bytes(&[98; 32]), Vec::new(), None);
-    let client =
-        ProviderClient::for_test(net.join(&client_key).transport, RoutingTable::new(my_id));
+    let client = ProviderClient::<_, MemoryRepoSnapshot>::for_test(
+        net.join(&client_key).transport,
+        RoutingTable::new(my_id),
+    );
     client.connections.connect(stalled.peer).await.unwrap();
     let key = blob_locator([8; 32]);
 
@@ -1487,7 +1512,8 @@ async fn resident_descriptor_is_not_a_collection_participant_hint() {
         None,
         StoreChanges::ALL,
     )
-    .unwrap();
+    .unwrap()
+    .map_blobs(|blobs| CountedBlobReader::new(blobs, &Arc::default()));
     fixture.provider_snapshot.send_replace(Some(snapshot));
 
     assert_eq!(
@@ -1543,7 +1569,7 @@ async fn known_resident_outside_selected_dht_replicas_is_not_directly_probed() {
     for signer in &closer_keys {
         let peer = signer.verifying_key().to_bytes();
         let mut harness = fixture.net.join(signer);
-        let handler = SnapshotHandler {
+        let handler = SnapshotHandler::<MemoryRepoSnapshot> {
             snapshot: tokio::sync::watch::channel(None).1,
             health: Health::new(EndpointId::from_bytes(&peer).unwrap()),
             candidates: Arc::new(Mutex::new(RoutingTable::new(peer))),

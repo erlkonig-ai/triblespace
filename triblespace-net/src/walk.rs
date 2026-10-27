@@ -74,6 +74,7 @@ use triblespace_core::collection::{
 #[cfg(test)]
 use triblespace_core::collection::CollectionRecord;
 use triblespace_core::patch::{Blake3Merkle, Entry, IdentitySchema, PATCH};
+use triblespace_core::repo::BlobStoreGet;
 
 use crate::channel::NetEvent;
 use crate::clock::Mono;
@@ -231,10 +232,10 @@ pub(crate) enum Event {
 /// One node's exchanges: what each neighbour and this side agreed on, per
 /// collection and kind, and whether each neighbour is sent or received
 /// from.
-pub(crate) struct Walks {
+pub(crate) struct Walks<R> {
     algorithm: crate::walk_stream::Algorithm,
     health: Health,
-    snapshot: Option<StoreSnapshot>,
+    snapshot: Option<StoreSnapshot<R>>,
     /// The collections the last snapshot selected: one that leaves the
     /// selection is forgotten.
     selected: PATCH<32, IdentitySchema, ()>,
@@ -243,7 +244,7 @@ pub(crate) struct Walks {
     agreed: PATCH<65, IdentitySchema, Arc<Tree>>,
 }
 
-impl Walks {
+impl<R: BlobStoreGet + Clone> Walks<R> {
     pub(crate) fn new(health: Health) -> Self {
         Self {
             health,
@@ -269,7 +270,7 @@ impl Walks {
         peer: PeerId,
         collection: CollectionHandle,
         kind: WalkKind,
-    ) -> Option<Exchange> {
+    ) -> Option<Exchange<R>> {
         self.start_selected(peer, collection, kind, None)
     }
 
@@ -279,7 +280,7 @@ impl Walks {
         collection: CollectionHandle,
         kind: WalkKind,
         requested: Option<crate::walk_stream::Algorithm>,
-    ) -> Option<Exchange> {
+    ) -> Option<Exchange<R>> {
         if kind == WalkKind::Authorization {
             if requested == Some(crate::walk_stream::Algorithm::CachedRiblt) {
                 return None;
@@ -330,7 +331,7 @@ impl Walks {
         kind: WalkKind,
         algorithm: crate::walk_stream::Algorithm,
         offer: Option<crate::walk_stream::OfferRole>,
-    ) -> Option<Exchange> {
+    ) -> Option<Exchange<R>> {
         use crate::walk_stream::{Algorithm, OfferRole};
         if kind == WalkKind::Authorization {
             // Prefix only. The opener's role decides the direction: an
@@ -479,7 +480,7 @@ impl Walks {
     /// Take the latest serving snapshot: what new exchanges pin and are
     /// admitted against. A collection it no longer selects is forgotten for
     /// every peer.
-    pub(crate) fn observe(&mut self, snapshot: StoreSnapshot) {
+    pub(crate) fn observe(&mut self, snapshot: StoreSnapshot<R>) {
         let mut selected = PATCH::new();
         for collection in snapshot
             .active()
@@ -727,11 +728,11 @@ pub(crate) fn decode_proof(key: [u8; KEY_BYTES], bytes: &[u8]) -> anyhow::Result
 /// What a leaf of a `kind` exchange of C that the local store lacks needs. A
 /// held reference joins the held set as it is when the blob is resident, and
 /// is fetched by hash otherwise; `None` is a value to request from the peer.
-pub(crate) fn admit_missing(
+pub(crate) fn admit_missing<R: BlobStoreGet>(
     kind: WalkKind,
     collection: CollectionHandle,
     key: [u8; KEY_BYTES],
-    snapshot: Option<&StoreSnapshot>,
+    snapshot: Option<&StoreSnapshot<R>>,
 ) -> Option<Admit> {
     if kind != WalkKind::References {
         return None;
@@ -944,16 +945,19 @@ pub(crate) enum Command {
 /// joins the exchanges its peers open and follows `snapshots`. Returns what
 /// opens exchanges, where receives are reported for the scheduler, and
 /// where grant walks report to the grant exchange.
-pub(crate) fn spawn<T: Transport, S: Service>(
+pub(crate) fn spawn<T: Transport, S: Service, R>(
     connections: ConnectionTable<T, S>,
-    snapshots: watch::Receiver<Option<StoreSnapshot>>,
-    walks: Walks,
+    snapshots: watch::Receiver<Option<StoreSnapshot<R>>>,
+    walks: Walks<R>,
     lander: LandSlot,
 ) -> (
     WalksHandle,
     mpsc::UnboundedReceiver<Event>,
     mpsc::UnboundedReceiver<GrantEvent>,
-) {
+)
+where
+    R: BlobStoreGet + Clone + Send + Sync + 'static,
+{
     let (commands, commanded) = mpsc::unbounded_channel();
     let (landing, items) = mpsc::unbounded_channel();
     let (acks, landed) = mpsc::unbounded_channel();
@@ -979,10 +983,10 @@ pub(crate) fn spawn<T: Transport, S: Service>(
     (WalksHandle(commands), heard, walked)
 }
 
-struct Task<T: Transport, S> {
+struct Task<T: Transport, S, R> {
     connections: ConnectionTable<T, S>,
-    snapshots: watch::Receiver<Option<StoreSnapshot>>,
-    walks: Walks,
+    snapshots: watch::Receiver<Option<StoreSnapshot<R>>>,
+    walks: Walks<R>,
     /// Where exchanges report back.
     commands: WalksHandle,
     /// Values for the landing task, by exchange.
@@ -1059,10 +1063,13 @@ struct Running {
     _replace: oneshot::Sender<()>,
 }
 
-impl<T: Transport, S: Service> Task<T, S> {
+impl<T: Transport, S: Service, R> Task<T, S, R>
+where
+    R: BlobStoreGet + Clone + Send + Sync + 'static,
+{
     async fn run(
         mut self,
-        mut snapshots: watch::Receiver<Option<StoreSnapshot>>,
+        mut snapshots: watch::Receiver<Option<StoreSnapshot<R>>>,
         mut commands: mpsc::UnboundedReceiver<Command>,
         mut landed: mpsc::UnboundedReceiver<Landed<u64>>,
     ) {
@@ -1100,7 +1107,7 @@ impl<T: Transport, S: Service> Task<T, S> {
         }
     }
 
-    fn observe(&mut self, snapshot: StoreSnapshot) {
+    fn observe(&mut self, snapshot: StoreSnapshot<R>) {
         self.walks.observe(snapshot);
         // Dropping the replacement sender retires drivers admitted under
         // a selection that no longer exists. Their queued ends are stale.
@@ -1372,9 +1379,9 @@ impl<T: Transport, S: Service> Task<T, S> {
         &mut self,
         key: Key,
         opened: bool,
-        exchange: &Exchange,
+        exchange: &Exchange<R>,
     ) -> (
-        Driver<T, S>,
+        Driver<T, S, R>,
         mpsc::UnboundedReceiver<(u64, u64)>,
         oneshot::Receiver<()>,
     ) {
@@ -1517,9 +1524,9 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Progress<W> {
 }
 
 /// What one exchange's driver holds of the task.
-struct Driver<T: Transport, S> {
+struct Driver<T: Transport, S, R> {
     connections: ConnectionTable<T, S>,
-    snapshots: watch::Receiver<Option<StoreSnapshot>>,
+    snapshots: watch::Receiver<Option<StoreSnapshot<R>>>,
     landing: mpsc::UnboundedSender<(u64, Vec<NetEvent>)>,
     /// Where a kept grant that cannot land yet goes.
     grants: mpsc::UnboundedSender<GrantEvent>,
@@ -1530,7 +1537,7 @@ struct Driver<T: Transport, S> {
     kind: WalkKind,
 }
 
-impl<T: Transport, S> Driver<T, S> {
+impl<T: Transport, S, R> Driver<T, S, R> {
     fn ended(&self, ended: Ended, duplicate: bool) {
         let _ = self.commands.send(Command::Ended {
             id: self.id,
@@ -1554,14 +1561,17 @@ type Fetched = (RawHash, Option<Blob<UnknownBlob>>);
 /// frame and sends none for [`WALK_DEADLINE`] is reset too. Returns the
 /// exchange as it ended, and whether the peer reset the stream for the one
 /// it opened at the same time.
-async fn drive<T: Transport, S: Service>(
-    driver: &Driver<T, S>,
-    mut exchange: Exchange,
+async fn drive<T: Transport, S: Service, R>(
+    driver: &Driver<T, S, R>,
+    mut exchange: Exchange<R>,
     send: Box<dyn SendStream>,
     recv: Box<dyn RecvStream>,
     mut acked: mpsc::UnboundedReceiver<(u64, u64)>,
     mut replaced: oneshot::Receiver<()>,
-) -> (Ended, bool) {
+) -> (Ended, bool)
+where
+    R: BlobStoreGet + Clone + Send + Sync + 'static,
+{
     if exchange.algorithm() == crate::walk_stream::Algorithm::CachedRiblt {
         return cached::drive(driver, exchange, send, recv, acked, replaced).await;
     }
@@ -1926,6 +1936,8 @@ mod grant_walk_tests;
 pub(crate) mod tests {
     use super::*;
 
+    use triblespace_core::repo::memoryrepo::MemoryRepoSnapshot;
+
     /// One node's store, serving snapshot and walks, for the exchange
     /// tests.
     pub(crate) mod walking {
@@ -1969,7 +1981,7 @@ pub(crate) mod tests {
             /// The pile's configuration collection, where selections live.
             config: Collection<SimpleArchive>,
             pub(crate) active: ActiveCollections,
-            pub(crate) walks: Walks,
+            pub(crate) walks: Walks<MemoryRepoSnapshot>,
             pub(crate) health: Health,
         }
 
@@ -2062,11 +2074,11 @@ pub(crate) mod tests {
             }
 
             /// The serving snapshot the walks last observed.
-            pub(crate) fn serving(&self) -> &StoreSnapshot {
+            pub(crate) fn serving(&self) -> &StoreSnapshot<MemoryRepoSnapshot> {
                 self.walks.snapshot.as_ref().unwrap()
             }
 
-            pub(crate) fn snapshot(&self) -> StoreSnapshot {
+            pub(crate) fn snapshot(&self) -> StoreSnapshot<MemoryRepoSnapshot> {
                 self.walks.snapshot.clone().unwrap()
             }
 
@@ -2566,7 +2578,7 @@ pub(crate) mod tests {
         /// publishes the next serving snapshot.
         struct Lander {
             node: Mutex<Node>,
-            snapshots: watch::Sender<Option<StoreSnapshot>>,
+            snapshots: watch::Sender<Option<StoreSnapshot<MemoryRepoSnapshot>>>,
         }
 
         impl Land for Lander {
@@ -2610,7 +2622,10 @@ pub(crate) mod tests {
             fn serving(
                 node: Node,
                 net: &SimNet,
-                service: impl FnOnce(PeerId, watch::Receiver<Option<StoreSnapshot>>) -> S,
+                service: impl FnOnce(
+                    PeerId,
+                    watch::Receiver<Option<StoreSnapshot<MemoryRepoSnapshot>>>,
+                ) -> S,
             ) -> Self {
                 let (mut harness, taps) = net.tap(&node.key);
                 let peer = harness.transport.local_id();
@@ -2792,7 +2807,7 @@ pub(crate) mod tests {
         #[derive(Clone)]
         struct PacedBlobs {
             local: PeerId,
-            snapshots: watch::Receiver<Option<StoreSnapshot>>,
+            snapshots: watch::Receiver<Option<StoreSnapshot<MemoryRepoSnapshot>>>,
             pause: Duration,
             piece: usize,
             one_at_a_time: Arc<tokio::sync::Mutex<()>>,
@@ -2963,7 +2978,7 @@ pub(crate) mod tests {
                     .bytes(collection)
                     .unwrap(),
             };
-            let mut exchange = Exchange::start(
+            let mut exchange = Exchange::<MemoryRepoSnapshot>::start(
                 collection,
                 kind,
                 sender.pinned(collection),
@@ -4528,7 +4543,7 @@ pub(crate) mod tests {
                 next_id: 0,
             };
             let kind = WalkKind::Authorization;
-            let open = |task: &mut Task<_, _>, peer, resource| {
+            let open = |task: &mut Task<_, _, _>, peer, resource| {
                 task.command(Command::Open {
                     peer,
                     collection: resource,
@@ -4555,7 +4570,7 @@ pub(crate) mod tests {
             open(&mut task, other.peer, resources[MAX_GRANT_WALKS_PER_PEER]);
             assert_eq!(outcome(&mut walked), GrantOutcome::NotStarted(NotStarted::Queued));
 
-            let id = |task: &Task<_, _>, resource: CollectionHandle| {
+            let id = |task: &Task<_, _, _>, resource: CollectionHandle| {
                 task.running[&(other.peer, resource.raw, kind)].id
             };
             let end = |agreed: bool, failure: Option<crate::exchange::Failure>, refused: bool| {
@@ -4653,7 +4668,7 @@ pub(crate) mod tests {
             };
             task.observe(snapshot);
             let kind = WalkKind::Authorization;
-            let running = |task: &Task<_, _>| {
+            let running = |task: &Task<_, _, _>| {
                 task.running
                     .keys()
                     .filter(|(peer, _, kind)| *peer == other.peer && *kind == WalkKind::Authorization)
@@ -4698,8 +4713,11 @@ pub(crate) mod tests {
         /// its grant walks report.
         fn grant_task<S: Service>(
             hosted: &Hosted<S>,
-            snapshot: StoreSnapshot,
-        ) -> (Task<Tapped, S>, mpsc::UnboundedReceiver<GrantEvent>) {
+            snapshot: StoreSnapshot<MemoryRepoSnapshot>,
+        ) -> (
+            Task<Tapped, S, MemoryRepoSnapshot>,
+            mpsc::UnboundedReceiver<GrantEvent>,
+        ) {
             let (landing, _) = mpsc::unbounded_channel();
             let (events, _) = mpsc::unbounded_channel();
             let (commands, _) = mpsc::unbounded_channel();
@@ -4724,7 +4742,7 @@ pub(crate) mod tests {
         /// The halves of a grant walk `peer` opened over R and offered to the
         /// task: the opener's end, kept open, and where a refusal is noted.
         fn join<S: Service>(
-            task: &mut Task<Tapped, S>,
+            task: &mut Task<Tapped, S, MemoryRepoSnapshot>,
             peer: PeerId,
             resource: CollectionHandle,
         ) -> (Arc<Mutex<Option<u32>>>, DuplexStream) {
@@ -4746,7 +4764,7 @@ pub(crate) mod tests {
         /// End the grant walk with `peer` over R running in the task, as
         /// failed.
         fn end_grant_walk<S: Service>(
-            task: &mut Task<Tapped, S>,
+            task: &mut Task<Tapped, S, MemoryRepoSnapshot>,
             peer: PeerId,
             resource: CollectionHandle,
         ) {

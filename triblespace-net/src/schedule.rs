@@ -81,7 +81,9 @@ pub(crate) struct Schedules {
 }
 
 /// The selected collections of `snapshot` and their record roots.
-pub(crate) fn roots(snapshot: &StoreSnapshot) -> impl Iterator<Item = (CollectionHandle, RawHash)> {
+pub(crate) fn roots<R>(
+    snapshot: &StoreSnapshot<R>,
+) -> impl Iterator<Item = (CollectionHandle, RawHash)> {
     snapshot.active().filter_map(|collection| {
         let selected = snapshot.selected(collection)?;
         Some((

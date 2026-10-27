@@ -82,8 +82,8 @@ fn observe(
     snapshot: &MemoryRepoSnapshot,
     active: &ActiveCollections,
     local: VerifyingKey,
-    prior: Option<(&MemoryRepoSnapshot, &StoreSnapshot)>,
-) -> StoreSnapshot {
+    prior: Option<(&MemoryRepoSnapshot, &StoreSnapshot<MemoryRepoSnapshot>)>,
+) -> StoreSnapshot<MemoryRepoSnapshot> {
     StoreSnapshot::from_store_changes(
         snapshot.clone(),
         active,
@@ -99,7 +99,7 @@ fn observe(
 
 /// The root of the held set, which a pushed references tree carries: all
 /// zeros for the empty set.
-fn digest(serving: &StoreSnapshot, collection: CollectionHandle) -> [u8; 32] {
+fn digest(serving: &StoreSnapshot<MemoryRepoSnapshot>, collection: CollectionHandle) -> [u8; 32] {
     serving
         .collection(collection)
         .unwrap()
@@ -109,7 +109,11 @@ fn digest(serving: &StoreSnapshot, collection: CollectionHandle) -> [u8; 32] {
         .unwrap_or_default()
 }
 
-fn held(serving: &StoreSnapshot, collection: CollectionHandle, handle: &[u8; 32]) -> bool {
+fn held(
+    serving: &StoreSnapshot<MemoryRepoSnapshot>,
+    collection: CollectionHandle,
+    handle: &[u8; 32],
+) -> bool {
     serving
         .collection(collection)
         .unwrap()

@@ -59,6 +59,7 @@ use triblespace_core::collection::CollectionHandle;
 #[cfg(test)]
 use triblespace_core::collection::CollectionRecord;
 use triblespace_core::patch::{Blake3Merkle, Entry, IdentitySchema, PATCH, PatchHash};
+use triblespace_core::repo::BlobStoreGet;
 
 use crate::channel::NetEvent;
 use crate::collection_activation::CollectionRepairOverlay;
@@ -513,7 +514,7 @@ pub(crate) struct Ended {
     pub(crate) skipped: u64,
 }
 
-pub(crate) struct Exchange {
+pub(crate) struct Exchange<R> {
     riblt: Option<Riblt>,
     offers: Option<Offers>,
     collection: CollectionHandle,
@@ -542,7 +543,7 @@ pub(crate) struct Exchange {
     /// Essential protocol membership proof of ONLY the peer's delta. This
     /// shares known immutable trees; it is not a catalogue of the local store.
     peer: Tree,
-    snapshot: Option<StoreSnapshot>,
+    snapshot: Option<StoreSnapshot<R>>,
     root_sent: bool,
     queue: VecDeque<Vec<u8>>,
     announced: PATCH<33, IdentitySchema, ()>,
@@ -587,7 +588,7 @@ struct Riblt {
     bound: usize,
 }
 
-impl Exchange {
+impl<R: BlobStoreGet + Clone> Exchange<R> {
     pub(crate) fn start(
         collection: CollectionHandle,
         kind: WalkKind,
@@ -901,7 +902,11 @@ impl Exchange {
         })
     }
 
-    pub(crate) fn on_frame(&mut self, frame: Frame, snapshot: Option<StoreSnapshot>) -> Vec<Out> {
+    pub(crate) fn on_frame(
+        &mut self,
+        frame: Frame,
+        snapshot: Option<StoreSnapshot<R>>,
+    ) -> Vec<Out> {
         let mut outs = Vec::new();
         if self.outcome.is_some() {
             return outs;
@@ -1645,6 +1650,7 @@ pub(crate) mod tests {
         CollectionData, CollectionMerge, CollectionRecord, CollectionRecordFingerprint,
         CollectionStore,
     };
+    use triblespace_core::repo::memoryrepo::MemoryRepoSnapshot;
 
     use crate::patch_repair::{PatchBranch, PatchChild, PatchNode};
     use crate::walk::{node, summary};
@@ -1717,7 +1723,7 @@ pub(crate) mod tests {
 
     pub(crate) struct Side {
         pub(crate) node: Node,
-        pub(crate) exchange: Exchange,
+        pub(crate) exchange: Exchange<MemoryRepoSnapshot>,
         /// Every frame this side sent, in order.
         pub(crate) sent: Vec<Frame>,
         /// Every frame this side heard, in order.
@@ -1756,7 +1762,7 @@ pub(crate) mod tests {
         }
 
         /// `node`'s side of an exchange its walks already started.
-        pub(crate) fn with(node: Node, exchange: Exchange) -> Self {
+        pub(crate) fn with(node: Node, exchange: Exchange<MemoryRepoSnapshot>) -> Self {
             Self {
                 exchange,
                 node,
@@ -1954,7 +1960,7 @@ pub(crate) mod tests {
         kind: WalkKind,
         omit: &BTreeSet<[u8; 32]>,
     ) -> Vec<Frame> {
-        let mut exchange = Exchange::start(
+        let mut exchange = Exchange::<MemoryRepoSnapshot>::start(
             collection,
             kind,
             sender.pinned(collection),

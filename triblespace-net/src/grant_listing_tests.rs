@@ -8,7 +8,7 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::TryFromBlob as _;
 use triblespace_core::capability::{CapabilityHandle, CapabilityProof};
 use triblespace_core::collection::CollectionHandle;
-use triblespace_core::repo::memoryrepo::MemoryRepo;
+use triblespace_core::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
 use triblespace_core::repo::{
     BlobStorePut, CapabilityProofRead, CapabilityProofStore, SnapshotSource, StoreChanges,
 };
@@ -23,7 +23,7 @@ struct Node {
     key: SigningKey,
     store: MemoryRepo,
     active: ActiveCollections,
-    grants: Grants,
+    grants: Grants<MemoryRepoSnapshot>,
 }
 
 impl Node {
@@ -41,7 +41,7 @@ impl Node {
         self.store.put::<SimpleArchive, _>(facts.clone()).unwrap()
     }
 
-    fn snapshot(&mut self) -> StoreSnapshot {
+    fn snapshot(&mut self) -> StoreSnapshot<MemoryRepoSnapshot> {
         StoreSnapshot::from_store_changes(
             self.store.snapshot().unwrap(),
             &self.active,
