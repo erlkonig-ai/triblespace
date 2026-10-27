@@ -661,6 +661,11 @@ pub(super) struct Unfetched {
     /// No holder handed these over: an answer about elsewhere, so a leaf
     /// naming one of them as its output does not count.
     pub(super) unavailable: BTreeSet<CollectionData>,
+    /// Not here, asked of a store that answers from its own blobs alone
+    /// ([`AsyncBlobStoreAcquire::acquires_remotely`]). That says nothing
+    /// about any holder, so a leaf naming one of them still counts: its
+    /// foundation waits.
+    pub(super) absent: BTreeSet<CollectionData>,
     /// Fetching these failed outright -- the store could not ask other
     /// holders, or could not keep what it got. That is a fault here and says
     /// nothing about any holder, so a leaf naming one of them is not given
@@ -669,10 +674,12 @@ pub(super) struct Unfetched {
 }
 
 impl Unfetched {
-    /// Whether `member` was asked for and is not here, for either reason:
-    /// for this call, what needs it waits.
+    /// Whether `member` was asked for and is not here, for any reason: for
+    /// this call, what needs it waits.
     pub(super) fn contains(&self, member: &CollectionData) -> bool {
-        self.unavailable.contains(member) || self.failed.contains(member)
+        self.unavailable.contains(member)
+            || self.absent.contains(member)
+            || self.failed.contains(member)
     }
 }
 
@@ -713,6 +720,10 @@ impl Unfetched {
 /// the store's host ([`CollectionRealizationError::HostMismatch`]): that
 /// stops a whole upkeep pass, so it is reported first. A storage error the
 /// operation itself raises ends the call at once and is the one reported.
+///
+/// A blob a store that cannot reach other holders does not have is only
+/// absent here, whichever role it plays, as an optional fetch's miss would
+/// be: what needs it waits, and no leaf naming it is given up on.
 async fn acquiring<S, F>(store: &mut S, mut operation: F) -> Result<(), CollectionRealizationError>
 where
     S: Store + AsyncBlobStoreAcquire,
@@ -816,9 +827,10 @@ where
 }
 
 /// Ask for one blob this call has not asked for: whether its bytes are here
-/// now. One no holder handed over is recorded `unavailable`; one whose fetch
-/// failed outright is recorded `failed`, and the first such error is kept in
-/// `broken`, to be reported once the work is done.
+/// now. One no holder handed over is recorded `unavailable`, and one a store
+/// that cannot ask other holders does not have is recorded `absent`; one
+/// whose fetch failed outright is recorded `failed`, and the first such
+/// error is kept in `broken`, to be reported once the work is done.
 async fn ask<S>(
     store: &mut S,
     attempted: &mut BTreeSet<CollectionData>,
@@ -831,8 +843,12 @@ where
 {
     match acquire_missing(store, attempted, member).await {
         Ok(true) => true,
-        Ok(false) => {
+        Ok(false) if store.acquires_remotely() => {
             unfetched.unavailable.insert(member);
+            false
+        }
+        Ok(false) => {
+            unfetched.absent.insert(member);
             false
         }
         Err(error) => {
