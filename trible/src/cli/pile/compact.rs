@@ -19,6 +19,13 @@
 //! an append after the final check can remain outside the valid observed-prefix
 //! result.
 //!
+//! `--source-prefix L` reads the source as exactly its first `L` bytes,
+//! through a read-only handle bounded to that prefix: writers may keep
+//! appending while it runs, nothing at or past `L` is mapped, parsed or
+//! replayed, and every length check compares against `L`. Because the pile
+//! is append-only, the result is the compaction of a copy of those `L`
+//! bytes without making the copy. `L` must be a record boundary.
+//!
 //! `--drop-collection` is deliberately different: it opts into reachability
 //! garbage collection. Only bytes reached by carried records, proofs, WANTs,
 //! pins and opaque-frame conservative references survive. Raw unrooted blobs
@@ -50,9 +57,12 @@ struct RecordCensus {
     opaque_bytes: u64,
 }
 
-fn census(path: &Path) -> Result<RecordCensus> {
-    let mut records =
-        PileRecords::open(path).map_err(|error| super::pile_read_error(path, error))?;
+fn census(path: &Path, prefix: Option<u64>) -> Result<RecordCensus> {
+    let records = match prefix {
+        Some(prefix) => PileRecords::open_prefix(path, prefix),
+        None => PileRecords::open(path),
+    };
+    let mut records = records.map_err(|error| super::pile_read_error(path, error))?;
     let bytes = u64::try_from(records.bytes().len()).context("pile length exceeds u64")?;
     let mut census = RecordCensus {
         bytes,
@@ -103,6 +113,15 @@ pub(super) fn cleanup_incomplete_destination(path: &Path, primary: anyhow::Error
     }
 }
 
+/// The source length every check compares: the file's length, or for a
+/// `--source-prefix` handle the prefix itself (less only if the file shrank
+/// below it).
+fn observed_source_len(source: &Pile, when: &str) -> Result<u64> {
+    source
+        .observed_length()
+        .map_err(|error| anyhow!("stat source pile {when}: {error}"))
+}
+
 fn compact_into(
     source: &mut Pile,
     destination: &mut Pile,
@@ -120,10 +139,7 @@ fn compact_into(
         }
     }
 
-    let after_inventory = source
-        .backing_file_metadata()
-        .context("stat source pile after inventory")?
-        .len();
+    let after_inventory = observed_source_len(source, "after inventory")?;
     if after_inventory != stable_source_len {
         bail!(
             "source pile changed while its blob inventory was frozen ({} -> {} bytes); retry after quiescing writers",
@@ -144,10 +160,7 @@ fn compact_into(
     }
     .map_err(|error| anyhow!("compact pile: {error}"))?;
 
-    let final_source_len = source
-        .backing_file_metadata()
-        .context("stat source pile after compaction")?
-        .len();
+    let final_source_len = observed_source_len(source, "after compaction")?;
     if final_source_len != stable_source_len {
         bail!(
             "source pile changed during compaction ({} -> {} bytes); cleanup of the incomplete destination will be attempted and any cleanup failure reported; retry after quiescing writers",
@@ -173,6 +186,7 @@ pub(super) fn run(
     destination_path: PathBuf,
     drop_drained: Vec<String>,
     drop_collection: Vec<String>,
+    source_prefix: Option<u64>,
 ) -> Result<()> {
     let drained = drop_drained
         .iter()
@@ -194,16 +208,40 @@ pub(super) fn run(
     }
 
     eprintln!("Compaction: scanning source record headers...");
-    let source_census = census(&source_path)?;
+    let source_census = census(&source_path, source_prefix)?;
 
     eprintln!(
         "Compaction: opening source indexes ({} bytes)...",
         source_census.bytes
     );
-    let mut source = super::open_refreshed(&source_path)?;
-    let source_metadata = source.backing_file_metadata().context("stat source pile")?;
-    let stable_source_len = source_metadata.len();
-    let source_permissions = source_metadata.permissions();
+    let mut source = match source_prefix {
+        // Read-only, bounded, and replayed to exactly the prefix by the open.
+        Some(prefix) => Pile::open_prefix(&source_path, prefix)
+            .map_err(|error| super::pile_read_error(&source_path, error))?,
+        None => super::open_refreshed(&source_path)?,
+    };
+    let source_permissions = match source.backing_file_metadata() {
+        Ok(metadata) => metadata.permissions(),
+        Err(error) => {
+            let _ = source.close();
+            return Err(anyhow!(error).context("stat source pile"));
+        }
+    };
+    let stable_source_len = match observed_source_len(&source, "after replay") {
+        Ok(length) => length,
+        Err(error) => {
+            let _ = source.close();
+            return Err(error);
+        }
+    };
+    if source_prefix.is_some_and(|prefix| prefix != stable_source_len) {
+        let _ = source.close();
+        bail!(
+            "source pile shrank below its fixed prefix ({} -> {} bytes)",
+            source_prefix.unwrap_or_default(),
+            stable_source_len,
+        );
+    }
     if stable_source_len != source_census.bytes {
         let _ = source.close();
         bail!(
@@ -237,10 +275,7 @@ pub(super) fn run(
             bail!("collection exclusion reaches {} corrupt blobs; refusing before destination creation",
                 prepared.corrupt_blobs().len());
         }
-        let planned_len = source
-            .backing_file_metadata()
-            .context("stat source after exclusion plan")?
-            .len();
+        let planned_len = observed_source_len(&source, "after exclusion plan")?;
         if planned_len != stable_source_len {
             bail!(
                 "source pile changed during collection exclusion preflight ({} -> {} bytes)",
@@ -292,7 +327,7 @@ pub(super) fn run(
         &drained,
         prepared,
     )
-    .and_then(|stats| Ok((stats, census(&destination_path)?)));
+    .and_then(|stats| Ok((stats, census(&destination_path, None)?)));
     let destination_close = destination
         .close()
         .map_err(|error| anyhow!("close destination: {error}"));
