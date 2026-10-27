@@ -1,10 +1,11 @@
-//! Independent bounded-decoder tests: honest streams use upstream Encoders;
-//! two tiny contract cases isolate exact-zero and mapping-incidence checks.
+//! Independent decoder tests: honest streams use upstream Encoders; tiny
+//! contract cases isolate exact-zero, budget-free and mapping-incidence checks.
 
 use riblt::{Encoder, HashKey, RandomMapping, Symbol};
 
 use crate::riblt_cache::{Cell, KeySymbol};
-use crate::riblt_decode::{DecodeError, Limits, ResidualDecoder};
+use crate::riblt_decode::{DecodeError, ResidualDecoder};
+use crate::riblt_store::CHUNK;
 
 fn symbol(number: u64) -> KeySymbol {
     let mut bytes = [0; 32];
@@ -75,122 +76,53 @@ fn riblt_decode_honest_mixed_sign_cascade_matches_upstream_encoders() {
 }
 
 #[test]
-fn riblt_decode_honest_cascade_has_a_cumulative_work_budget() {
-    let key = [7; 16];
-    let mut saw_partial_recovery_limit = false;
-    // These are small injected work allowances, not timing-based deadlines.
-    // At least one must stop ordinary peeling after making partial progress.
-    for work in [8, 16, 32, 64, 128, 256, 512] {
-        let mut local = encoder(key, (0..24).map(symbol));
-        let mut remote = encoder(key, (12..36).map(symbol));
-        let mut decoder = ResidualDecoder::with_limits(
-            key,
-            Limits {
-                cells: 4096,
-                support: 64,
-                work,
-            },
-        );
-        let mut stopped = false;
-        for _ in 0..4096 {
-            match decoder.add(residual(&mut local, &mut remote)) {
-                Ok(()) if decoder.decoded() => {
-                    stopped = true;
-                    break;
-                }
-                Ok(()) => {}
-                Err(error) => {
-                    assert_eq!(error, DecodeError::Limit);
-                    saw_partial_recovery_limit |=
-                        !decoder.local().is_empty() || !decoder.remote().is_empty();
-                    stopped = true;
-                    break;
-                }
-            }
-        }
-        assert!(stopped);
+fn riblt_decode_recovers_across_file_backed_chunk_boundaries() {
+    // More residual rows and more remote-only keys than one storage chunk
+    // holds, so rows, windows and frontiers all cross chunk boundaries.
+    let key = [11; 16];
+    let remote_only = CHUNK as u64 + 4_000;
+    let mut local = encoder(key, (0..6_000).map(symbol));
+    let mut remote = encoder(key, (3_000..6_000 + remote_only).map(symbol));
+    let mut decoder = ResidualDecoder::with_key(key);
+    let mut rows = 0;
+    while !decoder.decoded() {
+        decoder.add(residual(&mut local, &mut remote)).unwrap();
+        rows += 1;
     }
-    assert!(
-        saw_partial_recovery_limit,
-        "work is bounded during recovery, not only before it"
+    assert!(rows > CHUNK, "{rows} rows stay within one chunk");
+    assert_eq!(
+        recovered(&decoder, true),
+        (0..3_000).map(|n| symbol(n).0).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        recovered(&decoder, false),
+        (6_000..6_000 + remote_only)
+            .map(|n| symbol(n).0)
+            .collect::<Vec<_>>()
     );
 }
 
 #[test]
-fn riblt_decode_recovered_support_is_bounded_even_when_each_residual_count_fits() {
-    let key = [17; 16];
-    let mut locals = Vec::new();
-    let (mut first_remote, mut second_remote) = (None, None);
-    // Choose ordinary source keys by their upstream mapping: the local pair
-    // skips rows1,2; the remote pair occupies row1 and row2 separately.
-    for number in 0..4096 {
-        let candidate = symbol(number);
-        let mut mapping = RandomMapping::new(candidate.keyed_mapping_seed(&key));
-        let first = mapping.next_index();
-        let second = mapping.next_index();
-        if first >= 3 && locals.len() < 2 {
-            locals.push(candidate);
-        }
-        if first == 1 && second >= 3 {
-            first_remote.get_or_insert(candidate);
-        }
-        if first == 2 {
-            second_remote.get_or_insert(candidate);
-        }
-        if locals.len() == 2 && first_remote.is_some() && second_remote.is_some() {
-            break;
-        }
-    }
-    assert_eq!(locals.len(), 2);
-    let remotes = [first_remote.unwrap(), second_remote.unwrap()];
-    let mut local = encoder(key, locals);
-    let mut remote = encoder(key, remotes);
-    let mut decoder = ResidualDecoder::with_limits(
-        key,
-        Limits {
-            cells: 16,
-            support: 1,
-            work: 1024,
-        },
-    );
-    for index in 0..3 {
-        let row = residual(&mut local, &mut remote);
-        assert!(row.count.unsigned_abs() <= 1);
-        let result = decoder.add(row);
-        if index < 2 {
-            assert_eq!(result, Ok(()));
-        } else {
-            assert_eq!(result, Err(DecodeError::Limit));
-        }
-    }
-    assert_eq!(decoder.remote().len(), 1);
-    assert!(decoder.local().is_empty());
-    assert!(!decoder.decoded());
-}
-
-#[test]
-fn riblt_decode_cell_and_residual_limits_are_independent_of_zero_completion() {
+fn riblt_decode_has_no_cell_or_support_budget() {
+    // The exchange bounds residual counts by the peer's root count and cell
+    // indices by the u32 wire domain; the decoder itself refuses neither.
     let key = [23; 16];
-    let limits = Limits {
-        cells: 1,
-        support: 1,
-        work: 128,
-    };
-    let mut decoder = ResidualDecoder::with_limits(key, limits);
-    assert!(!decoder.decoded());
-    assert_eq!(decoder.add(Cell::default()), Ok(()));
-    assert!(decoder.decoded());
-    assert_eq!(decoder.add(Cell::default()), Err(DecodeError::Limit));
-    for count in [-2, 2] {
-        let mut decoder = ResidualDecoder::with_limits(key, limits);
+    let mut decoder = ResidualDecoder::with_key(key);
+    for _ in 0..3 {
+        assert_eq!(decoder.add(Cell::default()), Ok(()));
+        assert!(decoder.decoded());
+    }
+    for count in [-2, 2, -(1 << 21), 1 << 21] {
+        let mut decoder = ResidualDecoder::with_key(key);
         assert_eq!(
             decoder.add(Cell {
                 count,
                 ..Cell::default()
             }),
-            Err(DecodeError::Limit)
+            Ok(())
         );
         assert!(!decoder.decoded());
+        assert!(decoder.local().is_empty() && decoder.remote().is_empty());
     }
 }
 
