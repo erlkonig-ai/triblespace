@@ -551,9 +551,10 @@ where
     /// 2.9). Other modes keep none, and peer with the full flag unset.
     ///
     /// The first Full selection starts the peer's held-set thread: a
-    /// collection's first closure is computed there, published as it grows,
-    /// and neither landing nor this call waits for it. The thread ends once
-    /// the store is gone.
+    /// collection's first closure is computed there and published once
+    /// whole (until then its held set is unknown, and its references tree is
+    /// not exchanged), and neither landing nor this call waits for it. The
+    /// thread ends once the store is gone.
     pub fn set_replication(
         &mut self,
         mode: ReplicationMode,
@@ -1293,9 +1294,9 @@ mod tests {
     }
 
     /// Full replication builds a collection's first closure on the peer's
-    /// held-set thread: wider than a snapshot's allowance, the held set
-    /// still completes while nothing but snapshots that build nothing runs
-    /// here, and landing goes on meanwhile.
+    /// held-set thread: wider than a snapshot's allowance, its held set is
+    /// unknown until the thread publishes it whole, while nothing but
+    /// snapshots that build nothing runs here and landing goes on.
     #[tokio::test]
     async fn full_replication_builds_held_sets_on_their_own_thread() {
         use triblespace_core::collection::{
@@ -1340,9 +1341,8 @@ mod tests {
         assert_eq!(lander.land(vec![NetEvent::Blob(blob)]), [true]);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
-            let held = HeldRead::held(&peer.snapshot().unwrap(), collection)
-                .expect("a tracked collection settles at once");
-            if held.has_prefix(&data) {
+            if let Some(held) = HeldRead::held(&peer.snapshot().unwrap(), collection) {
+                assert!(held.has_prefix(&data), "a published set is whole");
                 assert!(leaves.iter().all(|leaf| held.has_prefix(leaf)));
                 break;
             }

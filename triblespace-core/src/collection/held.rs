@@ -49,21 +49,24 @@
 //! # Snapshots
 //!
 //! Every snapshot carries the held sets as they stood when it was taken, and
-//! they never change afterwards. A published held set is *closed*, not
-//! necessarily complete:
+//! they never change afterwards. A published held set is a collection's
+//! whole first closure plus what the collection gained since; it is never a
+//! part of one.
 //!
 //! A held set is closed under the edge cache for readable children: a blob
 //! joins only once every child the cache names for it has joined. So every
 //! closure computed later stops at a held blob without missing anything
-//! readable the cache knows below it, and any prefix of a closure computation
-//! is itself closed. A blob that cannot be read -- absent, or resident and
-//! failing to read -- is unknown on every path: nothing above it joins. A seed
-//! is read again when its bytes arrive, a reported blob when a peer reports
-//! it again.
+//! readable the cache knows below it, and a closure computation can pause
+//! between any two steps without leaving the set open. A blob that cannot be
+//! read -- absent, or resident and failing to read -- is unknown on every
+//! path: nothing above it joins. A seed is read again when its bytes arrive,
+//! a reported blob when a peer reports it again.
 //!
-//! A tracked collection is *settled* once its seeds are selected; from then
-//! on it has a held set. Until its first closure (since tracking began, or
-//! since a reset) is computed, it is *building*; afterwards it is *built*.
+//! A tracked collection is *settled* once its seeds are selected. Until its
+//! first closure (since tracking began, or since a reset) is whole, it is
+//! *building*; afterwards it is *built*. Only a built collection's held set
+//! is published: a building one's is unknown, as an unsettled one's is, and
+//! [`HeldRead::held`] answers `None` for both.
 //!
 //! Taking a snapshot first extends the sets of built collections by the
 //! closures of what arrived since the previous one -- every seed of a new
@@ -77,12 +80,14 @@
 //! A building collection's closure is computed by the snapshot that settles
 //! it, reading every blob it reaches once -- unless the store's held sets are
 //! *driven* ([`HeldStore::drive_held`]). Then that snapshot reads only a small
-//! allowance of it, and the [`HeldWork`] the driver holds computes the rest in
-//! bounded steps against the latest observed snapshot, publishing the set as
-//! it grows. The driver never holds the index across a blob read, so taking a
-//! snapshot waits for at most a few in-memory updates, never for the build.
-//! What arrives for a building collection queues behind its build. Nothing
-//! here starts a thread: the driver's thread is its caller's.
+//! allowance of it -- enough to publish a small collection at once -- and the
+//! [`HeldWork`] the driver holds computes the rest in bounded steps against
+//! the latest observed snapshot, publishing each collection when its closure
+//! is whole, so small collections become known first. The driver never holds
+//! the index across a blob read, so taking a snapshot waits for at most a few
+//! in-memory updates, never for the build. What arrives for a building
+//! collection queues behind its build. Nothing here starts a thread: the
+//! driver's thread is its caller's.
 //!
 //! A snapshot that lost a blob its predecessor had (a store that forgets
 //! blobs) resets the index: the edges are forgotten and every collection is
@@ -163,11 +168,11 @@ fn take_related(pairs: &mut Pairs, first: &Raw) -> Vec<Raw> {
 
 /// The held sets of one immutable observation.
 pub trait HeldRead {
-    /// Every blob `collection` holds in this observation, or `None` when the
-    /// store does not track it (or has not yet been able to select its
-    /// seeds): unknown, not empty. The set is closed; while the collection is
-    /// building it may be partial. Absence from the set is not evidence that
-    /// a blob is missing.
+    /// Every blob `collection` holds in this observation: its whole first
+    /// closure plus what it gained since. `None` when the store does not
+    /// track it, has not yet been able to select its seeds, or has not yet
+    /// computed its first closure: unknown, not empty. Absence from the set
+    /// is not evidence that a blob is missing.
     fn held(&self, collection: CollectionHandle) -> Option<HeldBlobs>;
 
     /// Differs between two observations of one store whenever their held sets
@@ -189,9 +194,10 @@ pub trait HeldStore {
     /// Build the first closures of tracked collections off the snapshot
     /// path: from now on a snapshot reads only a small allowance of a
     /// building collection's closure, and the returned work computes the
-    /// rest, publishing each collection's held set, closed, as it grows. A
-    /// snapshot never waits for a blob read the work makes. Dropping the
-    /// work hands the building back to snapshots.
+    /// rest, publishing each collection's held set once its first closure is
+    /// whole; until then the set is unknown. A snapshot never waits for a
+    /// blob read the work makes. Dropping the work hands the building back to
+    /// snapshots.
     fn drive_held(&mut self) -> HeldWork;
 }
 
@@ -348,7 +354,8 @@ struct State<T> {
     candidates: Pairs,
     /// Closure computations not finished yet, oldest first.
     jobs: VecDeque<Job>,
-    /// Settled collections whose first closure a driver is still computing.
+    /// Settled collections whose first closure a driver is still computing:
+    /// kept here, published only once built.
     building: Handles,
     /// A driver computes building collections' closures
     /// ([`HeldStore::drive_held`]).
@@ -626,11 +633,17 @@ impl<T> State<T> {
         self.epoch += 1;
     }
 
+    /// Hand out the held sets of every built collection. A building
+    /// collection's set is unknown until its first closure is whole.
     fn publish_view(&mut self) {
+        let mut sets = self.held.clone();
+        for building in self.building.iter() {
+            sets.remove(building);
+        }
         self.generation += 1;
         self.view = Arc::new(HeldView {
             generation: self.generation,
-            sets: self.held.clone(),
+            sets,
         });
     }
 
@@ -654,11 +667,15 @@ impl<T> State<T> {
         }
     }
 
-    /// A building collection with no job left is built.
-    fn retire(&mut self, collection: CollectionHandle) {
-        if !self.jobs.iter().any(|job| job.collection == collection) {
+    /// A building collection with no job left is built; whether this made
+    /// it so.
+    fn retire(&mut self, collection: CollectionHandle) -> bool {
+        let built = self.building.get(&collection.raw).is_some()
+            && !self.jobs.iter().any(|job| job.collection == collection);
+        if built {
             self.building.remove(&collection.raw);
         }
+        built
     }
 
     /// Follow `job` until it is done, needs a blob read, or `pause` (asked
@@ -768,7 +785,7 @@ impl<T: HeldSource> State<T> {
             }
         }
         for collection in finished {
-            self.retire(collection);
+            grew |= self.retire(collection);
         }
         grew
     }
@@ -1008,7 +1025,8 @@ impl<T: HeldSource + Send> Drive for HeldIndex<T> {
     /// for about `budget`: at least one step, then until the budget is spent
     /// or another locker waits. Blobs are read with the state unlocked; a
     /// read made across a reset is dropped with its job, which the reset
-    /// requeued from scratch.
+    /// requeued from scratch. A collection is published when its last job
+    /// finishes, never in between.
     fn advance(&self, budget: Duration) -> bool {
         let started = Instant::now();
         let mut stepped = false;
@@ -1019,7 +1037,7 @@ impl<T: HeldSource + Send> Drive for HeldIndex<T> {
             pause
         };
         let mut state = self.lock_driver();
-        let mut grew = false;
+        let mut built = false;
         let more = loop {
             let Some(mut job) = state.jobs.pop_front() else {
                 break false;
@@ -1027,8 +1045,7 @@ impl<T: HeldSource + Send> Drive for HeldIndex<T> {
             let epoch = state.epoch;
             // `Some(done)`, or `None` when a reset dropped the job.
             let done = loop {
-                let (step, more) = state.follow(&mut job, &mut pause);
-                grew |= more;
+                let (step, _) = state.follow(&mut job, &mut pause);
                 match step {
                     Step::Done => break Some(true),
                     Step::Paused => break Some(false),
@@ -1048,7 +1065,7 @@ impl<T: HeldSource + Send> Drive for HeldIndex<T> {
                 }
             };
             match done {
-                Some(true) => state.retire(job.collection),
+                Some(true) => built |= state.retire(job.collection),
                 Some(false) => {
                     state.jobs.push_front(job);
                     break true;
@@ -1056,7 +1073,7 @@ impl<T: HeldSource + Send> Drive for HeldIndex<T> {
                 None => {}
             }
         };
-        if grew {
+        if built {
             state.publish_view();
         }
         drop(state);
@@ -2136,43 +2153,36 @@ mod tests {
         all
     }
 
-    /// A driven store publishes a building collection's held set as it
-    /// grows: every published set is closed and contains the previous one,
-    /// and the last is the whole closure, each blob read once.
+    /// A driven store publishes nothing for a building collection until its
+    /// closure is whole, then exactly the whole closure, each blob read
+    /// once, though the driver computed it in many small steps.
     #[test]
-    fn a_driven_build_publishes_closed_growing_held_sets_until_whole() {
+    fn a_driven_build_publishes_nothing_until_the_closure_is_whole() {
         let mut store = Store::default();
         let c = collection(&mut store, "driven");
         let whole = wide(&mut store, c, 20);
         let work = store.drive_held();
         store.track_held([c]);
-        let first = store.snapshot().unwrap();
-        assert_closed(&first, c);
-        let mut previous = held_set(&first, c);
-        assert!(previous.len() < whole.len(), "the allowance left work");
-        let mut publications = 1;
+        assert_eq!(store.snapshot().unwrap().held(c), None, "the allowance left work");
+        let mut unknown = 1;
+        let mut published = None;
         for _ in 0..100_000 {
-            if previous == whole {
-                break;
-            }
             assert!(work.step(Duration::ZERO, Duration::ZERO));
             let snapshot = store.snapshot().unwrap();
-            assert_closed(&snapshot, c);
-            let held = held_set(&snapshot, c);
-            assert!(held.is_superset(&previous), "a held set never shrinks");
-            if held != previous {
-                publications += 1;
+            if snapshot.held(c).is_some() {
+                published = Some(held_set(&snapshot, c));
+                break;
             }
-            previous = held;
+            unknown += 1;
         }
-        assert_eq!(previous, whole);
-        assert!(publications > 10, "{publications} publications");
+        assert_eq!(published, Some(whole));
+        assert!(unknown > 10, "{unknown} snapshots before it was whole");
         let counts = store.reads.lock().unwrap().clone();
         assert!(counts.values().all(|count| *count == 1), "{counts:?}");
     }
 
     /// Dropping the work hands the building back: the next snapshot
-    /// computes the rest itself.
+    /// computes the rest itself and publishes it whole.
     #[test]
     fn a_dropped_driver_hands_the_build_back_to_snapshots() {
         let mut store = Store::default();
@@ -2180,15 +2190,15 @@ mod tests {
         let whole = wide(&mut store, c, 20);
         let work = store.drive_held();
         store.track_held([c]);
-        assert!(held_set(&store.snapshot().unwrap(), c).len() < whole.len());
+        assert_eq!(store.snapshot().unwrap().held(c), None);
         drop(work);
         assert_eq!(held_set(&store.snapshot().unwrap(), c), whole);
     }
 
     /// While the driver waits on a blob read, a snapshot neither waits for
     /// it nor loses its barrier: a built collection's new record is
-    /// published with its closure, and the building one with a closed,
-    /// partial set. Then the build completes.
+    /// published with its closure, and the building one stays unknown. Then
+    /// the build completes and is published whole.
     #[test]
     fn a_snapshot_never_waits_for_a_read_the_driver_makes() {
         let mut store = Store::default();
@@ -2199,7 +2209,7 @@ mod tests {
         let whole = wide(&mut store, c, 20);
         let work = store.drive_held();
         store.track_held([c]);
-        let first = store.snapshot().unwrap();
+        assert_eq!(store.snapshot().unwrap().held(c), None);
         let unread = *whole
             .iter()
             .find(|blob| reads(&store, blob) == 0)
@@ -2230,19 +2240,22 @@ mod tests {
             "the snapshot waited for the read"
         );
         assert!(held_set(&during, built).is_superset(&BTreeSet::from([data, leaf, metadata])));
-        assert_closed(&during, c);
-        assert!(held_set(&first, c).is_subset(&held_set(&during, c)));
-        assert!(!held_set(&during, c).contains(&unread));
+        assert_eq!(during.held(c), None, "a building collection is unknown");
 
         release.send(()).unwrap();
-        let mut held = BTreeSet::new();
+        let mut held = None;
         for _ in 0..1000 {
-            held = held_set(&store.snapshot().unwrap(), c);
-            if held == whole {
+            held = store.snapshot().unwrap().held(c);
+            if held.is_some() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+        let held: BTreeSet<Raw> = held
+            .expect("the driver publishes the whole closure")
+            .iter_ordered()
+            .copied()
+            .collect();
         assert_eq!(held, whole);
         drop(store);
         driver.join().unwrap();
