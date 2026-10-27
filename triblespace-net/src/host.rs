@@ -213,6 +213,10 @@ impl BlobStoreGet for ResidentBlobReader {
 pub(crate) struct CollectionSnapshot {
     repair: Arc<CollectionRepairOverlay>,
     caches: [Arc<crate::riblt_cache::Generation>; 3],
+    /// The store published a held set for the collection. One it has not
+    /// published -- untracked, or tracked and not yet settled -- is unknown,
+    /// not empty, and no references exchange runs on it either way.
+    held_known: bool,
 }
 
 impl CollectionSnapshot {
@@ -233,16 +237,18 @@ impl CollectionSnapshot {
 
     /// Bind the collection's held set, fixed by the same store observation
     /// as the repair evidence. The store's held-blob index computed it: no
-    /// blob is scanned while publishing.
+    /// blob is scanned while publishing. `None` is a set the store has not
+    /// published: the inventory is empty and [`Self::held_known`] says no.
     fn with_held(
         repair: CollectionRepairOverlay,
-        held: HeldBlobs,
+        held: Option<HeldBlobs>,
         previous: Option<&Self>,
     ) -> anyhow::Result<Self> {
         use crate::exchange::Tree;
         use crate::riblt_cache::Generation;
         use crate::walk::WalkKind;
-        let repair = Arc::new(repair.with_blob_inventory(Arc::new(held)));
+        let held_known = held.is_some();
+        let repair = Arc::new(repair.with_blob_inventory(Arc::new(held.unwrap_or_default())));
         let advance = |index, kind| {
             Generation::advance(
                 repair.collection(),
@@ -257,13 +263,24 @@ impl CollectionSnapshot {
             advance(1, WalkKind::References)?,
             advance(2, WalkKind::Derive)?,
         ];
-        Ok(Self { repair, caches })
+        Ok(Self {
+            repair,
+            caches,
+            held_known,
+        })
     }
 
     /// This overlay holding exactly `held`, with fresh component caches.
     #[cfg(test)]
     pub(crate) fn with_inventory(&self, held: HeldBlobs) -> Arc<Self> {
-        Arc::new(Self::with_held(self.repair.as_ref().clone(), held, None).unwrap())
+        Arc::new(Self::with_held(self.repair.as_ref().clone(), Some(held), None).unwrap())
+    }
+
+    /// Whether the store published the collection's held set. An unknown
+    /// set is never exchanged: compared against a peer's, its emptiness
+    /// would read as lacking everything the peer holds.
+    pub(crate) fn held_known(&self) -> bool {
+        self.held_known
     }
 
     pub(crate) fn cache(&self, kind: crate::walk::WalkKind) -> Arc<crate::riblt_cache::Generation> {
@@ -351,9 +368,9 @@ impl StoreSnapshot {
         let reader = ResidentBlobReader::new(&snapshot);
         for raw in active.iter_ordered() {
             let collection = CollectionHandle::new(*raw);
-            // Positive; a collection replicated on demand is untracked and
-            // holds nothing.
-            let held = snapshot.held(collection).unwrap_or_default();
+            // Positive. `None` is unknown: a collection replicated on demand
+            // is untracked, and a tracked one is not settled yet.
+            let held = snapshot.held(collection);
             let prior = previous.and_then(|prior| prior.collections.get(&collection.raw));
             let relevant = match (previous_store, prior) {
                 (Some(before), Some(prior)) => snapshot.changes_for(before, &prior.dependencies),
