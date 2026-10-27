@@ -87,6 +87,9 @@ const REFERENCE_SUMMARY_MAPPING_V2: &str = "C0F7F9B5A68660407FDBFD8CF4D6E1AD";
 const REFERENCE_SUMMARY_MAPPING_V1: &str = "A8C939AA55A7EC07C12FFCDA1FAA5785";
 /// The semantic index's mapping id before f0c6157b: deployed indexes name it.
 const SEMANTIC_BEFORE_F0C6157B: &str = "2B69128192930EE0782CCA03B97677F5";
+/// The entity-keyed text BM25 mapping, the one the pre-v3 lattice derived;
+/// `TEXT_ATTRIBUTE_TO_BM25` now names its text-keyed successor.
+const TEXT_BM25_ENTITY_KEYED: &str = "221CC84DDF0A61477A26BCE6ABD879D1";
 /// An algorithm no table knows, minted for this test with `trible genid`.
 const UNRECOGNISED: &str = "3E378C5714EE7DFCA8022855191FE864";
 
@@ -340,7 +343,7 @@ impl Fixture {
                 triblespace_core::blob::encodings::entity_id_set::GENID_ATTRIBUTE_VALUES_MAPPING_V1,
                 triblespace_core::collection::latest::LATEST_STATES_MAPPING_V1,
                 triblespace_core::collection::lww_register::REGISTER_COORDINATES_MAPPING_V1,
-                triblespace_search::text_bm25::TEXT_ATTRIBUTE_TO_BM25,
+                id(TEXT_BM25_ENTITY_KEYED),
                 triblespace_paths::REGULAR_PATH_MAPPING_V1,
             ] {
                 attached.push(hand_descriptor(&mut pile, root, &[algorithm]));
@@ -829,7 +832,7 @@ fn the_filter_keeps_commits_and_derived_mappings_and_leaves_merges_and_attached_
         "GENID_ATTRIBUTE_VALUES_MAPPING_V1 [attached]: 0 / 1 in 1",
         "LATEST_STATES_MAPPING_V1 [attached]: 0 / 1 in 1",
         "REGISTER_COORDINATES_MAPPING_V1 [attached]: 0 / 1 in 1",
-        "TEXT_ATTRIBUTE_TO_BM25 [attached]: 0 / 1 in 1",
+        "TEXT_ATTRIBUTE_TO_BM25 (entity-keyed) [attached]: 0 / 1 in 1",
         "REGULAR_PATH_MAPPING_V1 [attached]: 0 / 1 in 1",
     ] {
         assert!(

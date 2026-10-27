@@ -6,6 +6,18 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+- `TextAttributeToBm25` keys its documents on the text payloads, not the
+  entities: every distinct `Handle<UTF8String>` a node holds under the
+  attribute is one document, read from the node's rows in place. A text's
+  hash fixes its terms, so documents are whole wherever they appear and an
+  unmerged cover scores like the merged carrier even when one entity's texts
+  are split over commits. Readers join texts to the entities naming them at
+  query time (`trible pile collection search` prints each entity once, at its
+  best text's score). The mapping id is `97085CF14F12761AB804555FEE8F00E5`
+  (minted with `trible genid` on 2026-10-27), replacing
+  `221CC84DDF0A61477A26BCE6ABD879D1`, whose descriptors no longer bind;
+  existing BM25 attachments must be attached again.
+
 - `PortableBM25Blob` stores each document's length (`u64 lengths[D]`, after
   the document keys), so scoring no longer visits every posting to derive
   lengths. The grammar change mints encoding

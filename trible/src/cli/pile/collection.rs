@@ -271,10 +271,11 @@ pub enum Command {
     /// Search a maintained BM25 collection from the command line.
     ///
     /// Reads the attached cover the key believes, cuts the query with the
-    /// tokenizer the descriptor names, and prints the best documents
-    /// (entities of the source collection) with their BM25 scores. With
-    /// --snippet, also prints the start of each hit's text, read from the
-    /// source collection through the attribute the descriptor names. When
+    /// tokenizer the descriptor names, and ranks the texts it indexes. Each
+    /// text is joined to the entities of the source collection that hold it
+    /// under the attribute the descriptor names, and the best entities are
+    /// printed, each once, at its best text's BM25 score. With --snippet,
+    /// also prints the start of that text. When
     /// the read uses no attachment at all, it says why (no key loads, or no
     /// usable attachment here for it: none signed by it, or their bytes are
     /// not here).
@@ -2775,9 +2776,10 @@ fn run_search(
         // Score under the tokenizer the descriptor names; the carrier bytes are
         // the same grammar whichever term space they hold. Interpreting a cover
         // does not rebuild a physical carrier, even when it has several shards.
-        let hits: Vec<(Inline<GenId>, f32)> = match argument.tokenizer {
+        // The documents are texts, keyed by their handles.
+        let hits: Vec<(Inline<Handle<UTF8String>>, f32)> = match argument.tokenizer {
             Bm25Tokenizer::Bigram => {
-                let index: PortableBM25View<GenId, BigramHash> = view
+                let index: PortableBM25View<Handle<UTF8String>, BigramHash> = view
                     .view()
                     .map_err(|error| anyhow!("read carriers: {error}"))?;
                 index
@@ -2787,7 +2789,7 @@ fn run_search(
                     .map_err(|error| anyhow!("BM25 scoring: {error}"))?
             }
             Bm25Tokenizer::Word | Bm25Tokenizer::Code => {
-                let index: PortableBM25View<GenId, WordHash> = view
+                let index: PortableBM25View<Handle<UTF8String>, WordHash> = view
                     .view()
                     .map_err(|error| anyhow!("read carriers: {error}"))?;
                 let terms = if argument.tokenizer == Bm25Tokenizer::Code {
@@ -2802,14 +2804,13 @@ fn run_search(
                     .map_err(|error| anyhow!("BM25 scoring: {error}"))?
             }
         };
-        let mut hits = hits;
-        hits.truncate(top);
 
-        // The normal source view is needed only for selected snippets. Query it
-        // at the point of use; do not serialize it again or build a shadow map.
-        // Attaching the source from the same snapshot as the index reads what
-        // that snapshot holds of it, which covers everything the index stands on.
-        let source_facts: Option<TribleSet> = if snippet && !hits.is_empty() {
+        // The texts are joined to the entities holding them by a query over
+        // the source, at the point of use; nothing is serialized again and no
+        // shadow map is built. Attaching the source from the same snapshot as
+        // the index reads what that snapshot holds of it. The source is read
+        // only when some entity is wanted.
+        let source_facts: Option<TribleSet> = if top > 0 && !hits.is_empty() {
             let source_collection: Collection<SimpleArchive> = Collection::open(&snapshot, source)
                 .map_err(|error| anyhow!("open source descriptor: {error}"))?;
             Some(
@@ -2822,43 +2823,71 @@ fn run_search(
         } else {
             None
         };
+        // Best text first: an entity holding several hits is shown once, at
+        // its best text's score, beside that text.
+        let text_attribute: Inline<GenId> = argument.attribute.to_inline();
+        let mut shown: BTreeSet<Inline<GenId>> = BTreeSet::new();
+        let mut entities: Vec<(Inline<GenId>, Inline<Handle<UTF8String>>, f32)> = Vec::new();
+        let mut unnamed = 0usize;
+        if let Some(facts) = &source_facts {
+            for (text, score) in &hits {
+                if entities.len() == top {
+                    break;
+                }
+                let holders: BTreeSet<Inline<GenId>> = find!(
+                    entity: Inline<GenId>,
+                    facts.pattern(entity, text_attribute, *text)
+                )
+                .collect();
+                if holders.is_empty() {
+                    unnamed += 1;
+                }
+                for entity in holders {
+                    if entities.len() < top && shown.insert(entity) {
+                        entities.push((entity, *text, *score));
+                    }
+                }
+            }
+        }
+        if unnamed > 0 {
+            eprintln!(
+                "{unnamed} matching text(s) are named by no fact this pile holds of the source \
+                 collection, so no entity is shown for them"
+            );
+        }
 
         println!(
             "{} hit(s) for {:?} over {} carrier(s), tokenizer {}",
-            hits.len(),
+            entities.len(),
             query,
             members.len(),
             argument.tokenizer.name()
         );
-        let text_attribute: Inline<GenId> = argument.attribute.to_inline();
-        for (document, score) in hits {
+        for (document, text, score) in entities {
             let entity: &Id = document
                 .try_from_inline()
-                .map_err(|error| anyhow!("document key is not an entity id: {error:?}"))?;
+                .map_err(|error| anyhow!("source entity is not an id: {error:?}"))?;
             let line = format!("{score:>8.3}  {entity:X}");
-            if let Some(facts) = &source_facts {
-                let text = find!(
-                    handle: Inline<Handle<UTF8String>>,
-                    facts.pattern(document, text_attribute, handle)
-                )
-                .find_map(|handle| {
-                    let blob: Blob<UTF8String> = snapshot.get(handle).ok()?;
-                    let text = View::<str>::try_from_blob(blob).ok()?;
-                    // Only consume enough characters to display this snippet.
-                    let mut chars =
-                        text.split_whitespace()
-                            .enumerate()
-                            .flat_map(|(index, word)| {
-                                (index != 0).then_some(' ').into_iter().chain(word.chars())
-                            });
-                    let mut snippet: String = chars.by_ref().take(110).collect();
-                    if chars.next().is_some() {
-                        snippet.push('…');
-                    }
-                    Some(snippet)
-                })
-                .unwrap_or_default();
-                println!("{line}  {text}");
+            if snippet {
+                let blob: Option<Blob<UTF8String>> = snapshot.get(text).ok();
+                let snippet = blob
+                    .and_then(|blob| View::<str>::try_from_blob(blob).ok())
+                    .map(|text| {
+                        // Only consume enough characters to display this snippet.
+                        let mut chars =
+                            text.split_whitespace()
+                                .enumerate()
+                                .flat_map(|(index, word)| {
+                                    (index != 0).then_some(' ').into_iter().chain(word.chars())
+                                });
+                        let mut snippet: String = chars.by_ref().take(110).collect();
+                        if chars.next().is_some() {
+                            snippet.push('…');
+                        }
+                        snippet
+                    })
+                    .unwrap_or_default();
+                println!("{line}  {snippet}");
             } else {
                 println!("{line}");
             }

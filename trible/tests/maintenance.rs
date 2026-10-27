@@ -959,15 +959,19 @@ fn an_upstream_node_left_unattached_does_not_suppress_available_downstream_work(
     pile.close().unwrap();
 }
 
+/// The index ranks texts; the entities holding them come from the source.
+/// A resident, properly witnessed image whose source node is cold still
+/// scores its text, but no fact this pile holds names an entity for it: the
+/// search says so instead of printing a text as if it were an entity, and,
+/// like every search, writes nothing.
 #[cfg(feature = "search")]
 #[test]
-fn bm25_search_without_selected_snippets_does_not_load_source_payloads() {
+fn bm25_search_names_a_hit_whose_source_node_is_cold() {
+    use triblespace_core::blob::encodings::utf8string::UTF8String;
     use triblespace_core::blob::{Blob, IntoBlob};
     use triblespace_core::collection::records::{CollectionCommit, CollectionMap};
     use triblespace_core::collection::CollectionStore;
-    use triblespace_core::inline::encodings::genid::GenId;
     use triblespace_core::inline::encodings::hash::Handle;
-    use triblespace_core::inline::IntoInline;
     use triblespace_core::repo::BlobStoreMeta;
     use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25Index};
     use triblespace_search::text_bm25::{Bm25Tokenizer, TextAttributeToBm25};
@@ -984,8 +988,9 @@ fn bm25_search_without_selected_snippets_does_not_load_source_payloads() {
             },
         )
         .unwrap();
-    let cold = entity! { metadata::description: "cold" };
-    let document = cold.root().unwrap();
+    let text: Blob<UTF8String> = String::from("cold").to_blob();
+    let document = text.get_handle();
+    let cold = entity! { metadata::description: document };
     let data: Blob<SimpleArchive> = cold.facts().to_blob();
     let data_handle = data.get_handle();
     let metadata = pile.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
@@ -996,11 +1001,9 @@ fn bm25_search_without_selected_snippets_does_not_load_source_payloads() {
         metadata,
     );
     pile.insert(CollectionRecord::Commit(commit)).unwrap();
-    // A resident, properly witnessed image can be queried without its cold
-    // historical input archive. This is not a fabricated source fingerprint.
-    let carrier = PortableBM25Index::<GenId, WordHash>::from_exact_counts(
-        [(&document).to_inline()],
-        [((&document).to_inline(), hash_tokens("cold")[0], 1)],
+    let carrier = PortableBM25Index::<Handle<UTF8String>, WordHash>::from_exact_counts(
+        [document],
+        [(document, hash_tokens("cold")[0], 1)],
     )
     .unwrap();
     let output = pile.put::<PortableBM25Blob, _>(carrier).unwrap();
@@ -1021,10 +1024,10 @@ fn bm25_search_without_selected_snippets_does_not_load_source_payloads() {
 
     let before = records(&fixture.path);
     let bytes = std::fs::metadata(&fixture.path).unwrap().len();
-    for args in [
-        vec!["cold"],
-        vec!["cold", "--snippet", "--top", "0"],
-        vec!["absent", "--snippet"],
+    for (args, unnamed) in [
+        (vec!["cold"], true),
+        (vec!["cold", "--snippet", "--top", "0"], false),
+        (vec!["absent", "--snippet"], false),
     ] {
         let mut command = trible();
         command
@@ -1040,15 +1043,72 @@ fn bm25_search_without_selected_snippets_does_not_load_source_payloads() {
             .unwrap();
         assert_success(&output);
         let stdout = String::from_utf8(output.stdout).unwrap();
-        let expected_hits = if args.len() == 1 {
-            "1 hit(s)"
-        } else {
-            "0 hit(s)"
-        };
-        assert!(stdout.contains(expected_hits), "{stdout}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stdout.contains("0 hit(s)"), "{args:?}: {stdout}");
+        assert_eq!(
+            stderr.contains("1 matching text(s) are named by no fact"),
+            unnamed,
+            "{args:?}: {stderr}"
+        );
     }
     assert_eq!(records(&fixture.path), before);
     assert_eq!(std::fs::metadata(&fixture.path).unwrap().len(), bytes);
+}
+
+/// One entity's texts committed apart are two documents in two attachments;
+/// the search joins both back to the one entity and prints it once, at its
+/// better text's score, beside that text.
+#[cfg(feature = "search")]
+#[test]
+fn search_prints_an_entity_once_at_its_best_text() {
+    use triblespace_search::portable_bm25::PortableBM25Blob;
+    use triblespace_search::text_bm25::{Bm25Tokenizer, TextAttributeToBm25};
+
+    let fixture = Fixture::new();
+    let mut pile = Pile::open(&fixture.path).unwrap();
+    let index = pile
+        .attach::<PortableBM25Blob>(
+            fixture.source,
+            TextAttributeToBm25 {
+                attribute: metadata::description.id(),
+                tokenizer: Bm25Tokenizer::Word,
+            },
+        )
+        .unwrap();
+    let split = triblespace_core::id::ufoid();
+    for text in ["needle needle", "needle in a haystack of other words"] {
+        pile.commit(
+            fixture.source,
+            &fixture.signer,
+            entity! { &split @ metadata::description: text },
+        )
+        .unwrap();
+    }
+    pile.close().unwrap();
+    assert_success(&fixture.run("maintain", &[index.handle()]));
+
+    let mut command = trible();
+    command
+        .args(["pile", "collection", "search"])
+        .arg(&fixture.path)
+        .arg(handle_text(index.handle()))
+        .args(["needle", "--snippet"])
+        .arg("--key")
+        .arg(&fixture.key);
+    let output = Command::from_std(command)
+        .timeout(Duration::from_secs(30))
+        .output()
+        .unwrap();
+    assert_success(&output);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("1 hit(s)"), "{stdout}");
+    let entity = format!("{:X}", &*split);
+    let hits: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.contains(&entity))
+        .collect();
+    assert_eq!(hits.len(), 1, "{stdout}");
+    assert!(hits[0].ends_with("  needle needle"), "{stdout}");
 }
 
 #[cfg(feature = "search")]

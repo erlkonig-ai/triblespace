@@ -69,8 +69,13 @@ pub(crate) struct V3Mapping {
 }
 
 /// `TEXT_ATTRIBUTE_TO_BM25`, copied from triblespace-search/src/text_bm25.rs
-/// (introduced in 0ceb79b7).
-const TEXT_ATTRIBUTE_TO_BM25: Id = id_hex!("221CC84DDF0A61477A26BCE6ABD879D1");
+/// (current since its documents became text payloads keyed by handle).
+const TEXT_ATTRIBUTE_TO_BM25: Id = id_hex!("97085CF14F12761AB804555FEE8F00E5");
+/// The earlier value of `TEXT_ATTRIBUTE_TO_BM25`, whose documents were the
+/// entities holding the texts, copied from the line the text-keyed mapping
+/// replaced in the same file (introduced in 0ceb79b7). Its collections are
+/// the ones the pre-v3 lattice derived.
+const TEXT_ATTRIBUTE_TO_BM25_ENTITY_KEYED: Id = id_hex!("221CC84DDF0A61477A26BCE6ABD879D1");
 /// `ARCHIVE_BLOCK_TEXT_BM25_MAPPING_V1`, copied from faculties
 /// src/archive_bm25.rs (introduced in faculties 71317cae). Faculty-owned: no
 /// build of this binary can reach the constant.
@@ -103,8 +108,8 @@ const EMBEDDING_ATTRIBUTE_TO_NVFP4_BEFORE_A1927BD0: Id =
 ///
 /// Attached are the mappings every reader of a node can compute
 /// deterministically, detecting any missing dependency: Succinct, Rank9, the
-/// LWW register, latest states, EntityIdSet, both BM25 mappings and
-/// PathSummary. ReferenceSummary is deleted. The semantic index and the
+/// LWW register, latest states, EntityIdSet, the BM25 mappings (text BM25
+/// under both its entity-keyed and its text-keyed id) and PathSummary. ReferenceSummary is deleted. The semantic index and the
 /// stored-vector NVFP4 set stay derived: they need a model, or a vector
 /// source not every reader has. The table follows this list of the lattice
 /// v3 design; the migration filter's tests check it against the attached and
@@ -169,6 +174,12 @@ pub(crate) const V3_MAPPINGS: &[V3Mapping] = &[
         name: "TEXT_ATTRIBUTE_TO_BM25",
         fate: V3Fate::Attached,
         source: "triblespace-search text_bm25 (literal)",
+    },
+    V3Mapping {
+        id: TEXT_ATTRIBUTE_TO_BM25_ENTITY_KEYED,
+        name: "TEXT_ATTRIBUTE_TO_BM25 (entity-keyed)",
+        fate: V3Fate::Attached,
+        source: "triblespace-search text_bm25, retired (literal)",
     },
     V3Mapping {
         id: ARCHIVE_BLOCK_TEXT_BM25_MAPPING_V1,
@@ -276,6 +287,7 @@ mod tests {
             REGISTER_COORDINATES_MAPPING_V1,
             REGULAR_PATH_MAPPING_V1,
             TEXT_ATTRIBUTE_TO_BM25,
+            TEXT_ATTRIBUTE_TO_BM25_ENTITY_KEYED,
             ARCHIVE_BLOCK_TEXT_BM25_MAPPING_V1,
         ];
         let deleted = [REFERENCE_SUMMARY_MAPPING_V2, REFERENCE_SUMMARY_MAPPING_V1];

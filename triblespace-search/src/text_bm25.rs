@@ -9,23 +9,28 @@
 //! every reader act on the descriptor alone. Every host that holds a node and
 //! its texts computes its attachment, so it is attached, never derived.
 //!
-//! The document key is the entity. An entity with several texts under the
-//! attribute gets, per term, the largest frequency any one of its texts has:
-//! not the sum, because the carrier joins by pointwise maximum, and only a
-//! maximum over texts makes the map a homomorphism over source union,
-//! `map(A ∪ B) = map(A) ⊔ map(B)`, when one entity's texts land in different
-//! members. With one text per entity, which is the common case, the two agree.
-//! The same maximum is what makes a reader's cover of attachments answer
-//! alike whatever its granularity: a document present in two nodes' images
-//! is one document, its frequencies the pointwise maximum, never a sum.
-//! An unmerged cover ([`crate::portable_bm25::PortableBM25View`]) takes such a
-//! document's length from one carrier rather than recomputing it, so it scores
-//! like the merged carrier only while every member holding an entity holds
-//! all of that entity's texts; an entity whose texts are split across members
-//! scores with the largest single-member length until the members are merged.
+//! A document is one text payload blob, keyed by its `Handle<UTF8String>`,
+//! as the semantic HNSW index keys its documents on embedding handles. A
+//! node's image is every distinct value it holds under the attribute, each
+//! cut once by the tokenizer and counted with exact frequencies; an empty
+//! text is still a document. Which entities name a text is not part of the
+//! index: a reader ranks texts and joins each one to the entities holding it
+//! under the attribute, at query time, over the source it reads.
+//!
+//! A text blob is whole by definition: its hash fixes its terms. So the same
+//! text named by several nodes, entities or facts is one document with one
+//! set of frequencies, the map is a homomorphism over source union,
+//! `map(A ∪ B) = map(A) ⊔ map(B)`, and the whole-document premise of
+//! [`crate::portable_bm25::PortableBM25View`] holds however a writer spreads
+//! an entity's texts over commits: every cover of attachments answers like
+//! the index of the union of what it reads.
+//!
+//! The mapping reads the node's rows in place and never decodes them into a
+//! `TribleSet`: it needs only the values under one attribute. Rows under
+//! other attributes are inert.
 //!
 //! A text handle that cannot be read is a missing dependency, never a
-//! silently shorter document. Exact gets through an acquiring reader may
+//! silently missing document. Exact gets through an acquiring reader may
 //! obtain the text while its record and residency observation stay frozen.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,22 +43,25 @@ use triblespace_core::collection::records::{mapping_algorithm, KIND_COLLECTION_M
 use triblespace_core::collection::{
     CollectionAttachment, CollectionData, CollectionOperationError,
 };
-use triblespace_core::id::{id_hex, ExclusiveId, Id, RawId};
+use triblespace_core::id::{id_hex, ExclusiveId, Id};
 use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::hash::Handle;
-use triblespace_core::inline::{Encodes, Inline, IntoInline, RawInline};
+use triblespace_core::inline::{Inline, IntoInline, RawInline};
 use triblespace_core::macros::{attributes, entity};
 use triblespace_core::metadata::{self, MetaDescribe};
 use triblespace_core::repo::StoreRead;
-use triblespace_core::trible::{Fragment, TRIBLE_LEN};
+use triblespace_core::trible::{Fragment, A_START, TRIBLE_LEN, V_START};
 
 use crate::portable_bm25::{PortableBM25Blob, PortableBM25Index};
 use crate::tokens::{bigram_tokens, code_tokens, hash_tokens, BigramHash, WordHash};
 
-/// Stable identity of the text-attribute-to-BM25 mapping. Minted with
-/// `trible genid` on 2026-09-10. The selected attribute and the tokenizer are
-/// mapping-instance parameters.
-pub const TEXT_ATTRIBUTE_TO_BM25: Id = id_hex!("221CC84DDF0A61477A26BCE6ABD879D1");
+/// Stable identity of the text-attribute-to-BM25 mapping, whose documents are
+/// the attribute's text payloads keyed by handle. Minted with `trible genid`
+/// on 2026-10-27; it replaces `221CC84DDF0A61477A26BCE6ABD879D1`
+/// (2026-09-10), whose documents were the entities holding the texts, and
+/// whose descriptors this mapping does not bind. The selected attribute and
+/// the tokenizer are mapping-instance parameters.
+pub const TEXT_ATTRIBUTE_TO_BM25: Id = id_hex!("97085CF14F12761AB804555FEE8F00E5");
 
 attributes! {
     /// Which tokenizer one concrete BM25 mapping cuts its texts with, by name:
@@ -127,8 +135,8 @@ impl MetaDescribe for TextAttributeToBm25Recipe {
     fn describe() -> Fragment {
         let id = TEXT_ATTRIBUTE_TO_BM25;
         entity! { ExclusiveId::force_ref(&id) @
-            metadata::name: "text-attribute-to-bm25",
-            metadata::description: "Canonical join-preserving projection from one selected Handle<UTF8String>-valued SimpleArchive attribute to a portable BM25 carrier: the entity is the document, its texts are cut by the named tokenizer, and term frequencies are exact counts. Joins by document union and pointwise-maximum frequency.",
+            metadata::name: "text-attribute-to-bm25-v2",
+            metadata::description: "Canonical join-preserving projection from one selected Handle<UTF8String>-valued SimpleArchive attribute to a portable BM25 carrier: every distinct text handle a node holds under the attribute is one document keyed by that handle, including an empty text; each text is cut by the named tokenizer and term frequencies are exact counts. A text's hash fixes its terms, so carriers join as a plain document union. Readers join texts to the entities naming them at query time.",
             metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
@@ -203,58 +211,51 @@ impl CollectionAttachment for PortableBM25Blob {
         triblespace_core::collection::simplearchive_union::validate_element(source)
             .map_err(|source| fatal(source.to_string()))?;
 
-        // Every text handle under the attribute, per entity. A set, because a
-        // repeated fact is one fact and must count its terms once.
-        let mut texts: BTreeMap<RawId, BTreeSet<RawInline>> = BTreeMap::new();
-        for raw in source.bytes.as_ref().chunks_exact(TRIBLE_LEN) {
-            if raw[16..32] == argument.attribute[..] {
-                let entity: RawId = raw[..16].try_into().expect("16-byte entity");
-                let value: RawInline = raw[32..].try_into().expect("32-byte trible value");
-                texts.entry(entity).or_default().insert(value);
-            }
-        }
+        // Every distinct text handle under the attribute, read from the rows
+        // in place: a canonical SimpleArchive is a sorted run of 64-byte rows
+        // (entity, attribute, value). A set, because a text named by several
+        // entities or facts is one document and counts its terms once.
+        let texts: BTreeSet<RawInline> = source
+            .bytes
+            .as_ref()
+            .chunks_exact(TRIBLE_LEN)
+            .filter(|row| row[A_START..V_START] == argument.attribute[..])
+            .map(|row| {
+                row[V_START..]
+                    .try_into()
+                    .expect("a SimpleArchive row ends in a 32-byte value")
+            })
+            .collect();
 
-        let mut documents: Vec<Inline<GenId>> = Vec::with_capacity(texts.len());
-        let mut counts: Vec<(Inline<GenId>, RawInline, u32)> = Vec::new();
-        for (entity, handles) in texts {
-            let document: Inline<GenId> = GenId::encode(entity);
-            // Per term, the maximum over this entity's texts: see the module
-            // doc for why not the sum.
+        let mut documents: Vec<Inline<Handle<UTF8String>>> = Vec::with_capacity(texts.len());
+        let mut counts: Vec<(Inline<Handle<UTF8String>>, RawInline, u32)> = Vec::new();
+        for raw in texts {
+            let document = Inline::<Handle<UTF8String>>::new(raw);
+            // The logical dependency is this exact text, not a claim about
+            // its frozen residency. A local reader stays passive; an
+            // acquiring one can supply bytes without a newer view.
+            let blob: Blob<UTF8String> = match reader.get(document) {
+                Ok(blob) => blob,
+                Err(error) if triblespace_core::repo::is_missing_blob(&error) => {
+                    return Err(CollectionOperationError::MissingDependency(Handle::<
+                        UTF8String,
+                    >::to_hash(
+                        document
+                    )));
+                }
+                Err(error) => return Err(fatal(error.to_string())),
+            };
+            let text: View<str> = View::try_from_blob(blob).map_err(|source| {
+                fatal(format!(
+                    "text {} is not UTF-8: {source:?}",
+                    raw.iter()
+                        .map(|byte| format!("{byte:02X}"))
+                        .collect::<String>()
+                ))
+            })?;
             let mut frequencies: BTreeMap<RawInline, u32> = BTreeMap::new();
-            for raw in handles {
-                let handle = Inline::<Handle<UTF8String>>::new(raw);
-                // The logical dependency is this exact text, not a claim
-                // about its frozen residency. A local reader stays passive;
-                // an acquiring one can supply bytes without a newer view.
-                let blob: Blob<UTF8String> = match reader.get(handle) {
-                    Ok(blob) => blob,
-                    Err(error) if triblespace_core::repo::is_missing_blob(&error) => {
-                        return Err(CollectionOperationError::MissingDependency(Handle::<
-                            UTF8String,
-                        >::to_hash(
-                            handle
-                        )));
-                    }
-                    Err(error) => return Err(fatal(error.to_string())),
-                };
-                let text: View<str> = View::try_from_blob(blob).map_err(|source| {
-                    fatal(format!(
-                        "text {} is not UTF-8: {source:?}",
-                        raw.iter()
-                            .map(|byte| format!("{byte:02X}"))
-                            .collect::<String>()
-                    ))
-                })?;
-                let mut in_this_text: BTreeMap<RawInline, u32> = BTreeMap::new();
-                for term in argument.tokenizer.terms(&text) {
-                    *in_this_text.entry(term).or_insert(0) += 1;
-                }
-                for (term, frequency) in in_this_text {
-                    frequencies
-                        .entry(term)
-                        .and_modify(|best| *best = (*best).max(frequency))
-                        .or_insert(frequency);
-                }
+            for term in argument.tokenizer.terms(&text) {
+                *frequencies.entry(term).or_insert(0) += 1;
             }
             documents.push(document);
             counts.extend(
@@ -265,17 +266,19 @@ impl CollectionAttachment for PortableBM25Blob {
         }
 
         let index = match argument.tokenizer {
-            Bm25Tokenizer::Bigram => PortableBM25Index::<GenId, BigramHash>::from_exact_counts(
-                documents,
-                counts.into_iter().map(|(document, term, frequency)| {
-                    (document, Inline::<BigramHash>::new(term), frequency)
-                }),
-            )
-            .map_err(|source| fatal(source.to_string()))?
-            .bytes()
-            .clone(),
+            Bm25Tokenizer::Bigram => {
+                PortableBM25Index::<Handle<UTF8String>, BigramHash>::from_exact_counts(
+                    documents,
+                    counts.into_iter().map(|(document, term, frequency)| {
+                        (document, Inline::<BigramHash>::new(term), frequency)
+                    }),
+                )
+                .map_err(|source| fatal(source.to_string()))?
+                .bytes()
+                .clone()
+            }
             Bm25Tokenizer::Word | Bm25Tokenizer::Code => {
-                PortableBM25Index::<GenId, WordHash>::from_exact_counts(
+                PortableBM25Index::<Handle<UTF8String>, WordHash>::from_exact_counts(
                     documents,
                     counts.into_iter().map(|(document, term, frequency)| {
                         (document, Inline::<WordHash>::new(term), frequency)
@@ -299,6 +302,8 @@ mod tests {
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::repo::{BlobStorePut, SnapshotSource};
     use triblespace_core::trible::{Trible, TribleSet};
+
+    type TextView = crate::portable_bm25::PortableBM25View<Handle<UTF8String>, WordHash>;
 
     fn text_facts(
         attribute: Id,
@@ -362,7 +367,8 @@ mod tests {
         assert_eq!(members.len(), 1);
         let member: Blob<PortableBM25Blob> = snapshot.get(members[0]).unwrap();
         let index =
-            PortableBM25Index::<GenId, BigramHash>::from_bytes(member.bytes.clone()).unwrap();
+            PortableBM25Index::<Handle<UTF8String>, BigramHash>::from_bytes(member.bytes.clone())
+                .unwrap();
         assert_eq!(index.doc_count(), 1);
         assert_eq!(index.term_count(), 3);
     }
@@ -444,10 +450,7 @@ mod tests {
 
     /// Scores, per document, for one query, rounded to compare across two
     /// summation orders.
-    fn scores(
-        view: &crate::portable_bm25::PortableBM25View,
-        query: &str,
-    ) -> BTreeMap<RawInline, i64> {
+    fn scores(view: &TextView, query: &str) -> BTreeMap<RawInline, i64> {
         view.query()
             .unwrap()
             .query_multi(&hash_tokens(query))
@@ -463,11 +466,9 @@ mod tests {
     /// the attached cover scores every query exactly as the index of the
     /// union of every foundation does.
     ///
-    /// Each commit names its own entities, so every node holding an entity
-    /// holds all of its texts: the whole-document premise of
-    /// [`crate::portable_bm25::PortableBM25View`]. Merged nodes still overlap.
-    /// An entity whose texts are split across members would take one
-    /// member's length in the cover (see the module docs).
+    /// Entities recur across commits, so one entity's texts are split over
+    /// members, and some texts recur too, so one document sits in several
+    /// foundations: a text-keyed document is whole wherever it appears.
     #[test]
     fn attached_covers_answer_like_the_index_of_the_union() {
         use ed25519_dalek::SigningKey;
@@ -500,16 +501,20 @@ mod tests {
             let mut union = TribleSet::new();
             for index in 0..8 + random.below(8) {
                 let mut rows = Vec::new();
-                for _ in 0..1 + random.below(3) {
+                for row in 0..1 + random.below(3) {
                     let words: Vec<&str> = (0..1 + random.below(4))
                         .map(|_| WORDS[random.below(WORDS.len() as u64) as usize])
                         .collect();
-                    // Real distinct foundations; documents overlap only
-                    // through merged nodes, never by splitting an entity.
-                    let text = store
-                        .put::<UTF8String, _>(format!("{} node{index}", words.join(" ")))
-                        .unwrap();
-                    rows.push((1 + 5 * index as u8 + random.below(5) as u8, text));
+                    // Real distinct foundations, while entity IDs overlap.
+                    // Every first text names its node; a later one may
+                    // repeat a text another commit holds.
+                    let text = if row == 0 || random.below(2) == 0 {
+                        format!("{} node{index}", words.join(" "))
+                    } else {
+                        words.join(" ")
+                    };
+                    let text = store.put::<UTF8String, _>(text).unwrap();
+                    rows.push((1 + random.below(5) as u8, text));
                 }
                 let facts = text_facts(attribute.id(), rows);
                 union += facts.clone();
@@ -630,10 +635,10 @@ mod tests {
             let snapshot = store.snapshot().unwrap();
             let descriptor: Blob<SimpleArchive> = snapshot.get(target.handle()).unwrap();
             let descriptor = Fragment::from(TribleSet::try_from_blob(descriptor).unwrap());
-            let through_cover: crate::portable_bm25::PortableBM25View =
+            let through_cover: TextView =
                 TryFromCover::try_from_cover(&target.cover(members), &descriptor, &snapshot)
                     .unwrap();
-            let through_union: crate::portable_bm25::PortableBM25View =
+            let through_union: TextView =
                 TryFromCover::try_from_cover(&target.cover([expected]), &descriptor, &snapshot)
                     .unwrap();
             assert_eq!(
@@ -688,8 +693,12 @@ mod tests {
             .put::<UTF8String, _>(String::from("needle hay"))
             .unwrap();
         let other = store.put::<UTF8String, _>(String::from("hay")).unwrap();
+        // A text of its own on the right, so the two nodes' images differ.
+        let third = store
+            .put::<UTF8String, _>(String::from("hay stack"))
+            .unwrap();
         let left = text_facts(attribute.id(), [(1, shared), (2, other)]);
-        let right = text_facts(attribute.id(), [(1, shared), (3, other)]);
+        let right = text_facts(attribute.id(), [(1, shared), (3, other), (4, third)]);
         let mut union = left.clone();
         union += right.clone();
         let mut nodes = Vec::new();
@@ -728,7 +737,7 @@ mod tests {
         let snapshot = store.snapshot().unwrap();
         let descriptor: Blob<SimpleArchive> = snapshot.get(target.handle()).unwrap();
         let descriptor = Fragment::from(TribleSet::try_from_blob(descriptor).unwrap());
-        let through_union: crate::portable_bm25::PortableBM25View =
+        let through_union: TextView =
             TryFromCover::try_from_cover(&target.cover([expected]), &descriptor, &snapshot)
                 .unwrap();
 
@@ -736,9 +745,7 @@ mod tests {
         let attached = snapshot.attached(target).unwrap();
         assert_eq!(attached.cover().len(), 1);
         assert_eq!(attached.residual().len(), 1);
-        let read = attached
-            .read::<crate::portable_bm25::PortableBM25View>()
-            .unwrap();
+        let read = attached.read::<TextView>().unwrap();
         assert!(read.unread().is_empty());
         drop(snapshot);
 
@@ -748,8 +755,9 @@ mod tests {
         let attached = snapshot.attached(target).unwrap();
         assert_eq!(attached.cover().len(), 2);
         assert!(attached.residual().is_empty());
-        let through_cover: crate::portable_bm25::PortableBM25View = attached.view().unwrap();
+        let through_cover: TextView = attached.view().unwrap();
 
+        // Three texts, whichever entities name them, in either node.
         for view in [&through_cover, read.value()] {
             assert_eq!(view.query().unwrap().doc_count(), 3);
             for query in ["needle", "hay", "needle hay"] {
@@ -794,9 +802,7 @@ mod tests {
             .unwrap();
         let before = store.snapshot().unwrap();
         let attached = before.attached(target).unwrap();
-        let read = attached
-            .read::<crate::portable_bm25::PortableBM25View>()
-            .unwrap();
+        let read = attached.read::<TextView>().unwrap();
         assert_eq!(
             read.unread()
                 .members()
@@ -812,11 +818,7 @@ mod tests {
             !attached.is_current(&after),
             "the text the read asked for moves it off current"
         );
-        let read = after
-            .attached(target)
-            .unwrap()
-            .read::<crate::portable_bm25::PortableBM25View>()
-            .unwrap();
+        let read = after.attached(target).unwrap().read::<TextView>().unwrap();
         assert!(read.unread().is_empty());
         assert_eq!(read.value().query().unwrap().doc_count(), 1);
     }
@@ -903,15 +905,20 @@ mod tests {
                 .unwrap();
         assert_eq!(mapped_union.bytes.as_ref(), joined.bytes.as_ref());
 
-        let index =
-            PortableBM25Index::<GenId, WordHash>::from_bytes(mapped_union.bytes.clone()).unwrap();
+        // Three texts, whichever entities name them: entity 2 holds two of
+        // them and is no document of its own.
+        let index = PortableBM25Index::<Handle<UTF8String>, WordHash>::from_bytes(
+            mapped_union.bytes.clone(),
+        )
+        .unwrap();
         assert_eq!(index.doc_count(), 3);
-        let two: Inline<GenId> = GenId::encode([2u8; 16]);
+        let documents: BTreeSet<_> = index.document_keys().collect();
+        assert_eq!(documents, BTreeSet::from([apples, pears, empty]));
         let apple_terms = hash_tokens("apples");
-        assert_eq!(index.term_frequency(&two, &apple_terms[0]).unwrap(), 2);
-        // "pears" occurs once in each of entity 2's texts: the maximum, not the sum.
+        assert_eq!(index.term_frequency(&apples, &apple_terms[0]).unwrap(), 2);
         let pear_terms = hash_tokens("pears");
-        assert_eq!(index.term_frequency(&two, &pear_terms[0]).unwrap(), 1);
+        assert_eq!(index.term_frequency(&apples, &pear_terms[0]).unwrap(), 1);
+        assert_eq!(index.term_frequency(&pears, &pear_terms[0]).unwrap(), 1);
     }
 
     #[test]
