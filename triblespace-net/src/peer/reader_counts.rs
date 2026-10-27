@@ -212,7 +212,7 @@ impl<S: HeldStore> HeldStore for Counted<S> {
         self.inner.note_held(collection, handle)
     }
 
-    fn drive_held(&mut self) -> triblespace_core::collection::HeldWork {
+    fn drive_held(&mut self) -> Option<triblespace_core::collection::HeldWork> {
         self.inner.drive_held()
     }
 }

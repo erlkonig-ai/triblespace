@@ -276,9 +276,8 @@ where
         self.held.note(collection, handle.raw);
     }
 
-    fn drive_held(&mut self) -> HeldWork {
-        self.held.drive();
-        self.held.work()
+    fn drive_held(&mut self) -> Option<HeldWork> {
+        self.held.drive().then(|| self.held.work())
     }
 }
 

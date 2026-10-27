@@ -409,7 +409,8 @@ where
 /// How long the held-set thread computes before it lets go of the index,
 /// and how long it waits for work when there is none. It lets go at once
 /// for a snapshot that waits, and never holds the index across a blob read,
-/// so a snapshot waits for at most one in-memory step of it.
+/// so a snapshot waits for at most one in-memory step of it. A read in
+/// progress outlasts the step; nothing waits on it.
 const HELD_STEP: std::time::Duration = std::time::Duration::from_millis(20);
 const HELD_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -564,16 +565,17 @@ where
         let mut full = ActiveCollections::new();
         if mode == ReplicationMode::Full {
             if !self.held_driven {
+                // `None`: another driver already builds this store's sets.
                 let work = self.store().drive_held();
-                // A thread that cannot start drops the work, which hands the
-                // building back to snapshots.
-                let spawned = std::thread::Builder::new()
-                    .name("held-sets".into())
-                    .spawn(move || while work.step(HELD_STEP, HELD_IDLE) {});
-                match spawned {
-                    Ok(_) => self.held_driven = true,
-                    Err(error) => {
-                        tracing::warn!(%error, "held sets are built by snapshots: no thread")
+                self.held_driven = true;
+                if let Some(mut work) = work {
+                    // A thread that cannot start drops the work, which hands
+                    // the building back to snapshots.
+                    let spawned = std::thread::Builder::new()
+                        .name("held-sets".into())
+                        .spawn(move || while work.step(HELD_STEP, HELD_IDLE) {});
+                    if let Err(error) = spawned {
+                        tracing::warn!(%error, "held sets are built by snapshots: no thread");
                     }
                 }
             }
