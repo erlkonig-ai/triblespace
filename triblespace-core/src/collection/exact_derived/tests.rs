@@ -5935,7 +5935,7 @@ mod lattice_v2 {
             store.offer(&shared);
             store.offer(&faulting);
             store.acquire_fails.insert(y);
-            let mut attempted = BTreeSet::new();
+            let mut attempted = crate::repo::DependencySet::new();
             let mut unfetched = Unfetched::default();
             let mut broken = None;
             let mut failures = 0;

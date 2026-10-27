@@ -22,9 +22,9 @@ use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
 use crate::inline::encodings::ed25519::ED25519PublicKey;
 use crate::inline::encodings::hash::Handle;
-use crate::inline::Inline;
+use crate::inline::{Inline, INLINE_LEN};
 use crate::repo::async_store::AsyncBlobStoreAcquire;
-use crate::repo::{BlobStoreGet, BlobStoreList, Store, StoreRead};
+use crate::repo::{BlobStoreGet, BlobStoreList, DependencySet, Store, StoreRead};
 use crate::trible::Fragment;
 
 use super::operation_snapshot::OperationFrontier;
@@ -494,7 +494,7 @@ where
 
 pub(crate) async fn acquire_missing<S>(
     store: &mut S,
-    attempted: &mut BTreeSet<CollectionData>,
+    attempted: &mut BlobSet,
     member: CollectionData,
 ) -> Result<bool, CollectionRealizationError>
 where
@@ -525,7 +525,7 @@ where
     S: Store + AsyncBlobStoreAcquire,
     E: CollectionEncoding,
 {
-    let mut attempted = BTreeSet::new();
+    let mut attempted = BlobSet::new();
     loop {
         let snapshot = store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("observe authority definitions", error)
@@ -600,7 +600,7 @@ pub(crate) async fn ensure_root<S>(
 where
     S: Store + AsyncBlobStoreAcquire,
 {
-    let mut attempted = BTreeSet::new();
+    let mut attempted = BlobSet::new();
     loop {
         let snapshot = store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("observe root realization", error)
@@ -655,22 +655,25 @@ where
 /// `n` calls in expectation, or `n/8` in the one-blob case.
 const OPTIONAL_FETCH_FAILURES: usize = 8;
 
+/// Blob hashes kept across the operation reruns of one call, as a PATCH set.
+type BlobSet = DependencySet<INLINE_LEN, CollectionData>;
+
 /// The blobs one call asked for and did not get.
 #[derive(Default)]
 pub(super) struct Unfetched {
     /// No holder handed these over: an answer about elsewhere, so a leaf
     /// naming one of them as its output does not count.
-    pub(super) unavailable: BTreeSet<CollectionData>,
+    pub(super) unavailable: BlobSet,
     /// Not here, asked of a store that answers from its own blobs alone
     /// ([`AsyncBlobStoreAcquire::acquires_remotely`]). That says nothing
     /// about any holder, so a leaf naming one of them still counts: its
     /// foundation waits.
-    pub(super) absent: BTreeSet<CollectionData>,
+    pub(super) absent: BlobSet,
     /// Fetching these failed outright -- the store could not ask other
     /// holders, or could not keep what it got. That is a fault here and says
     /// nothing about any holder, so a leaf naming one of them is not given
     /// up on: its foundation waits.
-    pub(super) failed: BTreeSet<CollectionData>,
+    pub(super) failed: BlobSet,
 }
 
 impl Unfetched {
@@ -734,7 +737,7 @@ where
         &mut OperationFrontier<S::Snapshot>,
     ) -> Result<(), CollectionRealizationError>,
 {
-    let mut attempted = BTreeSet::new();
+    let mut attempted = BlobSet::new();
     let mut unfetched = Unfetched::default();
     let mut failures = 0;
     let mut broken = None;
@@ -792,7 +795,7 @@ where
 async fn ask_wanted<S>(
     store: &mut S,
     wanted: Vec<Vec<CollectionData>>,
-    attempted: &mut BTreeSet<CollectionData>,
+    attempted: &mut BlobSet,
     unfetched: &mut Unfetched,
     broken: &mut Option<CollectionRealizationError>,
     failures: &mut usize,
@@ -833,7 +836,7 @@ where
 /// error is kept in `broken`, to be reported once the work is done.
 async fn ask<S>(
     store: &mut S,
-    attempted: &mut BTreeSet<CollectionData>,
+    attempted: &mut BlobSet,
     unfetched: &mut Unfetched,
     broken: &mut Option<CollectionRealizationError>,
     member: CollectionData,
@@ -963,7 +966,7 @@ where
     S: Store + AsyncBlobStoreAcquire,
     E: CollectionEncoding,
 {
-    let mut attempted = BTreeSet::new();
+    let mut attempted = BlobSet::new();
     loop {
         let snapshot = store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("observe attached lineage", error)
