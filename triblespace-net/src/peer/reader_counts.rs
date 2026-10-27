@@ -211,6 +211,10 @@ impl<S: HeldStore> HeldStore for Counted<S> {
     ) {
         self.inner.note_held(collection, handle)
     }
+
+    fn drive_held(&mut self) -> triblespace_core::collection::HeldWork {
+        self.inner.drive_held()
+    }
 }
 
 impl<R: triblespace_core::collection::CoverageRead> triblespace_core::collection::CoverageRead

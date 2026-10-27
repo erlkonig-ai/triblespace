@@ -49,32 +49,49 @@
 //! # Snapshots
 //!
 //! Every snapshot carries the held sets as they stood when it was taken, and
-//! they never change afterwards. Taking a snapshot first extends the sets by
-//! the closures of what arrived since the previous one -- every seed of a new
-//! record (one another record already named included), seeds whose bytes
-//! arrived, memberships peers reported -- computed against that snapshot.
-//! That is the publication barrier: an observation is never handed out ahead
-//! of its new records' closures. A changed [`HeldRead::held_generation`] says
-//! the sets grew although the store may not have changed, as a report does.
+//! they never change afterwards. A published held set is *closed*, not
+//! necessarily complete:
 //!
-//! A held set is *closed* under the edge cache for readable children: a blob
+//! A held set is closed under the edge cache for readable children: a blob
 //! joins only once every child the cache names for it has joined. So every
 //! closure computed later stops at a held blob without missing anything
-//! readable the cache knows below it. A blob that cannot be read -- absent,
-//! or resident and failing to read -- is unknown on every path: nothing above
-//! it joins. A seed is read again when its bytes arrive, a reported blob when
-//! a peer reports it again.
+//! readable the cache knows below it, and any prefix of a closure computation
+//! is itself closed. A blob that cannot be read -- absent, or resident and
+//! failing to read -- is unknown on every path: nothing above it joins. A seed
+//! is read again when its bytes arrive, a reported blob when a peer reports
+//! it again.
 //!
-//! When a collection is first tracked, its existing closure is computed by
-//! the next snapshot, which reads every blob it reaches once. Nothing here
-//! starts a thread.
+//! A tracked collection is *settled* once its seeds are selected; from then
+//! on it has a held set. Until its first closure (since tracking began, or
+//! since a reset) is computed, it is *building*; afterwards it is *built*.
+//!
+//! Taking a snapshot first extends the sets of built collections by the
+//! closures of what arrived since the previous one -- every seed of a new
+//! record (one another record already named included), seeds whose bytes
+//! arrived, memberships peers reported -- computed against that snapshot.
+//! That is the publication barrier: for a built collection, an observation
+//! is never handed out ahead of its new records' closures. A changed
+//! [`HeldRead::held_generation`] says the sets grew although the store may
+//! not have changed, as a report does.
+//!
+//! A building collection's closure is computed by the snapshot that settles
+//! it, reading every blob it reaches once -- unless the store's held sets are
+//! *driven* ([`HeldStore::drive_held`]). Then that snapshot reads only a small
+//! allowance of it, and the [`HeldWork`] the driver holds computes the rest in
+//! bounded steps against the latest observed snapshot, publishing the set as
+//! it grows. The driver never holds the index across a blob read, so taking a
+//! snapshot waits for at most a few in-memory updates, never for the build.
+//! What arrives for a building collection queues behind its build. Nothing
+//! here starts a thread: the driver's thread is its caller's.
 //!
 //! A snapshot that lost a blob its predecessor had (a store that forgets
 //! blobs) resets the index: the edges are forgotten and every collection is
 //! recomputed as if newly tracked.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::time::{Duration, Instant};
 
 use anybytes::Bytes;
 
@@ -148,7 +165,9 @@ fn take_related(pairs: &mut Pairs, first: &Raw) -> Vec<Raw> {
 pub trait HeldRead {
     /// Every blob `collection` holds in this observation, or `None` when the
     /// store does not track it (or has not yet been able to select its
-    /// seeds). Absence from the set is not evidence that a blob is missing.
+    /// seeds): unknown, not empty. The set is closed; while the collection is
+    /// building it may be partial. Absence from the set is not evidence that
+    /// a blob is missing.
     fn held(&self, collection: CollectionHandle) -> Option<HeldBlobs>;
 
     /// Differs between two observations of one store whenever their held sets
@@ -166,6 +185,66 @@ pub trait HeldStore {
     /// reaches join `held(collection)`; a report of a blob that is not
     /// resident is dropped. Kept in memory only.
     fn note_held(&mut self, collection: CollectionHandle, handle: Inline<Handle<UnknownBlob>>);
+
+    /// Build the first closures of tracked collections off the snapshot
+    /// path: from now on a snapshot reads only a small allowance of a
+    /// building collection's closure, and the returned work computes the
+    /// rest, publishing each collection's held set, closed, as it grows. A
+    /// snapshot never waits for a blob read the work makes. Dropping the
+    /// work hands the building back to snapshots.
+    fn drive_held(&mut self) -> HeldWork;
+}
+
+/// What a snapshot of a building collection reads itself in a driven store
+/// before leaving the rest of the closure to the driver: whichever of these
+/// runs out first. A small collection is published whole, as in a store
+/// nobody drives.
+const INLINE_SCANS: usize = 256;
+const INLINE_BYTES: usize = 16 << 20;
+
+/// The closure work a driven store's snapshots leave
+/// ([`HeldStore::drive_held`]). It refers to the store's index weakly, so it
+/// keeps nothing alive; dropping it hands the building back to snapshots.
+pub struct HeldWork(Weak<dyn Drive>);
+
+/// What [`HeldWork`] asks of the index it drives.
+trait Drive: Send + Sync {
+    /// Compute for about `budget`; whether work remains.
+    fn advance(&self, budget: Duration) -> bool;
+    /// Return once work is queued, or after `timeout`.
+    fn wait(&self, timeout: Duration);
+    /// Snapshots build first closures themselves again.
+    fn undrive(&self);
+}
+
+impl HeldWork {
+    /// Compute for about `budget`, or, when nothing is queued, wait up to
+    /// `idle` for work. `false` once the store is gone.
+    pub fn step(&self, budget: Duration, idle: Duration) -> bool {
+        let Some(index) = self.0.upgrade() else {
+            return false;
+        };
+        if !index.advance(budget) {
+            index.wait(idle);
+        }
+        true
+    }
+}
+
+impl Drop for HeldWork {
+    fn drop(&mut self) {
+        if let Some(index) = self.0.upgrade() {
+            index.undrive();
+        }
+    }
+}
+
+impl std::fmt::Debug for HeldWork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldWork")
+            .field("store", &(self.0.strong_count() > 0))
+            .finish()
+    }
 }
 
 /// What the index reads from a snapshot.
@@ -267,50 +346,132 @@ struct State<T> {
     proofs_stale: bool,
     /// `collection || blob`: peer reports not resolved yet.
     candidates: Pairs,
+    /// Closure computations not finished yet, oldest first.
+    jobs: VecDeque<Job>,
+    /// Settled collections whose first closure a driver is still computing.
+    building: Handles,
+    /// A driver computes building collections' closures
+    /// ([`HeldStore::drive_held`]).
+    driven: bool,
+    /// Counts resets: a read the driver made across one is dropped.
+    epoch: u64,
     /// The last observation fed in.
     fed: Option<T>,
     generation: u64,
     view: Arc<HeldView>,
 }
 
+/// One closure computation: roots to add to one collection's held set and
+/// the depth-first scratch following them, kept so that the computation can
+/// pause between any two steps.
+#[derive(Clone)]
+struct Job {
+    collection: CollectionHandle,
+    /// Depth first, a blob's children before it: a blob still to enter, or
+    /// one entered with its children, decided once they are.
+    stack: Vec<(Raw, Option<Vec<Raw>>)>,
+    entered: HashSet<Raw>,
+    /// Blobs that cannot be read, and every blob above one.
+    unknown: HashSet<Raw>,
+}
+
+impl Job {
+    fn new(collection: CollectionHandle, roots: impl IntoIterator<Item = Raw>) -> Self {
+        Self {
+            collection,
+            stack: roots.into_iter().map(|root| (root, None)).collect(),
+            entered: HashSet::new(),
+            unknown: HashSet::new(),
+        }
+    }
+
+    /// Enter `handle`: its children not `held` are decided before it.
+    fn descend(&mut self, handle: Raw, children: Vec<Raw>, held: Option<&HeldBlobs>) {
+        let unheld: Vec<(Raw, Option<Vec<Raw>>)> = children
+            .iter()
+            .filter(|child| !held.is_some_and(|held| held.has_prefix(*child)))
+            .map(|child| (*child, None))
+            .collect();
+        // Popped after every child below it has been decided.
+        self.stack.push((handle, Some(children)));
+        self.stack.extend(unheld);
+    }
+}
+
+/// Where [`State::follow`] stopped.
+enum Step {
+    /// The job is done.
+    Done,
+    /// The job needs this blob read, scanned and fed back through
+    /// [`State::read`].
+    Read(Raw),
+    /// The job was told to pause.
+    Paused,
+}
+
 /// The shared held-blob index of one store. Its own lock: holding it never
-/// blocks a coverage read. A clone is an independent copy.
+/// blocks a coverage read. A clone is an independent copy, driven by nobody.
 pub(crate) struct HeldIndex<T> {
     state: Mutex<State<T>>,
+    /// Notified when jobs are left for the driver.
+    queued: Condvar,
+    /// Lockers other than the driver waiting for the state: the driver
+    /// pauses for them.
+    waiting: AtomicUsize,
 }
 
 impl<T> Default for HeldIndex<T> {
     fn default() -> Self {
-        Self {
-            state: Mutex::new(State {
-                tracked: Handles::new(),
-                held: HeldSets::new(),
-                seeds: Pairs::new(),
-                routes: Pairs::new(),
-                scanned: Handles::new(),
-                edges: Pairs::new(),
-                pending: Pairs::new(),
-                unrouted: Handles::new(),
-                proofs_stale: false,
-                candidates: Pairs::new(),
-                fed: None,
-                generation: 0,
-                view: Arc::new(HeldView::default()),
-            }),
-        }
+        Self::with_state(State {
+            tracked: Handles::new(),
+            held: HeldSets::new(),
+            seeds: Pairs::new(),
+            routes: Pairs::new(),
+            scanned: Handles::new(),
+            edges: Pairs::new(),
+            pending: Pairs::new(),
+            unrouted: Handles::new(),
+            proofs_stale: false,
+            candidates: Pairs::new(),
+            jobs: VecDeque::new(),
+            building: Handles::new(),
+            driven: false,
+            epoch: 0,
+            fed: None,
+            generation: 0,
+            view: Arc::new(HeldView::default()),
+        })
     }
 }
 
 impl<T: Clone> Clone for HeldIndex<T> {
     fn clone(&self) -> Self {
-        Self {
-            state: Mutex::new(self.lock().clone()),
-        }
+        let mut state = self.lock().clone();
+        // The driver drives the original; the copy's snapshots build.
+        state.driven = false;
+        Self::with_state(state)
     }
 }
 
 impl<T> HeldIndex<T> {
+    fn with_state(state: State<T>) -> Self {
+        Self {
+            state: Mutex::new(state),
+            queued: Condvar::new(),
+            waiting: AtomicUsize::new(0),
+        }
+    }
+
+    /// The state, for anyone but the driver, which pauses for this.
     fn lock(&self) -> MutexGuard<'_, State<T>> {
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        let state = self.state.lock().expect("held-blob index is not poisoned");
+        self.waiting.fetch_sub(1, Ordering::SeqCst);
+        state
+    }
+
+    /// The state, for the driver.
+    fn lock_driver(&self) -> MutexGuard<'_, State<T>> {
         self.state.lock().expect("held-blob index is not poisoned")
     }
 
@@ -328,6 +489,11 @@ impl<T> HeldIndex<T> {
                 .candidates
                 .insert(&Entry::new(&pair(&collection.raw, &handle)));
         }
+    }
+
+    /// From now on a driver computes building collections' closures.
+    pub(crate) fn drive(&self) {
+        self.lock().driven = true;
     }
 }
 
@@ -408,9 +574,10 @@ fn proof_seeds<T: HeldSource>(
     Ok(found)
 }
 
-/// Read one blob and list its resident children, or `None` if it is not
-/// readable. Children are probed in the store's index without reading them.
-fn scan<T: HeldSource>(snapshot: &T, handle: &Raw) -> Option<Vec<Raw>> {
+/// Read one blob and list its resident children with its length, or `None`
+/// if it is not readable. Children are probed in the store's index without
+/// reading them.
+fn scan<T: HeldSource>(snapshot: &T, handle: &Raw) -> Option<(Vec<Raw>, usize)> {
     let body: Bytes = snapshot
         .get::<Bytes, UnknownBlob>(Inline::<Handle<UnknownBlob>>::new(*handle))
         .ok()?;
@@ -426,7 +593,24 @@ fn scan<T: HeldSource>(snapshot: &T, handle: &Raw) -> Option<Vec<Raw>> {
         .collect();
     children.sort_unstable();
     children.dedup();
-    Some(children)
+    Some((children, body.len()))
+}
+
+/// Blob reads a snapshot may still make for building collections.
+struct Allowance {
+    scans: usize,
+    bytes: usize,
+}
+
+impl Allowance {
+    fn spent(&self) -> bool {
+        self.scans == 0 || self.bytes == 0
+    }
+
+    fn spend(&mut self, bytes: usize) {
+        self.scans = self.scans.saturating_sub(1);
+        self.bytes = self.bytes.saturating_sub(bytes);
+    }
 }
 
 impl<T> State<T> {
@@ -437,6 +621,9 @@ impl<T> State<T> {
         self.edges = Pairs::new();
         self.pending = Pairs::new();
         self.held = HeldSets::new();
+        self.jobs = VecDeque::new();
+        self.building = Handles::new();
+        self.epoch += 1;
     }
 
     fn publish_view(&mut self) {
@@ -454,76 +641,136 @@ impl<T> State<T> {
             self.edges.insert(&Entry::new(&pair(&handle, child)));
         }
     }
+
+    /// Queue everything reachable from `roots` for `collection`'s held set,
+    /// in the last job if that one is the collection's and has entered
+    /// nothing yet.
+    fn enqueue(&mut self, collection: CollectionHandle, roots: impl IntoIterator<Item = Raw>) {
+        match self.jobs.back_mut() {
+            Some(last) if last.collection == collection && last.entered.is_empty() => {
+                last.stack.extend(roots.into_iter().map(|root| (root, None)));
+            }
+            _ => self.jobs.push_back(Job::new(collection, roots)),
+        }
+    }
+
+    /// A building collection with no job left is built.
+    fn retire(&mut self, collection: CollectionHandle) {
+        if !self.jobs.iter().any(|job| job.collection == collection) {
+            self.building.remove(&collection.raw);
+        }
+    }
+
+    /// Follow `job` until it is done, needs a blob read, or `pause` (asked
+    /// before every step) says to stop; and whether the held set grew.
+    ///
+    /// A blob joins only after every resident child it has joined, so a held
+    /// blob's whole closure is held, at every step, and a later closure stops
+    /// at it. A blob never scanned is read ([`Step::Read`]); one that cannot
+    /// be read, resident or not, is unknown, and so is everything above it.
+    fn follow(&mut self, job: &mut Job, pause: &mut dyn FnMut() -> bool) -> (Step, bool) {
+        let Some(mut held) = self.held.get(&job.collection.raw).cloned() else {
+            // Not settled (any more): its selection computes it.
+            return (Step::Done, false);
+        };
+        let mut grew = false;
+        let step = loop {
+            if pause() {
+                break Step::Paused;
+            }
+            let Some((handle, visited)) = job.stack.pop() else {
+                break Step::Done;
+            };
+            if let Some(children) = visited {
+                if children.iter().any(|child| job.unknown.contains(child)) {
+                    job.unknown.insert(handle);
+                } else {
+                    held.insert(&Entry::new(&handle));
+                    grew = true;
+                }
+                continue;
+            }
+            if held.has_prefix(&handle) || !job.entered.insert(handle) {
+                continue;
+            }
+            if self.scanned.get(&handle).is_none() {
+                break Step::Read(handle);
+            }
+            job.descend(handle, related(&self.edges, &handle), Some(&held));
+        };
+        if grew {
+            self.held
+                .replace(&Entry::with_value(&job.collection.raw, held));
+        }
+        (step, grew)
+    }
+
+    /// Feed `job` the read [`Self::follow`] asked for: the children of a
+    /// readable blob, or `None` for one that is not.
+    fn read(&mut self, job: &mut Job, handle: Raw, children: Option<Vec<Raw>>) {
+        match children {
+            Some(children) => {
+                self.record_scan(handle, &children);
+                let held = self.held.get(&job.collection.raw).cloned();
+                job.descend(handle, children, held.as_ref());
+            }
+            None => {
+                if self.seeds.get(&pair(&job.collection.raw, &handle)).is_some() {
+                    self.pending
+                        .insert(&Entry::new(&pair(&handle, &job.collection.raw)));
+                }
+                // Not readable: absent, or resident and failing to read.
+                // Either way nothing above it joins.
+                job.unknown.insert(handle);
+            }
+        }
+    }
 }
 
 impl<T: HeldSource> State<T> {
-    /// Add everything reachable from `roots` to `collection`'s held set.
-    ///
-    /// A blob joins only after every resident child it has joined, so a held
-    /// blob's whole closure is held and a later closure stops at it. A blob
-    /// never scanned is read now; one that cannot be read, resident or not,
-    /// is unknown, and so is everything above it.
-    fn reach(
+    /// Run the queued jobs a snapshot runs, against it: every job of a
+    /// collection that is not building, or when nobody drives; a building
+    /// collection's only if it settled in this snapshot, and only within
+    /// `allowance`. Whether a held set grew.
+    fn run_jobs(
         &mut self,
-        snapshot: &T,
-        collection: CollectionHandle,
-        roots: impl IntoIterator<Item = Raw>,
+        now: &T,
+        settled_now: &BTreeSet<CollectionHandle>,
+        allowance: &mut Allowance,
     ) -> bool {
-        let Some(mut held) = self.held.get(&collection.raw).cloned() else {
-            return false;
-        };
-        let mut changed = false;
-        // Scratch for this call: depth first, a blob's children before it.
-        let mut entered: HashSet<Raw> = HashSet::new();
-        let mut unknown: HashSet<Raw> = HashSet::new();
-        let mut stack: Vec<(Raw, Option<Vec<Raw>>)> =
-            roots.into_iter().map(|root| (root, None)).collect();
-        while let Some((handle, visited)) = stack.pop() {
-            if let Some(children) = visited {
-                if children.iter().any(|child| unknown.contains(child)) {
-                    unknown.insert(handle);
-                } else {
-                    held.insert(&Entry::new(&handle));
-                    changed = true;
-                }
+        let mut grew = false;
+        let mut finished = Vec::new();
+        for mut job in std::mem::take(&mut self.jobs) {
+            let building = self.driven && self.building.get(&job.collection.raw).is_some();
+            if building && (allowance.spent() || !settled_now.contains(&job.collection)) {
+                self.jobs.push_back(job);
                 continue;
             }
-            if held.has_prefix(&handle) || !entered.insert(handle) {
-                continue;
-            }
-            let children = if self.scanned.get(&handle).is_some() {
-                related(&self.edges, &handle)
-            } else {
-                match scan(snapshot, &handle) {
-                    Some(children) => {
-                        self.record_scan(handle, &children);
-                        children
-                    }
-                    None => {
-                        if self.seeds.get(&pair(&collection.raw, &handle)).is_some() {
-                            self.pending
-                                .insert(&Entry::new(&pair(&handle, &collection.raw)));
+            let done = loop {
+                let (step, more) = self.follow(&mut job, &mut || building && allowance.spent());
+                grew |= more;
+                match step {
+                    Step::Done => break true,
+                    Step::Paused => break false,
+                    Step::Read(handle) => {
+                        let read = scan(now, &handle);
+                        if building {
+                            allowance.spend(read.as_ref().map_or(0, |(_, bytes)| *bytes));
                         }
-                        // Not readable: absent, or resident and failing to
-                        // read. Either way nothing above it joins.
-                        unknown.insert(handle);
-                        continue;
+                        self.read(&mut job, handle, read.map(|(children, _)| children));
                     }
                 }
             };
-            let unheld: Vec<(Raw, Option<Vec<Raw>>)> = children
-                .iter()
-                .filter(|child| !held.has_prefix(*child))
-                .map(|child| (*child, None))
-                .collect();
-            // Popped after every child below it has been decided.
-            stack.push((handle, Some(children)));
-            stack.extend(unheld);
+            if done {
+                finished.push(job.collection);
+            } else {
+                self.jobs.push_back(job);
+            }
         }
-        if changed {
-            self.held.replace(&Entry::with_value(&collection.raw, held));
+        for collection in finished {
+            self.retire(collection);
         }
-        changed
+        grew
     }
 
     /// Add proof seeds to their collections and queue the new ones as roots.
@@ -631,7 +878,9 @@ impl<T: HeldSource> HeldIndex<T> {
             }
         }
 
-        // Scratch: the tracked collections not settled yet.
+        // Scratch: the tracked collections not settled yet, and those this
+        // observation settles.
+        let mut settled_now: BTreeSet<CollectionHandle> = BTreeSet::new();
         let fresh: BTreeSet<CollectionHandle> = state
             .tracked
             .iter()
@@ -676,15 +925,26 @@ impl<T: HeldSource> HeldIndex<T> {
                     state
                         .held
                         .replace(&Entry::with_value(&collection.raw, HeldBlobs::new()));
+                    if state.driven {
+                        state.building.insert(&Entry::new(&collection.raw));
+                    }
+                    settled_now.insert(collection);
                     roots.entry(collection).or_default().extend(list);
                 }
                 changed = true;
             }
         }
 
+        // What a building collection settled here may read now; the driver
+        // computes the rest.
+        let mut allowance = Allowance {
+            scans: INLINE_SCANS,
+            bytes: INLINE_BYTES,
+        };
         for (collection, list) in roots {
-            changed |= state.reach(now, collection, list);
+            state.enqueue(collection, list);
         }
+        changed |= state.run_jobs(now, &settled_now, &mut allowance);
 
         // Scratch for this observation: the reports to resolve.
         let candidates: Vec<(CollectionHandle, Raw)> = std::mem::take(&mut state.candidates)
@@ -720,13 +980,106 @@ impl<T: HeldSource> HeldIndex<T> {
             // A route even if something under it cannot be read yet: a later
             // report of it reads it again.
             state.routes.insert(&Entry::new(&key));
-            changed |= state.reach(now, collection, [handle]);
+            state.enqueue(collection, [handle]);
         }
+        changed |= state.run_jobs(now, &settled_now, &mut allowance);
         state.fed = Some(now.clone());
         if changed {
             state.publish_view();
         }
+        if state.driven && !state.jobs.is_empty() {
+            self.queued.notify_all();
+        }
         state.view.clone()
+    }
+
+    /// The work a driver of this index runs.
+    pub(crate) fn work(self: &Arc<Self>) -> HeldWork
+    where
+        T: Send + 'static,
+    {
+        let index: Weak<dyn Drive> = Arc::downgrade(self) as Weak<HeldIndex<T>>;
+        HeldWork(index)
+    }
+}
+
+impl<T: HeldSource + Send> Drive for HeldIndex<T> {
+    /// Run queued jobs, oldest first, against the latest observed snapshot,
+    /// for about `budget`: at least one step, then until the budget is spent
+    /// or another locker waits. Blobs are read with the state unlocked; a
+    /// read made across a reset is dropped with its job, which the reset
+    /// requeued from scratch.
+    fn advance(&self, budget: Duration) -> bool {
+        let started = Instant::now();
+        let mut stepped = false;
+        let mut pause = || {
+            let pause = stepped
+                && (started.elapsed() >= budget || self.waiting.load(Ordering::SeqCst) > 0);
+            stepped = true;
+            pause
+        };
+        let mut state = self.lock_driver();
+        let mut grew = false;
+        let more = loop {
+            let Some(mut job) = state.jobs.pop_front() else {
+                break false;
+            };
+            let epoch = state.epoch;
+            // `Some(done)`, or `None` when a reset dropped the job.
+            let done = loop {
+                let (step, more) = state.follow(&mut job, &mut pause);
+                grew |= more;
+                match step {
+                    Step::Done => break Some(true),
+                    Step::Paused => break Some(false),
+                    Step::Read(handle) => {
+                        let Some(snapshot) = state.fed.clone() else {
+                            break None;
+                        };
+                        drop(state);
+                        let read = scan(&snapshot, &handle);
+                        drop(snapshot);
+                        state = self.lock_driver();
+                        if state.epoch != epoch {
+                            break None;
+                        }
+                        state.read(&mut job, handle, read.map(|(children, _)| children));
+                    }
+                }
+            };
+            match done {
+                Some(true) => state.retire(job.collection),
+                Some(false) => {
+                    state.jobs.push_front(job);
+                    break true;
+                }
+                None => {}
+            }
+        };
+        if grew {
+            state.publish_view();
+        }
+        drop(state);
+        // Let a waiting locker in before the next step takes the state.
+        while self.waiting.load(Ordering::SeqCst) > 0 {
+            std::thread::yield_now();
+        }
+        more
+    }
+
+    fn wait(&self, timeout: Duration) {
+        let state = self.lock_driver();
+        if state.jobs.is_empty() {
+            drop(
+                self.queued
+                    .wait_timeout(state, timeout)
+                    .expect("held-blob index is not poisoned"),
+            );
+        }
+    }
+
+    fn undrive(&self) {
+        self.lock().driven = false;
     }
 }
 
@@ -736,6 +1089,7 @@ mod tests {
     use std::convert::Infallible;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use anybytes::Bytes;
     use ed25519_dalek::SigningKey;
@@ -763,6 +1117,16 @@ mod tests {
         /// Resident blobs whose reads fail (an indexed blob every copy of
         /// which fails validation).
         unreadable: Mutex<std::collections::HashSet<Raw>>,
+        /// A blob whose next read blocks until released.
+        gate: Mutex<Option<Gate>>,
+    }
+
+    /// The read of `blob` says it began on `entered`, then waits on
+    /// `release`, for at most half a minute so a stuck test fails.
+    struct Gate {
+        blob: Raw,
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
     }
 
     #[derive(Debug)]
@@ -862,6 +1226,18 @@ mod tests {
                         handle: handle.transmute(),
                     },
                 ));
+            }
+            let gate = {
+                let mut gate = self.faults.gate.lock().unwrap();
+                if gate.as_ref().is_some_and(|gate| gate.blob == handle.raw) {
+                    gate.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(gate) = gate {
+                gate.entered.send(()).unwrap();
+                let _ = gate.release.recv_timeout(std::time::Duration::from_secs(30));
             }
             *self.reads.lock().unwrap().entry(handle.raw).or_default() += 1;
             self.inner.get(handle)
@@ -1735,5 +2111,140 @@ mod tests {
             !held.contains(&routed.raw),
             "a proof over R seeded C through R's backlink"
         );
+    }
+
+    /// One payload naming `fanout` intermediates that each name `fanout`
+    /// leaves, committed to `c`: wider than a snapshot's allowance for a
+    /// building collection. Every blob `c` holds once built.
+    fn wide(store: &mut Store, c: CollectionHandle, fanout: u8) -> BTreeSet<Raw> {
+        let metadata = blob(store, b"wide metadata");
+        let mut all = BTreeSet::from([c.raw, metadata]);
+        let mids: Vec<Raw> = (0..fanout)
+            .map(|mid| {
+                let leaves: Vec<Raw> = (0..fanout)
+                    .map(|leaf| blob(store, &[b'l', mid, leaf]))
+                    .collect();
+                all.extend(&leaves);
+                blob_naming(store, &[b'm', mid], &leaves)
+            })
+            .collect();
+        all.extend(&mids);
+        let data = blob_naming(store, b"wide payload", &mids);
+        all.insert(data);
+        commit(store, c, data, metadata);
+        assert!(all.len() > INLINE_SCANS);
+        all
+    }
+
+    /// A driven store publishes a building collection's held set as it
+    /// grows: every published set is closed and contains the previous one,
+    /// and the last is the whole closure, each blob read once.
+    #[test]
+    fn a_driven_build_publishes_closed_growing_held_sets_until_whole() {
+        let mut store = Store::default();
+        let c = collection(&mut store, "driven");
+        let whole = wide(&mut store, c, 20);
+        let work = store.drive_held();
+        store.track_held([c]);
+        let first = store.snapshot().unwrap();
+        assert_closed(&first, c);
+        let mut previous = held_set(&first, c);
+        assert!(previous.len() < whole.len(), "the allowance left work");
+        let mut publications = 1;
+        for _ in 0..100_000 {
+            if previous == whole {
+                break;
+            }
+            assert!(work.step(Duration::ZERO, Duration::ZERO));
+            let snapshot = store.snapshot().unwrap();
+            assert_closed(&snapshot, c);
+            let held = held_set(&snapshot, c);
+            assert!(held.is_superset(&previous), "a held set never shrinks");
+            if held != previous {
+                publications += 1;
+            }
+            previous = held;
+        }
+        assert_eq!(previous, whole);
+        assert!(publications > 10, "{publications} publications");
+        let counts = store.reads.lock().unwrap().clone();
+        assert!(counts.values().all(|count| *count == 1), "{counts:?}");
+    }
+
+    /// Dropping the work hands the building back: the next snapshot
+    /// computes the rest itself.
+    #[test]
+    fn a_dropped_driver_hands_the_build_back_to_snapshots() {
+        let mut store = Store::default();
+        let c = collection(&mut store, "abandoned");
+        let whole = wide(&mut store, c, 20);
+        let work = store.drive_held();
+        store.track_held([c]);
+        assert!(held_set(&store.snapshot().unwrap(), c).len() < whole.len());
+        drop(work);
+        assert_eq!(held_set(&store.snapshot().unwrap(), c), whole);
+    }
+
+    /// While the driver waits on a blob read, a snapshot neither waits for
+    /// it nor loses its barrier: a built collection's new record is
+    /// published with its closure, and the building one with a closed,
+    /// partial set. Then the build completes.
+    #[test]
+    fn a_snapshot_never_waits_for_a_read_the_driver_makes() {
+        let mut store = Store::default();
+        let built = collection(&mut store, "built beside");
+        store.track_held([built]);
+        store.snapshot().unwrap();
+        let c = collection(&mut store, "slow");
+        let whole = wide(&mut store, c, 20);
+        let work = store.drive_held();
+        store.track_held([c]);
+        let first = store.snapshot().unwrap();
+        let unread = *whole
+            .iter()
+            .find(|blob| reads(&store, blob) == 0)
+            .expect("the allowance left blobs unread");
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        *store.faults.gate.lock().unwrap() = Some(Gate {
+            blob: unread,
+            entered,
+            release: release_rx,
+        });
+        // The driver's thread: it ends once the store is gone.
+        let driver = std::thread::spawn(move || {
+            while work.step(Duration::from_secs(60), Duration::from_millis(10)) {}
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the driver reads the gated blob");
+
+        let metadata = blob(&mut store, b"metadata beside");
+        let leaf = blob(&mut store, b"leaf beside");
+        let data = blob_naming(&mut store, b"payload beside", &[leaf]);
+        commit(&mut store, built, data, metadata);
+        let started = Instant::now();
+        let during = store.snapshot().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the snapshot waited for the read"
+        );
+        assert!(held_set(&during, built).is_superset(&BTreeSet::from([data, leaf, metadata])));
+        assert_closed(&during, c);
+        assert!(held_set(&first, c).is_subset(&held_set(&during, c)));
+        assert!(!held_set(&during, c).contains(&unread));
+
+        release.send(()).unwrap();
+        let mut held = BTreeSet::new();
+        for _ in 0..1000 {
+            held = held_set(&store.snapshot().unwrap(), c);
+            if held == whole {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(held, whole);
+        drop(store);
+        driver.join().unwrap();
     }
 }

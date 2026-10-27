@@ -401,7 +401,17 @@ where
     serving: Arc<Serving<S>>,
     /// Local retry/cursor state; demand and residency are observed in the store.
     reconciler: Reconciler,
+    /// The store's held sets are built by this peer's held-set thread
+    /// ([`HeldStore::drive_held`]).
+    held_driven: bool,
 }
+
+/// How long the held-set thread computes before it lets go of the index,
+/// and how long it waits for work when there is none. It lets go at once
+/// for a snapshot that waits, and never holds the index across a blob read,
+/// so a snapshot waits for at most one in-memory step of it.
+const HELD_STEP: std::time::Duration = std::time::Duration::from_millis(20);
+const HELD_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl<S> Peer<S>
 where
@@ -509,6 +519,7 @@ where
             receiver,
             serving,
             reconciler: Reconciler::new(),
+            held_driven: false,
         };
         if peer.host_is_running() {
             peer.refresh();
@@ -538,6 +549,11 @@ where
     /// snapshot on, and this side's peerings for them say it replicates them
     /// in full, so that Full neighbours compare and pull held sets (design
     /// 2.9). Other modes keep none, and peer with the full flag unset.
+    ///
+    /// The first Full selection starts the peer's held-set thread: a
+    /// collection's first closure is computed there, published as it grows,
+    /// and neither landing nor this call waits for it. The thread ends once
+    /// the store is gone.
     pub fn set_replication(
         &mut self,
         mode: ReplicationMode,
@@ -546,6 +562,20 @@ where
         let collections: Vec<_> = collections.into_iter().collect();
         let mut full = ActiveCollections::new();
         if mode == ReplicationMode::Full {
+            if !self.held_driven {
+                let work = self.store().drive_held();
+                // A thread that cannot start drops the work, which hands the
+                // building back to snapshots.
+                let spawned = std::thread::Builder::new()
+                    .name("held-sets".into())
+                    .spawn(move || while work.step(HELD_STEP, HELD_IDLE) {});
+                match spawned {
+                    Ok(_) => self.held_driven = true,
+                    Err(error) => {
+                        tracing::warn!(%error, "held sets are built by snapshots: no thread")
+                    }
+                }
+            }
             self.store().track_held(collections.iter().copied());
             for collection in &collections {
                 full.insert(&PatchEntry::new(&collection.raw));
@@ -1260,6 +1290,68 @@ mod tests {
         let lander = Lander(Arc::downgrade(&peer.serving));
         assert_eq!(lander.land(vec![NetEvent::Blob(blob)]), [true]);
         assert!(peer.last_event_at() > before);
+    }
+
+    /// Full replication builds a collection's first closure on the peer's
+    /// held-set thread: wider than a snapshot's allowance, the held set
+    /// still completes while nothing but snapshots that build nothing runs
+    /// here, and landing goes on meanwhile.
+    #[tokio::test]
+    async fn full_replication_builds_held_sets_on_their_own_thread() {
+        use triblespace_core::collection::{
+            CollectionCommit, CollectionRecord, CollectionStore, empty_metadata_handle,
+        };
+        let key = SigningKey::from_bytes(&[86; 32]);
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(
+                "held-set thread",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap()
+            .handle();
+        let leaves: Vec<RawHash> = (0..600_u32)
+            .map(|leaf| {
+                store
+                    .put::<UnknownBlob, _>(Bytes::from_source(leaf.to_be_bytes().to_vec()))
+                    .unwrap()
+                    .raw
+            })
+            .collect();
+        let payload: Vec<u8> = leaves.iter().flatten().copied().collect();
+        let data = store
+            .put::<UnknownBlob, _>(Bytes::from_source(payload))
+            .unwrap()
+            .raw;
+        store
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &key,
+                collection,
+                Inline::new(data),
+                empty_metadata_handle(),
+            )))
+            .unwrap();
+        let (sender, receiver, _wiring) =
+            host::wire(crate::identity::iroh_secret(&key).public().into());
+        let mut peer = Peer::with_wiring(store, sender, receiver);
+        peer.set_replication(ReplicationMode::Full, [collection]);
+        let lander = Lander(Arc::downgrade(&peer.serving));
+        let blob = Blob::<UnknownBlob>::new(Bytes::from_source(b"landed beside".to_vec()));
+        assert_eq!(lander.land(vec![NetEvent::Blob(blob)]), [true]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let held = HeldRead::held(&peer.snapshot().unwrap(), collection)
+                .expect("a tracked collection settles at once");
+            if held.has_prefix(&data) {
+                assert!(leaves.iter().all(|leaf| held.has_prefix(leaf)));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the held-set thread completes the build"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[tokio::test]

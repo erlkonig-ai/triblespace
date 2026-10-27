@@ -913,6 +913,10 @@ mod tests {
         fn note_held(&mut self, collection: CollectionHandle, handle: Inline<Handle<UnknownBlob>>) {
             self.inner.note_held(collection, handle)
         }
+
+        fn drive_held(&mut self) -> triblespace_core::collection::HeldWork {
+            self.inner.drive_held()
+        }
     }
 
     impl CollectionStore for LandingStore {
