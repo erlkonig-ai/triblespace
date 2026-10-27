@@ -7,7 +7,7 @@ use triblespace_core::collection::{
     CollectionCommit, CollectionDerive, CollectionMap, CollectionStore, SourceLocator,
 };
 use triblespace_core::inline::Inline;
-use triblespace_core::repo::{pile::PileFile, SnapshotSource};
+use triblespace_core::repo::{pile::PileFile, DependencySet, SnapshotSource};
 
 fn overlay_value(overlay: &CollectionRecordPatch, record: CollectionRecord) -> Value {
     let key = record.fingerprint().raw();
@@ -78,7 +78,7 @@ fn observed_and_borrowed_wrappers_forward_views_without_owned_fallback() {
     let initial = collection_record_patch(&&before, c).unwrap();
     let advanced = update_collection_record_patch(&&after, &&before, &initial).unwrap();
     assert_eq!(advanced.get(record.fingerprint()), Some(record));
-    let expected = BTreeSet::from([CollectionRecordSelector::Foundations(c)]);
+    let expected = DependencySet::from([CollectionRecordSelector::Foundations(c)]);
     assert_eq!(before.dependencies().records, expected);
     assert_eq!(after.dependencies().records, expected);
     assert!(!before.dependencies().all_records && !after.dependencies().all_records);
@@ -233,8 +233,9 @@ fn native_body_overlay_eager_bytes_and_observed_delta_survive_all_source_drops()
     let advanced = update_collection_record_patch(&after, &before, &overlay).unwrap();
     assert_eq!(advanced.len(), 3);
     assert_eq!(overlay.len(), 2);
-    assert_eq!(before.dependencies().records, selectors);
-    assert_eq!(after.dependencies().records, selectors);
+    let expected = DependencySet::from_iter(selectors.iter().copied());
+    assert_eq!(before.dependencies().records, expected);
+    assert_eq!(after.dependencies().records, expected);
     assert!(!before.dependencies().all_records && !after.dependencies().all_records);
     let single = overlay_value(&overlay, records[0]);
     let weak = value_body(&single).downgrade();

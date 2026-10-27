@@ -630,8 +630,8 @@ impl<R> Default for MaintenanceState<R> {
 }
 
 fn extend_maintenance_interests(into: &mut StoreDependencies, from: &StoreDependencies) {
-    into.records.extend(from.records.iter().copied());
-    into.blobs.extend(from.blobs.iter().copied());
+    into.records.union(from.records.clone());
+    into.blobs.union(from.blobs.clone());
     into.capability_proofs |= from.capability_proofs;
     into.all_records |= from.all_records;
     into.all_blobs |= from.all_blobs;

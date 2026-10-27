@@ -158,6 +158,135 @@ impl StoreChanges {
     }
 }
 
+/// A value that a [`DependencySet`] holds as fixed-width PATCH key bytes.
+///
+/// The encoding lives only in memory and is never persisted, so it may change
+/// freely. [`from_key`](Self::from_key) must invert [`to_key`](Self::to_key),
+/// which makes the encoding injective.
+pub trait DependencyKey<const KEY_LEN: usize>: Copy {
+    /// The key bytes, ordered like `Self`'s `Ord`.
+    fn to_key(&self) -> [u8; KEY_LEN];
+    /// Recover the value from bytes produced by [`to_key`](Self::to_key).
+    fn from_key(key: &[u8; KEY_LEN]) -> Self;
+}
+
+impl DependencyKey<INLINE_LEN> for CollectionData {
+    fn to_key(&self) -> [u8; INLINE_LEN] {
+        self.raw
+    }
+
+    fn from_key(key: &[u8; INLINE_LEN]) -> Self {
+        CollectionData::new(*key)
+    }
+}
+
+/// One component of a raw read-set, held as PATCH keys.
+///
+/// A retained observation is cloned whenever it is reused, so a clone shares
+/// structure instead of copying every key. Equality compares the key sets, and
+/// iteration follows key order, which matches the values' `Ord`.
+pub struct DependencySet<const KEY_LEN: usize, T> {
+    keys: PATCH<KEY_LEN, IdentitySchema, ()>,
+    _value: PhantomData<fn() -> T>,
+}
+
+impl<const KEY_LEN: usize, T: DependencyKey<KEY_LEN>> DependencySet<KEY_LEN, T> {
+    /// An empty set.
+    pub fn new() -> Self {
+        Self {
+            keys: PATCH::new(),
+            _value: PhantomData,
+        }
+    }
+
+    /// Add `value`, returning whether it was absent.
+    pub fn insert(&mut self, value: T) -> bool {
+        let before = self.keys.len();
+        self.keys.insert(&Entry::new(&value.to_key()));
+        self.keys.len() != before
+    }
+
+    /// Whether `value` is a member.
+    pub fn contains(&self, value: &T) -> bool {
+        self.keys.get(&value.to_key()).is_some()
+    }
+
+    /// The number of members.
+    pub fn len(&self) -> usize {
+        self.keys.len() as usize
+    }
+
+    /// Whether the set has no members.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// Every member, in order.
+    pub fn iter(&self) -> impl Iterator<Item = T> + '_ {
+        self.keys.iter_ordered().map(T::from_key)
+    }
+
+    /// Add every member of `other`, sharing its structure.
+    pub fn union(&mut self, other: Self) {
+        self.keys.union(other.keys);
+    }
+}
+
+impl<const KEY_LEN: usize, T> Clone for DependencySet<KEY_LEN, T> {
+    fn clone(&self) -> Self {
+        Self {
+            keys: self.keys.clone(),
+            _value: PhantomData,
+        }
+    }
+}
+
+impl<const KEY_LEN: usize, T: DependencyKey<KEY_LEN>> Default for DependencySet<KEY_LEN, T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const KEY_LEN: usize, T> PartialEq for DependencySet<KEY_LEN, T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.keys == other.keys
+    }
+}
+
+impl<const KEY_LEN: usize, T> Eq for DependencySet<KEY_LEN, T> {}
+
+impl<const KEY_LEN: usize, T: DependencyKey<KEY_LEN> + Debug> Debug for DependencySet<KEY_LEN, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_set().entries(self.iter()).finish()
+    }
+}
+
+impl<const KEY_LEN: usize, T: DependencyKey<KEY_LEN>> Extend<T> for DependencySet<KEY_LEN, T> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, values: I) {
+        for value in values {
+            self.insert(value);
+        }
+    }
+}
+
+impl<const KEY_LEN: usize, T: DependencyKey<KEY_LEN>> FromIterator<T>
+    for DependencySet<KEY_LEN, T>
+{
+    fn from_iter<I: IntoIterator<Item = T>>(values: I) -> Self {
+        let mut set = Self::new();
+        set.extend(values);
+        set
+    }
+}
+
+impl<const KEY_LEN: usize, const N: usize, T: DependencyKey<KEY_LEN>> From<[T; N]>
+    for DependencySet<KEY_LEN, T>
+{
+    fn from(values: [T; N]) -> Self {
+        values.into_iter().collect()
+    }
+}
+
 /// The raw read-set of one retained immutable-store observation.
 ///
 /// These are lookup interests, including absent records and blobs, rather
@@ -169,9 +298,9 @@ impl StoreChanges {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StoreDependencies {
     /// Raw record selection routes consulted by the observation.
-    pub records: BTreeSet<CollectionRecordSelector>,
+    pub records: DependencySet<SELECTOR_KEY_LEN, CollectionRecordSelector>,
     /// Exact blob hashes consulted, whether resident, missing, or unreadable.
-    pub blobs: BTreeSet<CollectionData>,
+    pub blobs: DependencySet<INLINE_LEN, CollectionData>,
     /// Whether complete capability proof evidence was consulted.
     pub capability_proofs: bool,
     /// Whether an unrestricted record enumeration was consulted.
@@ -296,6 +425,72 @@ mod store_dependency_tests {
         }
     }
 
+    fn every_selector_shape(c: u8, h: u8) -> [CollectionRecordSelector; 6] {
+        let c = CollectionHandle::new([c; INLINE_LEN]);
+        let h = CollectionData::new([h; INLINE_LEN]);
+        [
+            CollectionRecordSelector::Collection(c),
+            CollectionRecordSelector::CommitMember(c, h),
+            CollectionRecordSelector::ProducedMember(c, h),
+            CollectionRecordSelector::MergeCollection(c),
+            CollectionRecordSelector::DeriveTarget(c),
+            CollectionRecordSelector::Foundations(c),
+        ]
+    }
+
+    #[test]
+    fn selector_keys_round_trip_and_never_collide() {
+        let mut selectors = BTreeSet::new();
+        for (c, h) in [(0, 0), (1, 2), (2, 1), (0xff, 0), (0, 0xff)] {
+            selectors.extend(every_selector_shape(c, h));
+        }
+        let mut keys = BTreeSet::new();
+        for selector in &selectors {
+            let key = selector.to_key();
+            assert_eq!(CollectionRecordSelector::from_key(&key), *selector);
+            keys.insert(key);
+        }
+        assert_eq!(keys.len(), selectors.len(), "two selectors shared a key");
+        // Key order is selector order, so iteration matches the old BTreeSet.
+        let by_key: Vec<_> = keys
+            .iter()
+            .map(CollectionRecordSelector::from_key)
+            .collect();
+        assert_eq!(by_key, selectors.iter().copied().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn dependency_sets_have_set_semantics() {
+        let shapes = every_selector_shape(7, 8);
+        let mut forward = DependencySet::new();
+        for selector in shapes {
+            assert!(forward.insert(selector));
+        }
+        assert!(!forward.insert(shapes[2]), "a repeated insert adds nothing");
+        assert_eq!(forward.len(), shapes.len());
+        assert!(shapes.iter().all(|selector| forward.contains(selector)));
+        assert!(!forward.contains(&every_selector_shape(8, 7)[0]));
+
+        let backward: DependencySet<SELECTOR_KEY_LEN, _> = shapes.into_iter().rev().collect();
+        assert_eq!(forward, backward, "equality ignores insertion order");
+        assert_eq!(forward.iter().collect::<Vec<_>>(), shapes.to_vec());
+
+        let mut union = DependencySet::from([shapes[0], shapes[1]]);
+        union.union(DependencySet::from([shapes[1], shapes[5]]));
+        assert_eq!(
+            union,
+            DependencySet::from([shapes[0], shapes[1], shapes[5]])
+        );
+
+        let mut blobs = DependencySet::from([CollectionData::new([1; INLINE_LEN])]);
+        let snapshot = blobs.clone();
+        blobs.insert(CollectionData::new([2; INLINE_LEN]));
+        assert_eq!(snapshot.len(), 1, "a clone is independent of later inserts");
+        assert!(!snapshot.contains(&CollectionData::new([2; INLINE_LEN])));
+        assert_ne!(snapshot, blobs);
+        assert!(DependencySet::<INLINE_LEN, CollectionData>::new().is_empty());
+    }
+
     #[test]
     fn scoped_default_keeps_unclassified_wrappers_conservative() {
         let snapshot = UnclassifiedSnapshot;
@@ -326,8 +521,8 @@ mod store_dependency_tests {
         assert_eq!(snapshot.changes_for(&snapshot, &dependencies), all_reads);
         assert!(!all_reads.contains(StoreChanges::WANTS));
 
-        dependencies.records.clear();
-        dependencies.blobs.clear();
+        dependencies.records = DependencySet::new();
+        dependencies.blobs = DependencySet::new();
         dependencies.all_records = true;
         dependencies.all_blobs = true;
         assert_eq!(snapshot.changes_for(&snapshot, &dependencies), all_reads);
@@ -415,11 +610,13 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::fmt::Debug;
 use std::fmt::{self};
+use std::marker::PhantomData;
 
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
+use crate::collection::store::SELECTOR_KEY_LEN;
 use crate::collection::{
     CollectionData, CollectionRead, CollectionRecordSelector, CollectionStore, CoverageRead,
 };
@@ -427,6 +624,7 @@ use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
 use crate::inline::InlineEncoding;
 use crate::inline::INLINE_LEN;
+use crate::patch::Entry;
 use crate::patch::IdentitySchema;
 use crate::patch::PATCH;
 use crate::prelude::inlineencodings::GenId;

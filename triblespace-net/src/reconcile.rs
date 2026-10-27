@@ -253,7 +253,7 @@ impl<T: StoreRead> Hydration<T> {
             .map(|&collection| CollectionRecordSelector::Foundations(collection))
             .collect();
         let read_set = StoreDependencies {
-            records: selectors.clone(),
+            records: selectors.iter().copied().collect(),
             all_blobs: true,
             ..StoreDependencies::default()
         };

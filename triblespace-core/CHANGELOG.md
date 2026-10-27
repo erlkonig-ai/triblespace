@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `StoreDependencies::records` and `::blobs` are now `DependencySet`s, PATCH
+  sets of fixed-width keys, so cloning a retained read-set shares structure
+  instead of copying every consulted selector and hash (measured on a 100k +
+  100k read-set: 33,329 allocations per clone before, 0 after). The set keeps
+  `insert`, `contains`, `len`, `is_empty`, `iter` (by value, in the old order),
+  `Extend`, `FromIterator` and `From<[T; N]>`, and adds `union`. Selectors are
+  keyed in memory only by a variant tag and their raw fields
+  (`DependencyKey`); the encoding is never persisted.
 - Remove the `resource_collection` backlink and its routing. A proof is a
   collection's authorization evidence only when it is over that exact
   collection and starts at one of its descriptor's policy roots;

@@ -3464,7 +3464,9 @@ impl super::StoreSnapshot for PileFileSnapshot {
                 .shares_root(&previous.collection_records)
         } else {
             dependencies.records.iter().any(|selector| {
-                !self.collection_records.shares_selected(&previous.collection_records, selector)
+                !self
+                    .collection_records
+                    .shares_selected(&previous.collection_records, &selector)
             })
         };
         if records_changed {
@@ -7411,7 +7413,7 @@ mod tests {
     use crate::macros::entity;
     use crate::repo::yard::{Yard, YardCollectError, YardConfig, YardReclaimError};
     use crate::repo::{
-        BlobStoreMeta, RetentionRoots, SnapshotSource, StorageClose, StoreChanges,
+        BlobStoreMeta, DependencySet, RetentionRoots, SnapshotSource, StorageClose, StoreChanges,
         StoreDependencies, StoreSnapshot, WantRead,
     };
     use crate::trible::TribleSet;
@@ -13165,7 +13167,7 @@ mod tests {
         let realized = observer.snapshot().unwrap();
         for route in routes {
             let exact = StoreDependencies {
-                records: BTreeSet::from([route]),
+                records: DependencySet::from([route]),
                 ..StoreDependencies::default()
             };
             assert_eq!(
@@ -13173,9 +13175,12 @@ mod tests {
                 StoreChanges::COLLECTION_RECORDS,
                 "{route:?}",
             );
-            assert!(unrelated.select_records(&exact.records).unwrap().is_empty());
+            assert!(unrelated
+                .select_records(&BTreeSet::from([route]))
+                .unwrap()
+                .is_empty());
             assert_eq!(
-                realized.select_records(&exact.records).unwrap(),
+                realized.select_records(&BTreeSet::from([route])).unwrap(),
                 vec![produced]
             );
             assert_eq!(
@@ -13196,7 +13201,7 @@ mod tests {
             alternate_witness.changes_for(
                 &realized,
                 &StoreDependencies {
-                    records: BTreeSet::from([CollectionRecordSelector::ProducedMember(
+                    records: DependencySet::from([CollectionRecordSelector::ProducedMember(
                         target, output
                     )]),
                     ..StoreDependencies::default()
@@ -13209,7 +13214,7 @@ mod tests {
                 alternate_witness.changes_for(
                     &realized,
                     &StoreDependencies {
-                        records: BTreeSet::from([unchanged]),
+                        records: DependencySet::from([unchanged]),
                         ..StoreDependencies::default()
                     }
                 ),
@@ -13227,7 +13232,7 @@ mod tests {
             input_arrived.changes_for(
                 &alternate_witness,
                 &StoreDependencies {
-                    records: BTreeSet::from([untouched]),
+                    records: DependencySet::from([untouched]),
                     ..StoreDependencies::default()
                 }
             ),
@@ -13238,7 +13243,7 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(
-            realized.select_records(&dependencies.records).unwrap(),
+            realized.select_records(&BTreeSet::from(routes)).unwrap(),
             vec![produced]
         );
         assert_eq!(realized.blobs().count(), 0);
@@ -13254,7 +13259,7 @@ mod tests {
         let handle = Blob::<UnknownBlob>::new(Bytes::from_source(payload.to_vec())).get_handle();
         let hash: CollectionData = handle.into();
         let dependencies = StoreDependencies {
-            blobs: BTreeSet::from([hash]),
+            blobs: DependencySet::from([hash]),
             ..StoreDependencies::default()
         };
         let mut observer = Pile::open(&path).unwrap();
@@ -13318,7 +13323,7 @@ mod tests {
             recovered.changes_for(
                 &invalid,
                 &StoreDependencies {
-                    blobs: BTreeSet::from([other_hash]),
+                    blobs: DependencySet::from([other_hash]),
                     ..StoreDependencies::default()
                 }
             ),

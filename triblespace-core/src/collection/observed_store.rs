@@ -398,7 +398,7 @@ mod tests {
         CollectionPolicy, CollectionStoreExt,
     };
     use crate::repo::memoryrepo::MemoryRepo;
-    use crate::repo::{BlobStorePut, SnapshotSource};
+    use crate::repo::{BlobStorePut, DependencySet, SnapshotSource};
 
     fn blob(text: &str) -> Blob<UnknownBlob> {
         Blob::new(Bytes::from_source(text.as_bytes().to_vec()))
@@ -501,8 +501,8 @@ mod tests {
         assert!(before.proof(proof.id()).unwrap().is_none());
         assert_eq!(after.proof(proof.id()).unwrap(), Some(proof));
         let expected = StoreDependencies {
-            blobs: BTreeSet::from([Handle::<UnknownBlob>::to_hash(handle)]),
-            records: produced.clone(),
+            blobs: DependencySet::from([Handle::<UnknownBlob>::to_hash(handle)]),
+            records: produced.iter().copied().collect(),
             capability_proofs: true,
             ..StoreDependencies::default()
         };
@@ -619,7 +619,7 @@ mod tests {
         assert_eq!(
             observed.dependencies(),
             StoreDependencies {
-                records: BTreeSet::from([
+                records: DependencySet::from([
                     CollectionRecordSelector::Collection(collection.handle()),
                     CollectionRecordSelector::ProducedMember(collection.handle(), unpublished),
                 ]),
@@ -662,7 +662,7 @@ mod tests {
             assert_eq!(
                 observed.dependencies(),
                 StoreDependencies {
-                    records: selectors.clone(),
+                    records: selectors.iter().copied().collect(),
                     ..StoreDependencies::default()
                 }
             );

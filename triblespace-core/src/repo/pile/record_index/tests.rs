@@ -90,7 +90,7 @@ fn occurrence_origin_guard_precedes_equal_keys_and_notifies_selected_readers() {
     let selectors = BTreeSet::from([CollectionRecordSelector::Foundations(record(3).collection())]);
     assert!(matches!(sb.select_record_view_changes(&sa, &selectors).unwrap(), RecordViewChanges::Rebuild));
     assert!(sb.changes_since(&sa).contains(StoreChanges::COLLECTION_RECORDS));
-    let dependencies = StoreDependencies { records: selectors.clone(), ..Default::default() };
+    let dependencies = StoreDependencies { records: selectors.iter().copied().collect(), ..Default::default() };
     assert!(sb.changes_for(&sa, &dependencies).contains(StoreChanges::COLLECTION_RECORDS));
     assert_eq!(sb.select_record_changes(&sa, &selectors).unwrap(), (vec![record(4)], vec![record(3)]));
     let mut fresh = Vec::new();

@@ -730,7 +730,7 @@ fn native_fixed_cross_owner_mixed_deltas_and_invalidation_match_set_oracle() {
             .changes_for(
                 &before,
                 &StoreDependencies {
-                    records: selectors,
+                    records: selectors.into_iter().collect(),
                     ..StoreDependencies::default()
                 }
             )

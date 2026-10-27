@@ -12,6 +12,8 @@ use std::fmt::Debug;
 
 use super::coverage::{Coverage, CoverageIndex};
 use super::{CollectionData, CollectionHandle, CollectionRecord, CollectionRecordView};
+use crate::inline::INLINE_LEN;
+use crate::repo::DependencyKey;
 
 /// One raw selection route into the grow-only collection-record set.
 ///
@@ -54,6 +56,48 @@ pub enum CollectionRecordSelector {
     /// own lattice node, never replicated, so it never matches. This is the
     /// selection sync exports and hydrates.
     Foundations(CollectionHandle),
+}
+
+/// Width of a selector's in-memory dependency key: a variant tag and up to two
+/// 32-byte fields.
+pub(crate) const SELECTOR_KEY_LEN: usize = 1 + 2 * INLINE_LEN;
+
+/// A variant tag followed by the variant's fields at fixed offsets, zero-padded
+/// to the widest variant. Distinct tags separate the variants, and within one
+/// variant the fields are the raw inline bytes, so `from_key` inverts `to_key`.
+/// Tags follow declaration order, so key order matches the derived `Ord`.
+impl DependencyKey<SELECTOR_KEY_LEN> for CollectionRecordSelector {
+    fn to_key(&self) -> [u8; SELECTOR_KEY_LEN] {
+        use CollectionRecordSelector::*;
+        let (tag, first, second) = match *self {
+            Collection(c) => (0, c.raw, [0; INLINE_LEN]),
+            CommitMember(c, h) => (1, c.raw, h.raw),
+            ProducedMember(c, h) => (2, c.raw, h.raw),
+            MergeCollection(c) => (3, c.raw, [0; INLINE_LEN]),
+            DeriveTarget(c) => (4, c.raw, [0; INLINE_LEN]),
+            Foundations(c) => (5, c.raw, [0; INLINE_LEN]),
+        };
+        let mut key = [0; SELECTOR_KEY_LEN];
+        key[0] = tag;
+        key[1..1 + INLINE_LEN].copy_from_slice(&first);
+        key[1 + INLINE_LEN..].copy_from_slice(&second);
+        key
+    }
+
+    fn from_key(key: &[u8; SELECTOR_KEY_LEN]) -> Self {
+        use CollectionRecordSelector::*;
+        let collection = CollectionHandle::new(key[1..1 + INLINE_LEN].try_into().unwrap());
+        let data = || CollectionData::new(key[1 + INLINE_LEN..].try_into().unwrap());
+        match key[0] {
+            0 => Collection(collection),
+            1 => CommitMember(collection, data()),
+            2 => ProducedMember(collection, data()),
+            3 => MergeCollection(collection),
+            4 => DeriveTarget(collection),
+            5 => Foundations(collection),
+            tag => unreachable!("selector key tag {tag} was not produced by to_key"),
+        }
+    }
 }
 
 pub(crate) fn selectors_match_record(
