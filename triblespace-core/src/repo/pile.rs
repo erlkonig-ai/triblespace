@@ -80,6 +80,8 @@ use crate::repo::{
 
 #[cfg(test)]
 mod append_visibility_tests;
+#[cfg(test)]
+mod prefix_tests;
 mod record_kind;
 mod record_index;
 use record_index::CollectionRecordIndex;
@@ -2791,6 +2793,9 @@ pub struct PileRecords {
     bytes: Bytes,
     offset: usize,
     failed: bool,
+    /// Set by [`Self::open_prefix`]: a record crossing the end of `bytes` is
+    /// then a prefix that is not a record boundary, not a torn tail.
+    prefix: Option<usize>,
 }
 
 impl PileRecords {
@@ -2813,6 +2818,41 @@ impl PileRecords {
             bytes,
             offset: 0,
             failed: false,
+            prefix: None,
+        })
+    }
+
+    /// Opens the first `prefix` bytes of the pile file at `path`, read-only,
+    /// and returns an iterator over exactly their records, as if the file
+    /// were `prefix` bytes long.
+    ///
+    /// Only those bytes are mapped; writers may keep appending. A prefix past
+    /// the end of the file is refused here with
+    /// [`ReadError::PrefixBeyondFile`]. Because the walk is lazy, a prefix
+    /// that is not a record boundary surfaces as the iterator's final item,
+    /// [`ReadError::PrefixNotRecordBoundary`]; [`PileFile::open_prefix`]
+    /// refuses it at open instead.
+    pub fn open_prefix(path: &Path, prefix: u64) -> Result<Self, ReadError> {
+        let file = File::open(path)?;
+        let length = usize::try_from(file.metadata()?.len())
+            .map_err(|_| ReadError::FileTooLarge { length: usize::MAX })?;
+        let prefix =
+            usize::try_from(prefix).map_err(|_| ReadError::FileTooLarge { length: usize::MAX })?;
+        if length < prefix {
+            return Err(ReadError::PrefixBeyondFile { prefix, length });
+        }
+        let bytes = if prefix == 0 {
+            Bytes::empty()
+        } else {
+            // SAFETY: the pile file is append-only by contract and the first
+            // `prefix` bytes exist, so the mapped region is never mutated.
+            unsafe { Bytes::map_file_region(&file, 0, prefix)? }
+        };
+        Ok(Self {
+            bytes,
+            offset: 0,
+            failed: false,
+            prefix: Some(prefix),
         })
     }
 
@@ -2834,6 +2874,13 @@ impl Iterator for PileRecords {
             Ok(record) => {
                 self.offset += record.len;
                 Some(Ok(record))
+            }
+            Err(ReadError::CorruptPile { valid_length }) if self.prefix.is_some() => {
+                self.failed = true;
+                Some(Err(ReadError::PrefixNotRecordBoundary {
+                    prefix: self.bytes.len(),
+                    valid_length,
+                }))
             }
             Err(e) => {
                 self.failed = true;
@@ -2883,6 +2930,19 @@ impl Pile {
     /// needs the pile opened as that key's verifying key.
     pub fn open_as(path: &Path, host: VerifyingKey) -> Result<Self, ReadError> {
         PileFile::open(path).map(|file| Self::with_host(file, Some(host)))
+    }
+
+    /// Open exactly the first `prefix` bytes of the pile at `path`,
+    /// read-only, replayed: see [`PileFile::open_prefix`]. The coverage
+    /// index is fed at the first snapshot, from that prefix alone.
+    pub fn open_prefix(path: &Path, prefix: u64) -> Result<Self, ReadError> {
+        PileFile::open_prefix(path, prefix).map(Self::new)
+    }
+
+    /// [`Self::open_prefix`] as `host`, as [`Self::open_as`] is to
+    /// [`Self::open`].
+    pub fn open_prefix_as(path: &Path, prefix: u64, host: VerifyingKey) -> Result<Self, ReadError> {
+        PileFile::open_prefix(path, prefix).map(|file| Self::with_host(file, Some(host)))
     }
 }
 
@@ -2961,6 +3021,8 @@ pub struct PileFile {
     /// Offsets below this value are guaranteed valid; corruption detection
     /// only operates on the un-applied tail beyond this boundary.
     applied_length: usize,
+    /// The fixed prefix a [`Self::open_prefix`] handle is bounded to.
+    prefix: Option<usize>,
 }
 
 /// Arrivals in one applied batch that can change a parked coverage decision.
@@ -3115,6 +3177,7 @@ impl PileFileSnapshot {
             bytes,
             offset: 0,
             failed: false,
+            prefix: None,
         }
     }
 
@@ -3479,6 +3542,24 @@ pub enum ReadError {
         /// Actual file length.
         length: usize,
     },
+    /// A handle bounded to a fixed prefix was asked for more bytes than the
+    /// file holds.
+    PrefixBeyondFile {
+        /// The requested prefix length.
+        prefix: usize,
+        /// The file's length when it was checked.
+        length: usize,
+    },
+    /// A scan of a fixed prefix from byte 0 stopped at `valid_length` without
+    /// landing on `prefix`: a record crosses the prefix boundary, or the
+    /// bytes at `valid_length` are malformed. Bytes at or past `prefix` were
+    /// not read to tell the two apart.
+    PrefixNotRecordBoundary {
+        /// The requested prefix length.
+        prefix: usize,
+        /// The last record boundary the scan reached below `prefix`.
+        valid_length: usize,
+    },
 }
 
 impl std::fmt::Display for ReadError {
@@ -3496,6 +3577,18 @@ impl std::fmt::Display for ReadError {
             ReadError::FileTooLarge { length } => {
                 write!(f, "PileFile of length {length} exceeds supported size")
             }
+            ReadError::PrefixBeyondFile { prefix, length } => write!(
+                f,
+                "fixed prefix of {prefix} bytes lies past the end of the {length}-byte pile"
+            ),
+            ReadError::PrefixNotRecordBoundary {
+                prefix,
+                valid_length,
+            } => write!(
+                f,
+                "fixed prefix of {prefix} bytes is not a record boundary; the scan from byte 0 \
+                 stopped at byte {valid_length}"
+            ),
         }
     }
 }
@@ -3505,7 +3598,9 @@ impl std::error::Error for ReadError {
             Self::IoError(err) => Some(err),
             Self::CorruptPile { .. }
             | Self::UnsupportedRecord { .. }
-            | Self::FileTooLarge { .. } => None,
+            | Self::FileTooLarge { .. }
+            | Self::PrefixBeyondFile { .. }
+            | Self::PrefixNotRecordBoundary { .. } => None,
         }
     }
 }
@@ -3530,6 +3625,8 @@ impl From<ReadError> for std::io::Error {
             ReadError::FileTooLarge { length } => {
                 std::io::Error::other(format!("pile length {length} exceeds supported size"))
             }
+            err @ (ReadError::PrefixBeyondFile { .. }
+            | ReadError::PrefixNotRecordBoundary { .. }) => std::io::Error::other(err.to_string()),
         }
     }
 }
@@ -3798,7 +3895,7 @@ impl PileFile {
     /// Complete opaque envelopes are crossed; unknown unenveloped markers are
     /// refused without truncation.
     pub fn open(path: &Path) -> Result<Self, ReadError> {
-        Self::from_file(OpenOptions::new().read(true).append(true).open(path)?)
+        Self::from_file(OpenOptions::new().read(true).append(true).open(path)?, None)
     }
 
     /// Opens an existing pile file for reading only.
@@ -3811,20 +3908,76 @@ impl PileFile {
     /// mutate the pile they read, such as the clean-pile migration; the file
     /// itself may be read-only.
     pub fn open_read_only(path: &Path) -> Result<Self, ReadError> {
-        Self::from_file(OpenOptions::new().read(true).open(path)?)
+        Self::from_file(OpenOptions::new().read(true).open(path)?, None)
     }
 
-    fn from_file(file: File) -> Result<Self, ReadError> {
+    /// Opens exactly the first `prefix` bytes of an existing pile file,
+    /// read-only, and replays them.
+    ///
+    /// The handle behaves as if the file were `prefix` bytes long, while
+    /// writers may keep appending to it: only the first `prefix` bytes are
+    /// mapped, and no byte at or past `prefix` is parsed or replayed, at this
+    /// open or at any later [`Self::refresh`] or snapshot. Because the pile is
+    /// append-only, this reads what a copy of those bytes would hold, without
+    /// making the copy.
+    ///
+    /// Refused with [`ReadError::PrefixBeyondFile`] when the file is shorter
+    /// than `prefix`, and with [`ReadError::PrefixNotRecordBoundary`] when
+    /// the replay from byte 0 does not land exactly on `prefix`. The
+    /// descriptor carries no write access, every write fails, and the handle
+    /// never takes the exclusive file lock (it refuses the paths that would);
+    /// replay holds the shared lock while it reads, as [`Self::refresh`] does.
+    pub fn open_prefix(path: &Path, prefix: u64) -> Result<Self, ReadError> {
+        let prefix =
+            usize::try_from(prefix).map_err(|_| ReadError::FileTooLarge { length: usize::MAX })?;
+        let mut pile = Self::from_file(OpenOptions::new().read(true).open(path)?, Some(prefix))?;
+        pile.refresh()?;
+        if pile.applied_length != prefix {
+            // Only a file that shrank below the prefix during the open ends
+            // the replay early.
+            return Err(ReadError::PrefixBeyondFile {
+                prefix,
+                length: pile.applied_length,
+            });
+        }
+        Ok(pile)
+    }
+
+    /// The fixed prefix this handle is bounded to, if it was opened with
+    /// [`Self::open_prefix`].
+    pub fn prefix(&self) -> Option<u64> {
+        self.prefix.map(|prefix| prefix as u64)
+    }
+
+    /// The file length this handle observes: the backing file's length, or
+    /// for a bounded handle the smaller of that and its prefix. It falls
+    /// below the prefix only if the file shrank, which a later refresh
+    /// treats as fatal truncation.
+    pub fn observed_length(&self) -> Result<u64, ReadError> {
+        Ok(self.observed_file_len()? as u64)
+    }
+
+    fn from_file(file: File, prefix: Option<usize>) -> Result<Self, ReadError> {
         let length_u64 = file.metadata()?.len();
         let length = usize::try_from(length_u64)
             .map_err(|_| ReadError::FileTooLarge { length: usize::MAX })?;
-        let page_size = page_size::get();
-        let base_size = page_size * 1024;
-        let mapped_size = base_size.max(
-            length
-                .checked_next_power_of_two()
-                .ok_or(ReadError::FileTooLarge { length })?,
-        );
+        let mapped_size = match prefix {
+            Some(prefix) if length < prefix => {
+                return Err(ReadError::PrefixBeyondFile { prefix, length });
+            }
+            // Exactly the prefix, never remapped: nothing past it is ever
+            // addressable through this handle. A mapping cannot be empty, so
+            // an empty prefix maps one byte it never reads.
+            Some(prefix) => prefix.max(1),
+            None => {
+                let base_size = page_size::get() * 1024;
+                base_size.max(
+                    length
+                        .checked_next_power_of_two()
+                        .ok_or(ReadError::FileTooLarge { length })?,
+                )
+            }
+        };
 
         let mmap = MmapOptions::new()
             .len(mapped_size)
@@ -3848,6 +4001,7 @@ impl PileFile {
             exact_frame_digests: PATCH::<32, IdentitySchema>::new(),
             wants: PATCH::<WANT_REQUEST_BYTES_LEN, IdentitySchema>::new(),
             applied_length: 0,
+            prefix,
         })
     }
 
@@ -3897,9 +4051,26 @@ impl PileFile {
         self.apply_next_bounded(file_len)
     }
 
+    /// The length every replay bound is taken from. For a bounded handle it
+    /// is capped at the prefix, so no replay, remap or retry path can reach
+    /// a byte at or past it.
     fn observed_file_len(&self) -> Result<usize, ReadError> {
-        usize::try_from(self.file.metadata()?.len())
-            .map_err(|_| ReadError::FileTooLarge { length: usize::MAX })
+        let length = usize::try_from(self.file.metadata()?.len())
+            .map_err(|_| ReadError::FileTooLarge { length: usize::MAX })?;
+        Ok(self.prefix.map_or(length, |prefix| length.min(prefix)))
+    }
+
+    /// The exclusive file lock every append and amputation path takes. A
+    /// bounded handle refuses it: it never writes, and must never stall the
+    /// writers of the file it reads.
+    fn lock_exclusive(&self) -> std::io::Result<()> {
+        if self.prefix.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "a pile handle bounded to a fixed prefix never writes or takes the exclusive lock",
+            ));
+        }
+        self.file.lock()
     }
 
     /// Applies one record from a file-length snapshot already covered by the
@@ -4066,7 +4237,12 @@ impl PileFile {
     /// every return path; successful recovery retains the stronger lock.
     fn refresh_shared_locked(&mut self) -> Result<(), ReadError> {
         match self.refresh_locked() {
-            Err(ReadError::CorruptPile { .. } | ReadError::UnsupportedRecord { .. }) => {
+            // A bounded handle never rechecks: its replay bound is the fixed
+            // prefix, not a fresh length an in-flight append could move, and
+            // the recheck would take the exclusive lock.
+            Err(ReadError::CorruptPile { .. } | ReadError::UnsupportedRecord { .. })
+                if self.prefix.is_none() =>
+            {
                 #[cfg(test)]
                 append_visibility_tests::before_exclusive_recheck();
                 // Append serialization prevents writers from interleaving, not
@@ -4074,7 +4250,7 @@ impl PileFile {
                 // for all participating writers, then take a NEW length below.
                 // Do not retry the append, truncate, or suppress a stable error.
                 self.file.unlock()?;
-                self.file.lock()?;
+                self.lock_exclusive()?;
                 self.refresh_locked()
             }
             result => result,
@@ -4095,6 +4271,12 @@ impl PileFile {
             match self.apply_next_bounded(file_len) {
                 Ok(Some(_)) => {}
                 Ok(None) => return Ok(()),
+                Err(ReadError::CorruptPile { valid_length }) if self.prefix.is_some() => {
+                    return Err(ReadError::PrefixNotRecordBoundary {
+                        prefix: self.prefix.unwrap_or(file_len),
+                        valid_length,
+                    });
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -4145,7 +4327,7 @@ impl PileFile {
         &mut self,
         expected_valid_length: Option<usize>,
     ) -> Result<bool, ReadError> {
-        self.file.lock()?;
+        self.lock_exclusive()?;
         let result = (|| match self.refresh_locked() {
             Ok(()) => Ok(false),
             Err(ReadError::CorruptPile { valid_length })
@@ -4489,7 +4671,7 @@ impl PileFile {
             })
         ));
 
-        self.file.lock()?;
+        self.lock_exclusive()?;
         let result = (|| {
             self.refresh_locked()?;
 
@@ -4553,7 +4735,7 @@ impl PileFile {
         equation: &RetiredCollectionEquation,
     ) -> Result<(), CollectionInsertError> {
         let frame = retired_equation_frame(equation);
-        self.file.lock()?;
+        self.lock_exclusive()?;
         let result = (|| {
             self.refresh_locked()?;
 
@@ -4613,7 +4795,7 @@ impl PileFile {
                 )
         );
 
-        self.file.lock()?;
+        self.lock_exclusive()?;
         let result = (|| {
             self.refresh_locked()?;
 
@@ -4678,7 +4860,12 @@ impl PileFileSnapshot {
             )
         };
         let mut keys = Vec::new();
-        for frame in (PileRecords { bytes, offset: 0, failed: false }) {
+        for frame in (PileRecords {
+            bytes,
+            offset: 0,
+            failed: false,
+            prefix: None,
+        }) {
             let frame = frame?;
             if let PileRecordContent::Collection { record } = frame.content {
                 keys.push(collection_record_key(&record, frame.offset));
@@ -4871,7 +5058,7 @@ impl CollectionStore for PileFile {
     fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
         let header = collection_record_header(&record);
 
-        self.file.lock()?;
+        self.lock_exclusive()?;
         let result = (|| {
             self.refresh_locked()?;
 
@@ -4947,7 +5134,7 @@ impl CapabilityProofStore for PileFile {
         })?;
         let id = proof.id();
 
-        self.file.lock()?;
+        self.lock_exclusive()?;
         let result = (|| {
             self.refresh_locked()?;
 
@@ -5066,7 +5253,7 @@ impl PileFile {
             // Oversized record: exclude other writers for the duration of
             // the multi-syscall append. Shared readers ([`refresh`]) block
             // until unlock, so they never observe a partially-written tail.
-            self.file.lock()?;
+            self.lock_exclusive()?;
         }
         let res = (|| {
             if use_atomic {
@@ -5183,7 +5370,7 @@ impl PileFile {
         id: Id,
         head: Option<Inline<Handle<SimpleArchive>>>,
     ) -> Result<(), PileWriteError> {
-        self.file.lock()?;
+        self.lock_exclusive()?;
         let result = (|| {
             self.refresh_locked().map_err(PileWriteError::from)?;
             self.dirty = true;
@@ -5375,7 +5562,7 @@ impl PileFile {
     /// semantic state. A short or torn frame still requires the ordinary
     /// explicit tail-repair step before retrying; it is not silently skipped.
     pub fn migrate_retired_wants(&mut self) -> Result<WantCutoverStatus, PileWriteError> {
-        self.file.lock()?;
+        self.lock_exclusive()?;
         let result: Result<WantCutoverStatus, PileWriteError> = (|| {
             self.refresh_locked().map_err(PileWriteError::from)?;
             let (retired_records, active) = self
@@ -5402,7 +5589,7 @@ impl PileFile {
     /// while the exclusive lock is still held. Like other header appends, the
     /// record is not crash-durable until [`PileFile::flush`] is called.
     fn write_want_marker(&mut self, request: WantRequest) -> Result<(), PileWriteError> {
-        self.file.lock()?;
+        self.lock_exclusive()?;
         let res = (|| {
             self.refresh_locked().map_err(PileWriteError::from)?;
             self.append_want_locked(request).map(|_| ())

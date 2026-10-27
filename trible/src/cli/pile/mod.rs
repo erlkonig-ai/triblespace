@@ -86,6 +86,13 @@ pub enum PileCommand {
         /// does not revoke grants or prevent sync from restoring the data.
         #[arg(long = "drop-collection", value_name = "NAME_OR_FULL_HANDLE")]
         drop_collection: Vec<String>,
+        /// Read SOURCE as exactly its first BYTES bytes, read-only, while
+        /// writers may keep appending. BYTES must be a record boundary, such
+        /// as the file's length at some earlier moment. Bytes at or past it
+        /// are never parsed, and the output equals the compaction of a copy
+        /// of that prefix.
+        #[arg(long = "source-prefix", value_name = "BYTES")]
+        source_prefix: Option<u64>,
     },
     /// Write SOURCE minus MINUS as a fresh difference pile, read-only on both.
     ///
@@ -368,7 +375,8 @@ pub fn run(cmd: PileCommand) -> Result<()> {
             into,
             drop_drained,
             drop_collection,
-        } => compact::run(source, into, drop_drained, drop_collection),
+            source_prefix,
+        } => compact::run(source, into, drop_drained, drop_collection, source_prefix),
         PileCommand::Subtract {
             source,
             minus,
