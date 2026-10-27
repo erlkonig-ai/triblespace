@@ -1111,6 +1111,170 @@ fn search_prints_an_entity_once_at_its_best_text() {
     assert!(hits[0].ends_with("  needle needle"), "{stdout}");
 }
 
+/// The search names entities through the source's attached fact index, not
+/// by reading the source's facts whole. The witness is a source node whose
+/// payload is not here while its BM25, Succinct and Rank9 attachments are:
+/// no read of the source's own facts can name its entity, only the attached
+/// index can. Before the index covers anything the search falls back to the
+/// source's facts, says so, and cannot name it; once the index is
+/// maintained, and the cold node attached, it names it.
+#[cfg(feature = "search")]
+#[test]
+fn search_joins_through_the_sources_attached_fact_index() {
+    use triblespace_core::blob::encodings::succinctarchive::SuccinctArchive;
+    use triblespace_core::blob::encodings::utf8string::UTF8String;
+    use triblespace_core::blob::{Blob, IntoBlob};
+    use triblespace_core::collection::records::{CollectionCommit, CollectionMap};
+    use triblespace_core::collection::succinctarchive_union::derive_element;
+    use triblespace_core::collection::CollectionStore;
+    use triblespace_core::inline::encodings::hash::Handle;
+    use triblespace_core::repo::BlobStoreMeta;
+    use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25Index};
+    use triblespace_search::text_bm25::{Bm25Tokenizer, TextAttributeToBm25};
+    use triblespace_search::tokens::{hash_tokens, WordHash};
+
+    let fixture = Fixture::new();
+    let mut pile = Pile::open(&fixture.path).unwrap();
+    let index = pile
+        .attach::<PortableBM25Blob>(
+            fixture.source,
+            TextAttributeToBm25 {
+                attribute: metadata::description.id(),
+                tokenizer: Bm25Tokenizer::Word,
+            },
+        )
+        .unwrap();
+    pile.close().unwrap();
+    assert_success(&fixture.run("maintain", &[index.handle()]));
+
+    // A node whose text and attachments are here and whose payload is not.
+    let mut pile = Pile::open(&fixture.path).unwrap();
+    let document = pile.put::<UTF8String, _>(String::from("cold")).unwrap();
+    let holder = triblespace_core::id::ufoid();
+    let data: Blob<SimpleArchive> = entity! { &holder @ metadata::description: document }
+        .facts()
+        .clone()
+        .to_blob();
+    let empty = pile.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
+    let commit = CollectionCommit::sign(
+        &fixture.signer,
+        fixture.source.handle(),
+        Handle::<SimpleArchive>::to_hash(data.get_handle()),
+        empty,
+    );
+    pile.insert(CollectionRecord::Commit(commit)).unwrap();
+    let carrier = PortableBM25Index::<Handle<UTF8String>, WordHash>::from_exact_counts(
+        [document],
+        [(document, hash_tokens("cold")[0], 1)],
+    )
+    .unwrap();
+    let carrier = pile.put::<PortableBM25Blob, _>(carrier).unwrap();
+    pile.insert(CollectionRecord::Map(CollectionMap::sign(
+        &fixture.signer,
+        index.handle(),
+        commit.data(),
+        Handle::<PortableBM25Blob>::to_hash(carrier),
+    )))
+    .unwrap();
+    assert!(pile
+        .snapshot()
+        .unwrap()
+        .metadata(data.get_handle())
+        .unwrap()
+        .is_none());
+    pile.close().unwrap();
+
+    let search = |query: &str| {
+        let mut command = trible();
+        command
+            .args(["pile", "collection", "search"])
+            .arg(&fixture.path)
+            .arg(handle_text(index.handle()))
+            .args([query, "--snippet"])
+            .arg("--key")
+            .arg(&fixture.key);
+        let output = Command::from_std(command)
+            .timeout(Duration::from_secs(30))
+            .output()
+            .unwrap();
+        assert_success(&output);
+        (
+            String::from_utf8(output.stdout).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+        )
+    };
+    let named = format!("{:X}", &*holder);
+
+    // No usable fact attachment yet: the source's facts are read whole, and
+    // they cannot name the cold node's entity.
+    let (stdout, stderr) = search("cold");
+    assert!(stdout.contains("0 hit(s)"), "{stdout}");
+    assert!(stderr.contains("read whole into memory"), "{stderr}");
+    assert!(
+        stderr.contains("1 matching text(s) are named by no fact"),
+        "{stderr}"
+    );
+
+    // Maintain the Rank9 index over the nodes whose payload is here, then
+    // attach the cold node by hand, as a host holding it would have.
+    assert_success(&fixture.run("maintain-all", &[fixture.rank9.handle()]));
+    let mut pile = Pile::open(&fixture.path).unwrap();
+    let raw = derive_element(&data).unwrap();
+    let accelerated =
+        SuccinctArchive::<OrderedUniverse>::build_accelerated_root(raw.clone()).unwrap();
+    let raw = pile.put::<SuccinctArchiveBlob, _>(raw).unwrap();
+    let accelerated = pile
+        .put::<Rank9AcceleratedSuccinctArchiveBlob, _>(accelerated)
+        .unwrap();
+    for (collection, attachment) in [
+        (
+            fixture.succinct.handle(),
+            Handle::<SuccinctArchiveBlob>::to_hash(raw),
+        ),
+        (
+            fixture.rank9.handle(),
+            Handle::<Rank9AcceleratedSuccinctArchiveBlob>::to_hash(accelerated),
+        ),
+    ] {
+        pile.insert(CollectionRecord::Map(CollectionMap::sign(
+            &fixture.signer,
+            collection,
+            commit.data(),
+            attachment,
+        )))
+        .unwrap();
+    }
+    pile.close().unwrap();
+    let mut reader = fixture.open();
+    let snapshot = reader.snapshot().unwrap();
+    let attached = snapshot.attached(fixture.rank9).unwrap();
+    assert!(!attached.cover().is_empty());
+    assert!(
+        attached.residual().is_empty(),
+        "the index covers every node"
+    );
+    drop((attached, snapshot));
+    reader.close().unwrap();
+
+    let before = records(&fixture.path);
+    let (stdout, stderr) = search("cold");
+    assert!(stdout.contains("1 hit(s)"), "{stdout}\n{stderr}");
+    let hits: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.contains(&named))
+        .collect();
+    assert_eq!(hits.len(), 1, "{stdout}");
+    assert!(hits[0].ends_with("  cold"), "{stdout}");
+    assert!(!stderr.contains("read whole"), "{stderr}");
+    assert!(!stderr.contains("named by no fact"), "{stderr}");
+    // A node whose payload is here is named through the maintained cover.
+    let (stdout, stderr) = search("first");
+    assert!(stdout.contains("1 hit(s)"), "{stdout}\n{stderr}");
+    assert!(stdout.contains("first fact"), "{stdout}");
+    assert!(!stderr.contains("read whole"), "{stderr}");
+    assert_eq!(records(&fixture.path), before, "search is a read");
+}
+
 #[cfg(feature = "search")]
 #[test]
 fn search_reads_existing_bm25_support_and_snippets_after_source_growth() {

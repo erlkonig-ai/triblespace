@@ -34,7 +34,7 @@ use triblespace_core::blob::encodings::entity_id_set::{
 };
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{
-    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::Blob;
@@ -44,14 +44,16 @@ use triblespace_core::collection::records::{
 };
 use triblespace_core::collection::CollectionRead;
 use triblespace_core::collection::{
-    descriptor, grant_collection_read, grant_collection_write, AdmissionPolicy, Collection,
-    CollectionPolicy, CollectionRecordSelector, CollectionStoreExt,
+    descriptor, grant_collection_read, grant_collection_write, succinctarchive_union,
+    AdmissionPolicy, Collection, CollectionEncoding, CollectionPolicy, CollectionRecordSelector,
+    CollectionSnapshotExt, CollectionStoreExt, TryFromCover,
 };
 use triblespace_core::id::Id;
+use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
-use triblespace_core::inline::Inline;
+use triblespace_core::inline::{Inline, InlineEncoding};
 use triblespace_core::metadata::{self, MetaDescribe};
-use triblespace_core::prelude::{exists, pattern};
+use triblespace_core::prelude::{exists, find, pattern, TriblePattern};
 use triblespace_core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace_core::repo::pile::{Pile, PileSnapshot};
 use triblespace_core::repo::{BlobStoreGet, BlobStoreMeta, SnapshotSource, Store};
@@ -2712,6 +2714,127 @@ fn unsearched(host: Option<VerifyingKey>, residual: usize) -> String {
     }
 }
 
+/// The facts the source collection holds here, read through its attached
+/// fact index: a Rank9 attachment, else a raw Succinct one, that is
+/// attached to the source alone and whose cover reaches at least one
+/// foundation for the key the read believes. The cover's archives are read
+/// in place from the pile's mapping; each residual foundation whose bytes
+/// are here is built in memory as one more segment, the ordinary attached
+/// read. `None`, saying why on stderr, when the source has no such index
+/// here: the caller then reads the source's facts whole.
+fn attached_source_facts(
+    snapshot: &PileSnapshot,
+    rows: &[Enumerated],
+    source: CollectionHandle,
+) -> Result<Option<UnionArchive<OrderedUniverse>>> {
+    fn read<E>(
+        snapshot: &PileSnapshot,
+        handle: CollectionHandle,
+    ) -> Result<Option<UnionArchive<OrderedUniverse>>>
+    where
+        E: CollectionEncoding,
+        Handle<E>: InlineEncoding,
+        UnionArchive<OrderedUniverse>: TryFromCover<E>,
+        <UnionArchive<OrderedUniverse> as TryFromCover<E>>::Error: std::fmt::Display,
+    {
+        let Ok(index) = Collection::<E>::open(snapshot, handle) else {
+            return Ok(None);
+        };
+        let view = snapshot
+            .attached(index)
+            .map_err(|error| anyhow!("attach source fact index: {error:?}"))?;
+        if view.cover().is_empty() {
+            return Ok(None);
+        }
+        let residual = view.residual().len();
+        if residual > 0 {
+            eprintln!(
+                "{residual} source foundation(s) have no fact attachment yet and are read from \
+                 their bytes; run 'collection maintain' on {}",
+                handle_hex(handle)
+            );
+        }
+        let facts = succinctarchive_union::read_attached(&view)
+            .map_err(|error| anyhow!("read source fact index: {error}"))?;
+        Ok(Some(facts.into_value()))
+    }
+
+    let attached_here = |representation: Id| {
+        rows.iter()
+            .filter(move |row| {
+                row.fields.facts().is_some_and(|facts| {
+                    descriptor::parents(facts).is_ok_and(|parents| parents == [source])
+                        && descriptor::representation(facts).is_ok_and(|id| id == representation)
+                })
+            })
+            .map(|row| row.handle)
+    };
+    let rank9 = attached_here(<Rank9AcceleratedSuccinctArchiveBlob as MetaDescribe>::id());
+    let succinct = attached_here(<SuccinctArchiveBlob as MetaDescribe>::id());
+    let mut indexes = 0usize;
+    for handle in rank9.clone() {
+        indexes += 1;
+        if let Some(facts) = read::<Rank9AcceleratedSuccinctArchiveBlob>(snapshot, handle)? {
+            return Ok(Some(facts));
+        }
+    }
+    for handle in succinct.clone() {
+        indexes += 1;
+        if let Some(facts) = read::<SuccinctArchiveBlob>(snapshot, handle)? {
+            return Ok(Some(facts));
+        }
+    }
+    if indexes == 0 {
+        eprintln!(
+            "source collection {} has no attached fact index, so its facts are read whole into \
+             memory to name the hits; attach one ('collection attach <pile> <source> rank9') and \
+             maintain it",
+            handle_hex(source)
+        );
+    } else {
+        eprintln!(
+            "the attached fact index of source collection {} has no usable attachment here for \
+             this key, so the source's facts are read whole into memory to name the hits; run \
+             'collection maintain' on it",
+            handle_hex(source)
+        );
+    }
+    Ok(None)
+}
+
+/// Walk the texts best first and name the entities holding each under the
+/// descriptor's attribute: each entity once, at its best text's score,
+/// until `top` are named. Also counts the texts no fact here names.
+fn join_texts<F: TriblePattern>(
+    facts: &F,
+    attribute: Inline<GenId>,
+    hits: &[(Inline<Handle<UTF8String>>, f32)],
+    top: usize,
+) -> (Vec<(Inline<GenId>, Inline<Handle<UTF8String>>, f32)>, usize) {
+    let mut shown: BTreeSet<Inline<GenId>> = BTreeSet::new();
+    let mut entities = Vec::new();
+    let mut unnamed = 0usize;
+    for (text, score) in hits {
+        if entities.len() == top {
+            break;
+        }
+        let holders: BTreeSet<Inline<GenId>> = find!(
+            entity: Inline<GenId>,
+            facts.pattern(entity, attribute, *text)
+        )
+        .collect();
+        if holders.is_empty() {
+            unnamed += 1;
+        }
+        for entity in holders {
+            if entities.len() < top && shown.insert(entity) {
+                entities.push((entity, *text, *score));
+            }
+        }
+    }
+    (entities, unnamed)
+}
+
 fn run_search(
     path: PathBuf,
     reference: String,
@@ -2721,11 +2844,8 @@ fn run_search(
     key: Option<PathBuf>,
 ) -> Result<()> {
     use anybytes::View;
-    use triblespace_core::blob::encodings::utf8string::UTF8String;
-    use triblespace_core::collection::{CollectionAttachment, CollectionSnapshotExt};
-    use triblespace_core::inline::encodings::genid::GenId;
+    use triblespace_core::collection::CollectionAttachment;
     use triblespace_core::inline::IntoInline;
-    use triblespace_core::prelude::{find, TriblePattern};
     use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25View};
     use triblespace_search::text_bm25::Bm25Tokenizer;
     use triblespace_search::tokens::{
@@ -2807,48 +2927,29 @@ fn run_search(
 
         // The texts are joined to the entities holding them by a query over
         // the source, at the point of use; nothing is serialized again and no
-        // shadow map is built. Attaching the source from the same snapshot as
-        // the index reads what that snapshot holds of it. The source is read
-        // only when some entity is wanted.
-        let source_facts: Option<TribleSet> = if top > 0 && !hits.is_empty() {
-            let source_collection: Collection<SimpleArchive> = Collection::open(&snapshot, source)
-                .map_err(|error| anyhow!("open source descriptor: {error}"))?;
-            Some(
-                snapshot
-                    .collection(source_collection)
-                    .map_err(|error| anyhow!("attach source: {error:?}"))?
-                    .view::<TribleSet>()
-                    .map_err(|error| anyhow!("view source: {error:?}"))?,
-            )
-        } else {
-            None
-        };
-        // Best text first: an entity holding several hits is shown once, at
-        // its best text's score, beside that text.
+        // shadow map is built. The source is read from the same snapshot as
+        // the index, and only when some entity is wanted: through its
+        // attached fact index when it has one, whose cover is mapped where it
+        // lies and only whose residual foundations are built here.
         let text_attribute: Inline<GenId> = argument.attribute.to_inline();
-        let mut shown: BTreeSet<Inline<GenId>> = BTreeSet::new();
-        let mut entities: Vec<(Inline<GenId>, Inline<Handle<UTF8String>>, f32)> = Vec::new();
-        let mut unnamed = 0usize;
-        if let Some(facts) = &source_facts {
-            for (text, score) in &hits {
-                if entities.len() == top {
-                    break;
-                }
-                let holders: BTreeSet<Inline<GenId>> = find!(
-                    entity: Inline<GenId>,
-                    facts.pattern(entity, text_attribute, *text)
-                )
-                .collect();
-                if holders.is_empty() {
-                    unnamed += 1;
-                }
-                for entity in holders {
-                    if entities.len() < top && shown.insert(entity) {
-                        entities.push((entity, *text, *score));
-                    }
+        let (entities, unnamed) = if top > 0 && !hits.is_empty() {
+            match attached_source_facts(&snapshot, &rows, source)? {
+                Some(facts) => join_texts(&facts, text_attribute, &hits, top),
+                None => {
+                    let source_collection: Collection<SimpleArchive> =
+                        Collection::open(&snapshot, source)
+                            .map_err(|error| anyhow!("open source descriptor: {error}"))?;
+                    let facts: TribleSet = snapshot
+                        .collection(source_collection)
+                        .map_err(|error| anyhow!("attach source: {error:?}"))?
+                        .view::<TribleSet>()
+                        .map_err(|error| anyhow!("view source: {error:?}"))?;
+                    join_texts(&facts, text_attribute, &hits, top)
                 }
             }
-        }
+        } else {
+            (Vec::new(), 0)
+        };
         if unnamed > 0 {
             eprintln!(
                 "{unnamed} matching text(s) are named by no fact this pile holds of the source \
