@@ -6293,3 +6293,365 @@ mod lattice_v2 {
         );
     }
 }
+
+/// Attachment dependencies the mapping names as absent are wanted together:
+/// one pass names every node's, the acquiring loop asks for them afterwards,
+/// and a pass after their arrival attaches what waited.
+mod attach_dependencies {
+    use super::*;
+
+    use std::convert::Infallible;
+
+    use crate::blob::encodings::succinctarchive::SuccinctArchiveBlob;
+    use crate::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
+    use crate::collection::{CollectionAttachment, CoverageRead, MapMapping, MERGE_FAN_IN};
+    use crate::macros::entity;
+    use crate::metadata;
+
+    fn host() -> SigningKey {
+        SigningKey::from_bytes(&[71; 32])
+    }
+
+    /// The blob [`Witnessed`] needs beside `node`: its bytes followed by
+    /// `0x5A`, so every node needs a distinct one.
+    fn witness(node: &Blob<SimpleArchive>) -> Blob<UnknownBlob> {
+        let mut bytes = node.bytes.as_ref().to_vec();
+        bytes.push(0x5A);
+        Blob::<UnknownBlob>::new(bytes.into())
+    }
+
+    /// Succinct attachments that need the node's [`witness`] to be here.
+    struct Witnessed;
+
+    impl MapMapping for Witnessed {
+        type Target = SuccinctArchiveBlob;
+
+        fn fragment(&self) -> Fragment {
+            let algorithm = crate::id::rngid();
+            entity! {
+                metadata::tag: KIND_COLLECTION_MAPPING,
+                mapping_algorithm*: entity! {
+                    &algorithm @
+                        metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
+                        metadata::name: "succinct, once the witness is here",
+                },
+            }
+        }
+
+        fn bind(_: &Fragment, _: &Fragment) -> Result<Self, CollectionOperationError> {
+            Ok(Witnessed)
+        }
+
+        fn map<R: StoreRead>(
+            &self,
+            node: &Blob<SimpleArchive>,
+            siblings: &[CollectionData],
+            reader: &R,
+        ) -> Result<Blob<SuccinctArchiveBlob>, CollectionOperationError> {
+            let needed = data(&witness(node));
+            let here = reader
+                .metadata(Handle::<UnknownBlob>::from_hash(needed))
+                .map_err(|error| CollectionOperationError::Fatal(error.to_string()))?
+                .is_some();
+            if !here {
+                return Err(CollectionOperationError::MissingDependency(needed));
+            }
+            <SuccinctArchiveBlob as CollectionAttachment>::map(&(), node, siblings, reader)
+        }
+    }
+
+    /// A store that asks other holders, who hold what it was offered. It
+    /// records each blob asked for, and how many MAPs had been published
+    /// when it was.
+    struct Holders {
+        inner: MemoryRepo,
+        offered: BTreeMap<CollectionData, Bytes>,
+        asked: Vec<CollectionData>,
+        maps_when_asked: Vec<usize>,
+        maps: usize,
+    }
+
+    impl Holders {
+        fn new(inner: MemoryRepo) -> Self {
+            Self {
+                inner,
+                offered: BTreeMap::new(),
+                asked: Vec::new(),
+                maps_when_asked: Vec::new(),
+                maps: 0,
+            }
+        }
+
+        fn offer(&mut self, blob: &Blob<UnknownBlob>) {
+            self.offered.insert(data(blob), blob.bytes.clone());
+        }
+    }
+
+    impl AsyncBlobStoreAcquire for Holders {
+        type AcquireError = Infallible;
+
+        fn acquire(
+            &mut self,
+            handle: Inline<Handle<UnknownBlob>>,
+        ) -> impl std::future::Future<Output = Result<Option<Bytes>, Self::AcquireError>> + Send
+        {
+            let member = Handle::<UnknownBlob>::to_hash(handle);
+            self.asked.push(member);
+            self.maps_when_asked.push(self.maps);
+            let bytes = self.offered.get(&member).cloned();
+            if let Some(bytes) = &bytes {
+                self.inner.put::<UnknownBlob, _>(bytes.clone()).unwrap();
+            }
+            std::future::ready(Ok(bytes))
+        }
+
+        fn acquires_remotely(&self) -> bool {
+            true
+        }
+    }
+
+    impl BlobStorePut for Holders {
+        type PutError = <MemoryRepo as BlobStorePut>::PutError;
+
+        fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
+        where
+            S: BlobEncoding + 'static,
+            T: IntoBlob<S>,
+            Handle<S>: InlineEncoding,
+        {
+            self.inner.put::<S, T>(item)
+        }
+    }
+
+    impl SnapshotSource for Holders {
+        type Snapshot = MemoryRepoSnapshot;
+        type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
+
+        fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+            self.inner.snapshot()
+        }
+    }
+
+    impl CollectionStore for Holders {
+        type InsertError = <MemoryRepo as CollectionStore>::InsertError;
+
+        fn insert(&mut self, record: CollectionRecord) -> Result<(), Self::InsertError> {
+            if matches!(record, CollectionRecord::Map(_)) {
+                self.maps += 1;
+            }
+            self.inner.insert(record)
+        }
+    }
+
+    impl CapabilityProofStore for Holders {
+        type InsertError = <MemoryRepo as CapabilityProofStore>::InsertError;
+
+        fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
+            self.inner.insert_proof(proof)
+        }
+    }
+
+    /// A root with `count` commits, one fact each, and a [`Witnessed`]
+    /// attachment of it: the commits' payloads and their witnesses.
+    fn rooted(
+        count: u8,
+    ) -> (
+        MemoryRepo,
+        Collection<SimpleArchive>,
+        Collection<SuccinctArchiveBlob>,
+        Vec<Blob<SimpleArchive>>,
+    ) {
+        let mut store = MemoryRepo::for_host(host().verifying_key());
+        let root = store.collection("witnessed", policy()).unwrap();
+        let attached = store.attach_with(root, Witnessed).unwrap();
+        let payloads: Vec<_> = (1..=count).map(|entity| archive(entity, 3)).collect();
+        for payload in &payloads {
+            publish_root(&mut store, root, payload, 71);
+        }
+        (store, root, attached, payloads)
+    }
+
+    fn residual(
+        store: &mut MemoryRepo,
+        attached: Collection<SuccinctArchiveBlob>,
+    ) -> BTreeSet<CollectionData> {
+        let snapshot = store.snapshot().unwrap();
+        let read = snapshot.attached(attached).unwrap();
+        read.residual().data_members().collect()
+    }
+
+    fn maps(store: &mut MemoryRepo, attached: Collection<SuccinctArchiveBlob>) -> usize {
+        let snapshot = store.snapshot().unwrap();
+        snapshot
+            .records()
+            .unwrap()
+            .filter(|record| {
+                matches!(record, Ok(CollectionRecord::Map(map)) if map.attached() == attached.handle())
+            })
+            .count()
+    }
+
+    /// One pass names every node's absent dependency, each as a group of
+    /// its own, and ends without an error: nothing ends the walk at the first.
+    /// No node waiting on one is given a MAP, so all of them stay residual.
+    #[test]
+    fn one_pass_wants_every_absent_dependency() {
+        let (mut store, _, attached, payloads) = rooted(3);
+        let mut wanted = Vec::new();
+        let mut frontier = OperationFrontier::new(store.snapshot().unwrap());
+        crate::collection::maintenance::attach_frontier::<_, Witnessed>(
+            &mut store,
+            attached,
+            &host(),
+            &Unfetched::default(),
+            &mut wanted,
+            &mut frontier,
+        )
+        .unwrap();
+        drop(frontier);
+        let mut named: Vec<Vec<CollectionData>> = wanted;
+        named.sort();
+        let mut expected: Vec<Vec<CollectionData>> = payloads
+            .iter()
+            .map(|payload| vec![data(&witness(payload))])
+            .collect();
+        expected.sort();
+        assert_eq!(named, expected);
+        assert_eq!(maps(&mut store, attached), 0);
+        assert_eq!(
+            residual(&mut store, attached),
+            payloads.iter().map(data).collect::<BTreeSet<_>>()
+        );
+    }
+
+    /// While the dependencies cannot be had, every node waiting on one is
+    /// residual and the call ends; once a holder has them, the next call asks
+    /// for all of them before it publishes any MAP, and attaches every node.
+    #[test]
+    fn dependencies_arriving_turn_the_residual_into_attachments() {
+        let (store, _, attached, payloads) = rooted(3);
+        let mut holders = Holders::new(store);
+        block_on(attach_acquiring_with::<_, Witnessed>(
+            &mut holders,
+            attached,
+            &host(),
+        ))
+        .unwrap();
+        assert_eq!(holders.asked.len(), 3, "each absence asked once");
+        assert_eq!(holders.maps, 0);
+        assert_eq!(
+            residual(&mut holders.inner, attached),
+            payloads.iter().map(data).collect::<BTreeSet<_>>(),
+            "nothing waiting on a dependency is read as attached"
+        );
+
+        for payload in &payloads {
+            holders.offer(&witness(payload));
+        }
+        holders.asked.clear();
+        holders.maps_when_asked.clear();
+        block_on(attach_acquiring_with::<_, Witnessed>(
+            &mut holders,
+            attached,
+            &host(),
+        ))
+        .unwrap();
+        let mut asked = holders.asked.clone();
+        asked.sort();
+        let mut expected: Vec<_> = payloads.iter().map(|p| data(&witness(p))).collect();
+        expected.sort();
+        assert_eq!(asked, expected);
+        assert_eq!(
+            holders.maps_when_asked,
+            vec![0; 3],
+            "every dependency was asked for before any node was attached"
+        );
+        assert_eq!(holders.maps, 3);
+        assert!(residual(&mut holders.inner, attached).is_empty());
+    }
+
+    /// Thousands of unfetchable dependencies, in miniature: more nodes wait
+    /// than one call lets fetches fail. The call asks for no more than its
+    /// budget, ends without looping, and leaves every waiting node residual.
+    #[test]
+    fn unfetchable_dependencies_end_the_call_with_their_nodes_residual() {
+        let count = (OPTIONAL_FETCH_FAILURES + 4) as u8;
+        let (store, _, attached, payloads) = rooted(count);
+        let mut holders = Holders::new(store);
+        for _ in 0..2 {
+            holders.asked.clear();
+            block_on(attach_acquiring_with::<_, Witnessed>(
+                &mut holders,
+                attached,
+                &host(),
+            ))
+            .unwrap();
+            assert_eq!(holders.asked.len(), OPTIONAL_FETCH_FAILURES);
+            assert_eq!(
+                holders.asked.iter().collect::<BTreeSet<_>>().len(),
+                OPTIONAL_FETCH_FAILURES,
+                "no blob asked twice in one call"
+            );
+            assert_eq!(holders.maps, 0);
+            assert_eq!(
+                residual(&mut holders.inner, attached),
+                payloads.iter().map(data).collect::<BTreeSet<_>>()
+            );
+        }
+    }
+
+    /// A node waiting on a dependency is descended: its finer nodes, whose
+    /// own dependencies are here, are attached in its place and read
+    /// complete. Once its dependency arrives the next pass attaches the node
+    /// itself, the reader takes it, and the finer attachments are no longer
+    /// selected.
+    #[test]
+    fn a_waiting_node_is_descended_and_attached_once_its_dependency_arrives() {
+        let (mut store, root, attached, payloads) = rooted(MERGE_FAN_IN as u8);
+        for payload in &payloads {
+            store.put::<UnknownBlob, _>(witness(payload)).unwrap();
+        }
+        block_on(store.maintain(root, &host())).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let merged: Vec<CollectionData> =
+            CoverageRead::coverage(&snapshot, &BTreeSet::from([root.handle()]))
+                .unwrap()
+                .frontier(root.handle())
+                .collect();
+        let merged_payload: Blob<SimpleArchive> = snapshot
+            .get(Handle::<SimpleArchive>::from_hash(merged[0]))
+            .unwrap();
+        drop(snapshot);
+        assert_eq!(merged.len(), 1, "one merged node over every commit");
+
+        let mut holders = Holders::new(store);
+        block_on(attach_acquiring_with::<_, Witnessed>(
+            &mut holders,
+            attached,
+            &host(),
+        ))
+        .unwrap();
+        assert_eq!(holders.asked, vec![data(&witness(&merged_payload))]);
+        assert_eq!(holders.maps, MERGE_FAN_IN, "every commit attached instead");
+        {
+            let snapshot = holders.inner.snapshot().unwrap();
+            let read = snapshot.attached(attached).unwrap();
+            assert_eq!(read.cover().len(), MERGE_FAN_IN);
+            assert!(read.residual().is_empty());
+        }
+
+        holders.offer(&witness(&merged_payload));
+        block_on(attach_acquiring_with::<_, Witnessed>(
+            &mut holders,
+            attached,
+            &host(),
+        ))
+        .unwrap();
+        assert_eq!(holders.maps, MERGE_FAN_IN + 1, "the merged node attached");
+        assert_eq!(maps(&mut holders.inner, attached), MERGE_FAN_IN + 1);
+        let snapshot = holders.inner.snapshot().unwrap();
+        let read = snapshot.attached(attached).unwrap();
+        assert_eq!(read.cover().len(), 1, "the reader takes the merged node");
+        assert!(read.residual().is_empty());
+    }
+}
