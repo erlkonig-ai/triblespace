@@ -48,6 +48,10 @@ pub(super) async fn drive<T: Transport, S: Service>(
     let mut progress_open = true;
     let mut failure_open = true;
     let mut duplicate = false;
+    // Why the walk stopped, when it stopped on something other than its own
+    // exchange outcome: those paths logged nothing, so a peer resetting
+    // every walk (the other side failing) was invisible here.
+    let mut stopped: Option<(&'static str, Option<u32>)> = None;
     let failed = 'drive: loop {
         if let Some(Outcome::Failed(failure)) = exchange.outcome() {
             // At info, with what failed where: a walk that keeps failing
@@ -100,7 +104,10 @@ pub(super) async fn drive<T: Transport, S: Service>(
                         permit.send(pending.take().expect("pending frame"));
                         Vec::new()
                     }
-                    Err(_) => break 'drive true,
+                    Err(_) => {
+                        stopped = Some(("outgoing frame channel closed", None));
+                        break 'drive true;
+                    }
                 },
             frame = next(&mut framed, deadline), if !peer_fin && exchange.want_read() => match frame {
                 Some(Ok(Some(frame))) => {
@@ -113,9 +120,16 @@ pub(super) async fn drive<T: Transport, S: Service>(
                 }
                 Some(Err(code)) => {
                     duplicate = code == Some(RESET_WALK_DUPLICATE);
+                    stopped = Some(match code {
+                        Some(_) => ("peer reset the stream", code),
+                        None => ("stream ended, truncated or malformed", None),
+                    });
                     break 'drive true;
                 }
-                None => break 'drive true,
+                None => {
+                    stopped = Some(("reader ended", None));
+                    break 'drive true;
+                }
             },
             Some((landed, failed)) = acked.recv() => exchange.on_landed_ack(landed, failed),
             Some((handle, blob)) = fetched.recv() => exchange.on_fetched(handle, blob),
@@ -133,13 +147,19 @@ pub(super) async fn drive<T: Transport, S: Service>(
             },
             failure = &mut writer_failed, if failure_open => {
                 failure_open = false;
-                if failure.is_ok() { break 'drive true; }
+                if failure.is_ok() {
+                    stopped = Some(("write failed", None));
+                    break 'drive true;
+                }
                 Vec::new() // Sender drop is not an I/O failure receipt.
             },
             result = &mut finished, if !finish_seen => {
                 finish_seen = true;
                 local_finished = matches!(result, Ok(true));
-                if !local_finished { break 'drive true; }
+                if !local_finished {
+                    stopped = Some(("local finish failed", None));
+                    break 'drive true;
+                }
                 Vec::new()
             },
             _ = &mut replaced => break 'drive true,
@@ -147,7 +167,10 @@ pub(super) async fn drive<T: Transport, S: Service>(
         for out in outs {
             match out {
                 Out::Send(frame) => {
-                    if outgoing.is_none() { break 'drive true; }
+                    if outgoing.is_none() {
+                        stopped = Some(("outgoing closed before a send", None));
+                        break 'drive true;
+                    }
                     outbox.push_back(frame);
                 }
                 Out::Land(events) => {
@@ -170,6 +193,18 @@ pub(super) async fn drive<T: Transport, S: Service>(
     reader.abort();
     if failed {
         let _ = reset.send(RESET_WALK_FAILED);
+    }
+    // A replaced or duplicate walk settles nothing and is ordinary churn; an
+    // exchange failure already logged its reason above.
+    if let Some((cause, code)) = stopped.filter(|_| failed && !duplicate) {
+        info!(
+            cause,
+            reset_code = ?code,
+            peer = %hex::encode(&driver.peer[..8]),
+            collection = %hex::encode(&driver.collection.raw[..8]),
+            kind = ?driver.kind,
+            "cached walk/1 ended unconfirmed"
+        );
     }
     drop(outgoing);
     drop(release);
