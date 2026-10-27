@@ -540,9 +540,17 @@ struct Member {
     provider: u32,
 }
 
+/// Free slots below which the provider table is never rebuilt.
+const PEER_TABLE_COMPACTION_FLOOR: usize = 1024;
+
 /// Interned provider identities. A directory holds millions of memberships
 /// from comparatively few publishers, so each membership names its provider
 /// by a four-byte index. An index is reused once its last membership leaves.
+///
+/// Identities are free to mint, so a burst of distinct providers can grow
+/// the table to one slot per membership. Once most slots are free the table
+/// is rebuilt at its live size ([`PeerTable::sparse`]), so the high-water
+/// allocation does not outlive the burst.
 #[derive(Default)]
 struct PeerTable {
     /// Each slot's identity and how many memberships name it; zero is free.
@@ -588,6 +596,40 @@ impl PeerTable {
             self.index.remove(&slot.0);
             self.free.push(index);
         }
+    }
+
+    /// Whether rebuilding is due: at least the floor and three quarters of
+    /// the slots are free, and the free slots number at least an eighth of
+    /// the `memberships` whose indexes a rebuild rewrites. Every free slot
+    /// was freed by a removal since the last rebuild, so each rebuild is paid
+    /// for by those removals, and a table that stays short of the last
+    /// condition wastes at most a few bytes per membership.
+    fn sparse(&self, memberships: usize) -> bool {
+        let free = self.free.len();
+        free >= PEER_TABLE_COMPACTION_FLOOR
+            && free >= 3 * self.index.len()
+            && free.saturating_mul(8) >= memberships
+    }
+
+    /// Rebuild at the live size, keeping live slots in index order. Returns
+    /// each old index's new one; free slots map to `u32::MAX`.
+    fn compact(&mut self) -> Vec<u32> {
+        let mut renumbered = vec![u32::MAX; self.slots.len()];
+        let mut slots = Vec::with_capacity(self.index.len());
+        for (old, &(peer, count)) in self.slots.iter().enumerate() {
+            if count > 0 {
+                renumbered[old] = slots.len() as u32;
+                slots.push((peer, count));
+            }
+        }
+        self.index = slots
+            .iter()
+            .enumerate()
+            .map(|(index, &(peer, _))| (peer, index as u32))
+            .collect();
+        self.slots = slots;
+        self.free = Vec::new();
+        renumbered
     }
 
     /// Allocated capacity of the slots, the identity index and the free list.
@@ -753,7 +795,12 @@ impl ProviderDirectory {
     /// never less than one full reply nor more than the per-key ceiling. It
     /// shrinks as memberships and keys grow.
     fn stored_cap(&self) -> usize {
-        (self.limits.memberships.saturating_sub(self.memberships) / self.groups.len().max(1))
+        self.stored_cap_at(self.memberships)
+    }
+
+    /// The stored cap were `memberships` retained across the current keys.
+    fn stored_cap_at(&self, memberships: usize) -> usize {
+        (self.limits.memberships.saturating_sub(memberships) / self.groups.len().max(1))
             .clamp(MAX_PROVIDERS_PER_REPLY, MAX_PROVIDERS_STORED_PER_KEY)
     }
 
@@ -770,24 +817,20 @@ impl ProviderDirectory {
         if self.key_len(key) < self.stored_cap() {
             return false;
         }
-        let expired = self
-            .members(key)
-            .iter()
-            .filter(|member| member.expires_at <= now)
-            .map(|member| self.peers.peer(member.provider))
-            .collect::<Vec<_>>();
-        for provider in expired {
-            self.remove_membership(key, provider);
+        self.remove_members(key, |_, member| member.expires_at <= now);
+        // Each trimmed member frees budget, which can raise the cap; count
+        // exactly the largest-ranked members that trimming them one at a
+        // time would take, then drop them in one pass. A key above its cap
+        // keeps at least one reply's worth, so its group never empties here.
+        let len = self.key_len(key);
+        let mut trimmed = 0;
+        while len - trimmed > self.stored_cap_at(self.memberships - trimmed) {
+            trimmed += 1;
         }
-        while self.key_len(key) > self.stored_cap() {
-            let largest = self.peers.peer(
-                self.members(key)
-                    .last()
-                    .expect("a key above its stored cap has members")
-                    .provider,
-            );
-            self.remove_membership(key, largest);
+        if trimmed > 0 {
+            self.remove_members(key, |position, _| position >= len - trimmed);
         }
+        self.compact_peers_if_sparse();
         self.key_len(key) >= self.stored_cap()
     }
 
@@ -839,26 +882,63 @@ impl ProviderDirectory {
     }
 
     /// Remove expired memberships in `(deadline, key, provider)` order, at
-    /// most a bounded number per call.
+    /// most a bounded number per call, with one pass over each key they
+    /// touch.
     fn prune_expired(&mut self, now: Mono) {
-        for _ in 0..MAX_EXPIRED_PROVIDER_MEMBERSHIPS_PER_CALL {
-            let Some(&(expires_at, key)) = self.deadlines.first() else {
-                break;
-            };
-            if expires_at > now {
-                break;
-            }
-            let provider = self
-                .members(key)
-                .iter()
-                .filter(|member| member.expires_at == expires_at)
-                .map(|member| self.peers.peer(member.provider))
-                .min();
-            match provider {
-                Some(provider) => self.remove_membership(key, provider),
-                None => {
-                    self.deadlines.remove(&(expires_at, key));
-                }
+        let budget = MAX_EXPIRED_PROVIDER_MEMBERSHIPS_PER_CALL;
+        // Every index entry names at least one member, so the first `budget`
+        // expired memberships lie among the members of the first `budget`
+        // expired entries: those whose (deadline, key) is at most `last`.
+        let due = self
+            .deadlines
+            .iter()
+            .take_while(|(deadline, _)| *deadline <= now)
+            .take(budget)
+            .copied()
+            .collect::<Vec<_>>();
+        let Some(&last) = due.last() else {
+            return;
+        };
+        let mut keys = due.into_iter().map(|(_, key)| key).collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys.dedup();
+        let mut expired = Vec::new();
+        for key in keys {
+            expired.extend(
+                self.members(key)
+                    .iter()
+                    .filter(|member| (member.expires_at, key) <= last)
+                    .map(|member| {
+                        let provider = self.peers.peer(member.provider);
+                        (member.expires_at, key, provider, member.provider)
+                    }),
+            );
+        }
+        if expired.len() > budget {
+            expired.select_nth_unstable(budget);
+            expired.truncate(budget);
+        }
+        expired.sort_unstable_by_key(|&(_, key, _, index)| (key, index));
+        for chosen in expired.chunk_by(|left, right| left.1 == right.1) {
+            self.remove_members(chosen[0].1, |_, member| {
+                chosen
+                    .binary_search_by_key(&member.provider, |&(.., index)| index)
+                    .is_ok()
+            });
+        }
+        self.compact_peers_if_sparse();
+    }
+
+    /// Rebuild the provider table at its live size once it is mostly free,
+    /// renumbering every member's provider index.
+    fn compact_peers_if_sparse(&mut self) {
+        if !self.peers.sparse(self.memberships) {
+            return;
+        }
+        let renumbered = self.peers.compact();
+        for group in self.groups.values_mut() {
+            for member in group.iter_mut() {
+                member.provider = renumbered[member.provider as usize];
             }
         }
     }
@@ -911,25 +991,53 @@ impl ProviderDirectory {
         let Some(index) = self.peers.find(provider) else {
             return;
         };
+        self.remove_members(key, |_, member| member.provider == index);
+    }
+
+    /// Remove the members of one key that `doomed` selects by position and
+    /// member, in one pass, then drop each deadline index entry that no
+    /// remaining member of the key holds.
+    fn remove_members(&mut self, key: ProviderKey, mut doomed: impl FnMut(usize, &Member) -> bool) {
         let distance = self.distance(key);
         let Some(group) = self.groups.get_mut(&distance) else {
             return;
         };
-        let Some(position) = group.iter().position(|member| member.provider == index) else {
+        let mut kept = Vec::with_capacity(group.len());
+        let mut gone = Vec::new();
+        for (position, member) in group.iter().enumerate() {
+            if doomed(position, member) {
+                self.peers.release(member.provider);
+                gone.push(member.expires_at);
+            } else {
+                kept.push(*member);
+            }
+        }
+        if gone.is_empty() {
             return;
-        };
-        let removed = group[position];
-        if group.len() == 1 {
+        }
+        self.memberships -= gone.len();
+        if kept.is_empty() {
             self.groups.remove(&distance);
         } else {
-            let mut shrunk = Vec::with_capacity(group.len() - 1);
-            shrunk.extend_from_slice(&group[..position]);
-            shrunk.extend_from_slice(&group[position + 1..]);
-            *group = shrunk.into_boxed_slice();
+            *group = kept.into_boxed_slice();
         }
-        self.memberships -= 1;
-        self.peers.release(index);
-        self.forget_deadline(key, removed.expires_at);
+        if let [deadline] = gone[..] {
+            self.forget_deadline(key, deadline);
+            return;
+        }
+        gone.sort_unstable();
+        gone.dedup();
+        let mut held = self
+            .members(key)
+            .iter()
+            .map(|member| member.expires_at)
+            .collect::<Vec<_>>();
+        held.sort_unstable();
+        for deadline in gone {
+            if held.binary_search(&deadline).is_err() {
+                self.deadlines.remove(&(deadline, key));
+            }
+        }
     }
 
     /// One key's ranked members with their leases, smallest rank first.
