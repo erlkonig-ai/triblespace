@@ -50,7 +50,16 @@ pub(super) async fn drive<T: Transport, S: Service>(
     let mut duplicate = false;
     let failed = 'drive: loop {
         if let Some(Outcome::Failed(failure)) = exchange.outcome() {
-            debug!(?failure, "cached walk/1 exchange failed");
+            // At info, with what failed where: a walk that keeps failing
+            // against one peer is a node that has stopped converging, and on
+            // 2026-10-27 that stayed invisible until a debug restart.
+            info!(
+                ?failure,
+                peer = %hex::encode(&driver.peer[..8]),
+                collection = %hex::encode(&driver.collection.raw[..8]),
+                kind = ?driver.kind,
+                "cached walk/1 exchange failed"
+            );
             break true;
         }
         if local_finished && peer_fin && exchange.outcome() == Some(Outcome::Confirmed) {
