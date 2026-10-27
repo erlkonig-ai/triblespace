@@ -192,9 +192,8 @@ fn source_prefix_compacts_a_prefix_while_a_writer_appends() {
         .assert()
         .failure()
         .stderr(
-            predicate::str::contains("source pile changed").or(predicate::str::contains(
-                "malformed or incomplete known record",
-            )),
+            predicate::str::contains("source pile changed")
+                .and(predicate::str::contains("amputate").not()),
         );
     stop.store(true, Ordering::Relaxed);
     appender.join().unwrap();

@@ -26,6 +26,10 @@
 //! is append-only, the result is the compaction of a copy of those `L`
 //! bytes without making the copy. `L` must be a record boundary.
 //!
+//! The record census is lock-free. On a source a writer is appending to it
+//! can map an append still in flight; when the file grew while the census
+//! read it, the failure says so instead of advising repair.
+//!
 //! `--drop-collection` is deliberately different: it opts into reachability
 //! garbage collection. Only bytes reached by carried records, proofs, WANTs,
 //! pins and opaque-frame conservative references survive. Raw unrooted blobs
@@ -62,14 +66,19 @@ fn census(path: &Path, prefix: Option<u64>) -> Result<RecordCensus> {
         Some(prefix) => PileRecords::open_prefix(path, prefix),
         None => PileRecords::open(path),
     };
-    let mut records = records.map_err(|error| super::pile_read_error(path, error))?;
+    let records = records.map_err(|error| super::pile_read_error(path, error))?;
+    census_records(path, records)
+}
+
+/// Count the records `records`, a lock-free scan opened on `path`, holds.
+fn census_records(path: &Path, mut records: PileRecords) -> Result<RecordCensus> {
     let bytes = u64::try_from(records.bytes().len()).context("pile length exceeds u64")?;
     let mut census = RecordCensus {
         bytes,
         ..RecordCensus::default()
     };
     while let Some(record) = records.next() {
-        let record = record.map_err(|error| super::pile_read_error(path, error))?;
+        let record = record.map_err(|error| census_read_error(path, bytes, error))?;
         match record.content {
             PileRecordContent::Blob { .. } => census.blobs += 1,
             PileRecordContent::Collection { .. } => census.collection_records += 1,
@@ -90,6 +99,37 @@ fn census(path: &Path, prefix: Option<u64>) -> Result<RecordCensus> {
         }
     }
     Ok(census)
+}
+
+/// A census read failure. The census takes no lock, so on a pile a writer
+/// is appending to it can map a record still being written and stop there.
+/// When the file grew past what the census mapped, that is what happened,
+/// and the repair advice for a torn tail would be dangerous: the pile is
+/// healthy. The advice stays only when the file did not grow.
+fn census_read_error(
+    path: &Path,
+    observed: u64,
+    error: triblespace_core::repo::pile::ReadError,
+) -> anyhow::Error {
+    use triblespace_core::repo::pile::ReadError;
+    if let ReadError::CorruptPile { valid_length } = error {
+        if let Ok(now) = std::fs::metadata(path).map(|metadata| metadata.len()) {
+            if now > observed {
+                return anyhow!(
+                    "source pile {} changed while being read: the record census mapped {observed} \
+                     bytes and found the record at byte {valid_length} still incomplete, and the \
+                     file has since grown to {now} bytes, so a writer is appending. This is not \
+                     damage. Compaction needs a quiescent source: stop its writers and retry, or \
+                     compact a fixed prefix with --source-prefix {valid_length} (a record \
+                     boundary). If a quiescent retry still fails here, the error it gives then \
+                     applies",
+                    path.display()
+                );
+            }
+        }
+        return super::pile_read_error(path, ReadError::CorruptPile { valid_length });
+    }
+    super::pile_read_error(path, error)
 }
 
 pub(super) fn create_fresh_destination(path: &Path) -> std::io::Result<std::fs::File> {
@@ -440,6 +480,75 @@ mod tests {
         assert_eq!(destination.backing_file_metadata().unwrap().len(), 0);
         destination.close().unwrap();
         source.close().unwrap();
+    }
+
+    /// A pile of one complete blob frame followed by all but the last 8
+    /// bytes of a second, as a writer leaves it mid-append. Returns the
+    /// missing 8 bytes and the boundary before the torn frame.
+    fn torn_pile(path: &Path) -> (Vec<u8>, u64) {
+        use std::io::Write as _;
+        use triblespace_core::blob::encodings::utf8string::UTF8String;
+        use triblespace_core::repo::BlobStorePut;
+
+        let model = path.with_extension("model");
+        create_fresh_destination(&model).unwrap();
+        let mut pile = Pile::open(&model).unwrap();
+        pile.put::<UTF8String, _>("the first, complete frame")
+            .unwrap();
+        pile.put::<UTF8String, _>("the second frame, still being appended")
+            .unwrap();
+        pile.close().unwrap();
+        let bytes = std::fs::read(&model).unwrap();
+        let first = PileRecords::open(&model)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .len;
+        let cut = bytes.len() - 8;
+        std::fs::File::create(path)
+            .unwrap()
+            .write_all(&bytes[..cut])
+            .unwrap();
+        (bytes[cut..].to_vec(), first as u64)
+    }
+
+    #[test]
+    fn census_reports_a_source_that_grew_while_read_as_a_writer_not_damage() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.pile");
+        let (rest, boundary) = torn_pile(&path);
+        // The census maps the file, then the writer finishes its append.
+        let records = PileRecords::open(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&rest)
+            .unwrap();
+
+        let rendered = format!("{:#}", census_records(&path, records).unwrap_err());
+        assert!(rendered.contains("changed while being read"), "{rendered}");
+        assert!(rendered.contains("a writer is appending"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("--source-prefix {boundary}")),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("amputate"), "{rendered}");
+        // The finished pile reads whole.
+        census(&path, None).unwrap();
+    }
+
+    #[test]
+    fn census_keeps_the_repair_advice_when_the_file_did_not_grow() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("torn.pile");
+        torn_pile(&path);
+        let rendered = format!("{:#}", census(&path, None).unwrap_err());
+        assert!(rendered.contains("malformed or incomplete known record"));
+        assert!(rendered.contains("amputate"), "{rendered}");
+        assert!(!rendered.contains("changed while being read"));
     }
 
     #[test]
