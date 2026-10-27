@@ -180,9 +180,10 @@ pub(crate) struct Peerings<R> {
 }
 
 /// Whether `peer` may READ (or WRITE) C under this side's evidence and the
-/// credentials it presented.
+/// credentials it presented, with capability definitions read from `reader`.
 fn admits(
     collection: &CollectionSnapshot,
+    reader: &impl BlobStoreGet,
     peer: PeerId,
     presented: &[CapabilityProof],
     write: bool,
@@ -197,9 +198,9 @@ fn admits(
         .cloned()
         .collect::<Vec<_>>();
     if write {
-        evidence.writer_is_admitted_by(peer, &proofs)
+        evidence.writer_is_admitted_by(reader, peer, &proofs)
     } else {
-        evidence.reader_is_admitted_by(peer, &proofs)
+        evidence.reader_is_admitted_by(reader, peer, &proofs)
     }
 }
 
@@ -207,13 +208,14 @@ fn admits(
 /// is full when it replicates the collection in full.
 fn flags(
     collection: &CollectionSnapshot,
+    reader: &impl BlobStoreGet,
     full: bool,
     peer: PeerId,
     presented: &[CapabilityProof],
 ) -> Flags {
     Flags {
         send: matches!(
-            admits(collection, peer, presented, false),
+            admits(collection, reader, peer, presented, false),
             QuorumOutcome::Met
         ),
         full,
@@ -224,6 +226,7 @@ fn flags(
 /// if it admits the peering, else the definitions whose arrival could.
 fn decide(
     collection: Option<&CollectionSnapshot>,
+    reader: &impl BlobStoreGet,
     full: bool,
     peer: PeerId,
     theirs: Flags,
@@ -233,13 +236,13 @@ fn decide(
         return Err(Vec::new());
     };
     let mut undefined = Vec::new();
-    let mut outcomes = vec![admits(collection, peer, presented, false)];
+    let mut outcomes = vec![admits(collection, reader, peer, presented, false)];
     if theirs.send {
-        outcomes.push(admits(collection, peer, presented, true));
+        outcomes.push(admits(collection, reader, peer, presented, true));
     }
     for outcome in outcomes {
         match outcome {
-            QuorumOutcome::Met => return Ok(flags(collection, full, peer, presented)),
+            QuorumOutcome::Met => return Ok(flags(collection, reader, full, peer, presented)),
             QuorumOutcome::Unmet => {}
             QuorumOutcome::Undefined(handles) => undefined.extend(handles),
         }
@@ -269,9 +272,11 @@ fn wanted(
 /// `blake3(salt || key)`. Participants are C's roots and the keys named on
 /// its indexed grants, so a key named only by junk delegation or by a grant
 /// still waiting for its definitions is none. Owners are the signers of
-/// records whose signer may WRITE C. `local` is left out.
+/// records whose signer may WRITE C. `local` is left out. Capability
+/// definitions are read from `reader`.
 pub(crate) fn candidate_order(
     collection: &CollectionSnapshot,
+    reader: &impl BlobStoreGet,
     grants: &crate::grants::GrantIndex,
     providers: &[PeerId],
     local: PeerId,
@@ -289,7 +294,7 @@ pub(crate) fn candidate_order(
         .filter(|signer| {
             VerifyingKey::from_bytes(signer).is_ok_and(|signer| {
                 matches!(
-                    evidence.writer_is_admitted_by(signer, &proofs),
+                    evidence.writer_is_admitted_by(reader, signer, &proofs),
                     QuorumOutcome::Met
                 )
             })
@@ -314,7 +319,7 @@ pub(crate) fn candidate_order(
         .map(|key| {
             let reads = VerifyingKey::from_bytes(key).is_ok_and(|key| {
                 matches!(
-                    evidence.reader_is_admitted_by(key, &proofs),
+                    evidence.reader_is_admitted_by(reader, key, &proofs),
                     QuorumOutcome::Met
                 )
             });
@@ -630,14 +635,19 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
                     Side::Peered { mine, theirs, .. } => {
                         let link = self.links.get(id)?;
                         let writes = || {
-                            self.snapshot
-                                .as_ref()
-                                .and_then(|snapshot| snapshot.collection(collection))
-                                .is_some_and(|local| {
+                            self.snapshot.as_ref().is_some_and(|snapshot| {
+                                snapshot.collection(collection).is_some_and(|local| {
                                     let presented = &peering.presented;
-                                    let admitted = admits(&local, link.peer(), presented, true);
+                                    let admitted = admits(
+                                        &local,
+                                        snapshot.store(),
+                                        link.peer(),
+                                        presented,
+                                        true,
+                                    );
                                     matches!(admitted, QuorumOutcome::Met)
                                 })
+                            })
                         };
                         let full = mine.full && theirs.full && (mine.send || writes());
                         Some((collection, link, mine.send, theirs.send, full))
@@ -830,15 +840,17 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
         theirs: Flags,
         invitation: bool,
     ) {
-        let local = self
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.selected(collection));
+        // A frame for C is answered only once a snapshot holds C.
+        let Some(snapshot) = self.snapshot.clone() else {
+            return;
+        };
+        let local = snapshot.selected(collection);
         let room = self.inbound(collection, link.id()) < MAX_INBOUND_PEERINGS;
         let full = self.full(collection);
         let peering = self.peering(collection, link.id());
         let decision = decide(
             local.as_deref(),
+            snapshot.store(),
             full,
             link.peer(),
             theirs,
@@ -896,10 +908,11 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
         let Some(link) = self.links.get(&id).cloned() else {
             return;
         };
-        let local = self
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.selected(collection));
+        // Peerings exist only once a snapshot was observed.
+        let Some(snapshot) = self.snapshot.clone() else {
+            return;
+        };
+        let local = snapshot.selected(collection);
         let room = self.inbound(collection, id) < MAX_INBOUND_PEERINGS;
         let full = self.full(collection);
         let peering = self.peering(collection, id);
@@ -912,7 +925,13 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
                 let Some(local) = &local else {
                     return;
                 };
-                let current = flags(local, full, link.peer(), &peering.presented);
+                let current = flags(
+                    local,
+                    snapshot.store(),
+                    full,
+                    link.peer(),
+                    &peering.presented,
+                );
                 if current != mine {
                     mine = current;
                     link.send(Frame::PeerFlags {
@@ -937,6 +956,7 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
                 };
                 match decide(
                     local.as_deref(),
+                    snapshot.store(),
                     full,
                     link.peer(),
                     theirs,
@@ -957,11 +977,10 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
 
     /// Send a request, or an invitation, for C on `link`.
     fn ask(&mut self, collection: CollectionHandle, link: &Link, invitation: bool) {
-        let Some(local) = self
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.selected(collection))
-        else {
+        let Some(snapshot) = self.snapshot.clone() else {
+            return;
+        };
+        let Some(local) = snapshot.selected(collection) else {
             return;
         };
         let credentials = self.credentials(&local);
@@ -971,7 +990,13 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
         if !matches!(peering.side, Side::Idle) {
             return;
         }
-        let mine = flags(&local, full, link.peer(), &peering.presented);
+        let mine = flags(
+            &local,
+            snapshot.store(),
+            full,
+            link.peer(),
+            &peering.presented,
+        );
         for frame in request_frames(collection, mine, invitation, &credentials) {
             link.send(frame);
         }
@@ -1128,7 +1153,8 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
         local: &CollectionSnapshot,
         now: Mono,
     ) -> Option<PeerId> {
-        let grants = self.snapshot.as_ref()?.grants().clone();
+        let snapshot = self.snapshot.as_ref()?;
+        let grants = snapshot.grants().clone();
         let mesh = self.meshes.get_mut(&collection.raw)?;
         let skipped = mesh
             .peerings
@@ -1157,10 +1183,17 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
             if !due && !order.stale {
                 return None;
             }
-            let peers = candidate_order(local, &grants, &[], self.local, &rand::random())
-                .into_iter()
-                .filter(|peer| grants.participates(collection, *peer))
-                .collect::<Vec<_>>();
+            let peers = candidate_order(
+                local,
+                snapshot.store(),
+                &grants,
+                &[],
+                self.local,
+                &rand::random(),
+            )
+            .into_iter()
+            .filter(|peer| grants.participates(collection, *peer))
+            .collect::<Vec<_>>();
             let changed = order.stale
                 && peers.iter().collect::<BTreeSet<_>>()
                     != order.peers.iter().collect::<BTreeSet<_>>();
@@ -1207,9 +1240,16 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
             if !due && !order.stale {
                 return None;
             }
-            let grants = self.snapshot.as_ref()?.grants().clone();
-            let peers =
-                candidate_order(local, &grants, &mesh.providers, self.local, &rand::random());
+            let snapshot = self.snapshot.as_ref()?;
+            let grants = snapshot.grants().clone();
+            let peers = candidate_order(
+                local,
+                snapshot.store(),
+                &grants,
+                &mesh.providers,
+                self.local,
+                &rand::random(),
+            );
             // Any change to C's records or evidence makes the order stale;
             // only a change of its candidates draws it before it is due.
             let changed = order.stale
@@ -2037,7 +2077,14 @@ mod tests {
         ]);
         for salt in [[0; 32], [1; 32], [2; 32]] {
             let snapshot = node.peerings.snapshot.clone().unwrap();
-            let order = candidate_order(&local, snapshot.grants(), &[provider], node.id(), &salt);
+            let order = candidate_order(
+                &local,
+                snapshot.store(),
+                snapshot.grants(),
+                &[provider],
+                node.id(),
+                &salt,
+            );
             assert_eq!(order.len(), 4);
             assert_eq!(
                 order[..2].iter().copied().collect::<BTreeSet<_>>(),
@@ -2114,9 +2161,16 @@ mod tests {
         node.select(collection, true);
         let snapshot = node.peerings.snapshot.clone().unwrap();
         let local = snapshot.selected(collection).unwrap();
-        let order = candidate_order(&local, snapshot.grants(), &[], node.id(), &[0; 32])
-            .into_iter()
-            .collect::<BTreeSet<_>>();
+        let order = candidate_order(
+            &local,
+            snapshot.store(),
+            snapshot.grants(),
+            &[],
+            node.id(),
+            &[0; 32],
+        )
+        .into_iter()
+        .collect::<BTreeSet<_>>();
         for (key, what) in [(&valid, "a validly delegated key"), (&g, "a grantee")] {
             assert!(order.contains(&key.verifying_key().to_bytes()), "{what} is a candidate");
         }

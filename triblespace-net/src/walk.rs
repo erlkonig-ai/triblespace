@@ -296,8 +296,9 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
         }
         self.selected.get(&collection.raw)?;
         let pinned = self.exchangeable(collection, kind)?;
-        let sends = self.sends(peer, &pinned);
-        let receives = self.receives(peer, &pinned);
+        let reader = self.snapshot.as_ref()?.store();
+        let sends = self.sends(peer, &pinned, reader);
+        let receives = self.receives(peer, &pinned, reader);
         if !sends && !receives {
             return None;
         }
@@ -355,8 +356,9 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
         }
         self.selected.get(&collection.raw)?;
         let pinned = self.exchangeable(collection, kind)?;
-        let sends = self.sends(peer, &pinned);
-        let receives = self.receives(peer, &pinned);
+        let reader = self.snapshot.as_ref()?.store();
+        let sends = self.sends(peer, &pinned, reader);
+        let receives = self.receives(peer, &pinned, reader);
         if !sends && !receives {
             return None;
         }
@@ -584,8 +586,9 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
     }
 
     /// Whether this side sends C to `peer`: an active peering's directional
-    /// flag, otherwise READ admission under the pinned evidence.
-    fn sends(&self, peer: PeerId, pinned: &CollectionSnapshot) -> bool {
+    /// flag, otherwise READ admission under the pinned evidence, with
+    /// capability definitions read from `reader`.
+    fn sends(&self, peer: PeerId, pinned: &CollectionSnapshot, reader: &R) -> bool {
         let collection = pinned.repair().collection();
         let mut flagged = None;
         self.health.update(|health| {
@@ -602,7 +605,7 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
                 let evidence = pinned.repair().authorization_evidence();
                 let proofs = evidence.proofs().cloned().collect::<Vec<_>>();
                 matches!(
-                    evidence.reader_is_admitted_by(peer, &proofs),
+                    evidence.reader_is_admitted_by(reader, peer, &proofs),
                     QuorumOutcome::Met
                 )
             })
@@ -611,8 +614,9 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
 
     /// Whether this side receives C from `peer`, the mirror of
     /// [`Self::sends`]: an active peering's receive flag, otherwise WRITE
-    /// admission under the pinned evidence.
-    fn receives(&self, peer: PeerId, pinned: &CollectionSnapshot) -> bool {
+    /// admission under the pinned evidence, with capability definitions read
+    /// from `reader`.
+    fn receives(&self, peer: PeerId, pinned: &CollectionSnapshot, reader: &R) -> bool {
         let collection = pinned.repair().collection();
         let mut flagged = None;
         self.health.update(|health| {
@@ -629,7 +633,7 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
                 let evidence = pinned.repair().authorization_evidence();
                 let proofs = evidence.proofs().cloned().collect::<Vec<_>>();
                 matches!(
-                    evidence.writer_is_admitted_by(peer, &proofs),
+                    evidence.writer_is_admitted_by(reader, peer, &proofs),
                     QuorumOutcome::Met
                 )
             })
@@ -2257,7 +2261,10 @@ pub(crate) mod tests {
         let collection = node.hold("explicit directions", open());
         let peer = Node::new(110).id();
         let pinned = node.pinned(collection);
-        assert!(node.walks.sends(peer, &pinned) && node.walks.receives(peer, &pinned));
+        let snapshot = node.snapshot();
+        let reader = snapshot.store();
+        assert!(node.walks.sends(peer, &pinned, reader));
+        assert!(node.walks.receives(peer, &pinned, reader));
         node.health.update(|health| {
             health.peerings.push(crate::health::PeeringHealth {
                 collection,
@@ -2270,14 +2277,14 @@ pub(crate) mod tests {
                 refused_by_them: false,
             })
         });
-        assert!(!node.walks.sends(peer, &pinned));
-        assert!(node.walks.receives(peer, &pinned));
+        assert!(!node.walks.sends(peer, &pinned, reader));
+        assert!(node.walks.receives(peer, &pinned, reader));
         node.health.update(|health| {
             health.peerings[0].sends = true;
             health.peerings[0].receives = false;
         });
-        assert!(node.walks.sends(peer, &pinned));
-        assert!(!node.walks.receives(peer, &pinned));
+        assert!(node.walks.sends(peer, &pinned, reader));
+        assert!(!node.walks.receives(peer, &pinned, reader));
     }
 
     /// A held set the store has not published is unknown, not empty: this

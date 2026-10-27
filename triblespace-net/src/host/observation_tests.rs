@@ -333,9 +333,7 @@ fn serving_handoff_keeps_only_the_latest_coherent_observation() {
         )
         .unwrap();
         sender.update_snapshot(serving, &selected);
-        retired.push(Arc::downgrade(
-            &sender.current_snapshot().unwrap().observation.0,
-        ));
+        retired.push(sender.current_snapshot().unwrap().observation());
     }
     assert!(retired[0].upgrade().is_none());
     assert!(retired[1].upgrade().is_none());
@@ -492,7 +490,7 @@ async fn landing_publishes_one_observation_that_the_connection_table_serves() {
             .get(fixture.pending.fingerprint())
             .is_some()
     );
-    let retired = Arc::downgrade(&before.observation.0);
+    let retired = before.observation();
     drop((before, old));
     assert!(
         retired.upgrade().is_none(),
@@ -632,9 +630,11 @@ fn proof_arrival_refreshes_authorization_without_record_enumeration() {
     // Grants are no part of the wake root.
     assert_eq!(old.wake_root(), new.wake_root());
     assert_eq!(
-        new.repair
-            .authorization_evidence()
-            .reader_is_admitted_by(reader, &[proof]),
+        new.repair.authorization_evidence().reader_is_admitted_by(
+            serving_after.store(),
+            reader,
+            &[proof]
+        ),
         QuorumOutcome::Met
     );
 }
@@ -844,9 +844,11 @@ fn arriving_read_definition_refreshes_admission_with_same_wake_root_and_record_l
     .unwrap();
     let old = serving_before.collection(collection).unwrap();
     assert_eq!(
-        old.repair
-            .authorization_evidence()
-            .reader_is_admitted_by(reader, &[proof.clone()]),
+        old.repair.authorization_evidence().reader_is_admitted_by(
+            serving_before.store(),
+            reader,
+            &[proof.clone()]
+        ),
         QuorumOutcome::Undefined(vec![read_capability()])
     );
     assert_eq!(enumerations.swap(0, Ordering::Relaxed), 1);
@@ -884,15 +886,19 @@ fn arriving_read_definition_refreshes_admission_with_same_wake_root_and_record_l
     assert!(new.repair.blob_inventory().get(&definition.raw).is_some());
     assert!(!Arc::ptr_eq(&old.repair, &new.repair));
     assert_eq!(
-        new.repair
-            .authorization_evidence()
-            .reader_is_admitted_by(reader, &[proof.clone()]),
+        new.repair.authorization_evidence().reader_is_admitted_by(
+            serving_after.store(),
+            reader,
+            &[proof.clone()]
+        ),
         QuorumOutcome::Met
     );
     assert_eq!(
-        old.repair
-            .authorization_evidence()
-            .reader_is_admitted_by(reader, &[proof]),
+        old.repair.authorization_evidence().reader_is_admitted_by(
+            serving_before.store(),
+            reader,
+            &[proof]
+        ),
         QuorumOutcome::Undefined(vec![read_capability()])
     );
 }
@@ -1268,9 +1274,11 @@ fn scoped_missing_definition_landing_changes_admission_without_rebuilding_record
     let before = fixture.observe(&selected, None);
     let old = before.1.collection(collection).unwrap();
     assert_eq!(
-        old.repair
-            .authorization_evidence()
-            .reader_is_admitted_by(fixture.local, &[proof.clone()]),
+        old.repair.authorization_evidence().reader_is_admitted_by(
+            before.1.store(),
+            fixture.local,
+            &[proof.clone()]
+        ),
         QuorumOutcome::Undefined(vec![capability])
     );
     fixture.take_counts();
@@ -1288,8 +1296,8 @@ fn scoped_missing_definition_landing_changes_admission_without_rebuilding_record
     assert_eq!((records, proofs), (0, 0));
     assert!(reads <= 1024 + 64);
 
-    // The definition changes no evidence: admission reads it through the
-    // rebound reader.
+    // The definition changes no evidence: admission reads it from the
+    // snapshot it is given.
     fixture.store.put::<SimpleArchive, _>(definition).unwrap();
     let arrived = fixture.observe(&selected, Some(&unrelated));
     let (records, proofs, reads) = fixture.take_counts();
@@ -1307,15 +1315,19 @@ fn scoped_missing_definition_landing_changes_admission_without_rebuilding_record
     assert_eq!(old.wake_root(), new.wake_root());
     assert!(new.repair.blob_inventory().get(&capability.raw).is_some());
     assert_eq!(
-        new.repair
-            .authorization_evidence()
-            .reader_is_admitted_by(fixture.local, &[proof.clone()]),
+        new.repair.authorization_evidence().reader_is_admitted_by(
+            arrived.1.store(),
+            fixture.local,
+            &[proof.clone()]
+        ),
         QuorumOutcome::Met
     );
     assert_eq!(
-        old.repair
-            .authorization_evidence()
-            .reader_is_admitted_by(fixture.local, &[proof]),
+        old.repair.authorization_evidence().reader_is_admitted_by(
+            before.1.store(),
+            fixture.local,
+            &[proof]
+        ),
         QuorumOutcome::Undefined(vec![capability])
     );
 }
@@ -1352,15 +1364,19 @@ fn scoped_reuse_rebinds_novel_request_definition_reads() {
     let new = after.1.collection(collection).unwrap();
     assert_eq!(old.wake_root(), new.wake_root());
     assert_eq!(
-        old.repair
-            .authorization_evidence()
-            .reader_is_admitted_by(recipient, &[incoming_read.clone()]),
+        old.repair.authorization_evidence().reader_is_admitted_by(
+            before.1.store(),
+            recipient,
+            &[incoming_read.clone()]
+        ),
         QuorumOutcome::Undefined(incoming_read.capabilities().collect())
     );
     assert_eq!(
-        new.repair
-            .authorization_evidence()
-            .reader_is_admitted_by(recipient, &[incoming_read.clone()]),
+        new.repair.authorization_evidence().reader_is_admitted_by(
+            after.1.store(),
+            recipient,
+            &[incoming_read.clone()]
+        ),
         QuorumOutcome::Met
     );
     // Reader freshness does not silently publish the newly received proof.

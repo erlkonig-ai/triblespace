@@ -1706,7 +1706,7 @@ mod tests {
         assert_eq!(
             initial_overlay
                 .authorization_evidence()
-                .reader_is_admitted_by(reader, &[]),
+                .reader_is_admitted_by(&before, reader, &[]),
             QuorumOutcome::Unmet
         );
         let initial_frontier = frontier().unwrap();
@@ -1777,9 +1777,11 @@ mod tests {
             Some(&proof)
         );
         assert_eq!(
-            expected
-                .authorization_evidence()
-                .reader_is_admitted_by(reader, std::slice::from_ref(&proof)),
+            expected.authorization_evidence().reader_is_admitted_by(
+                &after,
+                reader,
+                std::slice::from_ref(&proof)
+            ),
             QuorumOutcome::Met
         );
         // Health commits to the complete record PATCHes.

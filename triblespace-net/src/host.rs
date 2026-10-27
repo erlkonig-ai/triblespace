@@ -140,72 +140,6 @@ impl HostStarted {
     }
 }
 
-trait BlobSnapshotReader: Send + Sync + 'static {
-    fn get_blob(&self, hash: RawHash) -> Option<Bytes>;
-}
-
-struct CloneableBlobSnapshotReader<R>(R);
-
-impl<R> BlobSnapshotReader for CloneableBlobSnapshotReader<R>
-where
-    R: BlobStoreGet + Send + Sync + 'static,
-{
-    fn get_blob(&self, hash: RawHash) -> Option<Bytes> {
-        self.0
-            .get::<Bytes, UnknownBlob>(Inline::<Handle<UnknownBlob>>::new(hash))
-            .ok()
-    }
-}
-
-/// A clone of one resident snapshot, erased so the collection overlays that
-/// read capability definitions through it name no store type.
-/// Point reads never fetch, record demand, or copy a catalogue of its blobs.
-#[derive(Clone)]
-pub(crate) struct ResidentBlobReader(Arc<dyn BlobSnapshotReader>);
-
-impl ResidentBlobReader {
-    pub(crate) fn new<R>(reader: &R) -> Self
-    where
-        R: BlobStoreGet + Clone + Send + Sync + 'static,
-    {
-        Self(Arc::new(CloneableBlobSnapshotReader(reader.clone())))
-    }
-}
-
-impl std::fmt::Debug for ResidentBlobReader {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("ResidentBlobReader")
-    }
-}
-
-impl BlobStoreGet for ResidentBlobReader {
-    type GetError<E: std::error::Error + Send + Sync + 'static> =
-        triblespace_core::blob::MemoryStoreGetError<E>;
-
-    fn get<T, S>(
-        &self,
-        handle: Inline<Handle<S>>,
-    ) -> Result<T, Self::GetError<<T as triblespace_core::blob::TryFromBlob<S>>::Error>>
-    where
-        S: triblespace_core::blob::BlobEncoding,
-        T: triblespace_core::blob::TryFromBlob<S>,
-    {
-        use triblespace_core::blob::MemoryStoreGetError;
-        let bytes = self
-            .0
-            .get_blob(handle.raw)
-            .ok_or(MemoryStoreGetError::NotFound(
-                triblespace_core::repo::MissingBlob {
-                    handle: handle.transmute(),
-                },
-            ))?;
-        // The snapshot returned these bytes for this exact handle. Preserve
-        // that store invariant instead of hashing its output again.
-        T::try_from_blob(Blob::with_handle(bytes, handle))
-            .map_err(MemoryStoreGetError::ConversionFailed)
-    }
-}
-
 /// One collection's immutable server overlay. Grants are walked from the
 /// grant index, Prefix only, so no component cache serves them.
 pub(crate) struct CollectionSnapshot {
@@ -331,10 +265,10 @@ pub(crate) struct StoreSnapshot<R> {
     /// Every grant this host holds, over any resource, with each resource's
     /// participants: the one AUTH index (see [`GrantIndex`]).
     grants: GrantIndex,
-    /// This observation's identity in tests: the erased reader its
-    /// collection overlays share, created once per construction.
+    /// This observation's identity in tests, created once per construction
+    /// and shared only by its clones.
     #[cfg(test)]
-    observation: ResidentBlobReader,
+    observation: Arc<()>,
 }
 
 impl<R> StoreSnapshot<R> {
@@ -372,10 +306,6 @@ impl<R> StoreSnapshot<R> {
                 TribleSet::new()
             }),
         };
-        // This unobserved reader advances even when fixed per-C products do
-        // not change. A later peer request may name a previously unseen R or
-        // capability definition, outside any construction-time read set.
-        let reader = ResidentBlobReader::new(&snapshot);
         for raw in active.iter_ordered() {
             let collection = CollectionHandle::new(*raw);
             // Positive. `None` is unknown: a collection replicated on demand
@@ -392,7 +322,7 @@ impl<R> StoreSnapshot<R> {
                     .as_ref()
                     .map(|prior| {
                         CollectionSnapshot::with_held(
-                            prior.repair.as_ref().clone().with_reader(reader.clone()),
+                            prior.repair.as_ref().clone(),
                             held.clone(),
                             Some(prior),
                         )
@@ -465,7 +395,7 @@ impl<R> StoreSnapshot<R> {
                 .records
                 .insert(CollectionRecordSelector::Foundations(collection));
             let value = Arc::new(CollectionSnapshot::with_held(
-                repair.with_reader(reader.clone()),
+                repair,
                 held,
                 prior_value.map(Arc::as_ref),
             )?);
@@ -500,8 +430,15 @@ impl<R> StoreSnapshot<R> {
             full: ActiveCollections::new(),
             grants,
             #[cfg(test)]
-            observation: reader,
+            observation: Arc::new(()),
         })
+    }
+
+    /// The store snapshot this observation was built from. Admission reads
+    /// capability definitions from it: the collection overlays' authorization
+    /// evidence is data and holds no reader of its own.
+    pub(crate) fn store(&self) -> &R {
+        &self.blobs
     }
 
     /// Every grant this host holds, over any resource, with each resource's
@@ -564,14 +501,20 @@ impl<R> StoreSnapshot<R> {
     }
 
     /// Whether `other` is a clone of this very observation: each
-    /// construction erases its own blob reader.
+    /// construction creates its own identity.
     #[cfg(test)]
     pub(crate) fn same_observation(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.observation.0, &other.observation.0)
+        Arc::ptr_eq(&self.observation, &other.observation)
+    }
+
+    /// This observation's identity, to check in tests that it is freed.
+    #[cfg(test)]
+    pub(crate) fn observation(&self) -> std::sync::Weak<()> {
+        Arc::downgrade(&self.observation)
     }
 
     /// This observation over a different reader of the same store, such as
-    /// one that counts reads. The collection overlays keep their own.
+    /// one that counts reads.
     #[cfg(test)]
     pub(crate) fn map_blobs<B>(self, map: impl FnOnce(R) -> B) -> StoreSnapshot<B> {
         StoreSnapshot {
