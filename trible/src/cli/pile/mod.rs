@@ -14,6 +14,7 @@ pub mod migrate;
 pub mod net;
 mod path_text;
 mod signing;
+mod subtract;
 mod verify;
 
 #[derive(Parser)]
@@ -85,6 +86,68 @@ pub enum PileCommand {
         /// does not revoke grants or prevent sync from restoring the data.
         #[arg(long = "drop-collection", value_name = "NAME_OR_FULL_HANDLE")]
         drop_collection: Vec<String>,
+    },
+    /// Write SOURCE minus MINUS as a fresh difference pile, read-only on both.
+    ///
+    /// Concatenation is the merge, so a backup can be kept as its difference
+    /// to a mainline pile: `cat MINUS DESTINATION` then holds everything SOURCE
+    /// holds. Every frame of SOURCE's observed prefix whose content MINUS does
+    /// not already hold is copied byte-for-byte, in SOURCE order; a frame
+    /// repeated inside SOURCE is written once. Identity per kind:
+    ///
+    /// - blob: its handle (BLAKE3 of the payload), present only when MINUS
+    ///   holds an occurrence whose payload validates, read as ordinary blob
+    ///   reads are; a blob is copied only after its own payload matches its
+    ///   header.
+    ///
+    /// - COMMIT, MERGE, DERIVE, MAP: the record fingerprint, BLAKE3 of the
+    ///   canonical signed assertion.
+    ///
+    /// - AUTH proof: its proof id, BLAKE3 of the canonical body.
+    ///
+    /// - WANT: the exact canonical request.
+    ///
+    /// - legacy pin head or tombstone: pin id plus head (log order across
+    ///   files is not kept).
+    ///
+    /// - every retired, legacy, opaque or unknown kind: BLAKE3 of the exact
+    ///   frame bytes. Such frames are never dropped unless MINUS holds the
+    ///   identical bytes; opaque and unknown ones are counted.
+    ///
+    /// A malformed frame in SOURCE, or a blob frame failing its hash with no
+    /// valid copy elsewhere, refuses (naming the byte offset) unless
+    /// --allow-corrupt is given. DESTINATION must not exist; it is written to
+    /// a hidden sibling, synced, and published without replacing anything.
+    /// SOURCE, MINUS (and DIFF) must be distinct files by device and inode.
+    ///
+    /// With --check, nothing is written: every blob and record of SOURCE is
+    /// looked up in MINUS or DIFF by the same identities, anything missing
+    /// is listed, and the command exits 1 if any is.
+    Subtract {
+        /// Pile to subtract from; opened read-only.
+        source: PathBuf,
+        /// Mainline pile whose content is left out; opened read-only.
+        #[arg(long, value_name = "MINUS")]
+        minus: PathBuf,
+        /// Fresh difference pile to create; must not exist.
+        #[arg(
+            long,
+            value_name = "DESTINATION",
+            required_unless_present = "check",
+            conflicts_with = "check"
+        )]
+        into: Option<PathBuf>,
+        /// Verify instead of writing: SOURCE is contained in MINUS plus DIFF.
+        #[arg(long, requires = "diff")]
+        check: bool,
+        /// With --check: the difference pile written earlier.
+        #[arg(long, value_name = "DIFF", requires = "check")]
+        diff: Option<PathBuf>,
+        /// Omit SOURCE blob frames that fail hash validation and have no valid
+        /// copy, and stop at a malformed frame, instead of refusing; both are
+        /// reported.
+        #[arg(long)]
+        allow_corrupt: bool,
     },
     /// Diagnostic helpers for inspecting and repairing piles.
     Diagnose {
@@ -306,6 +369,21 @@ pub fn run(cmd: PileCommand) -> Result<()> {
             drop_drained,
             drop_collection,
         } => compact::run(source, into, drop_drained, drop_collection),
+        PileCommand::Subtract {
+            source,
+            minus,
+            into,
+            check,
+            diff,
+            allow_corrupt,
+        } => subtract::run(subtract::Request {
+            source,
+            minus,
+            into,
+            check,
+            diff,
+            allow_corrupt,
+        }),
         PileCommand::Net { cmd } => net::run(cmd),
         PileCommand::Diagnose { cmd } => diagnose::run(cmd),
         PileCommand::Verify { pile } => verify::run(&pile),
