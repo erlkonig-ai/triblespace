@@ -589,6 +589,16 @@ impl PeerTable {
             self.free.push(index);
         }
     }
+
+    /// Allocated capacity of the slots, the identity index and the free list.
+    #[cfg(test)]
+    fn allocated(&self) -> (usize, usize, usize) {
+        (
+            self.slots.capacity(),
+            self.index.capacity(),
+            self.free.capacity(),
+        )
+    }
 }
 
 /// Receiver-local exact soft directory. Memberships are grouped by key; the

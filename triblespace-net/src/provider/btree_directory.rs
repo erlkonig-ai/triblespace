@@ -429,6 +429,166 @@ mod tests {
         assert_eq!(dense.retained_counts(), (0, 0));
     }
 
+    /// Insertion schedule for one key at the per-key ceiling (deadlines tied
+    /// in runs of seven) and a second key of 300 members, either interleaved
+    /// with it or due entirely before it.
+    fn ceiling_schedule(
+        rng: &mut StdRng,
+        big: ProviderKey,
+        small: ProviderKey,
+        small_first: bool,
+    ) -> Vec<(Duration, ProviderKey, PeerId, ProviderToken)> {
+        let mut schedule = Vec::new();
+        for index in 0..MAX_PROVIDERS_STORED_PER_KEY {
+            let offset = Duration::from_micros(1 + index as u64 / 7);
+            schedule.push((offset, big, rng.r#gen(), rng.r#gen()));
+        }
+        for index in 0..300u64 {
+            let offset = if small_first {
+                Duration::from_nanos(index)
+            } else {
+                Duration::from_micros(index / 2) + Duration::from_nanos(500)
+            };
+            schedule.push((offset, small, rng.r#gen(), rng.r#gen()));
+        }
+        schedule.sort_by_key(|entry| entry.0);
+        schedule
+    }
+
+    /// A key at the per-key ceiling expires all at once: bounded prunes
+    /// that end inside its tied and distinct deadlines, interleaved with
+    /// another key's, and a request that reclaims the whole expired key
+    /// through its stored cap, leave exactly the reference's members.
+    #[test]
+    fn mass_expiry_of_a_key_at_the_ceiling_prunes_in_reference_order() {
+        let mut rng = StdRng::seed_from_u64(0xD15E_CA);
+        let lease = Duration::from_secs(1);
+        let limits = DirectoryLimits {
+            lease,
+            memberships: 1 << 16,
+        };
+        for small_first in [false, true] {
+            let (mut reference, mut dense) = pair(rng.r#gen(), rng.r#gen(), limits);
+            let start = crate::clock::mono_now();
+            let big: ProviderKey = rng.r#gen();
+            let small: ProviderKey = rng.r#gen();
+            for (offset, key, provider, token) in
+                ceiling_schedule(&mut rng, big, small, small_first)
+            {
+                assert!(reference.put(key, provider, token, start + offset));
+                assert!(dense.put(key, provider, token, start + offset));
+            }
+            same(&reference, &dense);
+            assert_eq!(dense.key_len(big), MAX_PROVIDERS_STORED_PER_KEY);
+            if small_first {
+                // The prune budget goes to the earlier key, then the full
+                // expired key is reclaimed through its stored cap.
+                let later = start + lease + Duration::from_secs(1);
+                assert_eq!(reference.get(big, later), dense.get(big, later));
+                same(&reference, &dense);
+                assert_eq!(dense.key_len(big), 0);
+            }
+            let unrelated: ProviderKey = rng.r#gen();
+            let mut step = 0u64;
+            while dense.retained_counts() != (0, 0) {
+                // Advance in steps smaller than the schedule, so budgets end
+                // between deadlines as well as inside tied ones.
+                let now = start + lease + Duration::from_nanos(700 * step);
+                step += 1;
+                assert_eq!(reference.get(unrelated, now), dense.get(unrelated, now));
+                same(&reference, &dense);
+            }
+            assert_eq!(reference.retained_counts(), (0, 0));
+        }
+    }
+
+    /// Provider identities are free to mint. After a burst of distinct
+    /// providers expires, the provider table must not keep its high-water
+    /// allocation; survivors keep their memberships throughout.
+    #[test]
+    fn distinct_provider_burst_releases_the_peer_table() {
+        let mut rng = StdRng::seed_from_u64(0xD15E_CB);
+        let lease = Duration::from_secs(1);
+        let limits = DirectoryLimits {
+            lease,
+            memberships: 1 << 16,
+        };
+        let (mut reference, mut dense) = pair(rng.r#gen(), rng.r#gen(), limits);
+        let start = crate::clock::mono_now();
+        let keys: Vec<ProviderKey> = (0..64).map(|_| rng.r#gen()).collect();
+        let burst = 20_000;
+        let mut survivors = Vec::new();
+        for index in 0..burst {
+            let now = start + Duration::from_micros(index as u64);
+            let key = keys[index % keys.len()];
+            let provider: PeerId = rng.r#gen();
+            let token: ProviderToken = rng.r#gen();
+            assert!(reference.put(key, provider, token, now));
+            assert!(dense.put(key, provider, token, now));
+            if index % 1000 == 999 {
+                survivors.push((key, provider, token));
+            }
+        }
+        same(&reference, &dense);
+        assert_eq!(dense.peers.index.len(), burst);
+        // Survivors, spread across the table, renew before the burst expires.
+        let renewal = start + Duration::from_millis(900);
+        for (key, provider, token) in &survivors {
+            assert!(reference.put(*key, *provider, *token, renewal));
+            assert!(dense.put(*key, *provider, *token, renewal));
+        }
+        let unrelated: ProviderKey = rng.r#gen();
+        let expired = start + lease + Duration::from_millis(100);
+        let mut calls = 0;
+        while dense.retained_counts().0 > survivors.len() {
+            assert_eq!(
+                reference.get(unrelated, expired),
+                dense.get(unrelated, expired)
+            );
+            calls += 1;
+            if calls % 16 == 0 {
+                same(&reference, &dense);
+            }
+        }
+        same(&reference, &dense);
+        for (key, provider, token) in &survivors {
+            let reply = dense.get(*key, expired);
+            assert_eq!(reference.get(*key, expired), reply);
+            assert!(
+                reply.contains(&(*provider, *token)),
+                "a survivor keeps its membership"
+            );
+        }
+        let (slots, index, free) = dense.peers.allocated();
+        assert!(
+            slots <= 2048 && index <= 2048 && free <= 2048,
+            "{burst} expired providers left slots={slots} index={index} free={free}"
+        );
+
+        // The table keeps working: a second burst and its expiry.
+        for index in 0..burst / 4 {
+            let now = expired + Duration::from_micros(index as u64);
+            let key = keys[index % keys.len()];
+            let provider: PeerId = rng.r#gen();
+            let token: ProviderToken = rng.r#gen();
+            assert_eq!(
+                reference.put(key, provider, token, now),
+                dense.put(key, provider, token, now)
+            );
+        }
+        same(&reference, &dense);
+        let gone = expired + lease * 2;
+        while dense.retained_counts() != (0, 0) {
+            assert_eq!(reference.get(unrelated, gone), dense.get(unrelated, gone));
+        }
+        same(&reference, &dense);
+        let (slots, index, free) = dense.peers.allocated();
+        assert!(
+            slots <= 2048 && index <= 2048 && free <= 2048,
+            "an emptied directory left slots={slots} index={index} free={free}"
+        );
+    }
+
     #[repr(C)]
     #[derive(Debug)]
     struct Mallinfo2 {
@@ -461,8 +621,11 @@ mod tests {
     /// --test-threads=1`. `TRIBLESPACE_DIRECTORY_REPRESENTATION` is `dense`
     /// (default) or `btree`; `TRIBLESPACE_DIRECTORY_KEYS` (default 2,000,000)
     /// random keys each get `TRIBLESPACE_DIRECTORY_PROVIDERS` (default 1)
-    /// providers. Every put is one nanosecond after the last, so no two
-    /// memberships share a deadline.
+    /// providers, or one provider of their own when it is `distinct`. Every
+    /// put is one nanosecond after the last, so no two memberships share a
+    /// deadline. After measuring, every lease expires and unrelated requests
+    /// prune until the directory is empty; the in-use bytes left then are
+    /// what the directory failed to give back.
     #[test]
     #[ignore = "manual allocator measurement; glibc only"]
     fn directory_bytes_per_membership_probe() {
@@ -470,14 +633,34 @@ mod tests {
             std::env::var(name).map_or(default, |value| value.parse().unwrap())
         };
         let keys = parameter("TRIBLESPACE_DIRECTORY_KEYS", 2_000_000);
-        let fanout = parameter("TRIBLESPACE_DIRECTORY_PROVIDERS", 1);
+        let distinct =
+            std::env::var("TRIBLESPACE_DIRECTORY_PROVIDERS").is_ok_and(|value| value == "distinct");
+        let fanout = if distinct {
+            1
+        } else {
+            parameter("TRIBLESPACE_DIRECTORY_PROVIDERS", 1)
+        };
         let mode = std::env::var("TRIBLESPACE_DIRECTORY_REPRESENTATION")
             .unwrap_or_else(|_| "dense".to_owned());
         let mut rng = StdRng::seed_from_u64(0x379);
         let entries: Vec<(ProviderKey, ProviderToken)> =
             (0..keys).map(|_| (rng.r#gen(), rng.r#gen())).collect();
-        let providers: Vec<PeerId> = (0..fanout).map(|_| rng.r#gen()).collect();
+        let shared: Vec<PeerId> = (0..fanout).map(|_| rng.r#gen()).collect();
         let local: PeerId = rng.r#gen();
+        let own: Vec<PeerId> = if distinct {
+            (0..keys).map(|_| rng.r#gen()).collect()
+        } else {
+            Vec::new()
+        };
+        fn providers<'a>(own: &'a [PeerId], shared: &'a [PeerId], entry: usize) -> &'a [PeerId] {
+            own.get(entry).map_or(shared, std::slice::from_ref)
+        }
+        let unrelated: ProviderKey = rng.r#gen();
+        let label = if distinct {
+            "distinct".to_owned()
+        } else {
+            fanout.to_string()
+        };
         let start = crate::clock::mono_now();
         macro_rules! measure {
             ($directory:expr) => {{
@@ -485,8 +668,8 @@ mod tests {
                 let mut directory = $directory;
                 let mut now = start;
                 let inserting = std::time::Instant::now();
-                for (key, token) in &entries {
-                    for provider in &providers {
+                for (entry, (key, token)) in entries.iter().enumerate() {
+                    for provider in providers(&own, &shared, entry) {
                         now = now + Duration::from_nanos(1);
                         assert!(directory.put(*key, *provider, *token, now));
                     }
@@ -494,8 +677,8 @@ mod tests {
                 let insert = inserting.elapsed();
                 let after = in_use_bytes();
                 let renewing = std::time::Instant::now();
-                for (key, token) in &entries {
-                    for provider in &providers {
+                for (entry, (key, token)) in entries.iter().enumerate() {
+                    for provider in providers(&own, &shared, entry) {
                         now = now + Duration::from_nanos(1);
                         assert!(directory.put(*key, *provider, *token, now));
                     }
@@ -509,14 +692,97 @@ mod tests {
                 let memberships = keys * fanout;
                 assert_eq!(directory.retained_counts(), (memberships, keys));
                 let bytes = after.saturating_sub(before);
+                let expired = now + PROVIDER_LEASE_LIFETIME + Duration::from_secs(1);
+                let expiring = std::time::Instant::now();
+                let mut prunes = 0usize;
+                let mut slowest = Duration::ZERO;
+                while directory.retained_counts() != (0, 0) {
+                    let call = std::time::Instant::now();
+                    std::hint::black_box(directory.get(unrelated, expired));
+                    slowest = slowest.max(call.elapsed());
+                    prunes += 1;
+                }
+                let expire = expiring.elapsed();
+                let left = in_use_bytes().saturating_sub(before);
                 println!(
-                    "directory_bytes mode={mode} keys={keys} providers_per_key={fanout} memberships={memberships} in_use_delta_bytes={bytes} bytes_per_membership={:.1} insert_seconds={:.3} renew_seconds={:.3} get_seconds={:.3}",
+                    "directory_bytes mode={mode} keys={keys} providers_per_key={label} memberships={memberships} in_use_delta_bytes={bytes} bytes_per_membership={:.1} insert_seconds={:.3} renew_seconds={:.3} get_seconds={:.3} expire_seconds={:.3} prune_calls={prunes} slowest_prune_us={:.1} in_use_after_expiry_bytes={left}",
                     bytes as f64 / memberships as f64,
                     insert.as_secs_f64(),
                     renew.as_secs_f64(),
                     get.as_secs_f64(),
+                    expire.as_secs_f64(),
+                    slowest.as_secs_f64() * 1e6,
                 );
                 std::hint::black_box(directory);
+            }};
+        }
+        match mode.as_str() {
+            "dense" => measure!(ProviderDirectory::new(local)),
+            "btree" => measure!(BTreeDirectory::new(local)),
+            _ => panic!("choose dense or btree"),
+        }
+    }
+
+    /// Time to prune one key at the per-key ceiling once all of its leases
+    /// expire, through unrelated requests only: `cargo test -p
+    /// triblespace-net --features sim --lib one_key_mass_expiry_probe --
+    /// --ignored --nocapture --test-threads=1`. Deadlines are either all
+    /// distinct (one nanosecond apart, as real arrivals are) or all tied.
+    /// `TRIBLESPACE_DIRECTORY_REPRESENTATION` is `dense` (default) or
+    /// `btree`; `TRIBLESPACE_DIRECTORY_ROUNDS` (default 200) fills.
+    #[test]
+    #[ignore = "manual timing of one key's mass expiry"]
+    fn one_key_mass_expiry_probe() {
+        let rounds = std::env::var("TRIBLESPACE_DIRECTORY_ROUNDS")
+            .map_or(200, |value| value.parse::<u32>().unwrap());
+        let mode = std::env::var("TRIBLESPACE_DIRECTORY_REPRESENTATION")
+            .unwrap_or_else(|_| "dense".to_owned());
+        let mut rng = StdRng::seed_from_u64(0x37A);
+        let key: ProviderKey = rng.r#gen();
+        let unrelated: ProviderKey = rng.r#gen();
+        let local: PeerId = rng.r#gen();
+        let members: Vec<(PeerId, ProviderToken)> = (0..MAX_PROVIDERS_STORED_PER_KEY)
+            .map(|_| (rng.r#gen(), rng.r#gen()))
+            .collect();
+        macro_rules! measure {
+            ($directory:expr) => {{
+                for tied in [false, true] {
+                    let mut total = Duration::ZERO;
+                    let mut slowest = Duration::ZERO;
+                    let mut prunes = 0usize;
+                    for _ in 0..rounds {
+                        let mut directory = $directory;
+                        let start = crate::clock::mono_now();
+                        for (index, (provider, token)) in members.iter().enumerate() {
+                            let now = if tied {
+                                start
+                            } else {
+                                start + Duration::from_nanos(index as u64)
+                            };
+                            assert!(directory.put(key, *provider, *token, now));
+                        }
+                        assert_eq!(
+                            directory.retained_counts(),
+                            (MAX_PROVIDERS_STORED_PER_KEY, 1)
+                        );
+                        let expired = start + PROVIDER_LEASE_LIFETIME + Duration::from_secs(1);
+                        let expiring = std::time::Instant::now();
+                        while directory.retained_counts() != (0, 0) {
+                            let call = std::time::Instant::now();
+                            std::hint::black_box(directory.get(unrelated, expired));
+                            slowest = slowest.max(call.elapsed());
+                            prunes += 1;
+                        }
+                        total += expiring.elapsed();
+                    }
+                    println!(
+                        "one_key_mass_expiry mode={mode} members={MAX_PROVIDERS_STORED_PER_KEY} deadlines={} rounds={rounds} mean_expiry_us={:.1} prune_calls_per_round={} slowest_prune_us={:.1}",
+                        if tied { "tied" } else { "distinct" },
+                        total.as_secs_f64() * 1e6 / f64::from(rounds),
+                        prunes / rounds as usize,
+                        slowest.as_secs_f64() * 1e6,
+                    );
+                }
             }};
         }
         match mode.as_str() {
