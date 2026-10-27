@@ -41,7 +41,7 @@ struct Fixture {
     sender: NetSender,
     provider: PeerId,
     provider_routes: Arc<Mutex<RoutingTable>>,
-    provider_snapshot: tokio::sync::watch::Sender<Option<SharedSnapshot>>,
+    provider_snapshot: tokio::sync::watch::Sender<Option<StoreSnapshot>>,
     provider_directory: Arc<Mutex<ProviderDirectory>>,
     provider_health: Health,
     blob_reads: Arc<AtomicUsize>,
@@ -110,8 +110,7 @@ impl Fixture {
             ));
         }
         let provider_routes = Arc::new(Mutex::new(RoutingTable::new(provider)));
-        let (provider_snapshot, serving_snapshot) =
-            tokio::sync::watch::channel(Some(Arc::new(snapshot)));
+        let (provider_snapshot, serving_snapshot) = tokio::sync::watch::channel(Some(snapshot));
         let provider_directory = Arc::new(Mutex::new(providers));
         let provider_health = Health::new(EndpointId::from_bytes(&provider).unwrap());
         let handler = SnapshotHandler {
@@ -169,7 +168,7 @@ struct RecoveryNode {
 }
 
 impl RecoveryNode {
-    fn new(net: &SimNet, key: &SigningKey, snapshot: Option<Arc<StoreSnapshot>>) -> Self {
+    fn new(net: &SimNet, key: &SigningKey, snapshot: Option<StoreSnapshot>) -> Self {
         let peer = key.verifying_key().to_bytes();
         let mut harness = net.join(key);
         let directory = Arc::new(Mutex::new(ProviderDirectory::new(peer)));
@@ -583,7 +582,7 @@ async fn stale_provider_lease_survives_loss_alternate_fetch_and_same_endpoint_re
         StoreChanges::ALL,
     )
     .unwrap();
-    let restarted = RecoveryNode::new(&fixture.net, &provider_key, Some(Arc::new(restored)));
+    let restarted = RecoveryNode::new(&fixture.net, &provider_key, Some(restored));
     assert_eq!(restarted.peer, fixture.provider);
     assert_eq!(
         restarted.directory.lock().unwrap().retained_counts(),
@@ -752,7 +751,7 @@ async fn mid_transfer_crash_rejects_old_bytes_after_restart_and_allows_fresh_ret
     let mut fixture = Fixture::with_bytes(false, Bytes::from_source(vec![b'x'; 8 * 1024 * 1024]));
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     fixture.provider_snapshot.send_modify(|slot| {
-        let snapshot = Arc::get_mut(slot.as_mut().unwrap()).unwrap();
+        let snapshot = slot.as_mut().unwrap();
         snapshot.blobs = Arc::new(SignallingBlobReader {
             inner: snapshot.blobs.clone(),
             started: Mutex::new(Some(started_tx)),
@@ -781,7 +780,7 @@ async fn mid_transfer_crash_rejects_old_bytes_after_restart_and_allows_fresh_ret
         StoreChanges::ALL,
     )
     .unwrap();
-    let _restarted = RecoveryNode::new(&fixture.net, &provider_key, Some(Arc::new(restored)));
+    let _restarted = RecoveryNode::new(&fixture.net, &provider_key, Some(restored));
     let failed_at = tokio::time::Instant::now();
     assert!(
         fetch.await.unwrap().is_none(),
@@ -1489,9 +1488,7 @@ async fn resident_descriptor_is_not_a_collection_participant_hint() {
         StoreChanges::ALL,
     )
     .unwrap();
-    fixture
-        .provider_snapshot
-        .send_replace(Some(Arc::new(snapshot)));
+    fixture.provider_snapshot.send_replace(Some(snapshot));
 
     assert_eq!(
         fixture

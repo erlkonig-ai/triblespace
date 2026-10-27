@@ -333,7 +333,7 @@ fn serving_handoff_keeps_only_the_latest_coherent_observation() {
         )
         .unwrap();
         sender.update_snapshot(serving, &selected);
-        retired.push(Arc::downgrade(&sender.current_snapshot().unwrap()));
+        retired.push(Arc::downgrade(&sender.current_snapshot().unwrap().blobs));
     }
     assert!(retired[0].upgrade().is_none());
     assert!(retired[1].upgrade().is_none());
@@ -341,7 +341,7 @@ fn serving_handoff_keeps_only_the_latest_coherent_observation() {
     assert!(wiring.snapshot.has_changed().unwrap());
     let latest = wiring.snapshot.borrow_and_update().clone().unwrap();
     assert!(!wiring.snapshot.has_changed().unwrap());
-    assert!(Arc::ptr_eq(&latest, &sender.current_snapshot().unwrap()));
+    assert!(latest.same_observation(&sender.current_snapshot().unwrap()));
     assert!(latest.collections.get(&unavailable.raw).is_some());
     assert!(latest.collection(unavailable).is_none());
     let advertised =
@@ -487,7 +487,7 @@ async fn landing_publishes_one_observation_that_the_connection_table_serves() {
             .get(fixture.pending.fingerprint())
             .is_some()
     );
-    let retired = Arc::downgrade(&before);
+    let retired = Arc::downgrade(&before.blobs);
     drop((before, old));
     assert!(
         retired.upgrade().is_none(),

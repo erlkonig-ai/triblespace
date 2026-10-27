@@ -542,7 +542,7 @@ pub(crate) struct Exchange {
     /// Essential protocol membership proof of ONLY the peer's delta. This
     /// shares known immutable trees; it is not a catalogue of the local store.
     peer: Tree,
-    snapshot: Option<Arc<StoreSnapshot>>,
+    snapshot: Option<StoreSnapshot>,
     root_sent: bool,
     queue: VecDeque<Vec<u8>>,
     announced: PATCH<33, IdentitySchema, ()>,
@@ -901,11 +901,7 @@ impl Exchange {
         })
     }
 
-    pub(crate) fn on_frame(
-        &mut self,
-        frame: Frame,
-        snapshot: Option<Arc<StoreSnapshot>>,
-    ) -> Vec<Out> {
+    pub(crate) fn on_frame(&mut self, frame: Frame, snapshot: Option<StoreSnapshot>) -> Vec<Out> {
         let mut outs = Vec::new();
         if self.outcome.is_some() {
             return outs;
@@ -1577,7 +1573,7 @@ impl Exchange {
         while self.requests.len() as usize + self.fetching < MAX_WALK_REQUESTS
             && let Some(key) = self.wanted.pop_front()
         {
-            match admit_missing(self.kind, self.collection, key, self.snapshot.as_deref()) {
+            match admit_missing(self.kind, self.collection, key, self.snapshot.as_ref()) {
                 Some(admit) => {
                     self.peer.insert(key, Value::Handle);
                     if let Err(failure) = self.proof_budget() {

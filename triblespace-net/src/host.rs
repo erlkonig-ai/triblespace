@@ -144,15 +144,14 @@ trait BlobSnapshotReader: Send + Sync + 'static {
     fn get_blob(&self, hash: RawHash) -> Option<Bytes>;
 }
 
-struct CloneableBlobSnapshotReader<R>(Mutex<R>);
+struct CloneableBlobSnapshotReader<R>(R);
 
 impl<R> BlobSnapshotReader for CloneableBlobSnapshotReader<R>
 where
-    R: BlobStoreGet + Clone + Send + 'static,
+    R: BlobStoreGet + Send + Sync + 'static,
 {
     fn get_blob(&self, hash: RawHash) -> Option<Bytes> {
-        let reader = self.0.lock().unwrap().clone();
-        reader
+        self.0
             .get::<Bytes, UnknownBlob>(Inline::<Handle<UnknownBlob>>::new(hash))
             .ok()
     }
@@ -166,11 +165,9 @@ pub(crate) struct ResidentBlobReader(Arc<dyn BlobSnapshotReader>);
 impl ResidentBlobReader {
     pub(crate) fn new<R>(reader: &R) -> Self
     where
-        R: BlobStoreGet + Clone + Send + 'static,
+        R: BlobStoreGet + Clone + Send + Sync + 'static,
     {
-        Self(Arc::new(CloneableBlobSnapshotReader(Mutex::new(
-            reader.clone(),
-        ))))
+        Self(Arc::new(CloneableBlobSnapshotReader(reader.clone())))
     }
 }
 
@@ -308,19 +305,25 @@ type CollectionSnapshotIndex = PATCH<32, IdentitySchema, Arc<CollectionObservati
 ///
 /// Each value pins record, native authorization-evidence, and positive resident
 /// blob PATCHes. There is no global team or plaintext payload inventory.
+///
+/// Shared by value: every field is a PATCH, a copy-on-write snapshot, or
+/// `Copy`, so a clone is O(1) and shares no mutable state. Watch channels
+/// carry it and their readers clone it out of the borrow guard, so never add
+/// a field that is expensive to clone.
+#[derive(Clone)]
 pub(crate) struct StoreSnapshot {
     collections: CollectionSnapshotIndex,
     local: VerifyingKey,
     blobs: Arc<dyn BlobSnapshotReader>,
-    bearer_locators: Arc<BearerLocatorIndex>,
+    bearer_locators: BearerLocatorIndex,
     /// This pile's configuration collection, where its sync selection lives.
-    config: Arc<TribleSet>,
+    config: TribleSet,
     /// The collections this side replicates in full
     /// ([`ReplicationMode::Full`](crate::reconcile::ReplicationMode::Full)).
     full: ActiveCollections,
     /// Every grant this host holds, over any resource, with each resource's
     /// participants: the one AUTH index (see [`GrantIndex`]).
-    grants: Arc<GrantIndex>,
+    grants: GrantIndex,
 }
 
 impl StoreSnapshot {
@@ -338,14 +341,10 @@ impl StoreSnapshot {
         let mut collections = CollectionSnapshotIndex::new();
         let bearer_locators = match (previous_store, previous) {
             (Some(previous_store), Some(previous)) if changes.contains(StoreChanges::BLOBS) => {
-                Arc::new(update_locator_index(
-                    &snapshot,
-                    previous_store,
-                    &previous.bearer_locators,
-                )?)
+                update_locator_index(&snapshot, previous_store, &previous.bearer_locators)?
             }
             (_, Some(previous)) => previous.bearer_locators.clone(),
-            _ => Arc::new(locator_index(&snapshot)?),
+            _ => locator_index(&snapshot)?,
         };
         // The selection lives in the configuration collection, whose writes
         // are records.
@@ -357,10 +356,10 @@ impl StoreSnapshot {
             {
                 previous.config.clone()
             }
-            _ => Arc::new(config_facts(&snapshot, local).unwrap_or_else(|error| {
+            _ => config_facts(&snapshot, local).unwrap_or_else(|error| {
                 warn!(%error, "configuration unreadable; no collection is selected for sync");
                 TribleSet::new()
-            })),
+            }),
         };
         // This unobserved reader advances even when fixed per-C products do
         // not change. A later peer request may name a previously unseen R or
@@ -494,7 +493,7 @@ impl StoreSnapshot {
 
     /// Every grant this host holds, over any resource, with each resource's
     /// participants.
-    pub(crate) fn grants(&self) -> &Arc<GrantIndex> {
+    pub(crate) fn grants(&self) -> &GrantIndex {
         &self.grants
     }
 
@@ -525,7 +524,7 @@ impl StoreSnapshot {
     /// The collection, if it is active here and the pile selects it for
     /// sync. A conflicted or unset register selects nothing.
     pub(crate) fn selected(&self, collection: CollectionHandle) -> Option<Arc<CollectionSnapshot>> {
-        let selected = sync_selection(&*self.config, collection) == Selection::Selected;
+        let selected = sync_selection(&self.config, collection) == Selection::Selected;
         self.collection(collection).filter(|_| selected)
     }
 
@@ -554,10 +553,16 @@ impl StoreSnapshot {
     pub(crate) fn bearer_locators(&self) -> &BearerLocatorIndex {
         &self.bearer_locators
     }
+
+    /// Whether `other` is a clone of this very observation: each
+    /// construction erases its own blob reader.
+    #[cfg(test)]
+    pub(crate) fn same_observation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.blobs, &other.blobs)
+    }
 }
 
-type SharedSnapshot = Arc<StoreSnapshot>;
-type SnapshotSlot = tokio::sync::watch::Receiver<Option<SharedSnapshot>>;
+type SnapshotSlot = tokio::sync::watch::Receiver<Option<StoreSnapshot>>;
 
 /// The async capability cloned into lazy readers.
 /// Implementations return Blobs constructed from the received bytes, with the
@@ -634,7 +639,7 @@ pub const INTERACTIVE_FETCH_DEADLINE: std::time::Duration = std::time::Duration:
 
 #[derive(Clone)]
 pub struct NetSender {
-    snapshot: tokio::sync::watch::Sender<Option<SharedSnapshot>>,
+    snapshot: tokio::sync::watch::Sender<Option<StoreSnapshot>>,
     cap: tokio::sync::watch::Receiver<Option<Arc<dyn NetCapability>>>,
     /// Where the store side installs the landing of what walks receive.
     lander: tokio::sync::watch::Sender<Option<Arc<dyn Land>>>,
@@ -681,7 +686,7 @@ impl NetSender {
         });
     }
 
-    pub(crate) fn current_snapshot(&self) -> Option<SharedSnapshot> {
+    pub(crate) fn current_snapshot(&self) -> Option<StoreSnapshot> {
         self.snapshot.borrow().clone()
     }
 
@@ -692,7 +697,6 @@ impl NetSender {
 
     pub(crate) fn update_snapshot(&self, snapshot: StoreSnapshot, active: &ActiveCollections) {
         self.observe_active_collections(active);
-        let snapshot = Arc::new(snapshot);
         // Serving and the coordinator observe exactly the same generation.
         // Slow consumers skip obsolete observations, never authenticated data.
         let retired = self.snapshot.send_replace(Some(snapshot.clone()));
@@ -1273,7 +1277,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, mut wi
 
     // Retain the last observation accounted for, not a second catalog.
     // ProviderPublisher separately retains genuinely pending work.
-    let mut processed_snapshot: Option<SharedSnapshot> = None;
+    let mut processed_snapshot: Option<StoreSnapshot> = None;
     let empty_collections = CollectionSnapshotIndex::new();
     let mut descriptor_fetches = DescriptorFetches::default();
     let mut next_warmup = crate::clock::mono_now();

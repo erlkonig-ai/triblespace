@@ -1764,10 +1764,7 @@ mod tests {
         let published_after_refresh = observer.current_snapshot().unwrap();
         let frontier_after_refresh = frontier();
         let after = peer.snapshot().unwrap();
-        assert!(Arc::ptr_eq(
-            &published_after_refresh,
-            &observer.current_snapshot().unwrap()
-        ));
+        assert!(published_after_refresh.same_observation(&observer.current_snapshot().unwrap()));
         assert_eq!(trace.lock().unwrap().flushes, 0);
         assert!(!before.contains_blob(handle).unwrap());
         assert!(BlobStoreGet::get::<Bytes, UnknownBlob>(&after, handle).is_ok());
@@ -1804,10 +1801,7 @@ mod tests {
                 .collections()
                 .any(|c| c.collection() == collection)
         );
-        assert!(!Arc::ptr_eq(
-            &previous_serving,
-            &observer.current_snapshot().unwrap()
-        ));
+        assert!(!previous_serving.same_observation(&observer.current_snapshot().unwrap()));
 
         trace.lock().unwrap().fail_put = true;
         let mut batch = NetEventBatch::default();

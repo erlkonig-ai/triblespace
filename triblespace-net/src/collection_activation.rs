@@ -318,7 +318,7 @@ impl CollectionRepairOverlay {
         CollectionRepairOverlayError<R::RecordsError, R::ProofsError, R::GetError<Infallible>>,
     >
     where
-        R: BlobStoreGet + CapabilityProofRead + CollectionRead + Clone + Send + 'static,
+        R: BlobStoreGet + CapabilityProofRead + CollectionRead + Clone + Send + Sync + 'static,
     {
         let authorization_evidence = match previous_authorization {
             Some(evidence) => CollectionAuthorizationEvidencePatch {
@@ -564,7 +564,7 @@ pub fn collection_repair_overlay<R>(
     CollectionRepairOverlayError<R::RecordsError, R::ProofsError, R::GetError<Infallible>>,
 >
 where
-    R: BlobStoreGet + CapabilityProofRead + CollectionRead + Clone + Send + 'static,
+    R: BlobStoreGet + CapabilityProofRead + CollectionRead + Clone + Send + Sync + 'static,
 {
     CollectionRepairOverlay::observe(snapshot, collection, None, None)
 }
@@ -596,7 +596,7 @@ pub fn collection_authorization_evidence<R>(
     CollectionAuthorizationEvidenceDiscoveryError<R::ProofsError, R::GetError<Infallible>>,
 >
 where
-    R: BlobStoreGet + CapabilityProofRead + Clone + Send + 'static,
+    R: BlobStoreGet + CapabilityProofRead + Clone + Send + Sync + 'static,
 {
     let descriptor = load_collection_descriptor_facts(snapshot, collection)
         .map_err(CollectionAuthorizationEvidenceDiscoveryError::Descriptor)?;
@@ -617,7 +617,7 @@ fn collection_authorization_evidence_patch_for_descriptor<R>(
     descriptor: TribleSet,
 ) -> Result<CollectionAuthorizationEvidencePatch, AuthorizationEvidenceBuildError<R::ProofsError>>
 where
-    R: BlobStoreGet + CapabilityProofRead + Clone + Send + 'static,
+    R: BlobStoreGet + CapabilityProofRead + Clone + Send + Sync + 'static,
 {
     let proofs = snapshot
         .proofs()
@@ -631,7 +631,7 @@ where
         .map_err(AuthorizationEvidenceBuildError::Evidence)
 }
 
-fn canonical_authorization_evidence<R: BlobStoreGet + Clone + Send + 'static>(
+fn canonical_authorization_evidence<R: BlobStoreGet + Clone + Send + Sync + 'static>(
     snapshot: &R,
     collection: CollectionHandle,
     descriptor: TribleSet,

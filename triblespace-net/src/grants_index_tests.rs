@@ -128,7 +128,7 @@ pub(crate) fn grant(
 struct Pile {
     store: MemoryRepo,
     active: ActiveCollections,
-    last: Option<(MemoryRepoSnapshot, Arc<GrantIndex>)>,
+    last: Option<(MemoryRepoSnapshot, GrantIndex)>,
 }
 
 impl Pile {
@@ -143,7 +143,7 @@ impl Pile {
     }
 
     /// Observe the store, from the previous index when there is one.
-    fn observe(&mut self) -> Arc<GrantIndex> {
+    fn observe(&mut self) -> GrantIndex {
         let snapshot = self.store.snapshot().unwrap();
         let (previous, changes) = match &self.last {
             Some((before, index)) => (Some(index), snapshot.changes_since(before)),

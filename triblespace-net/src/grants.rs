@@ -171,17 +171,16 @@ impl GrantIndex {
     pub(crate) fn observe<R>(
         snapshot: &R,
         active: &ActiveCollections,
-        previous: Option<&Arc<GrantIndex>>,
+        previous: Option<&GrantIndex>,
         changes: StoreChanges,
-    ) -> Result<Arc<GrantIndex>, R::ProofsError>
+    ) -> Result<GrantIndex, R::ProofsError>
     where
         R: BlobStoreGet + BlobStoreList + CapabilityProofRead,
     {
         let proofs_changed =
             previous.is_none() || changes.contains(StoreChanges::CAPABILITY_PROOFS);
         let blobs_changed = previous.is_none() || changes.contains(StoreChanges::BLOBS);
-        let mut index = previous.map_or_else(GrantIndex::default, |index| GrantIndex::clone(index));
-        let mut touched = false;
+        let mut index = previous.cloned().unwrap_or_default();
         if blobs_changed {
             // Waiting proofs one of whose handles became resident are judged
             // again; one still missing another handle waits on that.
@@ -205,7 +204,6 @@ impl GrantIndex {
             for id in ready {
                 let proof = index.unwait(id);
                 index.evaluate(snapshot, proof);
-                touched = true;
             }
         }
         if proofs_changed {
@@ -213,7 +211,6 @@ impl GrantIndex {
                 let proof = proof?;
                 if index.verdicts.get(&proof.id().raw).is_none() {
                     index.evaluate(snapshot, proof);
-                    touched = true;
                 }
             }
         }
@@ -227,12 +224,8 @@ impl GrantIndex {
                 raw,
                 Arc::new(ResourceGrants::rooted(&read_facts(snapshot, *raw))),
             ));
-            touched = true;
         }
-        Ok(match previous {
-            Some(previous) if !touched => previous.clone(),
-            _ => Arc::new(index),
-        })
+        Ok(index)
     }
 
     /// Judge one proof that has no final verdict, and index it if it is
@@ -902,9 +895,6 @@ struct Listing {
     link: Link,
     /// The summary last listed to the peer, per R.
     sent: PATCH<32, IdentitySchema, PatchSummary>,
-    /// The index the last listing was computed from; `None` once something
-    /// else the listing depends on changed.
-    from: Option<Arc<GrantIndex>>,
     /// The peer's last listed summary, per R: its standing statement of what
     /// it holds of R's grants, for the life of the connection.
     listed: PATCH<32, IdentitySchema, PatchSummary>,
@@ -962,7 +952,6 @@ impl Listing {
         Self {
             link,
             sent: PATCH::new(),
-            from: None,
             listed: PATCH::new(),
             opened: PATCH::new(),
             unknown: PATCH::new(),
@@ -1038,7 +1027,7 @@ impl Listing {
 /// becomes peered for it.
 pub(crate) struct Grants {
     local: PeerId,
-    snapshot: Option<Arc<StoreSnapshot>>,
+    snapshot: Option<StoreSnapshot>,
     /// By connection id.
     listings: HashMap<u64, Listing>,
     /// Grants walks kept whose descriptor is not resident here.
@@ -1365,14 +1354,6 @@ impl Grants {
         let Some(listing) = self.listings.get_mut(&id) else {
             return;
         };
-        if listing
-            .from
-            .as_ref()
-            .is_some_and(|from| Arc::ptr_eq(from, index))
-        {
-            return;
-        }
-        listing.from = Some(index.clone());
         let peer = listing.link.peer();
         let served = listing
             .serves
@@ -1446,7 +1427,6 @@ impl Grants {
             let peer = listing.link.peer();
             listing.peered = resources;
             listing.serves = serves;
-            listing.from = None;
             for (resource, local) in fresh.iter().copied().zip(locals) {
                 listing.opened.remove(&resource.raw);
                 if listing.reopen(resource, local) {
@@ -1670,7 +1650,7 @@ impl Grants {
     /// descriptor arrived and that start at one of its roots, dropping the
     /// rest of those, fetch what newly waiting stored grants need, and list
     /// changed roots on every connection.
-    pub(crate) fn observe(&mut self, snapshot: Arc<StoreSnapshot>) -> Effects {
+    pub(crate) fn observe(&mut self, snapshot: StoreSnapshot) -> Effects {
         let mut effects = Effects::default();
         let previous = self.snapshot.replace(snapshot.clone());
         self.changed = true;
@@ -1722,7 +1702,7 @@ impl Grants {
         // Becoming a participant of R widens what a walk over R keeps: walk
         // it again with each peer whose listed root still differs, so the
         // grants skipped while this side took no part arrive.
-        if let Some(previous) = previous.filter(|previous| !Arc::ptr_eq(previous.grants(), index)) {
+        if let Some(previous) = previous {
             let before = previous.grants();
             let local = self.local;
             for id in &ids {

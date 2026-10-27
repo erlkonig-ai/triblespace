@@ -3,8 +3,6 @@
 //! in bounded memory and land only once they validate. Every negative
 //! assertion has a positive control in the same test.
 
-use std::sync::Arc;
-
 use ed25519_dalek::SigningKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::TryFromBlob as _;
@@ -43,18 +41,16 @@ impl Node {
         self.store.put::<SimpleArchive, _>(facts.clone()).unwrap()
     }
 
-    fn snapshot(&mut self) -> Arc<StoreSnapshot> {
-        Arc::new(
-            StoreSnapshot::from_store_changes(
-                self.store.snapshot().unwrap(),
-                &self.active,
-                self.key.verifying_key(),
-                None,
-                None,
-                StoreChanges::ALL,
-            )
-            .unwrap(),
+    fn snapshot(&mut self) -> StoreSnapshot {
+        StoreSnapshot::from_store_changes(
+            self.store.snapshot().unwrap(),
+            &self.active,
+            self.key.verifying_key(),
+            None,
+            None,
+            StoreChanges::ALL,
         )
+        .unwrap()
     }
 
     fn observe(&mut self) -> Effects {

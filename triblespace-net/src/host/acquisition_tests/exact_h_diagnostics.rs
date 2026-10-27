@@ -470,7 +470,7 @@ impl Node {
     fn new(
         net: &SimNet,
         key: &SigningKey,
-        snapshot: Option<Arc<StoreSnapshot>>,
+        snapshot: Option<StoreSnapshot>,
         gate: Option<Arc<Gate>>,
     ) -> Self {
         let peer = key.verifying_key().to_bytes();
@@ -576,7 +576,7 @@ impl ThreeNodes {
             inner: snapshot.blobs,
             reads: reads.clone(),
         });
-        let holder = Node::new(&net, &holder_key, Some(Arc::new(snapshot)), holder_gate);
+        let holder = Node::new(&net, &holder_key, Some(snapshot), holder_gate);
         let other = Node::new(&net, &other_key, None, other_gate);
         if advertise {
             // Known valid directory lease, independent of the holder's

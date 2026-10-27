@@ -234,7 +234,7 @@ pub(crate) enum Event {
 pub(crate) struct Walks {
     algorithm: crate::walk_stream::Algorithm,
     health: Health,
-    snapshot: Option<Arc<StoreSnapshot>>,
+    snapshot: Option<StoreSnapshot>,
     /// The collections the last snapshot selected: one that leaves the
     /// selection is forgotten.
     selected: PATCH<32, IdentitySchema, ()>,
@@ -479,7 +479,7 @@ impl Walks {
     /// Take the latest serving snapshot: what new exchanges pin and are
     /// admitted against. A collection it no longer selects is forgotten for
     /// every peer.
-    pub(crate) fn observe(&mut self, snapshot: Arc<StoreSnapshot>) {
+    pub(crate) fn observe(&mut self, snapshot: StoreSnapshot) {
         let mut selected = PATCH::new();
         for collection in snapshot
             .active()
@@ -946,7 +946,7 @@ pub(crate) enum Command {
 /// where grant walks report to the grant exchange.
 pub(crate) fn spawn<T: Transport, S: Service>(
     connections: ConnectionTable<T, S>,
-    snapshots: watch::Receiver<Option<Arc<StoreSnapshot>>>,
+    snapshots: watch::Receiver<Option<StoreSnapshot>>,
     walks: Walks,
     lander: LandSlot,
 ) -> (
@@ -981,7 +981,7 @@ pub(crate) fn spawn<T: Transport, S: Service>(
 
 struct Task<T: Transport, S> {
     connections: ConnectionTable<T, S>,
-    snapshots: watch::Receiver<Option<Arc<StoreSnapshot>>>,
+    snapshots: watch::Receiver<Option<StoreSnapshot>>,
     walks: Walks,
     /// Where exchanges report back.
     commands: WalksHandle,
@@ -1062,7 +1062,7 @@ struct Running {
 impl<T: Transport, S: Service> Task<T, S> {
     async fn run(
         mut self,
-        mut snapshots: watch::Receiver<Option<Arc<StoreSnapshot>>>,
+        mut snapshots: watch::Receiver<Option<StoreSnapshot>>,
         mut commands: mpsc::UnboundedReceiver<Command>,
         mut landed: mpsc::UnboundedReceiver<Landed<u64>>,
     ) {
@@ -1100,7 +1100,7 @@ impl<T: Transport, S: Service> Task<T, S> {
         }
     }
 
-    fn observe(&mut self, snapshot: Arc<StoreSnapshot>) {
+    fn observe(&mut self, snapshot: StoreSnapshot) {
         self.walks.observe(snapshot);
         // Dropping the replacement sender retires drivers admitted under
         // a selection that no longer exists. Their queued ends are stale.
@@ -1519,7 +1519,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Progress<W> {
 /// What one exchange's driver holds of the task.
 struct Driver<T: Transport, S> {
     connections: ConnectionTable<T, S>,
-    snapshots: watch::Receiver<Option<Arc<StoreSnapshot>>>,
+    snapshots: watch::Receiver<Option<StoreSnapshot>>,
     landing: mpsc::UnboundedSender<(u64, Vec<NetEvent>)>,
     /// Where a kept grant that cannot land yet goes.
     grants: mpsc::UnboundedSender<GrantEvent>,
@@ -2058,15 +2058,15 @@ pub(crate) mod tests {
                     StoreChanges::ALL,
                 )
                 .unwrap();
-                self.walks.observe(Arc::new(snapshot));
+                self.walks.observe(snapshot);
             }
 
             /// The serving snapshot the walks last observed.
             pub(crate) fn serving(&self) -> &StoreSnapshot {
-                self.walks.snapshot.as_deref().unwrap()
+                self.walks.snapshot.as_ref().unwrap()
             }
 
-            pub(crate) fn snapshot(&self) -> Arc<StoreSnapshot> {
+            pub(crate) fn snapshot(&self) -> StoreSnapshot {
                 self.walks.snapshot.clone().unwrap()
             }
 
@@ -2566,7 +2566,7 @@ pub(crate) mod tests {
         /// publishes the next serving snapshot.
         struct Lander {
             node: Mutex<Node>,
-            snapshots: watch::Sender<Option<Arc<StoreSnapshot>>>,
+            snapshots: watch::Sender<Option<StoreSnapshot>>,
         }
 
         impl Land for Lander {
@@ -2610,7 +2610,7 @@ pub(crate) mod tests {
             fn serving(
                 node: Node,
                 net: &SimNet,
-                service: impl FnOnce(PeerId, watch::Receiver<Option<Arc<StoreSnapshot>>>) -> S,
+                service: impl FnOnce(PeerId, watch::Receiver<Option<StoreSnapshot>>) -> S,
             ) -> Self {
                 let (mut harness, taps) = net.tap(&node.key);
                 let peer = harness.transport.local_id();
@@ -2792,7 +2792,7 @@ pub(crate) mod tests {
         #[derive(Clone)]
         struct PacedBlobs {
             local: PeerId,
-            snapshots: watch::Receiver<Option<Arc<StoreSnapshot>>>,
+            snapshots: watch::Receiver<Option<StoreSnapshot>>,
             pause: Duration,
             piece: usize,
             one_at_a_time: Arc<tokio::sync::Mutex<()>>,
@@ -4698,7 +4698,7 @@ pub(crate) mod tests {
         /// its grant walks report.
         fn grant_task<S: Service>(
             hosted: &Hosted<S>,
-            snapshot: Arc<StoreSnapshot>,
+            snapshot: StoreSnapshot,
         ) -> (Task<Tapped, S>, mpsc::UnboundedReceiver<GrantEvent>) {
             let (landing, _) = mpsc::unbounded_channel();
             let (events, _) = mpsc::unbounded_channel();

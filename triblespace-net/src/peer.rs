@@ -284,7 +284,7 @@ where
             VerifyingKey::from_bytes(self.sender.id().as_bytes())
                 .expect("endpoint id is an Ed25519 key"),
             publication.last_store_snapshot.as_ref(),
-            previous_snapshot.as_deref(),
+            previous_snapshot.as_ref(),
             changes,
         )?
         .with_full(publication.full.clone());
@@ -1940,7 +1940,7 @@ mod tests {
         let serving = observer.current_snapshot().unwrap();
         let later = peer.snapshot().unwrap();
         assert_eq!(later.changes_since(&snapshot), StoreChanges::NONE);
-        assert!(Arc::ptr_eq(&serving, &observer.current_snapshot().unwrap()));
+        assert!(serving.same_observation(&observer.current_snapshot().unwrap()));
     }
 
     #[tokio::test]
@@ -1976,7 +1976,7 @@ mod tests {
         }
 
         let after = observer.current_snapshot().unwrap();
-        assert!(Arc::ptr_eq(&before, &after));
+        assert!(before.same_observation(&after));
     }
 
     #[test]

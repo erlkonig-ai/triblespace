@@ -168,7 +168,7 @@ struct Mesh {
 /// Every collection's peerings on every connection of one node.
 pub(crate) struct Peerings {
     local: PeerId,
-    snapshot: Option<Arc<StoreSnapshot>>,
+    snapshot: Option<StoreSnapshot>,
     links: HashMap<u64, Link>,
     meshes: HashMap<RawHash, Mesh>,
     changed: bool,
@@ -472,7 +472,7 @@ impl Peerings {
     /// Take a new store observation: end the peerings of collections no
     /// longer selected, revisit admissions whose evidence or selection
     /// changed, and send this side's credentials where they changed.
-    pub(crate) fn observe(&mut self, snapshot: Arc<StoreSnapshot>) {
+    pub(crate) fn observe(&mut self, snapshot: StoreSnapshot) {
         let previous = self.snapshot.replace(snapshot.clone());
         let local = VerifyingKey::from_bytes(&self.local).ok();
         let collections = self.meshes.keys().copied().collect::<Vec<_>>();
@@ -1283,7 +1283,7 @@ impl Peerings {
 /// fetched definitions go through `admissions`.
 pub(crate) async fn run<T: Transport, S: Service>(
     connections: ConnectionTable<T, S>,
-    mut snapshots: tokio::sync::watch::Receiver<Option<Arc<StoreSnapshot>>>,
+    mut snapshots: tokio::sync::watch::Receiver<Option<StoreSnapshot>>,
     mut events: tokio::sync::mpsc::Receiver<ReconEvent>,
     mut find_providers: impl FnMut(CollectionHandle) -> BoxFuture<'static, Vec<PeerId>>,
     walks: WalksHandle,
@@ -1485,19 +1485,17 @@ mod tests {
             .unwrap();
         }
 
-        fn snapshot(&mut self) -> Arc<StoreSnapshot> {
-            Arc::new(
-                StoreSnapshot::from_store_changes(
-                    self.store.snapshot().unwrap(),
-                    &self.active,
-                    self.key.verifying_key(),
-                    None,
-                    None,
-                    StoreChanges::ALL,
-                )
-                .unwrap()
-                .with_full(self.full.clone()),
+        fn snapshot(&mut self) -> StoreSnapshot {
+            StoreSnapshot::from_store_changes(
+                self.store.snapshot().unwrap(),
+                &self.active,
+                self.key.verifying_key(),
+                None,
+                None,
+                StoreChanges::ALL,
             )
+            .unwrap()
+            .with_full(self.full.clone())
         }
     }
 
@@ -2393,7 +2391,7 @@ mod tests {
         struct Host {
             pile: Pile,
             table: ConnectionTable<SimTransport, Forward>,
-            snapshots: watch::Sender<Option<Arc<StoreSnapshot>>>,
+            snapshots: watch::Sender<Option<StoreSnapshot>>,
             health: Health,
             tasks: Vec<tokio::task::JoinHandle<()>>,
         }

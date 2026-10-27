@@ -541,7 +541,7 @@ struct Driven {
     acked: mpsc::UnboundedSender<(u64, u64)>,
     landings: mpsc::UnboundedReceiver<(u64, Vec<NetEvent>)>,
     reset: Arc<Mutex<Option<u32>>>,
-    _snapshots: watch::Sender<Option<Arc<StoreSnapshot>>>,
+    _snapshots: watch::Sender<Option<StoreSnapshot>>,
 }
 
 fn driven(local: &Node, peer: &Node, collection: CollectionHandle) -> Driven {
