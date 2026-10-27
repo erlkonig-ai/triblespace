@@ -1,11 +1,20 @@
-//! Bounded residual-only decoding at the network boundary.
+//! Residual-only decoding at the network boundary.
 //!
 //! The mapping-window mechanics adapt ngerakines/riblt-rs d0737aee
 //! (`decoder.rs`/`window.rs`, MIT). Upstream remains our unmodified encoder and
 //! mapping oracle. Unlike its general decoder, this owns no complete local set:
-//! callers subtract source-bound cached cells before admission. All cascade and
-//! mapping work is charged inside the loops, arithmetic is checked, and a pure
-//! symbol must actually map to its triggering cell and be newly recovered.
+//! callers subtract source-bound cached cells before admission. Arithmetic is
+//! checked, and a pure symbol must actually map to its triggering cell and be
+//! newly recovered.
+//!
+//! No configured cell, support or work budget fails decoding: its state grows
+//! with the difference. Residual rows and recovered symbols live in file-backed
+//! chunks ([`crate::riblt_store`]). Per recovered key the heap keeps its
+//! mapping frontier (16 bytes), its heap entry (16 bytes) and its entry in the
+//! duplicate-recovery PATCH; `ready` holds at most one index per row. Once
+//! decoded, [`ResidualDecoder::finish`] releases all of that except the
+//! recovered windows. Liveness belongs to the walk's progress deadline, not to
+//! this decoder.
 
 /*
 MIT License
@@ -37,38 +46,56 @@ use std::collections::{BinaryHeap, VecDeque};
 use riblt::{HashKey, HashedSymbol, RandomMapping, Symbol};
 use triblespace_core::patch::{Entry, IdentitySchema, PATCH};
 
-use crate::riblt_cache::{Cell, KeySymbol, MAX_CELLS};
-
-/// Difference keys per sign, independent of the prepared/received cell limit.
-const MAX_SUPPORT: usize = 1024 * 1024;
-
-#[derive(Clone, Copy)]
-pub(crate) struct Limits {
-    pub(crate) cells: usize,
-    pub(crate) support: usize,
-    pub(crate) work: usize,
-}
-
-impl Default for Limits {
-    fn default() -> Self {
-        Self {
-            cells: MAX_CELLS,
-            support: MAX_SUPPORT,
-            work: 64 * MAX_CELLS,
-        }
-    }
-}
+use crate::riblt_cache::{Cell, KeySymbol};
+use crate::riblt_store::{Record, Records};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DecodeError {
-    Limit,
     Invalid,
     CountOverflow,
+    /// A chunk file could not be reserved, e.g. on a full disk.
+    Storage,
 }
 
-fn charge(work: &mut usize) -> Result<(), DecodeError> {
-    *work = work.checked_sub(1).ok_or(DecodeError::Limit)?;
-    Ok(())
+/// A recovered symbol: key, checksum and mapping seed, native endian.
+impl Record for HashedSymbol<KeySymbol> {
+    const BYTES: usize = 48;
+
+    fn load(bytes: &[u8]) -> Self {
+        Self {
+            symbol: KeySymbol(bytes[..32].try_into().unwrap()),
+            hash: u64::from_ne_bytes(bytes[32..40].try_into().unwrap()),
+            mapping_seed: u64::from_ne_bytes(bytes[40..48].try_into().unwrap()),
+        }
+    }
+
+    fn store(&self, bytes: &mut [u8]) {
+        bytes[..32].copy_from_slice(&self.symbol.0);
+        bytes[32..40].copy_from_slice(&self.hash.to_ne_bytes());
+        bytes[40..48].copy_from_slice(&self.mapping_seed.to_ne_bytes());
+    }
+}
+
+/// One residual row and whether it waits in `ready`.
+struct Row {
+    cell: Cell,
+    queued: bool,
+}
+
+impl Record for Row {
+    const BYTES: usize = Cell::BYTES + 1;
+
+    fn load(bytes: &[u8]) -> Self {
+        Self {
+            cell: Cell::load(&bytes[..Cell::BYTES]),
+            queued: bytes[Cell::BYTES] != 0,
+        }
+    }
+
+    fn store(&self, bytes: &mut [u8]) {
+        self.cell.store(&mut bytes[..Cell::BYTES]);
+        bytes[Cell::BYTES] = u8::from(self.queued);
+    }
 }
 
 fn apply(cell: &mut Cell, symbol: &HashedSymbol<KeySymbol>, sign: i64) -> Result<(), DecodeError> {
@@ -88,7 +115,7 @@ fn zero(cell: &Cell) -> bool {
 
 #[derive(Default)]
 struct Window {
-    symbols: Vec<HashedSymbol<KeySymbol>>,
+    symbols: Records<HashedSymbol<KeySymbol>>,
     mappings: Vec<RandomMapping>,
     // A forward mapping frontier per recovered difference key, never a full
     // source index. The heap avoids scanning every known key for every row.
@@ -96,15 +123,8 @@ struct Window {
 }
 
 impl Window {
-    fn apply_known(
-        &mut self,
-        cell: &mut Cell,
-        index: usize,
-        sign: i64,
-        work: &mut usize,
-    ) -> Result<(), DecodeError> {
+    fn apply_known(&mut self, cell: &mut Cell, index: usize, sign: i64) -> Result<(), DecodeError> {
         while let Some(&Reverse((mapped, key))) = self.next.peek() {
-            charge(work)?;
             if mapped > index {
                 break;
             }
@@ -112,88 +132,100 @@ impl Window {
                 return Err(DecodeError::Invalid);
             }
             self.next.pop();
-            apply(cell, &self.symbols[key], sign)?;
+            apply(cell, &self.symbols.get(key).expect("recovered"), sign)?;
             self.next
                 .push(Reverse((self.mappings[key].next_index(), key)));
         }
         Ok(())
     }
 
-    fn insert(&mut self, symbol: HashedSymbol<KeySymbol>, mapping: RandomMapping) {
+    fn insert(
+        &mut self,
+        symbol: HashedSymbol<KeySymbol>,
+        mapping: RandomMapping,
+    ) -> Result<(), DecodeError> {
+        self.symbols
+            .push(&symbol)
+            .map_err(|_| DecodeError::Storage)?;
         self.next
-            .push(Reverse((mapping.last_index(), self.symbols.len())));
-        self.symbols.push(symbol);
+            .push(Reverse((mapping.last_index(), self.mappings.len())));
         self.mappings.push(mapping);
+        Ok(())
     }
 }
 
 pub(crate) struct ResidualDecoder {
     key: HashKey,
-    limits: Limits,
-    work: usize,
-    cells: Vec<Cell>,
+    rows: Records<Row>,
     ready: VecDeque<usize>,
-    queued: Vec<bool>,
     zeros: usize,
     recovered: PATCH<32, IdentitySchema>,
     local: Window,
     remote: Window,
+    finished: bool,
 }
 
 impl ResidualDecoder {
     pub(crate) fn with_key(key: HashKey) -> Self {
-        Self::with_limits(key, Limits::default())
-    }
-
-    pub(crate) fn with_limits(key: HashKey, limits: Limits) -> Self {
         Self {
             key,
-            work: limits.work,
-            limits,
-            cells: Vec::new(),
+            rows: Records::default(),
             ready: VecDeque::new(),
-            queued: Vec::new(),
             zeros: 0,
             recovered: PATCH::new(),
             local: Window::default(),
             remote: Window::default(),
+            finished: false,
         }
     }
 
-    pub(crate) fn local(&self) -> &[HashedSymbol<KeySymbol>] {
+    pub(crate) fn local(&self) -> &Records<HashedSymbol<KeySymbol>> {
         &self.local.symbols
     }
 
-    pub(crate) fn remote(&self) -> &[HashedSymbol<KeySymbol>] {
+    pub(crate) fn remote(&self) -> &Records<HashedSymbol<KeySymbol>> {
         &self.remote.symbols
     }
 
     pub(crate) fn decoded(&self) -> bool {
-        !self.cells.is_empty() && self.zeros == self.cells.len()
+        self.finished || (!self.rows.is_empty() && self.zeros == self.rows.len())
     }
 
-    /// Admit one contiguous residual row and exhaust only the bounded cascade.
+    /// Release everything but the recovered windows once decoded: rows,
+    /// queue, duplicate PATCH and mapping frontiers. No row may follow.
+    pub(crate) fn finish(&mut self) {
+        debug_assert!(self.decoded());
+        self.finished = true;
+        self.rows = Records::default();
+        self.ready = VecDeque::new();
+        self.recovered = PATCH::new();
+        for window in [&mut self.local, &mut self.remote] {
+            window.mappings = Vec::new();
+            window.next = BinaryHeap::new();
+        }
+    }
+
+    /// Admit one contiguous residual row and exhaust its cascade.
     /// Any error is terminal: the owning exchange discards the decoder.
     pub(crate) fn add(&mut self, mut cell: Cell) -> Result<(), DecodeError> {
-        charge(&mut self.work)?;
-        if self.cells.len() >= self.limits.cells
-            || cell.count.unsigned_abs() > self.limits.support as u64
-        {
-            return Err(DecodeError::Limit);
+        if self.finished {
+            return Err(DecodeError::Invalid);
         }
-        let index = self.cells.len();
-        self.remote
-            .apply_known(&mut cell, index, -1, &mut self.work)?;
-        self.local
-            .apply_known(&mut cell, index, 1, &mut self.work)?;
+        let index = self.rows.len();
+        self.remote.apply_known(&mut cell, index, -1)?;
+        self.local.apply_known(&mut cell, index, 1)?;
         self.zeros += usize::from(zero(&cell));
-        self.cells.push(cell);
-        self.queued.push(false);
-        self.enqueue(index)?;
+        let mut row = Row {
+            cell,
+            queued: false,
+        };
+        self.enqueue(index, &mut row);
+        self.rows.push(&row).map_err(|_| DecodeError::Storage)?;
         while let Some(index) = self.ready.pop_front() {
-            charge(&mut self.work)?;
-            self.queued[index] = false;
-            let cell = &self.cells[index];
+            let mut row = self.rows.get(index).expect("queued rows exist");
+            row.queued = false;
+            self.rows.set(index, &row);
+            let cell = row.cell;
             // Another peel can invalidate a queued candidate before this turn.
             if !cell.is_pure_with_key(Some(&self.key)) {
                 continue;
@@ -203,14 +235,9 @@ impl ResidualDecoder {
             if self.recovered.get(&symbol.symbol.0).is_some() {
                 return Err(DecodeError::Invalid);
             }
-            let window = if remote { &self.remote } else { &self.local };
-            if window.symbols.len() >= self.limits.support {
-                return Err(DecodeError::Limit);
-            }
             // Purity alone does not prove incidence in an untrusted equation.
             let mut mapping = RandomMapping::new(symbol.mapping_seed);
             while mapping.last_index() < index {
-                charge(&mut self.work)?;
                 mapping.next_index();
             }
             if mapping.last_index() != index {
@@ -218,17 +245,14 @@ impl ResidualDecoder {
             }
             self.recovered.insert(&Entry::new(&symbol.symbol.0));
             let mut mapping = RandomMapping::new(symbol.mapping_seed);
-            while mapping.last_index() < self.cells.len() {
-                charge(&mut self.work)?;
+            while mapping.last_index() < self.rows.len() {
                 let mapped = mapping.last_index();
-                self.zeros -= usize::from(zero(&self.cells[mapped]));
-                apply(
-                    &mut self.cells[mapped],
-                    &symbol,
-                    if remote { -1 } else { 1 },
-                )?;
-                self.zeros += usize::from(zero(&self.cells[mapped]));
-                self.enqueue(mapped)?;
+                let mut row = self.rows.get(mapped).expect("mapped below len");
+                self.zeros -= usize::from(zero(&row.cell));
+                apply(&mut row.cell, &symbol, if remote { -1 } else { 1 })?;
+                self.zeros += usize::from(zero(&row.cell));
+                self.enqueue(mapped, &mut row);
+                self.rows.set(mapped, &row);
                 mapping.next_index();
             }
             let window = if remote {
@@ -236,17 +260,15 @@ impl ResidualDecoder {
             } else {
                 &mut self.local
             };
-            window.insert(symbol, mapping);
+            window.insert(symbol, mapping)?;
         }
         Ok(())
     }
 
-    fn enqueue(&mut self, index: usize) -> Result<(), DecodeError> {
-        charge(&mut self.work)?;
-        if !self.queued[index] && self.cells[index].is_pure_with_key(Some(&self.key)) {
-            self.queued[index] = true;
+    fn enqueue(&mut self, index: usize, row: &mut Row) {
+        if !row.queued && row.cell.is_pure_with_key(Some(&self.key)) {
+            row.queued = true;
             self.ready.push_back(index);
         }
-        Ok(())
     }
 }

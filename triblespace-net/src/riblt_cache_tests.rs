@@ -12,7 +12,10 @@ use triblespace_core::repo::{SnapshotSource, StoreChanges, StoreSnapshot as _};
 
 use crate::exchange::Tree;
 use crate::host::StoreSnapshot;
-use crate::riblt_cache::{CacheError, Cell, Generation, INITIAL_CELLS, KeySymbol, MAX_CELLS};
+use crate::riblt_cache::{
+    CacheError, Cell, Generation, INHERITED_CELLS, INITIAL_CELLS, KeySymbol, MAX_INDEX,
+};
+use crate::riblt_store::CHUNK;
 use crate::walk::WalkKind;
 use crate::walk::tests::walking::{Node, open};
 
@@ -198,12 +201,108 @@ fn riblt_cache_empty_source_and_exhaustion_do_not_publish_false_cells() {
     exact_prefix(&generation, INITIAL_CELLS + 1);
     let prepared = generation.prepared().unwrap();
     let first = generation.cell(0).unwrap();
-    for index in [MAX_CELLS, usize::MAX] {
+    // Only the wire's u32 index domain is a ceiling.
+    for index in [MAX_INDEX + 1, usize::MAX] {
         assert_eq!(generation.cell(index).unwrap_err(), CacheError::Exhausted);
         assert_eq!(generation.prepared().unwrap(), prepared);
         same_cell(&generation.cell(0).unwrap(), &first, 0);
     }
     assert_eq!(generation.summary().leaf_count(), 0);
+}
+
+#[test]
+fn riblt_cache_grows_past_the_retired_cell_budget_in_file_backed_chunks() {
+    // 1_048_576 cells was the retired MAX_CELLS. Growth past it maps more
+    // chunks, keeps every earlier cell, and still matches upstream exactly.
+    let retired = 1 << 20;
+    let generation = Generation::advance(
+        CollectionHandle::new([25; 32]),
+        WalkKind::References,
+        references(0..64),
+        None,
+    )
+    .unwrap();
+    let early: Vec<_> = (0..INITIAL_CELLS)
+        .map(|index| generation.cell(index).unwrap())
+        .collect();
+    generation.cell(retired).unwrap();
+    assert_eq!(generation.prepared().unwrap(), retired * 2);
+    assert_eq!(
+        generation.retained_bytes().unwrap(),
+        retired * 2 / CHUNK * CHUNK * std::mem::size_of::<Cell>()
+    );
+    for (index, cell) in early.iter().enumerate() {
+        same_cell(&generation.cell(index).unwrap(), cell, index);
+    }
+    exact_prefix(&generation, retired + 1);
+    // An edit inherits at most INHERITED_CELLS cells, keeps the old lease
+    // whole, and prepares the rest again, exactly, only when asked.
+    let Tree::References(mut edited) = generation.source().clone() else {
+        unreachable!()
+    };
+    edited.insert(&Entry::new(&bytes(64)));
+    let next = Generation::advance(
+        CollectionHandle::new([25; 32]),
+        WalkKind::References,
+        Tree::References(edited),
+        Some(&generation),
+    )
+    .unwrap();
+    assert_eq!(next.prepared().unwrap(), INHERITED_CELLS);
+    assert_eq!(
+        next.retained_bytes().unwrap(),
+        INHERITED_CELLS * std::mem::size_of::<Cell>()
+    );
+    assert_eq!(generation.prepared().unwrap(), retired * 2);
+    exact_prefix(&next, retired + 1);
+    assert_eq!(next.prepared().unwrap(), retired * 2);
+    exact_prefix(&generation, 4096);
+    // A small prefix is inherited whole.
+    let small = Generation::advance(
+        CollectionHandle::new([26; 32]),
+        WalkKind::References,
+        references(0..8),
+        None,
+    )
+    .unwrap();
+    small.cell(INITIAL_CELLS).unwrap();
+    let small_next = Generation::advance(
+        CollectionHandle::new([26; 32]),
+        WalkKind::References,
+        references(0..9),
+        Some(&small),
+    )
+    .unwrap();
+    assert_eq!(small_next.prepared().unwrap(), 2 * INITIAL_CELLS);
+    exact_prefix(&small_next, 2 * INITIAL_CELLS + 1);
+}
+
+#[test]
+fn riblt_cache_failed_growth_reserves_no_unpublished_chunks() {
+    let generation = Generation::advance(
+        CollectionHandle::new([27; 32]),
+        WalkKind::References,
+        references(0..8),
+        None,
+    )
+    .unwrap();
+    generation.cell(0).unwrap();
+    let prepared = generation.prepared().unwrap();
+    let bytes = generation.retained_bytes().unwrap();
+    assert_eq!(bytes, CHUNK * std::mem::size_of::<Cell>());
+    // Doubling to 4 * CHUNK needs three more chunks; the second one fails.
+    crate::riblt_store::fail_chunks_after(Some(1));
+    let failed = generation.cell(3 * CHUNK);
+    crate::riblt_store::fail_chunks_after(None);
+    assert_eq!(failed.unwrap_err(), CacheError::Storage);
+    assert_eq!(generation.prepared().unwrap(), prepared);
+    assert_eq!(
+        generation.retained_bytes().unwrap(),
+        bytes,
+        "the chunk mapped before the failure is dropped again"
+    );
+    exact_prefix(&generation, 4 * CHUNK);
+    assert_eq!(generation.prepared().unwrap(), 4 * CHUNK);
 }
 
 #[test]

@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, DuplexStream, ReadHalf, WriteHalf};
 use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy};
 
 use crate::exchange::Failure;
-use crate::riblt_cache::{CacheError, MAX_CELLS};
+use crate::riblt_cache::CacheError;
 use crate::transport::sim::{SimConfig, SimNet};
 use crate::walk::tests::walking::{Node, open};
 use crate::walk_stream::Algorithm;
@@ -221,7 +221,8 @@ fn riblt_runtime_large_source_summaries_do_not_impose_a_small_absolute_n_limit()
         WalkKind::References,
     ] {
         let cache = local.pinned(collection).cache(kind);
-        for count in [MAX_CELLS as u64 + 1, i64::MAX as u64] {
+        // The retired cell budget plus one, and the largest i64 count.
+        for count in [(1 << 20) + 1, i64::MAX as u64] {
             let summary = PatchSummary::new(Some([0x44; 32]), count).unwrap();
             let mut exchange = Exchange::start_riblt(collection, kind, local.pinned(collection));
             assert!(
@@ -275,13 +276,15 @@ fn riblt_runtime_large_source_summaries_do_not_impose_a_small_absolute_n_limit()
 }
 
 #[test]
-fn riblt_runtime_large_source_still_bounds_actual_residual_difference() {
+fn riblt_runtime_residual_counts_are_bounded_by_the_peer_root_not_a_budget() {
     let (local, _, collection, _) = pair();
-    let advertised = MAX_CELLS as u64 + 100;
+    // Above the retired 1_048_576 decoder support: only the peer root bounds it.
+    let advertised = (1 << 21) + 100;
     for (count, failure) in [
-        (MAX_CELLS as i64 + 1, Failure::ResourceLimit),
-        (advertised as i64 + 1, Failure::Protocol),
-        (-1, Failure::Protocol),
+        ((1 << 21) + 1, None),
+        (advertised as i64, None),
+        (advertised as i64 + 1, Some(Failure::Protocol)),
+        (-1, Some(Failure::Protocol)),
     ] {
         let mut exchange = receiver(&local, collection);
         exchange.on_frame(
@@ -300,7 +303,8 @@ fn riblt_runtime_large_source_still_bounds_actual_residual_difference() {
             },
             Some(local.snapshot()),
         );
-        assert_eq!(exchange.outcome(), Some(Outcome::Failed(failure)));
+        assert_eq!(exchange.outcome(), failure.map(Outcome::Failed));
+        assert!(!exchange.discovery_stopped());
         assert!(exchange.end().agreed.is_none());
     }
 }
@@ -393,6 +397,7 @@ fn riblt_runtime_transient_cow_frontier_can_exceed_absolute_source_limit() {
 #[test]
 fn riblt_runtime_local_cache_failures_are_not_malformed_peer_errors() {
     assert_eq!(Failure::from(CacheError::Exhausted), Failure::ResourceLimit);
+    assert_eq!(Failure::from(CacheError::Storage), Failure::ResourceLimit);
     assert_eq!(
         Failure::from(CacheError::Poisoned),
         Failure::CacheUnavailable
@@ -402,7 +407,7 @@ fn riblt_runtime_local_cache_failures_are_not_malformed_peer_errors() {
         Failure::CacheUnavailable
     );
     assert_eq!(
-        Failure::from(crate::riblt_decode::DecodeError::Limit),
+        Failure::from(crate::riblt_decode::DecodeError::Storage),
         Failure::ResourceLimit
     );
 }
@@ -1441,4 +1446,186 @@ async fn riblt_runtime_task_retains_prefix_agreement_but_releases_cached_source_
         assert_eq!(pair.confirmed.commits, Some(source_summary));
         assert_eq!(pair.received.commits, Some(source_summary));
     }
+}
+
+/// Anonymous and file-backed resident memory, from /proc/self/status.
+fn rss_kib() -> (u64, u64) {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
+            .unwrap_or(0)
+    };
+    (field("RssAnon:"), field("RssFile:") + field("RssShmem:"))
+}
+
+/// The 2026-10-27 incident shape, beyond every retired budget: 1,500,000
+/// differing held references need about two million cells (MAX_CELLS was
+/// 1,048,576) and recover 1,200,000 keys of one sign (MAX_SUPPORT and
+/// FLOOD_LOCATORS were 1,048,576 each). Both production exchanges run in
+/// lockstep, every fetch is answered with the real blob and every landing is
+/// acknowledged at once; both must confirm the same union.
+///
+/// Too slow and large for the default suite. Run it explicitly:
+/// `cargo test --release -p triblespace-net riblt_runtime_reference_difference_beyond_retired_budgets -- --ignored --nocapture`
+#[test]
+#[ignore = "1.5M-key difference; run explicitly in release"]
+fn riblt_runtime_reference_difference_beyond_retired_budgets_converges() {
+    const SHARED: u64 = 100_000;
+    const LOCAL_ONLY: u64 = 300_000;
+    const PEER_ONLY: u64 = 1_200_000;
+    const RETIRED: usize = 1 << 20;
+    let started = std::time::Instant::now();
+    let mut local = Node::new(223);
+    let mut peer = Node::new(224);
+    let collection = local.hold("riblt-unbounded-references", open());
+    assert_eq!(peer.hold("riblt-unbounded-references", open()), collection);
+    local.observe();
+    peer.observe();
+    let blob = |n: u64| Blob::<UnknownBlob>::new(Bytes::from_source(n.to_be_bytes().to_vec()));
+    let mut handles: Vec<([u8; 32], u64)> = (0..SHARED + LOCAL_ONLY + PEER_ONLY)
+        .map(|n| (blob(n).get_handle().raw, n))
+        .collect();
+    let held = |numbers: &mut dyn Iterator<Item = u64>| {
+        let mut patch = PATCH::<32, IdentitySchema, (), Blake3Merkle>::new();
+        for n in numbers {
+            patch.insert(&Entry::new(&handles[n as usize].0));
+        }
+        patch
+    };
+    let all = held(&mut (0..SHARED + LOCAL_ONLY + PEER_ONLY));
+    let a_pin = local
+        .pinned(collection)
+        .with_inventory(held(&mut (0..SHARED + LOCAL_ONLY)));
+    let b_pin = peer.pinned(collection).with_inventory(held(
+        &mut (0..SHARED).chain(SHARED + LOCAL_ONLY..SHARED + LOCAL_ONLY + PEER_ONLY),
+    ));
+    handles.sort_unstable();
+    let body = |handle: [u8; 32]| {
+        let at = handles
+            .binary_search_by_key(&handle, |(key, _)| *key)
+            .unwrap();
+        blob(handles[at].1)
+    };
+    let (a_snapshot, b_snapshot) = (local.snapshot(), peer.snapshot());
+    let kind = WalkKind::References;
+    let mut a = Exchange::start_riblt(collection, kind, a_pin.clone());
+    let mut b = Exchange::start_riblt(collection, kind, b_pin.clone());
+    let fixture = started.elapsed();
+    let baseline = rss_kib();
+    let started = std::time::Instant::now();
+
+    let mut a_fetches = VecDeque::new();
+    let mut b_fetches = VecDeque::new();
+    let collect = |outs: Vec<Out>, fetches: &mut VecDeque<[u8; 32]>| {
+        for out in outs {
+            match out {
+                Out::Fetch(handle) => fetches.push_back(handle),
+                other => panic!("unexpected discovery work: {other:?}"),
+            }
+        }
+    };
+    let (mut a_sent, mut b_sent) = (0, 0);
+    loop {
+        let mut moved = false;
+        if let Some(frame) = a.next_delta() {
+            if matches!(frame, Frame::RibltCell { .. }) {
+                a_sent += 1;
+                assert!(a.on_written(a_sent).is_empty());
+            } else {
+                assert!(a.on_root_written().is_empty());
+            }
+            collect(b.on_frame(frame, Some(b_snapshot.clone())), &mut b_fetches);
+            moved = true;
+        }
+        if let Some(frame) = b.next_delta() {
+            if matches!(frame, Frame::RibltCell { .. }) {
+                b_sent += 1;
+                assert!(b.on_written(b_sent).is_empty());
+            } else {
+                assert!(b.on_root_written().is_empty());
+            }
+            collect(a.on_frame(frame, Some(a_snapshot.clone())), &mut a_fetches);
+            moved = true;
+        }
+        assert_eq!(a.outcome(), None, "after {a_sent} cells");
+        assert_eq!(b.outcome(), None, "after {b_sent} cells");
+        if !moved {
+            break;
+        }
+    }
+    assert!(a.discovery_stopped() && b.discovery_stopped());
+    assert!(
+        a_sent > RETIRED && b_sent > RETIRED,
+        "{a_sent}/{b_sent} cells"
+    );
+    let discovery = started.elapsed();
+    let peak = rss_kib();
+    let a_prepared = a_pin.cache(kind).prepared().unwrap();
+    let a_file = a_pin.cache(kind).retained_bytes().unwrap();
+
+    // Fetch, land and acknowledge until both sides can finish; each FIN
+    // reaches the other side once.
+    let (mut a_fin, mut b_fin) = (false, false);
+    let (mut a_fetched, mut b_fetched) = (0u64, 0u64);
+    loop {
+        let mut moved = false;
+        for (exchange, fetches, fetched) in [
+            (&mut a, &mut a_fetches, &mut a_fetched),
+            (&mut b, &mut b_fetches, &mut b_fetched),
+        ] {
+            while let Some(handle) = fetches.pop_front() {
+                moved = true;
+                *fetched += 1;
+                let mut outs = VecDeque::from(exchange.on_fetched(handle, Some(body(handle))));
+                while let Some(out) = outs.pop_front() {
+                    match out {
+                        Out::Fetch(handle) => fetches.push_back(handle),
+                        Out::Land(events) => {
+                            assert!(matches!(
+                                &events[..],
+                                [NetEvent::Blob(_), NetEvent::Held { .. }]
+                            ));
+                            outs.extend(exchange.on_landed_ack(events.len() as u64, 0));
+                        }
+                        other => panic!("unexpected completion work: {other:?}"),
+                    }
+                }
+            }
+        }
+        if a.ready_to_finish() && !a_fin {
+            a_fin = true;
+            moved = true;
+            collect(b.on_fin(), &mut b_fetches);
+        }
+        if b.ready_to_finish() && !b_fin {
+            b_fin = true;
+            moved = true;
+            collect(a.on_fin(), &mut a_fetches);
+        }
+        if !moved {
+            break;
+        }
+    }
+    assert_eq!(a.outcome(), Some(Outcome::Confirmed));
+    assert_eq!(b.outcome(), Some(Outcome::Confirmed));
+    assert_eq!((a_fetched, b_fetched), (PEER_ONLY, LOCAL_ONLY));
+    let (a_end, b_end) = (a.end(), b.end());
+    let union = crate::exchange::Tree::References(all).summary();
+    let a_agreed = a_end.agreed.unwrap().summary();
+    assert_eq!(a_agreed, b_end.agreed.unwrap().summary());
+    assert_eq!(a_agreed, union);
+    assert_eq!(union.leaf_count(), SHARED + LOCAL_ONLY + PEER_ONLY);
+    eprintln!(
+        "RIBLT_UNBOUNDED_RECEIPT sample=1 shared={SHARED} local_only={LOCAL_ONLY} peer_only={PEER_ONLY} cells_a_sent={a_sent} cells_b_sent={b_sent} a_cache_prepared={a_prepared} a_cache_file_bytes={a_file} fixture_ms={} discovery_ms={} total_exchange_ms={} rss_anon_kib_baseline={} rss_file_kib_baseline={} rss_anon_kib_after_discovery={} rss_file_kib_after_discovery={}",
+        fixture.as_millis(),
+        discovery.as_millis(),
+        started.elapsed().as_millis(),
+        baseline.0,
+        baseline.1,
+        peak.0,
+        peak.1,
+    );
 }

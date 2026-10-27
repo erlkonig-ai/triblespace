@@ -3,6 +3,10 @@
 //! Cached mode binds a shared source/cache generation, peels full-source cell
 //! differences with eager bodies, and proves the native peer root before stopping
 //! at a completed-write frontier. It never subtracts connection agreement G.
+//! Its cells, residual rows and recovered keys grow with the difference in
+//! file-backed chunks; no configured budget fails them. A session that never
+//! decodes ends at the structural cell bound from both ROOT counts
+//! (`riblt_cache::cell_bound`), the u32 index domain, or the progress deadline.
 //! Its local landing readiness permits FIN independently of peer FIN. The
 //! driver drains all outgoing frames, half-closes, and continues receiving;
 //! fresh late-body insertion debt must settle before final confirmation.
@@ -62,7 +66,7 @@ use crate::grants::{Gate, Gated, ResourceGrants};
 use crate::host::{CollectionSnapshot, StoreSnapshot};
 use crate::patch_repair::PatchSummary;
 use crate::protocol::RawHash;
-use crate::riblt_cache::{CacheError, Cell, Generation, KeySymbol, MAX_CELLS};
+use crate::riblt_cache::{CacheError, Cell, Generation, KeySymbol, cell_bound};
 use crate::riblt_decode::{DecodeError, ResidualDecoder};
 use crate::walk::{
     Admit, KEY_BYTES, MAX_WALK_REQUESTS, MAX_WALK_UNLANDED, Value, WalkKind, admit_fetched,
@@ -406,7 +410,9 @@ pub(crate) enum Failure {
     /// The reconstructed peer delta is not its advertised complete tree.
     CountMismatch,
     InsertFailed,
-    /// A local configured cell/proof limit, not malformed peer data or success.
+    /// A local limit, not malformed peer data or success: a Prefix proof
+    /// budget, the cached cell bound from both ROOT counts, the u32 cell index
+    /// domain, or temporary storage that could not be reserved.
     ResourceLimit,
     /// A poisoned cache or local count invariant failure.
     CacheUnavailable,
@@ -415,7 +421,7 @@ pub(crate) enum Failure {
 impl From<CacheError> for Failure {
     fn from(error: CacheError) -> Self {
         match error {
-            CacheError::Exhausted => Self::ResourceLimit,
+            CacheError::Exhausted | CacheError::Storage => Self::ResourceLimit,
             CacheError::Poisoned | CacheError::CountOverflow => Self::CacheUnavailable,
         }
     }
@@ -424,7 +430,7 @@ impl From<CacheError> for Failure {
 impl From<DecodeError> for Failure {
     fn from(error: DecodeError) -> Self {
         match error {
-            DecodeError::Limit => Self::ResourceLimit,
+            DecodeError::Storage => Self::ResourceLimit,
             DecodeError::Invalid | DecodeError::CountOverflow => Self::Protocol,
         }
     }
@@ -458,7 +464,10 @@ pub(crate) struct Exchange {
     offers: Option<Offers>,
     collection: CollectionHandle,
     kind: WalkKind,
-    pinned: Pinned,
+    /// The pinned `kind` tree only. Holding the whole pin would keep its
+    /// collection snapshot, and with it the snapshot's RIBLT generations and
+    /// their mapped cells, alive for the exchange's whole life.
+    pinned: Tree,
     /// What a grant walk keeps of what it receives.
     gate: Option<Gate>,
     /// Peer keys accounted for but not kept here: skipped, or pending. They
@@ -502,8 +511,12 @@ pub(crate) struct Exchange {
 
 /// Per-exchange residual decoder only: no full encoder or copied cell prefix.
 /// The peer membership proof is the existing native `Exchange::peer` PATCH.
+/// `cache` is the exchange's only lease on its generation (`pinned` keeps
+/// just the tree). Once discovery stops it is released and the decoder keeps
+/// only its recovered windows: the fetch/landing and peer-FIN stages have no
+/// frame deadline, so they must not pin per-cell state.
 struct Riblt {
-    cache: Arc<Generation>,
+    cache: Option<Arc<Generation>>,
     decoder: ResidualDecoder,
     generated: usize,
     written: usize,
@@ -515,6 +528,9 @@ struct Riblt {
     proven: bool,
     values: PATCH<32, IdentitySchema, ()>,
     eager: usize,
+    /// [`cell_bound`] of the two ROOT counts, set when the peer ROOT arrives:
+    /// neither side sends or accepts a cell at or beyond it.
+    bound: usize,
 }
 
 impl Exchange {
@@ -541,7 +557,7 @@ impl Exchange {
             offers: None,
             collection,
             kind,
-            pinned,
+            pinned: mine,
             gate,
             excluded: PATCH::new(),
             skipped: 0,
@@ -600,7 +616,7 @@ impl Exchange {
         exchange.peer = exchange.delta.clone();
         exchange.riblt = Some(Riblt {
             decoder: ResidualDecoder::with_key(cache.key()),
-            cache,
+            cache: Some(cache),
             generated: 0,
             written: 0,
             root_written: false,
@@ -611,6 +627,7 @@ impl Exchange {
             proven: false,
             values: PATCH::new(),
             eager: 0,
+            bound: 0,
         });
         exchange
     }
@@ -762,9 +779,15 @@ impl Exchange {
                 return None;
             }
             let r = self.riblt.as_mut().unwrap();
-            match r.cache.cell(r.generated) {
-                Ok(cell) => {
-                    let index = r.generated as u32;
+            if r.generated >= r.bound {
+                self.fail(Failure::ResourceLimit);
+                return None;
+            }
+            let cache = r.cache.as_ref().expect("released only after discovery");
+            // The cache refuses indices beyond the u32 domain; never wrap.
+            let index = u32::try_from(r.generated).map_err(|_| CacheError::Exhausted);
+            match index.and_then(|index| Ok((index, cache.cell(r.generated)?))) {
+                Ok((index, cell)) => {
                     r.generated += 1;
                     return Some(Frame::RibltCell {
                         index,
@@ -935,7 +958,7 @@ impl Exchange {
             receives: self.receives,
             confirmed: self.landed_received,
             landed: self.landed_sent,
-            root: self.pinned.tree(self.kind).summary(),
+            root: self.pinned.summary(),
             peer_root,
             // A grant walk keeps no agreement: a key one side skipped or
             // holds pending would otherwise never be offered again on this
@@ -975,6 +998,7 @@ impl Exchange {
                     return Err(Failure::ResourceLimit);
                 }
                 self.peer_root = Some(summary);
+                r.bound = cell_bound(self.delta.summary().leaf_count(), summary.leaf_count());
                 if summary == self.delta.summary() {
                     r.decoded_at = Some(0);
                     r.proven = true;
@@ -995,16 +1019,21 @@ impl Exchange {
                 {
                     return Err(Failure::Protocol);
                 }
-                if r.received >= MAX_CELLS {
+                if r.received >= r.bound {
                     return Err(Failure::ResourceLimit);
                 }
                 r.received += 1;
                 // Once fully peeled, extra in-flight cells are harmless but are
-                // still ordered/bounded. Bodies never enter decoder windows.
+                // still ordered. Bodies never enter decoder windows.
                 if r.decoded_at.is_some() {
                     return Ok(());
                 }
-                let local = r.cache.cell(index as usize).map_err(Failure::from)?;
+                let local = r
+                    .cache
+                    .as_ref()
+                    .ok_or(Failure::Protocol)?
+                    .cell(index as usize)
+                    .map_err(Failure::from)?;
                 let count = count.checked_sub(local.count).ok_or(Failure::Protocol)?;
                 r.decoder
                     .add(Cell {
@@ -1013,23 +1042,21 @@ impl Exchange {
                         count,
                     })
                     .map_err(Failure::from)?;
-                if r.decoder.local().len() > FLOOD_LOCATORS
-                    || r.decoder.remote().len() > FLOOD_LOCATORS
-                {
-                    return Err(Failure::ResourceLimit);
-                }
-                let local: Vec<_> = r.decoder.local()[r.local..]
-                    .iter()
+                let local: Vec<_> = r
+                    .decoder
+                    .local()
+                    .iter_from(r.local)
                     .map(|s| s.symbol.0)
                     .collect();
                 r.local = r.decoder.local().len();
                 if r.decoder.decoded() {
                     r.decoded_at = Some(r.received);
+                    r.decoder.finish();
                 }
                 if r.decoded_at.is_some() {
                     let mut retained = self.delta.clone();
                     let mut removed = PATCH::<32, IdentitySchema>::new();
-                    for item in r.decoder.local() {
+                    for item in r.decoder.local().iter() {
                         let key = item.symbol.0;
                         if self.delta.at(&key).is_none() || removed.get(&key).is_some() {
                             return Err(Failure::BadNode);
@@ -1038,7 +1065,7 @@ impl Exchange {
                         retained.remove(key);
                     }
                     let mut additions = PATCH::<32, IdentitySchema, (), Blake3Merkle>::new();
-                    for item in r.decoder.remote() {
+                    for item in r.decoder.remote().iter() {
                         let key = item.symbol.0;
                         if self.delta.at(&key).is_some() || additions.get(&key).is_some() {
                             return Err(Failure::BadNode);
@@ -1137,8 +1164,7 @@ impl Exchange {
                 } else if self.agreed.as_ref().and_then(|tree| tree.at(&prefix)) == Some(declared) {
                     self.agreed.as_deref().cloned()
                 } else {
-                    let pinned = self.pinned.tree(self.kind);
-                    (pinned.at(&prefix) == Some(declared)).then_some(pinned)
+                    (self.pinned.at(&prefix) == Some(declared)).then(|| self.pinned.clone())
                 };
                 if let Some(held) = held {
                     self.peer.include_at(&held, &prefix);
@@ -1369,8 +1395,9 @@ impl Exchange {
     }
 
     /// Prefix owns a materialized delta proof. Cached mode shares the native
-    /// full source and bounds newly recovered supports/bodies instead; its
-    /// transient typed frontier may exceed either final source's cardinality.
+    /// full source; its recovered supports are file-backed and unbounded, and
+    /// only typed eager bodies keep a budget. Its transient typed frontier may
+    /// exceed either final source's cardinality.
     /// The explicit limit also permits tiny structural regression fixtures.
     pub(crate) fn proof_budget_with_limit(&self, prefix_limit: u64) -> Result<(), Failure> {
         if self.riblt.is_none() && self.peer.summary().leaf_count() > prefix_limit {
@@ -1491,6 +1518,11 @@ impl Exchange {
         // our write half has finished. Peer FIN must not erase that debt.
         if self.riblt.is_some() {
             self.landed_sent = false;
+        }
+        if self.discovery_stopped()
+            && let Some(r) = &mut self.riblt
+        {
+            r.cache = None;
         }
         // The decoder already retains its sparse difference. Drain it by cursor
         // through bounded body scheduling, not another lifetime key queue.
@@ -3410,5 +3442,111 @@ pub(crate) mod tests {
             before.has_new_keys(&tree),
             "a genuinely new key needs another exchange"
         );
+    }
+
+    #[test]
+    fn cached_cells_stop_at_the_structural_bound_from_both_root_counts() {
+        use crate::riblt_cache::cell_bound;
+        let mut local = Node::new(231);
+        let mut peer = Node::new(232);
+        let collection = local.hold("riblt-cell-bound", open());
+        assert_eq!(peer.hold("riblt-cell-bound", open()), collection);
+        peer.commit(collection, 1);
+        local.observe();
+        peer.observe();
+        let kind = WalkKind::Commit;
+        let summary = peer.pinned(collection).cache(kind).summary();
+        let bound = cell_bound(0, summary.leaf_count());
+        assert_eq!(bound, 2 + crate::riblt_cache::CELL_HEADROOM);
+        assert_eq!(cell_bound(u64::MAX, 1), u32::MAX as usize + 1);
+
+        // Receiving: a stream that never decodes is refused at the bound.
+        let mut receiver = Exchange::start_riblt(collection, kind, local.pinned(collection));
+        receiver.on_frame(Frame::RibltRoot { summary }, Some(local.snapshot()));
+        let undecodable = |index: usize| Frame::RibltCell {
+            index: index as u32,
+            symbol: [0xA5; 32],
+            hash: 0,
+            count: 0,
+        };
+        for index in 0..bound {
+            receiver.on_frame(undecodable(index), Some(local.snapshot()));
+            assert_eq!(receiver.outcome(), None, "cell {index}");
+        }
+        receiver.on_frame(undecodable(bound), Some(local.snapshot()));
+        assert_eq!(
+            receiver.outcome(),
+            Some(Outcome::Failed(Failure::ResourceLimit))
+        );
+
+        // Sending: no cell at or beyond the bound is prepared or sent.
+        let mut sender = Exchange::start_riblt(collection, kind, local.pinned(collection));
+        assert!(matches!(sender.next_delta(), Some(Frame::RibltRoot { .. })));
+        sender.on_frame(Frame::RibltRoot { summary }, Some(local.snapshot()));
+        let mut sent = 0;
+        while let Some(frame) = sender.next_delta() {
+            assert!(matches!(frame, Frame::RibltCell { index, .. } if index as usize == sent));
+            sent += 1;
+        }
+        assert_eq!(sent, bound);
+        assert_eq!(
+            sender.outcome(),
+            Some(Outcome::Failed(Failure::ResourceLimit))
+        );
+        assert!(local.pinned(collection).cache(kind).prepared().unwrap() <= 2 * bound);
+    }
+
+    #[test]
+    fn completed_cached_discovery_releases_its_generation() {
+        let mut local = Node::new(233);
+        let mut peer = Node::new(234);
+        let kind = WalkKind::References;
+        let held = |numbers: std::ops::Range<u64>| {
+            let mut patch = PATCH::<32, IdentitySchema, (), Blake3Merkle>::new();
+            for number in numbers {
+                let mut key = [0; 32];
+                key[..8].copy_from_slice(&number.to_be_bytes());
+                patch.insert(&Entry::new(&key));
+            }
+            patch
+        };
+        let collection = local.hold("riblt-generation-release", open());
+        assert_eq!(peer.hold("riblt-generation-release", open()), collection);
+        local.observe();
+        peer.observe();
+        // Private snapshots: nothing but the exchanges may hold them.
+        let a_pin = local.pinned(collection).with_inventory(held(0..40));
+        let b_pin = peer.pinned(collection).with_inventory(held(20..60));
+        let a_cache = Arc::downgrade(&a_pin.cache(kind));
+        let b_cache = Arc::downgrade(&b_pin.cache(kind));
+        let mut a = Exchange::start_riblt(collection, kind, a_pin);
+        let mut b = Exchange::start_riblt(collection, kind, b_pin);
+        let (a_snapshot, b_snapshot) = (local.snapshot(), peer.snapshot());
+        let (mut a_sent, mut b_sent) = (0, 0);
+        while !(a.discovery_stopped() && b.discovery_stopped()) {
+            assert!(a_cache.upgrade().is_some() && b_cache.upgrade().is_some());
+            let frame = a.next_delta().expect("a frame before discovery stops");
+            if matches!(frame, Frame::RibltCell { .. }) {
+                a_sent += 1;
+                a.on_written(a_sent);
+            } else {
+                a.on_root_written();
+            }
+            b.on_frame(frame, Some(b_snapshot.clone()));
+            let frame = b.next_delta().expect("a frame before discovery stops");
+            if matches!(frame, Frame::RibltCell { .. }) {
+                b_sent += 1;
+                b.on_written(b_sent);
+            } else {
+                b.on_root_written();
+            }
+            a.on_frame(frame, Some(a_snapshot.clone()));
+            assert_eq!((a.outcome(), b.outcome()), (None, None));
+        }
+        // Fetches and FIN remain, but no exchange pins cells any longer.
+        assert!(!a.ready_to_finish() && !b.ready_to_finish());
+        assert!(a_cache.upgrade().is_none(), "local generation released");
+        assert!(b_cache.upgrade().is_none(), "peer generation released");
+        assert_eq!(a.end().root.leaf_count(), 40);
     }
 }

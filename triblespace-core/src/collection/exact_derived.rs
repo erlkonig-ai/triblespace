@@ -968,7 +968,9 @@ where
 }
 
 /// Give the parent's frontier nodes their missing attachments through one
-/// mapping, acquiring what the mapping names as missing and running again.
+/// mapping. The dependencies the mapping names as missing in one pass are
+/// wanted together, asked for afterwards like any optional fetch, and the
+/// pass runs again if any was asked for ([`super::maintenance::attach_frontier`]).
 pub(crate) async fn attach_acquiring_with<S, M>(
     store: &mut S,
     attached: Collection<M::Target>,
@@ -978,12 +980,13 @@ where
     S: Store + AsyncBlobStoreAcquire,
     M: MapMapping,
 {
-    acquiring(store, |store, unfetched, _wanted, frontier| {
+    acquiring(store, |store, unfetched, wanted, frontier| {
         super::maintenance::attach_frontier::<S, M>(
             store,
             attached,
             signing_key,
             unfetched,
+            wanted,
             frontier,
         )
     })

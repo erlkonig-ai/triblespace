@@ -260,6 +260,12 @@ impl CollectionSnapshot {
         Ok(Self { repair, caches })
     }
 
+    /// This overlay holding exactly `held`, with fresh component caches.
+    #[cfg(test)]
+    pub(crate) fn with_inventory(&self, held: HeldBlobs) -> Arc<Self> {
+        Arc::new(Self::with_held(self.repair.as_ref().clone(), held, None).unwrap())
+    }
+
     pub(crate) fn cache(&self, kind: crate::walk::WalkKind) -> Arc<crate::riblt_cache::Generation> {
         use crate::walk::WalkKind;
         self.caches[match kind {

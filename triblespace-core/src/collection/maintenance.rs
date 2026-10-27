@@ -921,17 +921,43 @@ where
 /// node whose bytes or siblings are not here, or whose attachment the
 /// mapping cannot represent (`Capacity`), is descended, so its finer nodes
 /// get attachments instead: frontier nodes first, finer ones only where a
-/// frontier node cannot have one. A dependency the mapping names is
-/// acquired, and the operation runs again; one that cannot be acquired
-/// leaves that node to its finer ones, and what no node covers is a reader's
-/// residual. Only frontier nodes are maintained: an interior node a merge
-/// has consumed needs no attachment, and one a MAP gave before its merge
-/// stays in the store until a compaction collects it.
+/// frontier node cannot have one. Only frontier nodes are maintained: an
+/// interior node a merge has consumed needs no attachment, and one a MAP
+/// gave before its merge stays in the store until a compaction collects it.
+///
+/// A dependency the mapping names that is not here is wanted, not required:
+/// it goes into `wanted` as a group of its own, and the node is descended
+/// exactly as one whose bytes are not here, so one pass visits every other
+/// node and names every node's absence, instead of ending at the first.
+/// The acquiring loop asks for them together once the pass is done, within
+/// its budget of failed fetches, and runs the operation again if it asked
+/// for any ([`super::exact_derived`]). Nothing is lost by not waiting: an
+/// attachment is an index of its node and never the only way to read it --
+/// what no taken attachment covers is the reader's residual, read from the
+/// parent's own foundations -- so an absent dependency costs lag, never a
+/// wrong or a falsely complete read. The node itself gets no MAP while its
+/// dependency is absent, and its finer nodes are mapped in its place where
+/// their own dependencies are here; each such attachment is complete for its
+/// own node. A foundation whose own mapping still names an absent blob has
+/// no attachment and stays residual. Once the bytes arrive, a later pass
+/// meets the node again -- it still has no usable attachment -- and maps
+/// it; the reader then takes it, widest first, and the finer attachments
+/// beneath it are no longer selected, left in the store like any MAP a
+/// merge supersedes. A blob already asked for and not got in this call
+/// ([`Unfetched`]) is not wanted again: the node is descended for the rest
+/// of the call, and its foundations stay residual until a later call gets
+/// the bytes.
+///
+/// A mapping names one dependency per node and call of `map`, so one pass
+/// names at most one absence per node visited; the walk visits each node
+/// once, and each blob is named once per pass, so `wanted` holds at most
+/// one group per node of the parent's lattice.
 pub(super) fn attach_frontier<S, M>(
     store: &mut S,
     attached: Collection<M::Target>,
     signing_key: &SigningKey,
     unfetched: &Unfetched,
+    wanted: &mut Vec<Vec<CollectionData>>,
     frontier: &mut OperationFrontier<S::Snapshot>,
 ) -> Result<(), CollectionRealizationError>
 where
@@ -947,6 +973,9 @@ where
     let coverage = index.published().clone();
     let signer = Inline::new(signing_key.verifying_key().to_bytes());
     let host = index.host();
+    // What this pass has named in `wanted`: a parent and a finer node
+    // beneath it often need the same blob, and asking for it once is enough.
+    let mut named = BTreeSet::new();
     walk(&coverage, parent, |node, _| {
         if usable_attachment::<_, M::Target>(&planning, &coverage, attached.handle(), node)?
             .is_some()
@@ -1002,13 +1031,13 @@ where
                 Ok(true)
             }
             Err(CollectionOperationError::Capacity(_)) => Ok(false),
-            Err(CollectionOperationError::MissingDependency(member))
-                if unfetched.contains(&member) =>
-            {
-                Ok(false)
-            }
+            // Wanted, and the node descended meanwhile; once asked for and
+            // not got, only descended.
             Err(CollectionOperationError::MissingDependency(member)) => {
-                Err(CollectionRealizationError::MissingDependency { member })
+                if !unfetched.contains(&member) && named.insert(member) {
+                    wanted.push(vec![member]);
+                }
+                Ok(false)
             }
             Err(CollectionOperationError::Fatal(reason)) => {
                 Err(CollectionRealizationError::Derive {
