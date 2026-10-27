@@ -1628,7 +1628,12 @@ async fn drive<T: Transport, S: Service>(
             frame = next_frame(&mut framed, deadline), if exchange.want_read() => match frame {
                 Some(Ok(frame)) => {
                     heard_at = tokio::time::Instant::now();
-                    exchange.on_frame(frame, driver.snapshots.borrow().clone())
+                    // Clone out and let the watch guard drop before the
+                    // frame is handled: held across a long on_frame, it made
+                    // the next publish wait, and every reader queued behind
+                    // that writer blocked its worker thread.
+                    let snapshot = driver.snapshots.borrow().clone();
+                    exchange.on_frame(frame, snapshot)
                 }
                 Some(Err(code)) => {
                     duplicate = code == Some(RESET_WALK_DUPLICATE);
