@@ -3,6 +3,7 @@
 //! `cat OUT DROPPED` holds everything SOURCE held, even after OUT replaces
 //! the source and older difference files relied on frames OUT left out.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -13,9 +14,10 @@ use predicates::prelude::*;
 use tempfile::tempdir;
 use triblespace::prelude::BlobStorePut;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
-use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy};
-use triblespace_core::repo::pile::{Pile, PileRecordContent, PileRecords};
-use triblespace_core::repo::{WantRequest, WantStore};
+use triblespace_core::collection::records::CollectionRecordFingerprint;
+use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionRead};
+use triblespace_core::repo::pile::{Pile, PileFile, PileRecordContent, PileRecords};
+use triblespace_core::repo::{BlobStoreList, SnapshotSource, WantRead, WantRequest, WantStore};
 
 const FRAME_MAGIC: &str = "0371B249F0626B2ABDDB80E23EA969059D9656A5EA5A497320351F3B";
 const RETIRED_PEER_EVIDENCE: &str =
@@ -303,6 +305,65 @@ fn an_existing_dropped_destination_is_refused_before_any_work() {
         .failure()
         .stderr(predicate::str::contains("same path"));
     assert!(!out.exists());
+}
+
+/// What a reader replaying `path` holds: blob handles, collection record
+/// fingerprints and WANTs.
+fn replayed(
+    path: &Path,
+) -> (
+    BTreeSet<[u8; 32]>,
+    BTreeSet<CollectionRecordFingerprint>,
+    BTreeSet<WantRequest>,
+) {
+    let mut file = PileFile::open_read_only(path).unwrap();
+    let snapshot = file.snapshot().unwrap();
+    let blobs = snapshot
+        .blobs()
+        .map(|info| info.unwrap().handle.raw)
+        .collect();
+    let records = snapshot
+        .records()
+        .unwrap()
+        .map(|record| record.unwrap().fingerprint())
+        .collect();
+    let wants = snapshot.wants().unwrap().map(Result::unwrap).collect();
+    drop(snapshot);
+    file.close().unwrap();
+    (blobs, records, wants)
+}
+
+/// The oracle independent of subtract's own classification: a reader of
+/// `cat OUT DROPPED` holds everything a reader of the source holds.
+#[test]
+fn cat_out_dropped_replays_everything_the_source_held() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source.pile");
+    build_source(&source, 12);
+    let (blobs, records, wants) = replayed(&source);
+
+    for drop in [false, true] {
+        let out = dir.path().join(format!("out-{drop}.pile"));
+        let dropped = dir.path().join(format!("dropped-{drop}.pile"));
+        compact(&source, &out, &dropped, None, drop)
+            .assert()
+            .success();
+        let union = dir.path().join(format!("union-{drop}.pile"));
+        let mut bytes = std::fs::read(&out).unwrap();
+        bytes.extend(std::fs::read(&dropped).unwrap());
+        std::fs::write(&union, bytes).unwrap();
+
+        let (held_blobs, held_records, held_wants) = replayed(&union);
+        assert!(blobs.is_subset(&held_blobs), "drop-collection: {drop}");
+        assert!(records.is_subset(&held_records), "drop-collection: {drop}");
+        assert!(wants.is_subset(&held_wants), "drop-collection: {drop}");
+        if drop {
+            // The witness: OUT alone lacks some of it, so DROPPED did work.
+            let (out_blobs, out_records, _) = replayed(&out);
+            assert!(!blobs.is_subset(&out_blobs));
+            assert!(!records.is_subset(&out_records));
+        }
+    }
 }
 
 /// OUT appears under its own name only once DROPPED is complete, so a run
