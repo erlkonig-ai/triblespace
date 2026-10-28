@@ -456,3 +456,65 @@ fn a_failed_dropped_write_leaves_no_compaction_output() {
     assert!(!dropped.exists());
     assert_eq!(std::fs::read_dir(&yard).unwrap().count(), 0);
 }
+
+/// Flip one payload byte of the blob frame holding exactly `text`, so the
+/// frame fails its hash.
+fn corrupt_blob(path: &Path, text: &str) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let offset = PileRecords::open(path)
+        .unwrap()
+        .find_map(|record| match record.unwrap().content {
+            PileRecordContent::Blob {
+                data_offset,
+                data_len,
+                ..
+            } if bytes[data_offset..data_offset + data_len] == *text.as_bytes() => {
+                Some(data_offset)
+            }
+            _ => None,
+        })
+        .expect("the blob frame is in the pile");
+    bytes[offset] ^= 0x20;
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// `--drop-collection` does not carry an unrooted blob whose only occurrence
+/// is corrupt, so the compaction succeeds and its difference pass meets the
+/// corrupt frame. The refusal advises --allow-corrupt, which compact must
+/// then accept, omitting the frame and saying so.
+#[test]
+fn an_unreached_corrupt_blob_is_refused_until_compact_allows_corrupt() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source.pile");
+    build_source(&source, 3);
+    corrupt_blob(&source, "unrooted payload 1");
+    let out = dir.path().join("out.pile");
+    let dropped = dir.path().join("dropped.pile");
+
+    compact(&source, &out, &dropped, None, true)
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("fail hash validation")
+                .and(predicate::str::contains("--allow-corrupt")),
+        );
+    assert!(!out.exists() && !dropped.exists());
+
+    compact(&source, &out, &dropped, None, true)
+        .arg("--allow-corrupt")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("corrupt blob frames skipped: 1"));
+    check(&source, &out, &dropped, None)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--allow-corrupt"));
+    check(&source, &out, &dropped, None)
+        .arg("--allow-corrupt")
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("missing: 0")
+                .and(predicate::str::contains("corrupt blob frames without a valid copy: 1")),
+        );
+}

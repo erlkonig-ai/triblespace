@@ -263,16 +263,34 @@ impl Side {
     }
 }
 
+/// What tells two files apart: device and inode where there are such.
 #[cfg(unix)]
-fn file_identity(path: &Path) -> Result<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt as _;
+pub(super) type FileIdentity = (u64, u64);
+#[cfg(not(unix))]
+pub(super) type FileIdentity = PathBuf;
+
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Result<FileIdentity> {
     let metadata = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    opened_identity(&metadata, path)
+}
+
+#[cfg(not(unix))]
+fn file_identity(path: &Path) -> Result<FileIdentity> {
+    fs::canonicalize(path).with_context(|| format!("resolve {}", path.display()))
+}
+
+/// The identity of the file `metadata` describes, taken from a handle open
+/// on `path`. Without inodes it falls back to `path`'s canonical form.
+#[cfg(unix)]
+pub(super) fn opened_identity(metadata: &fs::Metadata, _path: &Path) -> Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
     Ok((metadata.dev(), metadata.ino()))
 }
 
 #[cfg(not(unix))]
-fn file_identity(path: &Path) -> Result<PathBuf> {
-    fs::canonicalize(path).with_context(|| format!("resolve {}", path.display()))
+pub(super) fn opened_identity(_metadata: &fs::Metadata, path: &Path) -> Result<FileIdentity> {
+    file_identity(path)
 }
 
 /// Refuse unless every path names a different existing file.
@@ -337,6 +355,7 @@ pub(super) fn run(request: Request) -> Result<()> {
             into,
             request.allow_corrupt,
             request.source_prefix,
+            None,
         )?
         .print();
         Ok(())
@@ -423,18 +442,42 @@ pub(super) struct Difference {
 /// Write SOURCE (or its first `source_prefix` bytes) minus MINUS into the
 /// fresh file `into`: written to a hidden sibling, synced, and published by
 /// hard link, so `into` either does not exist or holds the whole difference.
+///
+/// SOURCE is opened by path. With `expected_source`, the identity of a file
+/// the caller already read there, a path that names another file once the
+/// scan has opened it is refused: the caller's file was replaced, and the
+/// replacement minus MINUS is not what the caller meant.
 pub(super) fn write_difference(
     source: &Path,
     minus: &Path,
     into: &Path,
     allow_corrupt: bool,
     source_prefix: Option<u64>,
+    expected_source: Option<&FileIdentity>,
 ) -> Result<Difference> {
     refuse_existing(into)?;
     require_distinct(&[source, minus])?;
 
     let minus_side = Side::open(minus)?;
-    let mut scan = match open_source(source, source_prefix) {
+    let opened = open_source(source, source_prefix).and_then(|scan| {
+        let Some(expected) = expected_source else {
+            return Ok(scan);
+        };
+        match file_identity(source) {
+            Ok(found) if found == *expected => Ok(scan),
+            found => bail!(
+                "refusing: {} was replaced after it was read: the file read there was {:?}, \
+                 but the path now names {}; its frames are not the ones that were read",
+                source.display(),
+                expected,
+                match found {
+                    Ok(found) => format!("{found:?}"),
+                    Err(error) => format!("no readable file ({error:#})"),
+                }
+            ),
+        }
+    });
+    let mut scan = match opened {
         Ok(scan) => scan,
         Err(error) => {
             let _ = minus_side.close();

@@ -106,6 +106,14 @@ pub enum PileCommand {
         /// like a finished one.
         #[arg(long = "dropped-into", value_name = "DROPPED")]
         dropped_into: Option<PathBuf>,
+        /// With --dropped-into: omit from DROPPED the source blob frames that
+        /// fail hash validation and have no valid copy, instead of refusing,
+        /// and count them, as `pile subtract --allow-corrupt` does. Under
+        /// --drop-collection such a blob is not carried when nothing reaches
+        /// it, so without this flag the run refuses after the compaction.
+        /// Check the result with `pile subtract --check --allow-corrupt`.
+        #[arg(long, requires = "dropped_into")]
+        allow_corrupt: bool,
     },
     /// Write SOURCE minus MINUS as a fresh difference pile, read-only on both.
     ///
@@ -398,6 +406,7 @@ pub fn run(cmd: PileCommand) -> Result<()> {
             drop_collection,
             source_prefix,
             dropped_into,
+            allow_corrupt,
         } => compact::run(compact::Request {
             source,
             into,
@@ -405,6 +414,7 @@ pub fn run(cmd: PileCommand) -> Result<()> {
             drop_collection,
             source_prefix,
             dropped_into,
+            allow_corrupt,
         }),
         PileCommand::Subtract {
             source,

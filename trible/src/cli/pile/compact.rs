@@ -40,6 +40,11 @@
 //! difference generation, written as exhaust of the run that drops it. The
 //! destination is published only after DROPPED is: a compacted pile without
 //! its dropped frames is the one result that must not look finished.
+//! The difference pass opens the source by path again, so it refuses unless
+//! that path still names the file the compaction read (device and inode).
+//! `--allow-corrupt` is passed to it: a blob frame that fails its hash, has
+//! no valid copy, and is not carried (possible under `--drop-collection`) is
+//! then omitted from DROPPED and counted, instead of refusing.
 //!
 //! The record census is lock-free. On a source a writer is appending to it
 //! can map an append still in flight; when the file grew while the census
@@ -279,6 +284,14 @@ impl CollectionFrameFilter for ExcludeCollections<'_> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Runs between the compaction and its difference pass: a test replaces
+    /// the source there.
+    static BEFORE_DIFFERENCE: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// What `pile compact` is asked to do.
 pub(super) struct Request {
     pub source: PathBuf,
@@ -287,6 +300,7 @@ pub(super) struct Request {
     pub drop_collection: Vec<String>,
     pub source_prefix: Option<u64>,
     pub dropped_into: Option<PathBuf>,
+    pub allow_corrupt: bool,
 }
 
 pub(super) fn run(request: Request) -> Result<()> {
@@ -297,6 +311,7 @@ pub(super) fn run(request: Request) -> Result<()> {
         drop_collection,
         source_prefix,
         dropped_into,
+        allow_corrupt,
     } = request;
     let drained = drop_drained
         .iter()
@@ -344,11 +359,20 @@ pub(super) fn run(request: Request) -> Result<()> {
             .map_err(|error| super::pile_read_error(&source_path, error))?,
         None => super::open_refreshed(&source_path)?,
     };
-    let source_permissions = match source.backing_file_metadata() {
-        Ok(metadata) => metadata.permissions(),
+    // The difference pass reopens the source by path once this handle is
+    // closed; the identity of the file compacted here is what it must find.
+    let source_stat = source
+        .backing_file_metadata()
+        .map_err(|error| anyhow!(error))
+        .and_then(|metadata| {
+            let identity = super::subtract::opened_identity(&metadata, &source_path)?;
+            Ok((metadata.permissions(), identity))
+        });
+    let (source_permissions, source_identity) = match source_stat {
+        Ok(stat) => stat,
         Err(error) => {
             let _ = source.close();
-            return Err(anyhow!(error).context("stat source pile"));
+            return Err(error.context("stat source pile"));
         }
     };
     let stable_source_len = match observed_source_len(&source, "after replay") {
@@ -527,13 +551,18 @@ pub(super) fn run(request: Request) -> Result<()> {
                 "Compaction: writing the frames it dropped into {}...",
                 dropped_path.display()
             );
+            #[cfg(test)]
+            if let Some(hook) = BEFORE_DIFFERENCE.take() {
+                hook();
+            }
             match super::subtract::write_difference(
                 &source_path,
                 &building,
                 dropped_path,
-                false,
-                // Exactly the bytes the compaction read.
+                allow_corrupt,
+                // Exactly the bytes the compaction read, of the file it read.
                 Some(stable_source_len),
+                Some(&source_identity),
             ) {
                 Ok(difference) => Some(difference.against(&destination_path)),
                 Err(error) => {
@@ -808,6 +837,63 @@ mod tests {
         assert!(rendered.contains("malformed or incomplete known record"));
         assert!(rendered.contains("amputate"), "{rendered}");
         assert!(!rendered.contains("changed while being read"));
+    }
+
+    /// A pile of blob frames holding `texts`, in order.
+    fn pile_of(path: &Path, texts: &[&str]) {
+        use triblespace_core::blob::encodings::utf8string::UTF8String;
+        use triblespace_core::repo::BlobStorePut;
+
+        create_fresh_destination(path).unwrap();
+        let mut pile = Pile::open(path).unwrap();
+        for text in texts {
+            pile.put::<UTF8String, _>(*text).unwrap();
+        }
+        pile.close().unwrap();
+    }
+
+    /// The difference pass reopens the source by path after the compaction
+    /// closed it. A file renamed over the source in between, as long and
+    /// with a record boundary at the same length, must not be taken for the
+    /// source: its frames minus the compaction are not what was dropped.
+    #[test]
+    fn a_source_replaced_before_the_difference_pass_fails_and_publishes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.pile");
+        let replacement = dir.path().join("replacement.pile");
+        let out = dir.path().join("out.pile");
+        let dropped = dir.path().join("dropped.pile");
+        pile_of(&source, &["alpha frame 1", "alpha frame 2"]);
+        // Same frame lengths, so the source's length is a boundary here too.
+        pile_of(&replacement, &["omega frame 1", "omega frame 2"]);
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().len(),
+            std::fs::metadata(&replacement).unwrap().len()
+        );
+
+        let (from, to) = (replacement.clone(), source.clone());
+        BEFORE_DIFFERENCE.set(Some(Box::new(move || std::fs::rename(from, to).unwrap())));
+        let result = run(Request {
+            source: source.clone(),
+            into: out.clone(),
+            drop_drained: Vec::new(),
+            drop_collection: Vec::new(),
+            source_prefix: None,
+            dropped_into: Some(dropped.clone()),
+            allow_corrupt: false,
+        });
+        assert!(BEFORE_DIFFERENCE.take().is_none(), "the seam ran");
+
+        let rendered = format!("{:#}", result.expect_err("a replaced source must fail"));
+        assert!(rendered.contains("replaced"), "{rendered}");
+        assert!(rendered.contains(source.to_str().unwrap()), "{rendered}");
+        assert!(!out.exists(), "no destination is published");
+        assert!(!dropped.exists(), "no dropped frames are published");
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("source.pile")]);
     }
 
     #[test]
