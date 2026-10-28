@@ -199,11 +199,15 @@ impl<const KEY_LEN: usize, T: DependencyKey<KEY_LEN>> DependencySet<KEY_LEN, T> 
         }
     }
 
-    /// Add `value`, returning whether it was absent.
+    /// Add `value`, returning whether it was absent. A member already present
+    /// costs one lookup and no allocation: trackers re-insert on every read.
     pub fn insert(&mut self, value: T) -> bool {
-        let before = self.keys.len();
-        self.keys.insert(&Entry::new(&value.to_key()));
-        self.keys.len() != before
+        let key = value.to_key();
+        if self.keys.get(&key).is_some() {
+            return false;
+        }
+        self.keys.insert(&Entry::new(&key));
+        true
     }
 
     /// Whether `value` is a member.
@@ -426,8 +430,24 @@ mod store_dependency_tests {
     }
 
     fn every_selector_shape(c: u8, h: u8) -> [CollectionRecordSelector; 6] {
-        let c = CollectionHandle::new([c; INLINE_LEN]);
-        let h = CollectionData::new([h; INLINE_LEN]);
+        every_selector_shape_of([c; INLINE_LEN], [h; INLINE_LEN])
+    }
+
+    /// A field whose first and last bytes can order in opposite directions,
+    /// so an encoding that permuted bytes would change the key order.
+    fn edges(first: u8, last: u8) -> [u8; INLINE_LEN] {
+        let mut raw = [0x55; INLINE_LEN];
+        raw[0] = first;
+        raw[INLINE_LEN - 1] = last;
+        raw
+    }
+
+    fn every_selector_shape_of(
+        c: [u8; INLINE_LEN],
+        h: [u8; INLINE_LEN],
+    ) -> [CollectionRecordSelector; 6] {
+        let c = CollectionHandle::new(c);
+        let h = CollectionData::new(h);
         [
             CollectionRecordSelector::Collection(c),
             CollectionRecordSelector::CommitMember(c, h),
@@ -443,6 +463,13 @@ mod store_dependency_tests {
         let mut selectors = BTreeSet::new();
         for (c, h) in [(0, 0), (1, 2), (2, 1), (0xff, 0), (0, 0xff)] {
             selectors.extend(every_selector_shape(c, h));
+        }
+        for (c, h) in [
+            (edges(1, 9), edges(4, 2)),
+            (edges(1, 9), edges(5, 1)),
+            (edges(2, 3), edges(3, 8)),
+        ] {
+            selectors.extend(every_selector_shape_of(c, h));
         }
         let mut keys = BTreeSet::new();
         for selector in &selectors {
