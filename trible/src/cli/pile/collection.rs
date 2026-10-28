@@ -1318,13 +1318,14 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
             return Ok(());
         }
         // A row's trailing columns are the same question for every section, so
-        // they are built once here.
-        let tail = |row: &Enumerated| -> Vec<String> {
-            let policies = row
-                .fields
-                .facts()
-                .map(|facts| descriptor_policy_columns(facts, long))
-                .unwrap_or_else(|| ["-".to_owned(), "-".to_owned()]);
+        // they are built once here. An attached descriptor has no policy by
+        // design (a MAP is believed only under the host's own key), so its
+        // policy columns are absent, not invalid.
+        let tail = |row: &Enumerated, attached: bool| -> Vec<String> {
+            let policies = match row.fields.facts() {
+                Some(facts) if !attached => descriptor_policy_columns(facts, long),
+                _ => ["-".to_owned(), "-".to_owned()],
+            };
             let mut cells = vec![
                 row.refs.total().to_string(),
                 abbrev(&handle_hex(row.handle), long),
@@ -1378,21 +1379,21 @@ fn run_list(path: PathBuf, named_only: bool, metadata: bool, long: bool) -> Resu
                         Ok(name) => name.clone(),
                         Err(e) => format!("<invalid: {e}>"),
                     }];
-                    cells.extend(tail(row));
+                    cells.extend(tail(row, false));
                     named.push(cells);
                 }
                 Anchor::Derived(source) => {
                     let mut cells = vec![abbrev(&handle_hex(source), long)];
-                    cells.extend(tail(row));
+                    cells.extend(tail(row, false));
                     derived.push(cells);
                 }
                 Anchor::Attached(parent) => {
                     let mut cells = vec![abbrev(&handle_hex(parent), long)];
-                    cells.extend(tail(row));
+                    cells.extend(tail(row, true));
                     attached.push(cells);
                 }
                 Anchor::Unreadable(why) => {
-                    anchorless.push((why, tail(row)));
+                    anchorless.push((why, tail(row, false)));
                 }
             }
         }
