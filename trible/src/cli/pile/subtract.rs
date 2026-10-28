@@ -371,14 +371,37 @@ pub(super) fn refuse_existing(into: &Path) -> Result<()> {
     Ok(())
 }
 
-fn temporary_sibling(into: &Path) -> Result<PathBuf> {
+/// The hidden name `verb` writes `into` under until it is published.
+pub(super) fn temporary_sibling(into: &Path, verb: &str) -> Result<PathBuf> {
     let name = into
         .file_name()
         .ok_or_else(|| anyhow!("destination {} names no file", into.display()))?;
     let mut temporary = std::ffi::OsString::from(".");
     temporary.push(name);
-    temporary.push(format!(".subtract-{}.tmp", std::process::id()));
+    temporary.push(format!(".{verb}-{}.tmp", std::process::id()));
     Ok(into.with_file_name(temporary))
+}
+
+/// Publish the written and synced `temporary` as `into`. A hard link
+/// publishes without replacing: it fails if `into` appeared meanwhile.
+pub(super) fn publish(temporary: &Path, into: &Path) -> Result<()> {
+    fs::hard_link(temporary, into).with_context(|| {
+        format!(
+            "publish {} as {} (refusing to replace an existing file)",
+            temporary.display(),
+            into.display()
+        )
+    })?;
+    fs::remove_file(temporary).with_context(|| format!("remove {}", temporary.display()))?;
+    if let Some(parent) = into
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("sync directory {}", parent.display()))?;
+    }
+    Ok(())
 }
 
 /// What one written difference holds, for the report.
@@ -420,7 +443,7 @@ pub(super) fn write_difference(
     };
     let bytes = scan.bytes().clone();
 
-    let created = temporary_sibling(into).and_then(|temporary| {
+    let created = temporary_sibling(into, "subtract").and_then(|temporary| {
         let file = super::compact::create_fresh_destination(&temporary)
             .with_context(|| format!("create {}", temporary.display()))?;
         Ok((temporary, file))
@@ -549,25 +572,7 @@ pub(super) fn write_difference(
         file.sync_all()
             .with_context(|| format!("sync {}", temporary.display()))?;
         drop(file);
-        // A hard link publishes without replacing: it fails if the
-        // destination appeared meanwhile.
-        fs::hard_link(&temporary, into).with_context(|| {
-            format!(
-                "publish {} as {} (refusing to replace an existing file)",
-                temporary.display(),
-                into.display()
-            )
-        })?;
-        fs::remove_file(&temporary).with_context(|| format!("remove {}", temporary.display()))?;
-        if let Some(parent) = into
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .with_context(|| format!("sync directory {}", parent.display()))?;
-        }
-        Ok(())
+        publish(&temporary, into)
     })();
     drop(scan);
     if let Err(error) = result {
@@ -598,6 +603,13 @@ pub(super) fn write_difference(
 }
 
 impl Difference {
+    /// The same difference, reported against `minus`: compact computes it
+    /// against its output's hidden name and reports the published one.
+    pub(super) fn against(mut self, minus: &Path) -> Self {
+        self.minus = minus.to_path_buf();
+        self
+    }
+
     pub(super) fn print(&self) {
         println!(
             "subtract {} minus {} -> {}",

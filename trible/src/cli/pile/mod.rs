@@ -97,11 +97,13 @@ pub enum PileCommand {
         /// write every frame of the source (or of its --source-prefix) that
         /// the destination does not hold into this fresh file, exactly as
         /// `pile subtract SOURCE --minus DESTINATION [--source-prefix BYTES]`
-        /// would. `cat DESTINATION DROPPED` then holds everything the source
-        /// held. It must not exist; it is written to a hidden sibling, synced,
-        /// and published by hard link. If it cannot be written, the
-        /// destination is removed and the command fails, so a compaction
-        /// without its dropped frames never looks like a finished one.
+        /// would. `cat DESTINATION DROPPED` then holds everything in the
+        /// source bytes the compaction read. It must not exist and must not
+        /// be the destination; it is written to a hidden sibling, synced, and
+        /// published by hard link. The destination is published only after
+        /// it, so a run that fails or is killed earlier leaves no
+        /// destination: a compaction without its dropped frames never looks
+        /// like a finished one.
         #[arg(long = "dropped-into", value_name = "DROPPED")]
         dropped_into: Option<PathBuf>,
     },

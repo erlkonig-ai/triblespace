@@ -26,20 +26,25 @@
 //! is append-only, the result is the compaction of a copy of those `L`
 //! bytes without making the copy. `L` must be a record boundary.
 //!
+//! The destination is written under a hidden name beside it and published
+//! by hard link only when the run is complete, so a run that fails or is
+//! killed leaves no file that looks like a finished compaction.
+//!
 //! `--dropped-into DROPPED` keeps what the compaction drops. After the
-//! destination is written and closed, every frame of the source the
-//! destination does not hold is written to DROPPED by `pile subtract`'s own
+//! compaction is written and closed, every frame of the source it does not
+//! hold is written to DROPPED by `pile subtract`'s own
 //! [`super::subtract::write_difference`], with the source bounded to exactly
 //! the bytes the compaction read. Difference files kept beside an older
 //! mainline stay complete only while the mainline keeps what they left out;
 //! a compaction can drop such a frame, so its dropped set is the next
-//! difference generation, written as exhaust of the run that drops it. If
-//! DROPPED cannot be written the destination is removed: a compacted pile
-//! without its dropped frames is the one result that must not look finished.
+//! difference generation, written as exhaust of the run that drops it. The
+//! destination is published only after DROPPED is: a compacted pile without
+//! its dropped frames is the one result that must not look finished.
 //!
 //! The record census is lock-free. On a source a writer is appending to it
 //! can map an append still in flight; when the file grew while the census
-//! read it, the failure says so instead of advising repair.
+//! read it and a second read finds the record whole, the failure says so
+//! instead of advising repair.
 //!
 //! `--drop-collection` is deliberately different: it opts into reachability
 //! garbage collection. Only bytes reached by carried records, proofs, WANTs,
@@ -114,9 +119,11 @@ fn census_records(path: &Path, mut records: PileRecords) -> Result<RecordCensus>
 
 /// A census read failure. The census takes no lock, so on a pile a writer
 /// is appending to it can map a record still being written and stop there.
-/// When the file grew past what the census mapped, that is what happened,
-/// and the repair advice for a torn tail would be dangerous: the pile is
-/// healthy. The advice stays only when the file did not grow.
+/// Growth alone does not show that: a live pile grows whatever stopped the
+/// census, damage in the middle included. So when the file grew, it is read
+/// again, and only a record that is now whole earns "a writer is
+/// appending", with its boundary as a safe `--source-prefix`. Anything else
+/// keeps the damage advice, saying what the second read saw.
 fn census_read_error(
     path: &Path,
     observed: u64,
@@ -124,23 +131,48 @@ fn census_read_error(
 ) -> anyhow::Error {
     use triblespace_core::repo::pile::ReadError;
     if let ReadError::CorruptPile { valid_length } = error {
-        if let Ok(now) = std::fs::metadata(path).map(|metadata| metadata.len()) {
-            if now > observed {
-                return anyhow!(
-                    "source pile {} changed while being read: the record census mapped {observed} \
-                     bytes and found the record at byte {valid_length} still incomplete, and the \
-                     file has since grown to {now} bytes, so a writer is appending. This is not \
-                     damage. Compaction needs a quiescent source: stop its writers and retry, or \
-                     compact a fixed prefix with --source-prefix {valid_length} (a record \
-                     boundary). If a quiescent retry still fails here, the error it gives then \
-                     applies",
-                    path.display()
-                );
-            }
+        let damage = || super::pile_read_error(path, ReadError::CorruptPile { valid_length });
+        let Ok(now) = std::fs::metadata(path).map(|metadata| metadata.len()) else {
+            return damage();
+        };
+        if now <= observed {
+            return damage();
         }
-        return super::pile_read_error(path, ReadError::CorruptPile { valid_length });
+        if !reads_whole_at(path, valid_length) {
+            return damage().context(format!(
+                "the file grew from {observed} to {now} bytes while the census read it, but a \
+                 second read of the grown file still stops at byte {valid_length}: that is \
+                 damage, or an append still in progress there. Stop the writers and retry to \
+                 tell them apart"
+            ));
+        }
+        return anyhow!(
+            "source pile {} changed while being read: the record census mapped {observed} bytes \
+             and found the record at byte {valid_length} still incomplete, the file has since \
+             grown to {now} bytes, and a second read finds that record whole, so a writer is \
+             appending. This is not damage. Compaction needs a quiescent source: stop its \
+             writers and retry, or compact a fixed prefix with --source-prefix {valid_length} \
+             (a record boundary)",
+            path.display()
+        );
     }
     super::pile_read_error(path, error)
+}
+
+/// Whether a fresh scan of the file at `path` reads a whole record at
+/// `offset`.
+fn reads_whole_at(path: &Path, offset: usize) -> bool {
+    let Ok(records) = PileRecords::open(path) else {
+        return false;
+    };
+    for record in records {
+        match record {
+            Ok(record) if record.offset < offset => continue,
+            Ok(record) => return record.offset == offset,
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 pub(super) fn create_fresh_destination(path: &Path) -> std::io::Result<std::fs::File> {
@@ -162,6 +194,21 @@ pub(super) fn cleanup_incomplete_destination(path: &Path, primary: anyhow::Error
             path.display()
         )),
     }
+}
+
+/// Whether `a` and `b` name the same directory entry, through their
+/// existing directories' canonical paths.
+fn same_entry(a: &Path, b: &Path) -> Result<bool> {
+    let entry = |path: &Path| -> Result<(PathBuf, Option<std::ffi::OsString>)> {
+        let directory = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let directory = std::fs::canonicalize(directory)
+            .with_context(|| format!("resolve {}", directory.display()))?;
+        Ok((directory, path.file_name().map(ToOwned::to_owned)))
+    };
+    Ok(entry(a)? == entry(b)?)
 }
 
 /// The source length every check compares: the file's length, or for a
@@ -390,16 +437,50 @@ pub(super) fn run(request: Request) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create --dropped-into directory {}", parent.display()))?;
     }
-    let destination_file = create_fresh_destination(&destination_path)
-        .with_context(|| format!("create fresh destination {}", destination_path.display()))?;
-    let mut destination = match Pile::open(&destination_path) {
+    if let Some(dropped) = &dropped_into {
+        // Both directories exist now, so a second spelling of one entry
+        // shows: publishing DROPPED there would put the dropped frames
+        // where the compaction is expected.
+        let same = same_entry(dropped, &destination_path);
+        if !matches!(same, Ok(false)) {
+            let _ = source.close();
+            let reason = match same {
+                Ok(_) => "is the same file as the destination".to_owned(),
+                Err(error) => format!("cannot be told apart from the destination: {error:#}"),
+            };
+            bail!(
+                "--dropped-into {} {reason} {}; it must be a third file",
+                dropped.display(),
+                destination_path.display()
+            );
+        }
+    }
+    // The compaction is written under a hidden name and published as the
+    // destination only when the run is complete, its dropped frames
+    // included: a run that fails or is killed before then leaves no file
+    // that looks like a finished compaction.
+    let building = match super::subtract::temporary_sibling(&destination_path, "compact") {
+        Ok(building) => building,
+        Err(error) => {
+            let _ = source.close();
+            return Err(error);
+        }
+    };
+    let destination_file = match create_fresh_destination(&building) {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = source.close();
+            return Err(anyhow!(error).context(format!("create {}", building.display())));
+        }
+    };
+    let mut destination = match Pile::open(&building) {
         Ok(pile) => pile,
         Err(error) => {
             drop(destination_file);
             let _ = source.close();
             return Err(cleanup_incomplete_destination(
-                &destination_path,
-                anyhow!("open destination {}: {error}", destination_path.display()),
+                &building,
+                anyhow!("open destination {}: {error}", building.display()),
             ));
         }
     };
@@ -412,7 +493,7 @@ pub(super) fn run(request: Request) -> Result<()> {
         &drained,
         prepared,
     )
-    .and_then(|stats| Ok((stats, census(&destination_path, None)?)));
+    .and_then(|stats| Ok((stats, census(&building, None)?)));
     let destination_close = destination
         .close()
         .map_err(|error| anyhow!("close destination: {error}"));
@@ -424,17 +505,17 @@ pub(super) fn run(request: Request) -> Result<()> {
         (Ok(result), Ok(()), Ok(())) => result,
         (Err(error), _, _) | (Ok(_), Err(error), _) | (Ok(_), Ok(()), Err(error)) => {
             drop(destination_file);
-            return Err(cleanup_incomplete_destination(&destination_path, error));
+            return Err(cleanup_incomplete_destination(&building, error));
         }
     };
 
     if let Err(error) = destination_file.set_permissions(source_permissions) {
         let error = anyhow!(error).context(format!(
             "copy source permissions to destination {}",
-            destination_path.display()
+            building.display()
         ));
         drop(destination_file);
-        return Err(cleanup_incomplete_destination(&destination_path, error));
+        return Err(cleanup_incomplete_destination(&building, error));
     }
     drop(destination_file);
 
@@ -448,13 +529,13 @@ pub(super) fn run(request: Request) -> Result<()> {
             );
             match super::subtract::write_difference(
                 &source_path,
-                &destination_path,
+                &building,
                 dropped_path,
                 false,
                 // Exactly the bytes the compaction read.
                 Some(stable_source_len),
             ) {
-                Ok(difference) => Some(difference),
+                Ok(difference) => Some(difference.against(&destination_path)),
                 Err(error) => {
                     let state = if std::fs::symlink_metadata(dropped_path).is_ok() {
                         "exists but the run failed after publishing it; inspect it"
@@ -463,18 +544,35 @@ pub(super) fn run(request: Request) -> Result<()> {
                     };
                     let error = error.context(format!(
                         "could not keep the compaction's dropped frames in {} ({} {state}); \
-                         the destination {} is removed, because a compacted pile without \
-                         its dropped frames would lose what older difference files left out. \
-                         The source is unchanged; fix the cause and rerun",
+                         the compaction is discarded and {} was not created, because a \
+                         compacted pile without its dropped frames would lose what older \
+                         difference files left out. The source is unchanged; fix the cause \
+                         and rerun",
                         dropped_path.display(),
                         dropped_path.display(),
                         destination_path.display(),
                     ));
-                    return Err(cleanup_incomplete_destination(&destination_path, error));
+                    return Err(cleanup_incomplete_destination(&building, error));
                 }
             }
         }
     };
+
+    if let Err(error) = super::subtract::publish(&building, &destination_path) {
+        let kept = dropped_into
+            .as_deref()
+            .map(|dropped| format!("; its dropped frames are kept in {}", dropped.display()))
+            .unwrap_or_default();
+        let error = error.context(format!(
+            "finish the compaction into {}{kept}",
+            destination_path.display()
+        ));
+        return Err(if building.exists() {
+            cleanup_incomplete_destination(&building, error)
+        } else {
+            error
+        });
+    }
 
     println!(
         "Compacted {} into {}:\n  bytes: {} -> {}\n  blob records: {} -> {}\n  collection records: {} -> {}\n  capability proofs: {} -> {}\n  retired capability proofs: {} -> {} (carried exactly)\n  current WANT records: {} -> {}\n  retired WANT log records: {} -> {} (dropped)\n  retired team records: {} -> {} (dropped)\n  frames of unknown kind: {} ({} bytes) -> {} ({} bytes) (carried exactly)\n  active wants: {}\n  active legacy pins: {}",
@@ -625,6 +723,80 @@ mod tests {
         assert!(!rendered.contains("amputate"), "{rendered}");
         // The finished pile reads whole.
         census(&path, None).unwrap();
+    }
+
+    /// A pile of three complete blob frames whose middle frame is damaged:
+    /// its span is zeroed, which the reader calls a malformed record.
+    /// Returns the damaged frame's offset.
+    fn damaged_in_the_middle(path: &Path) -> u64 {
+        use triblespace_core::blob::encodings::utf8string::UTF8String;
+        use triblespace_core::repo::BlobStorePut;
+
+        create_fresh_destination(path).unwrap();
+        let mut pile = Pile::open(path).unwrap();
+        for text in ["the first frame", "the damaged frame", "the frame after it"] {
+            pile.put::<UTF8String, _>(text).unwrap();
+        }
+        pile.close().unwrap();
+        let middle = PileRecords::open(path)
+            .unwrap()
+            .nth(1)
+            .unwrap()
+            .unwrap()
+            .offset;
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes[middle + 28..middle + 32].fill(0);
+        std::fs::write(path, &bytes).unwrap();
+        middle as u64
+    }
+
+    #[test]
+    fn census_calls_damage_in_the_middle_damage_while_the_file_grows() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.pile");
+        let damaged = damaged_in_the_middle(&path);
+        // The census maps the file, then a writer appends after it.
+        let records = PileRecords::open(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[0u8; 1024])
+            .unwrap();
+
+        let rendered = format!("{:#}", census_records(&path, records).unwrap_err());
+        assert!(!rendered.contains("a writer is appending"), "{rendered}");
+        assert!(!rendered.contains("--source-prefix"), "{rendered}");
+        assert!(rendered.contains("amputate"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("second read of the grown file still stops at byte {damaged}")),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn census_calls_a_record_still_incomplete_on_a_second_read_unresolved() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.pile");
+        let (rest, boundary) = torn_pile(&path);
+        let records = PileRecords::open(&path).unwrap();
+        // The file grows, but the torn frame is still not whole.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&rest[..4])
+            .unwrap();
+
+        let rendered = format!("{:#}", census_records(&path, records).unwrap_err());
+        assert!(!rendered.contains("a writer is appending"), "{rendered}");
+        assert!(!rendered.contains("--source-prefix"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("second read of the grown file still stops at byte {boundary}")),
+            "{rendered}"
+        );
     }
 
     #[test]

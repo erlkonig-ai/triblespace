@@ -305,6 +305,66 @@ fn an_existing_dropped_destination_is_refused_before_any_work() {
     assert!(!out.exists());
 }
 
+/// OUT appears under its own name only once DROPPED is complete, so a run
+/// killed at any moment leaves no OUT that looks like a finished compaction.
+#[test]
+fn out_is_published_only_after_its_dropped_frames() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source.pile");
+    build_source(&source, 400);
+    let out = dir.path().join("out.pile");
+    let dropped = dir.path().join("dropped.pile");
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("trible"))
+        .args(["pile", "compact"])
+        .arg(&source)
+        .arg("--into")
+        .arg(&out)
+        .arg("--dropped-into")
+        .arg(&dropped)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let (mut looks, mut early) = (0u64, 0u64);
+    let status = loop {
+        // OUT checked first: once it exists, DROPPED must already.
+        if out.exists() && !dropped.exists() {
+            early += 1;
+        }
+        looks += 1;
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+    };
+    assert!(status.success());
+    assert_eq!(early, 0, "OUT without DROPPED in {early} of {looks} looks");
+    assert!(out.exists() && dropped.exists());
+}
+
+#[test]
+fn dropped_into_spelling_the_destination_differently_is_refused_before_copying() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source.pile");
+    build_source(&source, 2);
+    let out = dir.path().join("out.pile");
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let alias = dir.path().join("sub").join("..").join("out.pile");
+
+    compact(&source, &out, &alias, None, false)
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("same file")
+                .and(predicate::str::contains("copying retained state").not()),
+        );
+    assert!(!out.exists());
+    let left: Vec<PathBuf> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(left.len(), 2, "{left:?}");
+}
+
 #[cfg(unix)]
 #[test]
 fn a_failed_dropped_write_leaves_no_compaction_output() {
