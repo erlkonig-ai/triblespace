@@ -325,6 +325,10 @@ pub(super) fn run(request: Request) -> Result<()> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    // Before anything is read: a cycle or a chain passes every pair's own
+    // drain check and would leave behind a generation said to keep content.
+    DrainedGeneration::check_consistent(&drained)
+        .map_err(|error| anyhow!("--drop-drained: {error}"))?;
     if destination_path.exists() {
         bail!(
             "destination {} already exists; compact writes a fresh pile",
@@ -894,6 +898,56 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(left, vec![std::ffi::OsString::from("source.pile")]);
+    }
+
+    /// `--drop-drained` pairs that would leave behind a generation another
+    /// pair names as current, or retire one generation twice, are refused
+    /// before the source is read. Taken alone, each pair here is drained:
+    /// the source holds no commits at all.
+    #[test]
+    fn contradicting_drop_drained_pairs_are_refused_before_any_work() {
+        let (a, b, c) = ("aa".repeat(32), "bb".repeat(32), "cc".repeat(32));
+        let cases = [
+            ("itself", vec![format!("{a}={a}")], vec![&a]),
+            (
+                "cycle",
+                vec![format!("{a}={b}"), format!("{b}={a}")],
+                vec![&a, &b],
+            ),
+            (
+                "chain",
+                vec![format!("{a}={b}"), format!("{b}={c}")],
+                vec![&a, &b],
+            ),
+            (
+                "retired twice",
+                vec![format!("{a}={b}"), format!("{a}={c}")],
+                vec![&a],
+            ),
+        ];
+        for (name, drop_drained, named) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("source.pile");
+            let out = dir.path().join("out.pile");
+            pile_of(&source, &["a frame of no collection"]);
+            let result = run(Request {
+                source: source.clone(),
+                into: out.clone(),
+                drop_drained,
+                drop_collection: Vec::new(),
+                source_prefix: None,
+                dropped_into: None,
+                allow_corrupt: false,
+            });
+            let rendered = format!(
+                "{:#}",
+                result.expect_err(&format!("{name}: contradicting pairs must refuse"))
+            );
+            for handle in named {
+                assert!(rendered.contains(handle.as_str()), "{name}: {rendered}");
+            }
+            assert!(!out.exists(), "{name}: no destination");
+        }
     }
 
     #[test]

@@ -41,9 +41,10 @@ use crate::blob::encodings::utf8string::UTF8String;
 use crate::blob::{Blob, TryFromBlob};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::Inline;
-use crate::repo::BlobStoreGet;
+use crate::repo::{BlobStoreGet, CapabilityProofRead};
 use crate::trible::TribleSet;
 
+use super::coverage::{Admittance, RecordAdmission, SourceResolution, StoreWriters};
 use super::discovery::CollectionDiscoveryError;
 use super::{descriptor, CollectionData, CollectionHandle, CollectionRead, CollectionRecord};
 
@@ -336,16 +337,27 @@ where
 /// reports how many records it processed, not how many the target was missing,
 /// so a partial migration looks exactly like a complete one.
 ///
-/// Counts distinct `(data, metadata)` pairs, so a target that already holds a
-/// payload under a different author counts as holding it.
+/// Counts distinct `(data, metadata)` pairs of `source`, so a target that
+/// already holds a payload under a different author counts as holding it.
+/// The target holds a pair only as its readers would see it: through a
+/// commit whose signature verifies and whose author the target's WRITE
+/// admission, decided from this snapshot's descriptor, policy definitions
+/// and proofs exactly as a collection reader decides it, admits. A pair
+/// re-signed under a key the target does not admit, or whose admission this
+/// snapshot cannot decide, is still missing, and so is every pair of a target
+/// that is not a root collection, since readers believe no commit into one.
 pub fn unreached_records<S>(
     snapshot: &S,
     source: CollectionHandle,
     target: CollectionHandle,
 ) -> Result<usize, CollectionDiscoveryError<S::RecordsError>>
 where
-    S: CollectionRead,
+    S: CollectionRead + BlobStoreGet + CapabilityProofRead,
 {
+    let writers = StoreWriters::new(snapshot);
+    // A reader believes commits only into a root: one written straight into
+    // a derived or attached collection names nothing of it.
+    let target_is_root = matches!(writers.source(target), SourceResolution::Root);
     let mut from = CommitContent::new();
     let mut into = CommitContent::new();
     let records = snapshot
@@ -355,10 +367,19 @@ where
         let record = record.map_err(CollectionDiscoveryError::Records)?;
         if let CollectionRecord::Commit(commit) = record {
             let collection = commit.collection();
+            let pair = (commit.data(), commit.metadata());
             if collection == source {
-                from.insert((commit.data(), commit.metadata()));
-            } else if collection == target {
-                into.insert((commit.data(), commit.metadata()));
+                from.insert(pair);
+            } else if collection == target
+                && target_is_root
+                && !into.contains(&pair)
+                && matches!(
+                    writers.admits(target, commit.public_key()),
+                    Admittance::Admitted
+                )
+                && commit.verify_strict().is_ok()
+            {
+                into.insert(pair);
             }
         }
     }
@@ -512,6 +533,39 @@ mod tests {
         // The other direction is already complete.
         assert_eq!(
             unreached_records(&snapshot, new.handle(), old.handle()).unwrap(),
+            0
+        );
+    }
+
+    /// A carried commit counts only as the target reads it. A pair re-signed
+    /// into the target under a key the target's WRITE policy does not admit
+    /// is invisible to every reader of the target, so it reaches nothing.
+    #[test]
+    fn a_commit_the_target_does_not_admit_reaches_nothing() {
+        let old_key = signer(1);
+        let new_key = signer(2);
+        let outsider = signer(3);
+        let mut store = MemoryRepo::default();
+        let old = store.collection("message", private(&old_key)).unwrap();
+        let new = store.collection("message", private(&new_key)).unwrap();
+        store.commit(old, &old_key, row(0x11)).unwrap();
+        store.commit(old, &old_key, row(0x22)).unwrap();
+        // Local storage is a claim ledger: this commit lands, unadmitted.
+        store.commit(new, &outsider, row(0x11)).unwrap();
+        store.commit(new, &new_key, row(0x22)).unwrap();
+
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(
+            unreached_records(&snapshot, old.handle(), new.handle()).unwrap(),
+            1
+        );
+
+        // Re-signed under the admitted key, the same pair is reached.
+        let mut store = store;
+        store.commit(new, &new_key, row(0x11)).unwrap();
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(
+            unreached_records(&snapshot, old.handle(), new.handle()).unwrap(),
             0
         );
     }

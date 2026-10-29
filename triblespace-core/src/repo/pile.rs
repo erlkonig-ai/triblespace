@@ -5981,14 +5981,25 @@ pub fn reframe_into(
     Ok(stats)
 }
 
-/// Stands in for a derive's absent second input in [`equation_key`].
-const ENDORSED_DERIVE_MARK: [u8; 32] = [0xFF; 32];
-
 /// The semantic identity of an equation, signed or not, in any framing: its
-/// collection, its inputs in digest order, and its result.
-type EquationKey = ([u8; 32], [u8; 32], [u8; 32], [u8; 32]);
+/// kind, its collection, its inputs (a merge's in digest order), and its
+/// result. A merge and a derive never compare equal, whatever their digests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum EquationKey {
+    Merge {
+        collection: [u8; 32],
+        low: [u8; 32],
+        high: [u8; 32],
+        result: [u8; 32],
+    },
+    Derive {
+        collection: [u8; 32],
+        input: [u8; 32],
+        output: [u8; 32],
+    },
+}
 
-fn equation_key(
+fn merge_equation_key(
     collection: [u8; 32],
     first: [u8; 32],
     second: [u8; 32],
@@ -5999,7 +6010,20 @@ fn equation_key(
     } else {
         (second, first)
     };
-    (collection, low, high, result)
+    EquationKey::Merge {
+        collection,
+        low,
+        high,
+        result,
+    }
+}
+
+fn derive_equation_key(collection: [u8; 32], input: [u8; 32], output: [u8; 32]) -> EquationKey {
+    EquationKey::Derive {
+        collection,
+        input,
+        output,
+    }
 }
 
 /// The equation a retired signed record states. It endorsed exactly what an
@@ -6012,13 +6036,13 @@ fn retired_equation_equation_key(equation: &RetiredCollectionEquation) -> Equati
             high,
             result,
             ..
-        } => equation_key(collection.raw, low.raw, high.raw, result.raw),
+        } => merge_equation_key(collection.raw, low.raw, high.raw, result.raw),
         RetiredCollectionEquation::DeriveV9 {
             target,
             input,
             output,
             ..
-        } => equation_key(target.raw, input.raw, ENDORSED_DERIVE_MARK, output.raw),
+        } => derive_equation_key(target.raw, input.raw, output.raw),
     }
 }
 
@@ -6029,12 +6053,12 @@ fn legacy_equation_key(equation: &LegacyUnsignedCollectionEquation) -> EquationK
             low,
             high,
             result,
-        } => equation_key(collection.raw, low.raw, high.raw, result.raw),
+        } => merge_equation_key(collection.raw, low.raw, high.raw, result.raw),
         LegacyUnsignedCollectionEquation::Derive {
             collection,
             input,
             output,
-        } => equation_key(collection.raw, input.raw, ENDORSED_DERIVE_MARK, output.raw),
+        } => derive_equation_key(collection.raw, input.raw, output.raw),
     }
 }
 
@@ -6053,16 +6077,16 @@ fn retired_signed_frame_equation_key(frame: &[u8]) -> Option<EquationKey> {
     if kind == record_kind::KIND_COLLECTION_MERGE_SIGNED_V2.as_slice()
         || kind == record_kind::KIND_COLLECTION_MERGE_WITNESSED_V6.as_slice()
     {
-        Some(equation_key(field(0)?, field(1)?, field(2)?, field(3)?))
+        Some(merge_equation_key(
+            field(0)?,
+            field(1)?,
+            field(2)?,
+            field(3)?,
+        ))
     } else if kind == record_kind::KIND_COLLECTION_DERIVE_SIGNED_V2.as_slice()
         || kind == record_kind::KIND_COLLECTION_DERIVE_WITNESSED_V7.as_slice()
     {
-        Some(equation_key(
-            field(0)?,
-            field(1)?,
-            ENDORSED_DERIVE_MARK,
-            field(2)?,
-        ))
+        Some(derive_equation_key(field(0)?, field(1)?, field(2)?))
     } else {
         None
     }
@@ -6367,6 +6391,68 @@ pub struct DrainedGeneration {
     pub current: CollectionHandle,
 }
 
+impl DrainedGeneration {
+    /// Refuse pairs that contradict each other, reading nothing: a
+    /// generation retired by two pairs, or one a pair names as current while
+    /// a pair (the same one, or another) retires it. Each pair's own check
+    /// passes in a cycle `A=B, B=A`, and leaving both behind would drop the
+    /// content the pairs claim is kept.
+    ///
+    /// The rewrite runs this first, and also refuses a current generation
+    /// derived from a retired one, which only the source can show.
+    pub fn check_consistent(pairs: &[Self]) -> Result<(), PileRewriteError> {
+        let mut successors: std::collections::BTreeMap<[u8; 32], CollectionHandle> =
+            std::collections::BTreeMap::new();
+        for pair in pairs {
+            if let Some(first) = successors.insert(pair.retired.raw, pair.current) {
+                return Err(PileRewriteError::ConflictingDrain {
+                    generation: pair.retired,
+                    conflict: DrainConflict::RetiredTwice {
+                        first,
+                        second: pair.current,
+                    },
+                });
+            }
+        }
+        for pair in pairs {
+            if successors.contains_key(&pair.current.raw) {
+                return Err(PileRewriteError::ConflictingDrain {
+                    generation: pair.current,
+                    conflict: DrainConflict::CurrentRetired {
+                        retired: pair.retired,
+                    },
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// How drained pairs contradict each other; see
+/// [`PileRewriteError::ConflictingDrain`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DrainConflict {
+    /// The generation is named as retired twice, with two successors.
+    RetiredTwice {
+        /// The successor the first such pair names.
+        first: CollectionHandle,
+        /// The successor the second such pair names.
+        second: CollectionHandle,
+    },
+    /// The generation is the current one of `retired`, and a pair (possibly
+    /// that same one) names it as retired.
+    CurrentRetired {
+        /// The generation said to be drained into it.
+        retired: CollectionHandle,
+    },
+    /// The generation is the current one of `retired`, and derives from a
+    /// retired generation, so it would be left behind with it.
+    CurrentDerived {
+        /// The generation said to be drained into it.
+        retired: CollectionHandle,
+    },
+}
+
 /// The bytes of the frame at `offset..offset + len` of `reader`'s mapping.
 fn mapped_frame(reader: &PileFileSnapshot, offset: usize, len: usize) -> &[u8] {
     // Every caller passes a frame replay accepted below the covered prefix.
@@ -6551,6 +6637,15 @@ pub enum PileRewriteError {
     },
     /// The drain check itself could not read the source.
     Drain(String),
+    /// The drained pairs contradict each other, so honouring them would
+    /// leave behind a generation they claim holds content. Nothing was
+    /// written.
+    ConflictingDrain {
+        /// The generation the pairs disagree about.
+        generation: CollectionHandle,
+        /// How they disagree.
+        conflict: DrainConflict,
+    },
     /// The walk reached resident blobs of which no occurrence matches its
     /// hash, under [`CorruptBlobPolicy::Refuse`]. Nothing was written.
     Corrupt {
@@ -6588,6 +6683,30 @@ impl std::fmt::Display for PileRewriteError {
                 hex::encode(current.raw)
             ),
             Self::Drain(error) => write!(f, "failed to check a drained generation: {error}"),
+            Self::ConflictingDrain {
+                generation,
+                conflict,
+            } => {
+                let generation = hex::encode(generation.raw);
+                match conflict {
+                    DrainConflict::RetiredTwice { first, second } => write!(
+                        f,
+                        "generation {generation} is named as retired twice, drained into {} and into {}; name each retired generation once",
+                        hex::encode(first.raw),
+                        hex::encode(second.raw)
+                    ),
+                    DrainConflict::CurrentRetired { retired } => write!(
+                        f,
+                        "generation {generation} is named as the current generation of {} but is itself named as retired; leaving it behind would drop the content said to be kept",
+                        hex::encode(retired.raw)
+                    ),
+                    DrainConflict::CurrentDerived { retired } => write!(
+                        f,
+                        "generation {generation} is named as the current generation of {} but derives from a retired generation, so it would be left behind with it",
+                        hex::encode(retired.raw)
+                    ),
+                }
+            }
             Self::Corrupt { blobs } => {
                 write!(
                     f,
@@ -6615,6 +6734,7 @@ impl Error for PileRewriteError {
             Self::StrongPinConflict { .. }
             | Self::Undrained { .. }
             | Self::Drain(_)
+            | Self::ConflictingDrain { .. }
             | Self::Corrupt { .. } => None,
         }
     }
@@ -7123,6 +7243,7 @@ impl PileFile {
         drained_generations: &[DrainedGeneration],
         filter: &mut dyn CollectionFrameFilter,
     ) -> Result<CollectionFrameSelection, PileRewriteError> {
+        DrainedGeneration::check_consistent(drained_generations)?;
         let reader = self.snapshot().map_err(PileRewriteError::Source)?;
         for pair in drained_generations {
             let unreached = crate::collection::generation::unreached_records(
@@ -7204,6 +7325,16 @@ impl PileFile {
                 }
             }
             close_drained_over_derivations(&reader, &mut drained, &candidates);
+            for pair in drained_generations {
+                if drained.contains(&pair.current.raw) {
+                    return Err(PileRewriteError::ConflictingDrain {
+                        generation: pair.current,
+                        conflict: DrainConflict::CurrentDerived {
+                            retired: pair.retired,
+                        },
+                    });
+                }
+            }
         }
 
         let mut opaque_frames = Vec::new();
@@ -13932,6 +14063,127 @@ mod tests {
         assert_eq!(destination.opaque_record_count().unwrap(), 0);
         destination.close().unwrap();
         source.close().unwrap();
+    }
+
+    /// Drained pairs that contradict each other refuse the rewrite before it
+    /// writes anything: a generation named as retired by itself, by a cycle,
+    /// or by a chain would be left behind while a pair names it as current;
+    /// so would a current generation derived from a retired one; and a
+    /// generation retired twice names two successors. No generation here
+    /// holds a commit, so each pair taken alone passes the completeness check.
+    #[test]
+    fn contradicting_drained_pairs_are_refused_before_anything_is_written() {
+        use crate::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "contradicting-source.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let policy = |seed: u8| {
+            let key = SigningKey::from_bytes(&[seed; 32]);
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(key.verifying_key()),
+                AdmissionPolicy::direct(key.verifying_key()),
+            )
+        };
+        let a_collection = source.collection("gen", policy(31)).unwrap();
+        let a = a_collection.handle();
+        let b = source.collection("gen", policy(32)).unwrap().handle();
+        let c = source.collection("gen", policy(33)).unwrap().handle();
+        let derived = source
+            .derive::<crate::collection::test_support::TestImage>(a_collection, (), policy(31))
+            .unwrap()
+            .handle();
+        // A frame naming the derived collection, which leaving `a` behind
+        // would leave behind too.
+        source
+            .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                &SigningKey::from_bytes(&[31; 32]),
+                derived,
+                crate::collection::SourceLocator::of(collection_test_hash(34).raw),
+                collection_test_hash(35),
+            )))
+            .unwrap();
+        let pair = |retired, current| DrainedGeneration { retired, current };
+        let cases: Vec<(&str, Vec<DrainedGeneration>, CollectionHandle)> = vec![
+            ("itself", vec![pair(a, a)], a),
+            ("cycle", vec![pair(a, b), pair(b, a)], b),
+            ("chain", vec![pair(a, b), pair(b, c)], b),
+            ("retired twice", vec![pair(a, b), pair(a, c)], a),
+            ("derived current", vec![pair(a, derived)], derived),
+        ];
+        for (name, pairs, named) in cases {
+            let destination_path = fresh_empty_pile_path(&dir, &format!("{name}.pile"));
+            let mut destination = Pile::open(&destination_path).unwrap();
+            let refused = source
+                .rewrite_retained_into_leaving(
+                    &mut destination,
+                    &RetentionRoots::new(),
+                    WantRewritePolicy::Drop,
+                    &pairs,
+                )
+                .map(|stats| stats.drained_frames);
+            let rendered = format!(
+                "{}",
+                refused.expect_err(&format!("{name}: contradicting pairs must refuse"))
+            );
+            assert!(
+                rendered.contains(&hex::encode(named.raw)),
+                "{name}: {rendered}"
+            );
+            destination.close().unwrap();
+            assert_eq!(
+                std::fs::metadata(&destination_path).unwrap().len(),
+                0,
+                "{name}: nothing written"
+            );
+        }
+        source.close().unwrap();
+    }
+
+    /// A derive has one input and a merge two, so the two can never state the
+    /// same equation, whatever digest the merge's second input happens to be.
+    #[test]
+    fn a_merge_whose_high_input_is_all_ones_is_not_a_derive() {
+        let collection = collection_test_collection(41);
+        let input = collection_test_hash(42);
+        let ones = collection_test_hash(0xFF);
+        let result = collection_test_hash(43);
+        let merge = LegacyUnsignedCollectionEquation::Merge {
+            collection,
+            low: input,
+            high: ones,
+            result,
+        };
+        let derive = LegacyUnsignedCollectionEquation::Derive {
+            collection,
+            input,
+            output: result,
+        };
+        assert_ne!(legacy_equation_key(&merge), legacy_equation_key(&derive));
+
+        // The same through the dense offsets a retired signed frame is read
+        // from.
+        let frame = |kind, fields: &[[u8; 32]]| {
+            let mut bytes = test_envelope_bytes(kind, 1, 256);
+            for (index, field) in fields.iter().enumerate() {
+                let at = FRAME_BODY_OFFSET + index * 32;
+                bytes[at..at + 32].copy_from_slice(field);
+            }
+            bytes
+        };
+        let merge_frame = frame(
+            record_kind::KIND_COLLECTION_MERGE_SIGNED_V2,
+            &[collection.raw, input.raw, ones.raw, result.raw],
+        );
+        let derive_frame = frame(
+            record_kind::KIND_COLLECTION_DERIVE_SIGNED_V2,
+            &[collection.raw, input.raw, result.raw],
+        );
+        let merge_key = retired_signed_frame_equation_key(&merge_frame).unwrap();
+        let derive_key = retired_signed_frame_equation_key(&derive_frame).unwrap();
+        assert_ne!(merge_key, derive_key);
+        assert_eq!(merge_key, legacy_equation_key(&merge));
+        assert_eq!(derive_key, legacy_equation_key(&derive));
     }
 
     /// A frame filter is asked once about every collection-algebra frame of

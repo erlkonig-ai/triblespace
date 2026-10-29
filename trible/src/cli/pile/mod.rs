@@ -75,7 +75,9 @@ pub enum PileCommand {
         /// Leave a drained generation behind: `RETIRED=CURRENT`, two
         /// collection handles. Every frame naming RETIRED or a collection
         /// derived from it is not carried, after checking that every commit
-        /// of RETIRED is present in CURRENT. Repeat for several generations.
+        /// of RETIRED is present in CURRENT, admitted under CURRENT's WRITE
+        /// policy. Repeat for several generations; a generation may be
+        /// retired once, and never while it is another pair's CURRENT.
         #[arg(long = "drop-drained", value_name = "RETIRED=CURRENT")]
         drop_drained: Vec<String>,
         /// Explicitly leave collections and their resident descriptor
