@@ -86,6 +86,10 @@ use prefix_offer::Offers;
 mod prefix_offer_tests;
 
 #[cfg(test)]
+#[path = "prefix_reconnect_tests.rs"]
+mod prefix_reconnect_tests;
+
+#[cfg(test)]
 #[path = "riblt_completion_tests.rs"]
 mod riblt_completion_tests;
 
