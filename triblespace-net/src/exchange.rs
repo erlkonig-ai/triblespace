@@ -43,10 +43,12 @@
 //! are assumed to grow. A G carried over from a closed connection is not known
 //! to be held by both: its user announces it (AGREED), and a receiver whose own
 //! G differs fails the exchange ([`Failure::StaleAgreement`]). A carried G
-//! enters the next agreement only when both sides announced that same tree;
-//! otherwise the agreement is the two deltas alone, no worse than a fresh full
-//! walk. A receive-only side advertises the empty delta and
-//! serves no value, including no private pinned digest/count.
+//! enters the next agreement, and the peer's reported root, only when both
+//! sides announced that same tree; otherwise the agreement is the two deltas
+//! alone, no worse than a fresh full walk. Only a confirmed exchange keeps a
+//! carried G: one cancelled or cut before its outcome is known forgets it. A
+//! receive-only side advertises the empty delta and serves no value,
+//! including no private pinned digest/count.
 //!
 //! State grows on demand within explicit budgets: FIFO positions, received
 //! commitments, matched announcements, and peer-delta leaves each have at
@@ -513,6 +515,9 @@ impl From<DecodeError> for Failure {
 pub(crate) struct Basis {
     pub(crate) connection: u64,
     pub(crate) agreement: Option<u64>,
+    /// That G was carried over from another connection and announced: the
+    /// peer may refuse it, so only a confirmation keeps it.
+    pub(crate) carried: bool,
 }
 
 pub(crate) struct Ended {
@@ -526,7 +531,8 @@ pub(crate) struct Ended {
     pub(crate) landed: bool,
     /// Physical pinned observation, not the advertised delta summary.
     pub(crate) root: PatchSummary,
-    /// Logical peer held view G ∪ Δpeer, not a physical publication frontier.
+    /// Logical peer held view: the shared base (the G both sides hold, as
+    /// in the agreement) ∪ Δpeer, not a physical publication frontier.
     pub(crate) peer_root: Option<PatchSummary>,
     /// Prefix reuses G; whole-source cached exchanges use the union only while
     /// retiring this task and never keep a second per-neighbour source pin.
@@ -1044,12 +1050,9 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
             self.union_tree()
                 .without_keys(self.excluded.iter().copied())
         });
+        let base = self.peer_root.and_then(|_| self.shared_base().cloned());
         let peer_root = self.peer_root.map(|_| {
-            let mut peer = self
-                .agreed
-                .as_deref()
-                .cloned()
-                .unwrap_or_else(|| Tree::empty(self.kind, self.collection));
+            let mut peer = base.unwrap_or_else(|| Tree::empty(self.kind, self.collection));
             peer.union(self.peer);
             peer.summary()
         });
@@ -1087,21 +1090,31 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
     /// when `carried`: announce it, so the peer takes our delta only if it
     /// holds that same G.
     pub(crate) fn based(mut self, basis: Basis, carried: bool) -> Self {
-        self.basis = basis;
         self.announce = carried && self.agreed.is_some();
+        self.basis = Basis {
+            carried: self.announce,
+            ..basis
+        };
         self
     }
 
-    /// The agreement this exchange ends with: its base G plus both deltas.
-    /// A G carried over from a closed connection is part of it only when the
-    /// peer announced that same tree, so both sides checked they hold it;
-    /// otherwise it is just the two deltas, which both sides landed.
-    fn union_tree(&self) -> Tree {
+    pub(crate) fn basis(&self) -> Basis {
+        self.basis
+    }
+
+    /// The G both sides hold: a G carried over from a closed connection only
+    /// when the peer announced that same tree, so both sides checked they
+    /// hold it. The agreement and the peer's reported root build on this.
+    fn shared_base(&self) -> Option<&Tree> {
         let unshared = self.announce && self.peer_agreed != Some(self.agreed_summary());
+        self.agreed.as_deref().filter(|_| !unshared)
+    }
+
+    /// The agreement this exchange ends with: its shared base plus both
+    /// deltas; without one, just the two deltas, which both sides landed.
+    fn union_tree(&self) -> Tree {
         let mut union = self
-            .agreed
-            .as_deref()
-            .filter(|_| !unshared)
+            .shared_base()
             .cloned()
             .unwrap_or_else(|| Tree::empty(self.kind, self.collection));
         union.union(self.delta.clone());

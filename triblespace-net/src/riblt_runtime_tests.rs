@@ -1273,6 +1273,7 @@ async fn riblt_runtime_simultaneous_open_tie_break_preserves_winners_explicit_al
                     id: 777,
                     opened: true,
                     acks: old_acks,
+                    basis: Default::default(),
                     _replace: old_replace,
                 },
             );

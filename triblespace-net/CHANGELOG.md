@@ -14,8 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both sides announced the same one. Agreed trees are tagged with the
   connection they were agreed on, so an exchange on a newer connection treats
   them as carried even before the old connection's close is processed, and a
-  late end from an older exchange clears only the tree it used. Generation 33
-  skips unknown walk frames and is refused at the handshake.
+  late end from an older exchange clears only the tree it used. A carried
+  tree is kept only by a confirmed exchange: one cancelled, replaced or cut
+  before its outcome is known forgets it, at the cost of one full walk, so a
+  tree the peer refused is never offered again. Generation 33 skips unknown
+  walk frames and is refused at the handshake.
 - Grant gossip by participation, in the unreleased ALPN33 candidate: one
   passive mechanism for the grants over every resource R, with no routing by
   resource kind. A grant over R is shown to every node that takes part in R

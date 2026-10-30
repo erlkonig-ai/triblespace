@@ -804,6 +804,40 @@ mod persisted {
         assert_eq!(ws.node.records(collection).len(), 1_000);
     }
 
+    /// R2, on the F1 witness: the writer restored with {a} and no G, the hub
+    /// carrying {a, x}. The hub's health reports as received the base the
+    /// next agreement takes, the writer's {a}, never the {a, x} the writer
+    /// did not announce.
+    #[test]
+    fn a_carried_agreement_the_peer_did_not_announce_is_not_reported_as_received() {
+        let r = records(1_000, 0, 0);
+        let (a, _) = r.shared.split_at(500);
+        let (mut lane, first) = Lane::new(&r, 1_000, 0).sync(&r.shared);
+        assert_eq!(first.h, Some(Outcome::Confirmed));
+        lane.close();
+        let (mut writer, _) = node(WRITER, HUB, true);
+        for record in a {
+            writer.store.insert(*record).unwrap();
+        }
+        writer.observe();
+        lane.w = writer;
+        let (lane, restored) = lane.sync(&[]);
+        assert_eq!(restored.h, Some(Outcome::Confirmed));
+        assert_eq!(restored.run.h.agreed, 1, "the hub announced its carried G");
+        lane.agree();
+        let base = Tree::pinned(WalkKind::Commit, lane.w.pinned(lane.collection).repair());
+        let received = lane
+            .h
+            .health
+            .snapshot()
+            .collections
+            .iter()
+            .find(|entry| entry.collection == lane.collection)
+            .and_then(|entry| entry.peers.iter().find(|pair| pair.peer == lane.w.id()))
+            .and_then(|pair| pair.received.commits);
+        assert_eq!(received, Some(base.summary()), "the shared base, {{a}}");
+    }
+
     /// Before and after. `cargo test -p triblespace-net
     /// prefix_reconnect_persisted_table -- --ignored --nocapture`.
     #[test]
