@@ -144,6 +144,17 @@ impl Tree {
         self.at(&[]).unwrap_or_else(empty)
     }
 
+    /// An empty tree of this one's kind and collection.
+    #[cfg(test)]
+    pub(crate) fn emptied(&self) -> Self {
+        match self {
+            Self::Commit(_) => Self::Commit(PATCH::new()),
+            Self::Derive(_) => Self::Derive(PATCH::new()),
+            Self::Authorization(collection, _) => Self::Authorization(*collection, PATCH::new()),
+            Self::References(_) => Self::References(PATCH::new()),
+        }
+    }
+
     /// Exact native summary after sparse inserts, without unknown typed bodies.
     pub(crate) fn summary_with_keys(
         &self,

@@ -51,6 +51,11 @@ pub(crate) mod riblt_decode;
 #[cfg(test)]
 mod riblt_decode_tests;
 pub(crate) mod riblt_proof;
+// Standalone prototype: nothing on the wire uses it yet.
+#[cfg(test)]
+pub(crate) mod riblt_shortcut;
+#[cfg(test)]
+mod riblt_shortcut_tests;
 pub(crate) mod riblt_store;
 pub(crate) mod routing;
 pub(crate) mod schedule;
