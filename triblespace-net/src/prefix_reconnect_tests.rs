@@ -31,6 +31,7 @@ struct Wire {
     values: usize,
     haves: usize,
     requests: usize,
+    agreed: usize,
 }
 
 impl Wire {
@@ -44,6 +45,7 @@ impl Wire {
             Frame::Value { .. } => self.values += 1,
             Frame::Have { .. } => self.haves += 1,
             Frame::ValueRequest { .. } => self.requests += 1,
+            Frame::Agreed { .. } => self.agreed += 1,
             _ => {}
         }
     }
@@ -74,6 +76,16 @@ impl Side {
             sends,
             !sends,
         );
+        Self {
+            node,
+            exchange,
+            replies: VecDeque::new(),
+            wire: Wire::default(),
+            useful: BTreeSet::new(),
+            useful_landed: 0,
+        }
+    }
+    fn with(node: Node, exchange: Exchange<MemoryRepoSnapshot>) -> Self {
         Self {
             node,
             exchange,
@@ -140,6 +152,16 @@ struct Run {
 /// Long-RTT pump: per round the writer writes all it may, the hub hears it
 /// all, then the hub's replies all reach the writer.
 fn pump(w: &mut Side, h: &mut Side, useful: usize) -> Run {
+    let run = pump_any(w, h, useful);
+    assert_eq!(w.exchange.outcome(), Some(Outcome::Confirmed));
+    assert_eq!(h.exchange.outcome(), Some(Outcome::Confirmed));
+    run
+}
+
+/// As [`pump`], but an exchange may fail: the pump stops when either side
+/// failed (its stream is reset) or nothing moves.
+fn pump_any(w: &mut Side, h: &mut Side, useful: usize) -> Run {
+    let failed = |side: &Side| matches!(side.exchange.outcome(), Some(Outcome::Failed(_)));
     let mut rounds = 0;
     let mut first_useful = None;
     let mut all_useful = None;
@@ -147,7 +169,10 @@ fn pump(w: &mut Side, h: &mut Side, useful: usize) -> Run {
         rounds += 1;
         assert!(rounds < 1_000_000, "did not quiesce");
         let mut moved = false;
-        while let Some(frame) = w.next() {
+        while !failed(w)
+            && !failed(h)
+            && let Some(frame) = w.next()
+        {
             moved = true;
             h.hear(frame);
             if first_useful.is_none() && h.useful_landed >= 1.min(useful) && useful > 0 {
@@ -157,16 +182,17 @@ fn pump(w: &mut Side, h: &mut Side, useful: usize) -> Run {
                 all_useful = Some((rounds, w.wire.bytes));
             }
         }
-        while let Some(frame) = h.next() {
+        while !failed(w)
+            && !failed(h)
+            && let Some(frame) = h.next()
+        {
             moved = true;
             w.hear(frame);
         }
-        if !moved {
+        if !moved || failed(w) || failed(h) {
             break;
         }
     }
-    assert_eq!(w.exchange.outcome(), Some(Outcome::Confirmed));
-    assert_eq!(h.exchange.outcome(), Some(Outcome::Confirmed));
     Run {
         w: w.wire,
         h: h.wire,
@@ -277,7 +303,10 @@ fn prefix_reconnect_without_agreement_resends_the_whole_writer_collection() {
     row("symmetric", 1_000, 0, 10, false, &forgotten);
     row("symmetric", 1_000, 0, 10, true, &held);
     assert_eq!(forgotten.w.leaves, 1_010);
-    assert_eq!(forgotten.w.values, 1_010, "every body goes out before its HAVE");
+    assert_eq!(
+        forgotten.w.values, 1_010,
+        "every body goes out before its HAVE"
+    );
     assert_eq!(forgotten.h.haves, 1_010);
     assert_eq!(held.w.leaves, 10);
     assert_eq!(held.w.values, 10);
@@ -306,7 +335,14 @@ fn prefix_reconnect_table() {
         let r = records(n, 0, 100);
         for d in [1, 10, 100] {
             for agreement in [true, false] {
-                row("symmetric", n as usize, 0, d, agreement, &run(&r, d, agreement));
+                row(
+                    "symmetric",
+                    n as usize,
+                    0,
+                    d,
+                    agreement,
+                    &run(&r, d, agreement),
+                );
             }
         }
     }
@@ -314,7 +350,371 @@ fn prefix_reconnect_table() {
         let r = records(1_000, extra, 10);
         for d in [1, 10] {
             for agreement in [true, false] {
-                row("superset", 1_000, extra as usize, d, agreement, &run(&r, d, agreement));
+                row(
+                    "superset",
+                    1_000,
+                    extra as usize,
+                    d,
+                    agreement,
+                    &run(&r, d, agreement),
+                );
+            }
+        }
+    }
+}
+
+/// The agreement carried over a closed connection, through the walks: the
+/// writer and the hub each keep what they confirmed in memory when the
+/// connection closes, and the reconnect's exchange is taken against it
+/// only once the hub has seen the writer's AGREED and holds the same tree.
+mod persisted {
+    use super::*;
+    use crate::walk_stream::{Algorithm, OfferRole};
+
+    /// The writer only sends C to the hub; the hub only receives it.
+    fn node(byte: u8, peer: u8, sends: bool) -> (Node, CollectionHandle) {
+        let mut node = Node::new(byte);
+        let collection = node.hold(NAME, open());
+        let peer = Node::new(peer).id();
+        node.health.update(|health| {
+            health.peerings.push(crate::health::PeeringHealth {
+                collection,
+                peer,
+                asked: false,
+                peered: true,
+                sends,
+                receives: !sends,
+                refused_by_me: false,
+                refused_by_them: false,
+            })
+        });
+        node.observe();
+        (node, collection)
+    }
+
+    struct Lane {
+        w: Node,
+        h: Node,
+        collection: CollectionHandle,
+    }
+
+    struct Synced {
+        run: Run,
+        w: Option<Outcome>,
+        h: Option<Outcome>,
+        /// The hub's walks asked to exchange again at once.
+        again: bool,
+    }
+
+    impl Lane {
+        fn new(r: &Records, writer: usize, hub: usize) -> Self {
+            let (mut w, collection) = node(WRITER, HUB, true);
+            let (mut h, _) = node(HUB, WRITER, false);
+            assert_eq!(collection, r.collection);
+            for record in &r.shared[..writer] {
+                w.store.insert(*record).unwrap();
+            }
+            for record in &r.shared[..hub] {
+                h.store.insert(*record).unwrap();
+            }
+            w.observe();
+            h.observe();
+            Self { w, h, collection }
+        }
+
+        /// One exchange the writer opens, as the walks start it on both
+        /// sides, ended into both walks. A side that failed resets the
+        /// stream as failed, which its peer reads.
+        fn sync(self, useful: &[CollectionRecord]) -> (Self, Synced) {
+            let Self { w, h, collection } = self;
+            let (wid, hid) = (w.id(), h.id());
+            let we = w.walks.start(hid, collection, WalkKind::Commit).unwrap();
+            assert_eq!(we.offer_role(), Some(OfferRole::Send));
+            let he = h
+                .walks
+                .start_incoming(
+                    wid,
+                    collection,
+                    WalkKind::Commit,
+                    Algorithm::Prefix,
+                    Some(OfferRole::Send),
+                )
+                .unwrap();
+            let mut ws = Side::with(w, we);
+            let mut hs = Side::with(h, he);
+            hs.useful = useful.iter().map(|r| r.fingerprint().raw()).collect();
+            let run = pump_any(&mut ws, &mut hs, useful.len());
+            let (wo, ho) = (ws.exchange.outcome(), hs.exchange.outcome());
+            let failed = |o: Option<Outcome>| matches!(o, Some(Outcome::Failed(_)));
+            let now = crate::clock::mono_now();
+            let end = |side: Side, peer, peer_failed| {
+                let mut node = side.node;
+                let mut ended = side.exchange.end();
+                ended.peer_failed = peer_failed;
+                let again = node
+                    .walks
+                    .ended(peer, collection, WalkKind::Commit, ended, now);
+                (node, again)
+            };
+            let (w, _) = end(ws, hid, failed(ho));
+            let (h, again) = end(hs, wid, failed(wo));
+            (
+                Self { w, h, collection },
+                Synced {
+                    run,
+                    w: wo,
+                    h: ho,
+                    again,
+                },
+            )
+        }
+
+        /// The connection closes: both sides carry their agreement over.
+        fn close(&mut self) {
+            let (wid, hid) = (self.w.id(), self.h.id());
+            self.w.walks.closed(hid);
+            self.h.walks.closed(wid);
+        }
+
+        fn write(&mut self, records: &[CollectionRecord]) {
+            for record in records {
+                self.w.store.insert(*record).unwrap();
+            }
+            self.w.observe();
+            self.h.observe();
+        }
+
+        fn confirmed(
+            node: &Node,
+            peer: crate::transport::PeerId,
+            collection: CollectionHandle,
+        ) -> Option<PatchSummary> {
+            node.health
+                .snapshot()
+                .collections
+                .iter()
+                .find(|entry| entry.collection == collection)?
+                .peers
+                .iter()
+                .find(|pair| pair.peer == peer)?
+                .confirmed
+                .commits
+        }
+
+        /// Both sides confirmed the same agreed root, the writer's tree.
+        fn agree(&self) {
+            let w = Self::confirmed(&self.w, self.h.id(), self.collection);
+            let h = Self::confirmed(&self.h, self.w.id(), self.collection);
+            assert_eq!(w, h);
+            assert_eq!(
+                w,
+                Some(
+                    Tree::pinned(WalkKind::Commit, self.w.pinned(self.collection).repair())
+                        .summary()
+                )
+            );
+        }
+    }
+
+    fn after(label: &str, n: usize, d: usize, run: &Run) {
+        eprintln!(
+            "PREFIX_RECONNECT_PERSISTED {label} w={n} d={d} | W->H bytes={} frames={} agreed={} nodes={} leaves={} values={} | H->W bytes={} haves={} | rounds={} all_useful={}",
+            run.w.bytes,
+            run.w.frames,
+            run.w.agreed,
+            run.w.nodes,
+            run.w.leaves,
+            run.w.values,
+            run.h.bytes,
+            run.h.haves,
+            run.rounds,
+            run.all_useful
+                .map_or("-".into(), |(r, b)| format!("r{r}/{b}B")),
+        );
+    }
+
+    /// First sync, close, d new records, reconnect: the reconnect costs what
+    /// a kept agreement costs, not the whole collection.
+    fn reconnect(r: &Records, d: usize) -> (Lane, Run) {
+        let n = r.shared.len();
+        // The hub already holds the writer's records (as after any earlier
+        // sync); the first exchange is still the full walk that agrees G.
+        let (mut lane, first) = Lane::new(r, n, n).sync(&[]);
+        assert_eq!(first.w, Some(Outcome::Confirmed));
+        assert_eq!(first.h, Some(Outcome::Confirmed));
+        assert_eq!(first.run.w.values, n);
+        lane.agree();
+        lane.close();
+        lane.write(&r.new[..d]);
+        let (mut lane, again) = lane.sync(&r.new[..d]);
+        assert_eq!(again.w, Some(Outcome::Confirmed));
+        assert_eq!(again.h, Some(Outcome::Confirmed));
+        assert_eq!(again.run.landed, d);
+        assert_eq!(again.run.w.agreed, 1, "a carried G is announced");
+        lane.agree();
+        assert_eq!(lane.h.records(lane.collection).len(), n + d);
+        (lane, again.run)
+    }
+
+    #[test]
+    fn prefix_reconnect_reuses_the_carried_agreement() {
+        let r = records(1_000, 0, 10);
+        let (_, run) = reconnect(&r, 10);
+        let held = super::run(&r, 10, true);
+        let forgotten = super::run(&r, 10, false);
+        after("carried", 1_000, 10, &run);
+        row("symmetric", 1_000, 0, 10, true, &held);
+        row("symmetric", 1_000, 0, 10, false, &forgotten);
+        assert_eq!(run.w.values, 10);
+        assert_eq!(run.w.leaves, 10);
+        assert_eq!(run.h.haves, held.h.haves);
+        // The only extra is the 45-byte AGREED frame.
+        assert_eq!(run.w.bytes, held.w.bytes + HEADER + 40);
+        assert_eq!(run.rounds, held.rounds);
+    }
+
+    /// The hub restarted (its walks forgot every agreement) with its store
+    /// intact: it refuses the writer's AGREED, both forget G, the hub asks
+    /// to exchange again at once, and that full walk converges. The next
+    /// reconnect is cheap again.
+    #[test]
+    fn a_restarted_hub_refuses_the_carried_agreement_and_the_full_walk_converges() {
+        let r = records(1_000, 0, 20);
+        let (mut lane, first) = Lane::new(&r, 1_000, 0).sync(&r.shared);
+        assert_eq!(first.h, Some(Outcome::Confirmed));
+        lane.close();
+        let (mut hub, _) = node(HUB, WRITER, false);
+        for record in lane.h.records(lane.collection) {
+            hub.store.insert(record).unwrap();
+        }
+        hub.observe();
+        lane.h = hub;
+        lane.write(&r.new[..10]);
+        let (lane, refused) = lane.sync(&r.new[..10]);
+        assert_eq!(refused.h, Some(Outcome::Failed(Failure::StaleAgreement)));
+        assert!(refused.again, "a stale agreement is followed at once");
+        assert_eq!(refused.run.landed, 0);
+        assert!(
+            refused.run.w.bytes < 64 * 1_024,
+            "refused within the first window"
+        );
+        let (mut lane, full) = lane.sync(&r.new[..10]);
+        assert_eq!(full.w, Some(Outcome::Confirmed));
+        assert_eq!(full.h, Some(Outcome::Confirmed));
+        assert_eq!(full.run.w.agreed, 0);
+        assert_eq!(full.run.w.values, 1_010, "the full walk");
+        assert_eq!(lane.h.records(lane.collection).len(), 1_010);
+        lane.agree();
+        lane.close();
+        lane.write(&r.new[10..20]);
+        let (mut lane, cheap) = lane.sync(&r.new[10..20]);
+        assert_eq!(cheap.h, Some(Outcome::Confirmed));
+        assert_eq!(cheap.run.w.values, 10);
+        assert_eq!(lane.h.records(lane.collection).len(), 1_020);
+    }
+
+    /// The hub's store was restored from an older backup while its walks
+    /// kept the carried agreement: it no longer holds every key in G, so it
+    /// does not offer G, refuses the writer's, and the full walk restores
+    /// what it lost.
+    #[test]
+    fn a_hub_restored_from_an_older_backup_gets_back_what_it_lost() {
+        let r = records(1_000, 0, 10);
+        let (mut lane, first) = Lane::new(&r, 1_000, 0).sync(&r.shared);
+        assert_eq!(first.h, Some(Outcome::Confirmed));
+        let g = Arc::new(Tree::pinned(
+            WalkKind::Commit,
+            lane.w.pinned(lane.collection).repair(),
+        ));
+        lane.close();
+        // Restored from a backup holding half the records, its walks
+        // carrying the agreement over from before.
+        let (mut hub, _) = node(HUB, WRITER, false);
+        for record in &r.shared[..500] {
+            hub.store.insert(*record).unwrap();
+        }
+        hub.observe();
+        let wid = lane.w.id();
+        hub.walks.ended(
+            wid,
+            lane.collection,
+            WalkKind::Commit,
+            Ended {
+                sends: false,
+                receives: true,
+                confirmed: true,
+                landed: true,
+                root: g.summary(),
+                peer_root: Some(g.summary()),
+                retain_agreement: true,
+                agreed: Some(g.clone()),
+                failure: None,
+                refused: false,
+                peer_failed: false,
+                skipped: 0,
+            },
+            crate::clock::mono_now(),
+        );
+        hub.walks.closed(wid);
+        lane.h = hub;
+        lane.write(&r.new[..10]);
+        let (lane, refused) = lane.sync(&r.new[..10]);
+        assert_eq!(refused.h, Some(Outcome::Failed(Failure::StaleAgreement)));
+        let (mut lane, full) = lane.sync(&r.new[..10]);
+        assert_eq!(full.h, Some(Outcome::Confirmed));
+        assert_eq!(full.w, Some(Outcome::Confirmed));
+        assert_eq!(
+            lane.h.records(lane.collection).len(),
+            1_010,
+            "nothing stays lost"
+        );
+        lane.agree();
+    }
+
+    /// The writer restarted with its store intact, the hub carrying G: the
+    /// writer walks against nothing, the hub's AGREED is only information to
+    /// a side that does not receive, and both end on the writer's tree, so
+    /// the following reconnect is cheap.
+    #[test]
+    fn a_restarted_writer_walks_in_full_once_and_then_reconnects_cheaply() {
+        let r = records(1_000, 0, 20);
+        let (mut lane, _) = Lane::new(&r, 1_000, 0).sync(&r.shared);
+        lane.close();
+        let (mut writer, _) = node(WRITER, HUB, true);
+        for record in lane.w.records(lane.collection) {
+            writer.store.insert(record).unwrap();
+        }
+        writer.observe();
+        lane.w = writer;
+        lane.write(&r.new[..10]);
+        let (mut lane, full) = lane.sync(&r.new[..10]);
+        assert_eq!(full.w, Some(Outcome::Confirmed));
+        assert_eq!(full.h, Some(Outcome::Confirmed));
+        assert_eq!(full.run.w.agreed, 0, "the writer has nothing to announce");
+        assert_eq!(full.run.h.agreed, 1);
+        // The writer announces its whole tree; the hub's carried G, which it
+        // still holds, certifies coarse HAVEs that prune most eager bodies.
+        assert_eq!(full.run.landed, 10);
+        assert!(full.run.w.values < 1_010, "{}", full.run.w.values);
+        assert_eq!(lane.h.records(lane.collection).len(), 1_010);
+        lane.agree();
+        lane.close();
+        lane.write(&r.new[10..20]);
+        let (_, cheap) = lane.sync(&r.new[10..20]);
+        assert_eq!(cheap.h, Some(Outcome::Confirmed));
+        assert_eq!(cheap.run.w.values, 10);
+    }
+
+    /// Before and after. `cargo test -p triblespace-net
+    /// prefix_reconnect_persisted_table -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement table, minutes at n = 100k"]
+    fn prefix_reconnect_persisted_table() {
+        for n in [1_000u64, 10_000, 100_000] {
+            let r = records(n, 0, 100);
+            for d in [1, 10, 100] {
+                let (_, run) = reconnect(&r, d);
+                after("carried", n as usize, d, &run);
             }
         }
     }

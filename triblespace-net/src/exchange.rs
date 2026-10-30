@@ -40,7 +40,9 @@
 //! stream writes/finish succeed in the driver. Failure forgets reusable G;
 //! already landed values remain. Publication lag creates an empty difference
 //! for already agreed keys and cannot shrink G. Within a connection held trees
-//! are assumed to grow. A receive-only side advertises the empty delta and
+//! are assumed to grow. A G carried over from a closed connection is not known
+//! to be held by both: its user announces it (AGREED), and a receiver whose own
+//! G differs fails the exchange ([`Failure::StaleAgreement`]). A receive-only side advertises the empty delta and
 //! serves no value, including no private pinned digest/count.
 //!
 //! State grows on demand within explicit budgets: FIFO positions, received
@@ -475,6 +477,12 @@ pub(crate) enum Failure {
     ResourceLimit,
     /// A poisoned cache or local count invariant failure.
     CacheUnavailable,
+    /// The peer took its delta against an agreed tree G this side does not
+    /// hold as its own G: a persisted agreement went stale (the peer or this
+    /// side was reset, restored or replaced, or an earlier exchange ended
+    /// confirmed on one side only). Both sides forget G, and the next
+    /// exchange is the full walk.
+    StaleAgreement,
 }
 
 impl From<CacheError> for Failure {
@@ -514,6 +522,9 @@ pub(crate) struct Ended {
     pub(crate) failure: Option<Failure>,
     /// The peer reset the stream as refused.
     pub(crate) refused: bool,
+    /// The peer reset the stream as failed: it decided this exchange failed,
+    /// possibly over our agreed tree, which is then forgotten here too.
+    pub(crate) peer_failed: bool,
     /// Received values a grant walk skipped.
     pub(crate) skipped: u64,
 }
@@ -544,6 +555,13 @@ pub(crate) struct Exchange<R> {
     /// Advertised source: prefix mode's pinned \ G, cached mode's whole source,
     /// or empty when directionality forbids sending.
     delta: Tree,
+    /// G was carried over from a closed connection: it is announced
+    /// (AGREED) before the root SUBTREE, because only the current
+    /// connection's G is known to be held by both.
+    announce: bool,
+    agreed_sent: bool,
+    /// The G the peer announced its delta against, if it did.
+    peer_agreed: Option<PatchSummary>,
     /// Essential protocol membership proof of ONLY the peer's delta. This
     /// shares known immutable trees; it is not a catalogue of the local store.
     peer: Tree,
@@ -625,6 +643,9 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
             receives,
             agreed,
             delta,
+            announce: false,
+            agreed_sent: false,
+            peer_agreed: None,
             peer: Tree::empty(kind, collection),
             snapshot: None,
             root_sent: false,
@@ -861,6 +882,13 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
                 }
             }
         }
+        if self.announce && !self.agreed_sent {
+            self.agreed_sent = true;
+            let summary = self.agreed_summary();
+            if summary.root().is_some() {
+                return Some(Frame::Agreed { summary });
+            }
+        }
         if self.offers.as_ref().is_some_and(Offers::full) {
             return None;
         }
@@ -1027,8 +1055,22 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
                 _ => None,
             },
             refused: false,
+            peer_failed: false,
             skipped: self.skipped,
         }
+    }
+
+    fn agreed_summary(&self) -> PatchSummary {
+        self.agreed
+            .as_ref()
+            .map_or_else(empty, |tree| tree.summary())
+    }
+
+    /// This exchange's G was carried over from a closed connection: announce
+    /// it, so the peer takes our delta only if it holds that same G.
+    pub(crate) fn carried_if(mut self, carried: bool) -> Self {
+        self.announce = carried && self.agreed.is_some();
+        self
     }
 
     fn union_tree(&self) -> Tree {
@@ -1303,6 +1345,19 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
                     .ok_or(Failure::Protocol)?
                     .have(&prefix, summary)?;
                 self.queue.retain(|queued| !queued.starts_with(&prefix));
+                Ok(())
+            }
+            Frame::Agreed { summary } => {
+                if self.riblt.is_some() || self.peer_root.is_some() || self.peer_agreed.is_some() {
+                    return Err(Failure::Protocol);
+                }
+                self.peer_agreed = Some(summary);
+                // The peer's delta omits a G carried over from a closed
+                // connection. That is sound here only if this side holds the
+                // same G; one it lost, never had, or moved past is refused.
+                if self.receives && summary != self.agreed_summary() {
+                    return Err(Failure::StaleAgreement);
+                }
                 Ok(())
             }
             Frame::Done => {

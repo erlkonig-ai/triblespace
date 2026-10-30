@@ -11,6 +11,7 @@
 //! | 0x09 | RIBLT_ROOT    | hash32, u64                     |
 //! | 0x0a | RIBLT_CELL    | index:u32, symbol32, hash:u64, count:i64 |
 //! | 0x0b | HAVE          | offered depth:u8, prefix32, hash32, u64 |
+//! | 0x0c | AGREED        | hash32, u64                     |
 //!
 //! SUBTREE has exactly73 payload bytes, or78 bytes with the ordinary five-byte
 //! frame header. Integers are big-endian. Prefix bytes outside depth are zero;
@@ -25,6 +26,14 @@
 //! explicit ALPN33 algorithms. Prefix offer profiles 2/3 additionally bind the
 //! opener's send/receive-only role; profile 0 always remains pull Prefix.
 //! This is not an old-wire compatibility negotiation.
+//! A Prefix side whose agreed tree G was carried over from a closed
+//! connection sends AGREED (G's root and count, exactly 40 payload bytes)
+//! before its root SUBTREE; G agreed on the current connection is held by
+//! both and goes unannounced. A receiving side takes a delta against an
+//! announced G only when its own G is that same tree; otherwise the exchange
+//! fails, both forget G, and the next exchange is the full walk. A peer that
+//! does not know this frame skips it, so a carried G is safe only between
+//! peers that do.
 //! Cached RIBLT derives its checksum key from OPEN locally; ROOT is exactly
 //! 40 payload bytes. DONE/LANDED belong only to Prefix. Cached completion uses
 //! clean write-half FIN after proof, actual landing and all owed frame writes.
@@ -46,6 +55,7 @@ pub const SUBTREE_BYTES: usize = 1 + 32 + 32 + 8;
 pub const FRAME_RIBLT_ROOT: u8 = 0x09;
 pub const FRAME_RIBLT_CELL: u8 = 0x0a;
 pub const FRAME_HAVE: u8 = 0x0b;
+pub const FRAME_AGREED: u8 = 0x0c;
 
 /// Explicit ALPN33 discovery profile. CachedRiblt is the default for mutually
 /// authorized peers. Prefix remains selectable and is required
@@ -114,6 +124,10 @@ pub(crate) enum Frame {
     },
     Done,
     Landed,
+    /// The agreed tree G this side's delta is taken against.
+    Agreed {
+        summary: PatchSummary,
+    },
     RibltRoot {
         summary: PatchSummary,
     },
@@ -167,6 +181,10 @@ impl Frame {
             Self::RibltRoot { summary } => {
                 push_summary(&mut payload, *summary);
                 FRAME_RIBLT_ROOT
+            }
+            Self::Agreed { summary } => {
+                push_summary(&mut payload, *summary);
+                FRAME_AGREED
             }
             Self::RibltCell {
                 index,
@@ -253,6 +271,13 @@ impl Frame {
             FRAME_RIBLT_ROOT => Self::RibltRoot {
                 summary: rest.summary()?,
             },
+            FRAME_AGREED => {
+                let summary = rest.summary()?;
+                if summary.root().is_none() {
+                    return Err(Malformed("AGREED names a nonempty agreed tree"));
+                }
+                Self::Agreed { summary }
+            }
             FRAME_RIBLT_CELL => Self::RibltCell {
                 index: u32::from_be_bytes(rest.take(4)?.try_into().unwrap()),
                 symbol: rest.hash()?,
