@@ -496,6 +496,12 @@ impl<C> Connection<C> {
         &self.handle.state
     }
 
+    /// This connection's id: unique within the table, and larger for a
+    /// connection made later.
+    pub(crate) fn id(&self) -> u64 {
+        self.state().id
+    }
+
     /// The key that dialled this connection.
     pub fn dialler(&self) -> PeerId {
         self.state().dialler
@@ -1157,6 +1163,7 @@ async fn stream<T: Transport, S: Service>(
                 ) => {
                     walks.incoming(
                         state.peer,
+                        state.id,
                         collection,
                         kind,
                         algorithm,

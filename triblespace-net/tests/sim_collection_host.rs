@@ -1161,7 +1161,7 @@ fn a_previous_generation_peer_is_refused() {
         let server_id = server_key.verifying_key().to_bytes();
         assert_eq!(
             triblespace_net::protocol::PILE_SYNC_ALPN,
-            b"/triblespace/pile-sync/33"
+            b"/triblespace/pile-sync/34"
         );
         let current = client
             .transport

@@ -8,14 +8,17 @@
 //! it, and the agreed tree for that peer, collection and kind becomes the
 //! prior agreement plus both deltas, which both hold; an exchange either side
 //! decided failed forgets it, and what landed stays. Agreed trees outlive the
-//! connection they were agreed on, in this node's memory only, and are
-//! forgotten for a collection when it is deselected. A tree carried over
-//! from a closed connection is offered again only while this side still
-//! holds every key in it, and only with the peer's assent: a side that
-//! subtracts G announces it (AGREED), and a receiver that does not hold the
-//! same G fails the exchange, after which both forget it and the next
-//! exchange is the full walk. An exchange the network interrupted keeps the
-//! prior G, which both still hold.
+//! connection they were agreed on, in this node's memory only, tagged with
+//! that connection's id, and are forgotten for a collection when it is
+//! deselected. On any other connection (the old one closed, or the peer
+//! opened a new one before this side saw the close) a tree is carried: it is
+//! offered only while this side still holds every key in it, and only with
+//! the peer's assent: a side that subtracts G announces it (AGREED), and a
+//! receiver that does not hold the same G fails the exchange, after which
+//! both forget it and the next exchange is the full walk. A carried G enters
+//! the next agreement only when both sides announced it. An exchange the
+//! network interrupted keeps the prior G, which both still hold; a replaced
+//! exchange that ends late forgets only the G it was based on.
 //!
 //! The kinds of tree are the collection's records and the blobs it holds, as
 //! handles without values, and the grants over any resource R (keyed by
@@ -92,7 +95,7 @@ use crate::connection::{
     ConnectionTable, FrameError, RESET_WALK_DUPLICATE, RESET_WALK_FAILED, RESET_WALK_REFUSED,
     Service, open_walk, read_frame, write_frame,
 };
-use crate::exchange::{Ended, Exchange, Out, Outcome, Pinned, Tree};
+use crate::exchange::{Basis, Ended, Exchange, Out, Outcome, Pinned, Tree};
 use crate::grants::{
     GrantEvent, GrantOutcome, GrantWalkEnd, MAX_UNKNOWN_RESOURCES_PER_LINK, NotStarted,
 };
@@ -245,14 +248,26 @@ pub(crate) struct Walks<R> {
     /// The collections the last snapshot selected: one that leaves the
     /// selection is forgotten.
     selected: PATCH<32, IdentitySchema, ()>,
-    /// Sound common-held keys agreed on the current connection: prior
-    /// acknowledged base plus both completed deltas, possibly ahead of
-    /// lagging physical pins.
-    agreed: PATCH<65, IdentitySchema, Arc<Tree>>,
-    /// Agreed trees of connections that closed. A cache of shared state,
-    /// never trusted blindly: offered only while every key in it is still
-    /// held here, and used only when the peer announces the same tree.
-    carried: PATCH<65, IdentitySchema, Arc<Tree>>,
+    /// Sound common-held keys: prior acknowledged base plus both completed
+    /// deltas, possibly ahead of lagging physical pins, with the connection
+    /// they were agreed on. On any other connection the tree is carried: a
+    /// cache of shared state, never trusted blindly.
+    agreed: PATCH<65, IdentitySchema, Agreement>,
+    /// The last [`Agreement::stamp`] given.
+    stamps: u64,
+}
+
+/// What a peer and this side agreed on for one collection and kind.
+#[derive(Clone)]
+pub(crate) struct Agreement {
+    /// The id of the connection it was agreed on. An exchange on that
+    /// connection uses it unannounced; one on any other connection announces
+    /// it (AGREED), and only while this side still holds every key in it.
+    pub(crate) connection: u64,
+    /// Which agreement this is: an exchange's end settles only the agreement
+    /// it was based on ([`Basis`]), never one stored after it started.
+    pub(crate) stamp: u64,
+    pub(crate) tree: Arc<Tree>,
 }
 
 impl<R: BlobStoreGet + Clone> Walks<R> {
@@ -263,7 +278,7 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
             snapshot: None,
             selected: PATCH::new(),
             agreed: PATCH::new(),
-            carried: PATCH::new(),
+            stamps: 0,
         }
     }
 
@@ -272,23 +287,51 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
         self
     }
 
-    /// Start an exchange of C's `kind` tree with `peer`, against what they
-    /// agreed on: none when C is not selected and active here, this side neither
-    /// sends C to the peer nor receives C from it, or `kind` is
-    /// [`WalkKind::References`] and C's held set is unknown here (an incoming
-    /// exchange is refused alike). [`Walks::ended`] ends it.
+    /// [`Walks::start_on`] the one connection a test does not name.
+    #[cfg(test)]
     pub(crate) fn start(
         &self,
         peer: PeerId,
         collection: CollectionHandle,
         kind: WalkKind,
     ) -> Option<Exchange<R>> {
-        self.start_selected(peer, collection, kind, None)
+        self.start_on(peer, 0, collection, kind, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn start_selected(
         &self,
         peer: PeerId,
+        collection: CollectionHandle,
+        kind: WalkKind,
+        requested: Option<crate::walk_stream::Algorithm>,
+    ) -> Option<Exchange<R>> {
+        self.start_on(peer, 0, collection, kind, requested)
+    }
+
+    /// [`Walks::join_on`] the one connection a test does not name.
+    #[cfg(test)]
+    pub(crate) fn start_incoming(
+        &self,
+        peer: PeerId,
+        collection: CollectionHandle,
+        kind: WalkKind,
+        algorithm: crate::walk_stream::Algorithm,
+        offer: Option<crate::walk_stream::OfferRole>,
+    ) -> Option<Exchange<R>> {
+        self.join_on(peer, 0, collection, kind, algorithm, offer)
+    }
+
+    /// Start an exchange of C's `kind` tree with `peer`, against what they
+    /// agreed on: none when C is not selected and active here, this side neither
+    /// sends C to the peer nor receives C from it, or `kind` is
+    /// [`WalkKind::References`] and C's held set is unknown here (an incoming
+    /// exchange is refused alike). [`Walks::ended`] ends it. It runs on
+    /// `connection`, the id of the connection its stream is opened on.
+    pub(crate) fn start_on(
+        &self,
+        peer: PeerId,
+        connection: u64,
         collection: CollectionHandle,
         kind: WalkKind,
         requested: Option<crate::walk_stream::Algorithm>,
@@ -317,7 +360,7 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
         if requested == Some(crate::walk_stream::Algorithm::CachedRiblt) && !(sends && receives) {
             return None;
         }
-        let (agreed, carried) = self.agreement(peer, collection, kind, &pinned);
+        let (agreed, carried, basis) = self.agreement(peer, connection, collection, kind, &pinned);
         Some(
             if sends
                 && receives
@@ -326,45 +369,49 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
                 Exchange::start_riblt(collection, kind, pinned)
             } else if sends != receives {
                 Exchange::start_one_way(collection, kind, pinned, agreed, sends, receives)
-                    .carried_if(carried)
+                    .based(basis, carried)
             } else {
                 Exchange::start(collection, kind, pinned, agreed, sends, receives)
-                    .carried_if(carried)
+                    .based(basis, carried)
             },
         )
     }
 
-    /// What this side and `peer` agreed on for C's `kind` tree: the current
-    /// connection's, or one carried over from a closed connection while
-    /// this side still holds every key in it. A carried tree this side no
-    /// longer holds (its store was reset or restored) is not offered, and
-    /// the peer then refuses its own (AGREED).
+    /// What this side and `peer` agreed on for C's `kind` tree, for an
+    /// exchange on `connection`: one agreed on that connection, or one
+    /// carried over from another (closed, or replaced) while this side still
+    /// holds every key in it, which is then announced. A carried tree this
+    /// side no longer holds (its store was reset or restored) is not offered,
+    /// and the peer then refuses its own (AGREED).
     fn agreement(
         &self,
         peer: PeerId,
+        connection: u64,
         collection: CollectionHandle,
         kind: WalkKind,
         pinned: &CollectionSnapshot,
-    ) -> (Option<Arc<Tree>>, bool) {
-        let key = agreed_key(peer, collection.raw, kind);
-        if let Some(agreed) = self.agreed.get(&key) {
-            return (Some(agreed.clone()), false);
-        }
-        let Some(carried) = self.carried.get(&key) else {
-            return (None, false);
+    ) -> (Option<Arc<Tree>>, bool, Basis) {
+        let mut basis = Basis {
+            connection,
+            agreement: None,
         };
-        let held = Tree::pinned(kind, pinned.repair());
-        if held.has_new_keys(carried) {
-            return (None, false);
+        let Some(agreed) = self.agreed.get(&agreed_key(peer, collection.raw, kind)) else {
+            return (None, false, basis);
+        };
+        let carried = agreed.connection != connection;
+        if carried && Tree::pinned(kind, pinned.repair()).has_new_keys(&agreed.tree) {
+            return (None, false, basis);
         }
-        (Some(carried.clone()), true)
+        basis.agreement = Some(agreed.stamp);
+        (Some(agreed.tree.clone()), carried, basis)
     }
 
     /// OPEN commits to the body protocol before driver registration. Ordinary
     /// Prefix never infers eager acceptance from our local authorization view.
-    pub(crate) fn start_incoming(
+    pub(crate) fn join_on(
         &self,
         peer: PeerId,
+        connection: u64,
         collection: CollectionHandle,
         kind: WalkKind,
         algorithm: crate::walk_stream::Algorithm,
@@ -399,14 +446,14 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
         if !sends && !receives {
             return None;
         }
-        let (agreed, carried) = self.agreement(peer, collection, kind, &pinned);
+        let (agreed, carried, basis) = self.agreement(peer, connection, collection, kind, &pinned);
         match (algorithm, offer) {
             (Algorithm::CachedRiblt, None) if sends && receives => {
                 Some(Exchange::start_riblt(collection, kind, pinned))
             }
             (Algorithm::Prefix, None) => Some(
                 Exchange::start(collection, kind, pinned, agreed, sends, receives)
-                    .carried_if(carried),
+                    .based(basis, carried),
             ),
             (Algorithm::Prefix, Some(role))
                 if kind != WalkKind::References
@@ -417,7 +464,7 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
             {
                 Some(
                     Exchange::start_one_way(collection, kind, pinned, agreed, sends, receives)
-                        .carried_if(carried),
+                        .based(basis, carried),
                 )
             }
             _ => None,
@@ -474,11 +521,9 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
             // is followed at once by the full walk.
             if ended.failure.is_some() || ended.peer_failed {
                 self.agreed.remove(&key);
-                self.carried.remove(&key);
             }
             return stale;
         };
-        self.carried.remove(&key);
         let current = match kind {
             WalkKind::Authorization => self
                 .grant_pin(peer, collection)
@@ -491,7 +536,13 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
         // The key stays constant across exchanges; replace must publish the
         // new attached tree even though PATCH set equality observes keys only.
         if ended.retain_agreement {
-            self.agreed.replace(&Entry::with_value(&key, agreed));
+            self.stamps += 1;
+            let agreement = Agreement {
+                connection: ended.basis.connection,
+                stamp: self.stamps,
+                tree: agreed,
+            };
+            self.agreed.replace(&Entry::with_value(&key, agreement));
         } else {
             // Cached mode never subtracts G. A prior Prefix agreement is also
             // released once this explicitly selected whole-source walk ends.
@@ -500,10 +551,34 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
         moved
     }
 
-    /// A connection to `peer` closed: what they agreed on is carried over
-    /// for the next connection. A peer that restarted holds no agreed trees,
-    /// and refuses an exchange against one it lacks (AGREED); both then
-    /// forget it, and the next exchange is the delta against nothing.
+    /// An exchange another one replaced ended late (its connection closed, or
+    /// the peer opened the same exchange again, possibly on a newer
+    /// connection), after the replacement may have started or ended. Health
+    /// and a confirmed agreement are the replacement's to settle; a failure
+    /// either side decided still forgets the agreement the late exchange was
+    /// based on, unless a newer one was stored since.
+    pub(crate) fn superseded(
+        &mut self,
+        peer: PeerId,
+        collection: CollectionHandle,
+        kind: WalkKind,
+        ended: &Ended,
+    ) {
+        let key = agreed_key(peer, collection.raw, kind);
+        if ended.agreed.is_none()
+            && (ended.failure.is_some() || ended.peer_failed)
+            && ended.basis.agreement.is_some()
+            && self.agreed.get(&key).map(|agreed| agreed.stamp) == ended.basis.agreement
+        {
+            self.agreed.remove(&key);
+        }
+    }
+
+    /// A connection to `peer` closed. What they agreed on stays, tagged with
+    /// the connection it was agreed on: the next connection announces it. A
+    /// peer that restarted holds no agreed trees, and refuses an exchange
+    /// against one it lacks (AGREED); both then forget it, and the next
+    /// exchange is the delta against nothing.
     pub(crate) fn closed(&mut self, peer: PeerId) {
         self.health.update(|health| {
             for collection in &mut health.collections {
@@ -512,18 +587,6 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
                 }
             }
         });
-        let dropped = self
-            .agreed
-            .iter()
-            .filter(|key| key[..32] == peer)
-            .copied()
-            .collect::<Vec<_>>();
-        for key in dropped {
-            if let Some(agreed) = self.agreed.get(&key).cloned() {
-                self.carried.replace(&Entry::with_value(&key, agreed));
-            }
-            self.agreed.remove(&key);
-        }
     }
 
     /// Take the latest serving snapshot: what new exchanges pin and are
@@ -552,15 +615,6 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
                 .collect::<Vec<_>>();
             for key in forgotten {
                 self.agreed.remove(&key);
-            }
-            let forgotten = self
-                .carried
-                .iter()
-                .filter(|key| dropped.contains(&key[32..64]))
-                .copied()
-                .collect::<Vec<_>>();
-            for key in forgotten {
-                self.carried.remove(&key);
             }
         }
         self.selected = selected;
@@ -943,6 +997,7 @@ impl WalksHandle {
     pub(crate) fn incoming(
         &self,
         peer: PeerId,
+        connection: u64,
         collection: CollectionHandle,
         kind: WalkKind,
         algorithm: crate::walk_stream::Algorithm,
@@ -952,6 +1007,7 @@ impl WalksHandle {
     ) {
         let incoming = Command::Incoming {
             peer,
+            connection,
             collection,
             kind,
             algorithm,
@@ -982,6 +1038,8 @@ pub(crate) enum Command {
     /// written on `send`.
     Incoming {
         peer: PeerId,
+        /// The id of the connection the stream arrived on.
+        connection: u64,
         collection: CollectionHandle,
         kind: WalkKind,
         algorithm: crate::walk_stream::Algorithm,
@@ -1200,13 +1258,14 @@ where
             }
             Command::Incoming {
                 peer,
+                connection,
                 collection,
                 kind,
                 algorithm,
                 offer,
                 send,
                 recv,
-            } => self.incoming(peer, collection, kind, algorithm, offer, send, recv),
+            } => self.incoming(peer, connection, collection, kind, algorithm, offer, send, recv),
             Command::Ended {
                 id,
                 peer,
@@ -1245,9 +1304,15 @@ where
                         landed: current && !duplicate && ended.landed,
                     });
                 }
-                // A replaced exchange, or one the peer reset for the stream
-                // it opened at the same time, settles nothing.
-                if !current || duplicate {
+                // One the peer reset for the stream it opened at the same
+                // time settles nothing. A replaced exchange settles only a
+                // failure of the agreement it was based on: its replacement
+                // may run on a newer connection, before this one's close.
+                if duplicate {
+                    return;
+                }
+                if !current {
+                    self.walks.superseded(peer, collection, kind, &ended);
                     return;
                 }
                 // A confirmed exchange of a tree that moved meanwhile is
@@ -1285,7 +1350,10 @@ where
             };
             return not_started(self, why);
         }
-        let Some(exchange) = self.walks.start(peer, collection, kind) else {
+        let Some(exchange) = self
+            .walks
+            .start_on(peer, connection.id(), collection, kind, None)
+        else {
             return not_started(self, NotStarted::StartDeclined);
         };
         let (driver, acked, replaced) = self.register(key, true, &exchange);
@@ -1359,6 +1427,7 @@ where
     fn incoming(
         &mut self,
         peer: PeerId,
+        connection: u64,
         collection: CollectionHandle,
         kind: WalkKind,
         algorithm: crate::walk_stream::Algorithm,
@@ -1381,7 +1450,7 @@ where
         }
         let Some(exchange) = self
             .walks
-            .start_incoming(peer, collection, kind, algorithm, offer)
+            .join_on(peer, connection, collection, kind, algorithm, offer)
         else {
             send.reset(RESET_WALK_REFUSED);
             recv.stop(RESET_WALK_REFUSED);
@@ -2229,11 +2298,11 @@ pub(crate) mod tests {
         all.into_iter().collect()
     }
 
-    /// What a peer and this side agreed on is carried over when a connection
-    /// to it closes, and offered from then on only with the peer's assent
-    /// (AGREED), so a peer that restarted is not held to a tree it lost; a
-    /// collection's agreed trees, current and carried, are forgotten for
-    /// every peer when the collection is deselected.
+    /// What a peer and this side agreed on outlives the connection it was
+    /// agreed on, and on any other connection is offered only with the peer's
+    /// assent (AGREED), so a peer that restarted is not held to a tree it
+    /// lost; a collection's agreed trees are forgotten for every peer when
+    /// the collection is deselected.
     #[test]
     fn agreed_trees_are_carried_over_a_closed_connection_and_dropped_with_the_collection() {
         let mut node = Node::new(63);
@@ -2261,6 +2330,7 @@ pub(crate) mod tests {
                     failure: None,
                     refused: false,
                     peer_failed: false,
+                    basis: Default::default(),
                     skipped: 0,
                 };
                 assert!(!node.walks.ended(peer, collection, kind, ended, now));
@@ -2277,25 +2347,17 @@ pub(crate) mod tests {
             assert!(remembered(&node, peer, collection));
         }
 
-        let carried = |node: &Node, peer: PeerId, collection: CollectionHandle| {
-            node.walks
-                .carried
-                .get(&agreed_key(peer, collection.raw, kind))
-                .is_some()
-        };
         // A connection to A closes: A's trees are carried over to the next
-        // connection, offered (announced) only from there; B's stay current.
+        // connection (1), offered (announced) only there; B's stay current
+        // on connection 0.
         node.walks.closed(a);
-        assert!(!remembered(&node, a, kept));
-        assert!(!remembered(&node, a, dropped));
-        assert!(carried(&node, a, kept));
-        assert!(carried(&node, a, dropped));
-        assert!(remembered(&node, b, kept));
-        assert!(remembered(&node, b, dropped));
-        let (agreed, from_closed) = node.walks.agreement(a, kept, kind, &node.pinned(kept));
-        assert!(agreed.is_some() && from_closed);
-        let (agreed, from_closed) = node.walks.agreement(b, kept, kind, &node.pinned(kept));
-        assert!(agreed.is_some() && !from_closed);
+        for (peer, collection) in pairs {
+            assert!(remembered(&node, peer, collection));
+        }
+        let (agreed, carried, _) = node.walks.agreement(a, 1, kept, kind, &node.pinned(kept));
+        assert!(agreed.is_some() && carried);
+        let (agreed, carried, _) = node.walks.agreement(b, 0, kept, kind, &node.pinned(kept));
+        assert!(agreed.is_some() && !carried);
 
         // One collection is deselected: its trees go for every peer, and
         // the other's stay, over this observation and the next.
@@ -2309,10 +2371,10 @@ pub(crate) mod tests {
         assert!(remembered(&node, b, kept));
         node.walks.closed(a);
         node.walks.closed(b);
-        assert!(carried(&node, a, kept) && carried(&node, b, kept));
+        assert!(remembered(&node, a, kept) && remembered(&node, b, kept));
         node.select(kept, false);
         node.observe();
-        assert!(!carried(&node, a, kept) && !carried(&node, b, kept));
+        assert!(!remembered(&node, a, kept) && !remembered(&node, b, kept));
 
         // Health saw every end: eight confirmed pushes and landed receives
         // for A, and the agreed root is each collection's own.
@@ -2440,6 +2502,7 @@ pub(crate) mod tests {
                 failure: None,
                 refused: false,
                 peer_failed: false,
+                basis: Default::default(),
                 skipped: 0,
             },
             crate::clock::mono_now(),
@@ -2514,6 +2577,7 @@ pub(crate) mod tests {
                     failure: None,
                     refused: false,
                     peer_failed: false,
+                    basis: Default::default(),
                     skipped: 0,
                 },
                 crate::clock::mono_now(),
@@ -2821,6 +2885,7 @@ pub(crate) mod tests {
                 let reset = Arc::new(Mutex::new(None));
                 self.walks.incoming(
                     peer,
+                    0,
                     collection,
                     WalkKind::Commit,
                     crate::walk_stream::Algorithm::Prefix,
@@ -3551,6 +3616,7 @@ pub(crate) mod tests {
                     failure: None,
                     refused: false,
                     peer_failed: false,
+                    basis: Default::default(),
                     skipped: 0,
                 },
             });
@@ -3643,6 +3709,145 @@ pub(crate) mod tests {
             stale_completion_is_ignored(true).await;
         }
 
+        /// F2. A peer's replacement connection (2) opens its walk before this
+        /// side processed the end of the exchange still running on the old
+        /// connection (1), or the old connection's close. The G agreed on
+        /// connection 1 is announced on connection 2, where the peer may have
+        /// restarted. The old exchange's late failure still forgets the G it
+        /// was based on, unless a newer exchange already stored another,
+        /// which the late end leaves alone.
+        async fn a_replacement_races_the_old_end(newer_first: bool) {
+            let net = SimNet::new(0x3A3F, SimConfig::default());
+            let mut node = Node::new(107);
+            let collection = node.hold("replacement race", open());
+            node.commit(collection, 1);
+            node.observe();
+            let snapshot = node.snapshot();
+            let pinned = node.pinned(collection);
+            let hosted = Hosted::new(node, &net);
+            let (landing, _landings) = mpsc::unbounded_channel();
+            let (events, _events) = mpsc::unbounded_channel();
+            let mut task = Task {
+                connections: hosted.table.clone(),
+                snapshots: hosted.lander.snapshots.subscribe(),
+                walks: Walks::new(hosted.lander.node.lock().unwrap().health.clone())
+                    .with_algorithm(crate::walk_stream::Algorithm::Prefix),
+                commands: hosted.walks.clone(),
+                landing,
+                events,
+                grants: mpsc::unbounded_channel().0,
+                grant_queue: GrantQueue::default(),
+                unknown_joins: PATCH::new(),
+                running: HashMap::new(),
+                next_id: 0,
+            };
+            task.observe(snapshot);
+            let peer = Node::new(108).id();
+            let kind = WalkKind::Commit;
+            let key = (peer, collection.raw, kind);
+            let tree = Arc::new(Tree::pinned(kind, pinned.repair()));
+            let g = tree.summary();
+            let confirmed = |connection| Ended {
+                basis: Basis {
+                    connection,
+                    agreement: None,
+                },
+                retain_agreement: true,
+                sends: true,
+                receives: true,
+                confirmed: true,
+                landed: true,
+                root: g,
+                peer_root: Some(g),
+                agreed: Some(tree.clone()),
+                failure: None,
+                refused: false,
+                peer_failed: false,
+                skipped: 0,
+            };
+            let stored = |task: &Task<_, _, _>| {
+                task.walks
+                    .agreed
+                    .get(&agreed_key(peer, collection.raw, kind))
+                    .is_some()
+            };
+            let now = crate::clock::mono_now();
+            // G agreed on connection 1, and an exchange still running there.
+            task.walks.ended(peer, collection, kind, confirmed(1), now);
+            let old = task.walks.start_on(peer, 1, collection, kind, None).unwrap();
+            let (old_driver, _acks, _replaced) = task.register(key, false, &old);
+
+            // Connection 2's walk arrives first and replaces it.
+            let (mut script, driven) = tokio::io::duplex(1 << 16);
+            let (recv, send) = tokio::io::split(driven);
+            let reset = Arc::new(Mutex::new(None));
+            task.command(Command::Incoming {
+                peer,
+                connection: 2,
+                collection,
+                kind,
+                algorithm: crate::walk_stream::Algorithm::Prefix,
+                offer: None,
+                send: Box::new(Tx(send, reset.clone())),
+                recv: Box::new(Rx(recv, reset.clone())),
+            });
+            let new_id = task.running[&key].id;
+            assert_ne!(new_id, old_driver.id, "replaced");
+            let (frame, payload) = crate::connection::read_frame(&mut script)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                Frame::decode(frame, &payload).unwrap(),
+                Some(Frame::Agreed { summary: g }),
+                "a G agreed on another connection is announced"
+            );
+
+            if newer_first {
+                // Connection 2's exchange confirms first.
+                task.command(Command::Ended {
+                    id: new_id,
+                    peer,
+                    collection,
+                    kind,
+                    ended: confirmed(2),
+                    duplicate: false,
+                });
+                assert!(stored(&task));
+            }
+            // The old exchange's end arrives late: the peer failed it.
+            let mut ended = old.end();
+            ended.peer_failed = true;
+            task.command(Command::Ended {
+                id: old_driver.id,
+                peer,
+                collection,
+                kind,
+                ended,
+                duplicate: false,
+            });
+            if newer_first {
+                let (agreed, carried, _) =
+                    task.walks.agreement(peer, 2, collection, kind, &pinned);
+                assert!(
+                    agreed.is_some() && !carried,
+                    "a late end leaves connection 2's agreement alone"
+                );
+            } else {
+                assert!(!stored(&task), "a late failure still forgets its G");
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_late_failure_from_a_replaced_connection_forgets_the_g_it_used() {
+            a_replacement_races_the_old_end(false).await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_late_end_from_a_replaced_connection_leaves_a_newer_agreement() {
+            a_replacement_races_the_old_end(true).await;
+        }
+
         #[tokio::test(start_paused = true)]
         async fn a_deselected_but_active_collection_refuses_new_open_and_incoming() {
             let net = SimNet::new(0x3A2B, SimConfig::default());
@@ -3692,6 +3897,7 @@ pub(crate) mod tests {
             let reset = Arc::new(Mutex::new(None));
             task.command(Command::Incoming {
                 peer: other.peer,
+                connection: 0,
                 collection,
                 kind,
                 algorithm: crate::walk_stream::Algorithm::Prefix,
@@ -4737,6 +4943,7 @@ pub(crate) mod tests {
                     failure,
                     refused,
                     peer_failed: false,
+                    basis: Default::default(),
                     skipped: 0,
                 }
             };
@@ -4900,6 +5107,7 @@ pub(crate) mod tests {
             let reset = Arc::new(Mutex::new(None));
             task.command(Command::Incoming {
                 peer,
+                connection: 0,
                 collection: resource,
                 kind: WalkKind::Authorization,
                 algorithm: crate::walk_stream::Algorithm::Prefix,
@@ -4936,6 +5144,7 @@ pub(crate) mod tests {
                     failure: None,
                     refused: false,
                     peer_failed: false,
+                    basis: Default::default(),
                     skipped: 0,
                 },
                 duplicate: false,

@@ -42,7 +42,10 @@
 //! for already agreed keys and cannot shrink G. Within a connection held trees
 //! are assumed to grow. A G carried over from a closed connection is not known
 //! to be held by both: its user announces it (AGREED), and a receiver whose own
-//! G differs fails the exchange ([`Failure::StaleAgreement`]). A receive-only side advertises the empty delta and
+//! G differs fails the exchange ([`Failure::StaleAgreement`]). A carried G
+//! enters the next agreement only when both sides announced that same tree;
+//! otherwise the agreement is the two deltas alone, no worse than a fresh full
+//! walk. A receive-only side advertises the empty delta and
 //! serves no value, including no private pinned digest/count.
 //!
 //! State grows on demand within explicit budgets: FIFO positions, received
@@ -503,7 +506,18 @@ impl From<DecodeError> for Failure {
     }
 }
 
+/// The connection an exchange ran on, and the stored agreement it took its
+/// G from, if any ([`crate::walk::Walks`]): an end is settled against the
+/// agreement it was based on, never a newer one.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Basis {
+    pub(crate) connection: u64,
+    pub(crate) agreement: Option<u64>,
+}
+
 pub(crate) struct Ended {
+    /// What the exchange was based on.
+    pub(crate) basis: Basis,
     pub(crate) sends: bool,
     pub(crate) receives: bool,
     /// Directional receipt: peer LANDED (Prefix) or valid FIN (cached),
@@ -560,6 +574,7 @@ pub(crate) struct Exchange<R> {
     /// connection's G is known to be held by both.
     announce: bool,
     agreed_sent: bool,
+    basis: Basis,
     /// The G the peer announced its delta against, if it did.
     peer_agreed: Option<PatchSummary>,
     /// Essential protocol membership proof of ONLY the peer's delta. This
@@ -645,6 +660,7 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
             delta,
             announce: false,
             agreed_sent: false,
+            basis: Basis::default(),
             peer_agreed: None,
             peer: Tree::empty(kind, collection),
             snapshot: None,
@@ -1038,6 +1054,7 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
             peer.summary()
         });
         Ended {
+            basis: self.basis,
             sends: self.sends,
             receives: self.receives,
             confirmed: self.landed_received,
@@ -1066,17 +1083,25 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
             .map_or_else(empty, |tree| tree.summary())
     }
 
-    /// This exchange's G was carried over from a closed connection: announce
-    /// it, so the peer takes our delta only if it holds that same G.
-    pub(crate) fn carried_if(mut self, carried: bool) -> Self {
+    /// This exchange runs on `basis`. Its G was agreed on another connection
+    /// when `carried`: announce it, so the peer takes our delta only if it
+    /// holds that same G.
+    pub(crate) fn based(mut self, basis: Basis, carried: bool) -> Self {
+        self.basis = basis;
         self.announce = carried && self.agreed.is_some();
         self
     }
 
+    /// The agreement this exchange ends with: its base G plus both deltas.
+    /// A G carried over from a closed connection is part of it only when the
+    /// peer announced that same tree, so both sides checked they hold it;
+    /// otherwise it is just the two deltas, which both sides landed.
     fn union_tree(&self) -> Tree {
+        let unshared = self.announce && self.peer_agreed != Some(self.agreed_summary());
         let mut union = self
             .agreed
             .as_deref()
+            .filter(|_| !unshared)
             .cloned()
             .unwrap_or_else(|| Tree::empty(self.kind, self.collection));
         union.union(self.delta.clone());

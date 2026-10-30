@@ -528,10 +528,11 @@ resource32 || proof-id32 key. Integers are big-endian.
 | `0x09` | RIBLT_ROOT | hash32, leaf-count:u64 |
 | `0x0a` | RIBLT_CELL | index:u32, symbol32, checksum:u64, count:i64 |
 | `0x0b` | HAVE | exact offered depth:u8, prefix32, hash32, leaf-count:u64 |
+| `0x0c` | AGREED | hash32, leaf-count:u64 (nonempty carried agreed tree) |
 
 DONE/LANDED are Prefix-only; cached RIBLT refuses them and uses the gated FIN
 semantics below. RIBLT_ROOT has 40 payload bytes (45 framed), with no repeated
-profile key. This remains the unreleased ALPN33 boundary, not compatibility
+profile key. This remains the unreleased ALPN34 boundary, not compatibility
 with earlier private33 variants or deployed32.
 
 Every SUBTREE payload is 73 bytes, 78 including the frame header, regardless of
@@ -654,7 +655,7 @@ liveness or throughput.
 
 ### Cached full-component discovery
 
-This source-only ALPN33 candidate defaults to cached RIBLT for mutually
+This source-only ALPN34 candidate defaults to cached RIBLT for mutually
 authorized locally opened streams, through both the CLI and
 `Algorithm::default()`. Explicit `trible pile net sync --walk-algorithm prefix`
 or `PeerConfig::walk_algorithm = Algorithm::Prefix` retains the Prefix option;
@@ -1536,7 +1537,10 @@ guarantee.
 
 ## Wire surface
 
-The ALPN is `/triblespace/pile-sync/33`, an unreleased generation. It
+The ALPN is `/triblespace/pile-sync/34`, an unreleased generation.
+Generation 34 adds the walk frame AGREED (`0x0c`), with which a Prefix side
+announces an agreed tree carried over from a closed connection; generation 33
+skips unknown walk frames, so it is refused at the handshake. Generation 33
 separates the COMMIT and DERIVE trees, and replaces the grant digest exchange
 with grant gossip by participation: GRANT_ROOTS listings on `recon/1` and a
 grant walk per resource on `walk/1`, Prefix only, whose receiver skips what it

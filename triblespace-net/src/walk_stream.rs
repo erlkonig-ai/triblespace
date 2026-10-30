@@ -23,7 +23,7 @@
 //! A kind or OPEN walk kind not understood is skipped. A known payload must
 //! decode completely and canonically; malformed frames end only the exchange.
 //! Unknown OPEN algorithms are refused. Prefix=0 and CachedRiblt=1 are separate
-//! explicit ALPN33 algorithms. Prefix offer profiles 2/3 additionally bind the
+//! explicit ALPN34 algorithms. Prefix offer profiles 2/3 additionally bind the
 //! opener's send/receive-only role; profile 0 always remains pull Prefix.
 //! This is not an old-wire compatibility negotiation.
 //! A Prefix side whose agreed tree G was carried over from a closed
@@ -31,9 +31,10 @@
 //! before its root SUBTREE; G agreed on the current connection is held by
 //! both and goes unannounced. A receiving side takes a delta against an
 //! announced G only when its own G is that same tree; otherwise the exchange
-//! fails, both forget G, and the next exchange is the full walk. A peer that
-//! does not know this frame skips it, so a carried G is safe only between
-//! peers that do.
+//! fails, both forget G, and the next exchange is the full walk. A carried G
+//! enters the next agreement only when both sides announced that same tree.
+//! A peer that does not know this frame would skip it, which is why AGREED
+//! came with generation 34: a generation-33 peer is refused at the handshake.
 //! Cached RIBLT derives its checksum key from OPEN locally; ROOT is exactly
 //! 40 payload bytes. DONE/LANDED belong only to Prefix. Cached completion uses
 //! clean write-half FIN after proof, actual landing and all owed frame writes.
@@ -57,7 +58,7 @@ pub const FRAME_RIBLT_CELL: u8 = 0x0a;
 pub const FRAME_HAVE: u8 = 0x0b;
 pub const FRAME_AGREED: u8 = 0x0c;
 
-/// Explicit ALPN33 discovery profile. CachedRiblt is the default for mutually
+/// Explicit ALPN34 discovery profile. CachedRiblt is the default for mutually
 /// authorized peers. Prefix remains selectable and is required
 /// when either direction lacks collection READ authority. Unknown profiles are
 /// refused, never interpreted as Prefix or as successful cache exhaustion.

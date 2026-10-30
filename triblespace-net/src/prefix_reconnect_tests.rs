@@ -396,6 +396,8 @@ mod persisted {
         w: Node,
         h: Node,
         collection: CollectionHandle,
+        /// The id of the connection the two are on.
+        connection: u64,
     }
 
     struct Synced {
@@ -419,21 +421,35 @@ mod persisted {
             }
             w.observe();
             h.observe();
-            Self { w, h, collection }
+            Self {
+                w,
+                h,
+                collection,
+                connection: 1,
+            }
         }
 
         /// One exchange the writer opens, as the walks start it on both
         /// sides, ended into both walks. A side that failed resets the
         /// stream as failed, which its peer reads.
         fn sync(self, useful: &[CollectionRecord]) -> (Self, Synced) {
-            let Self { w, h, collection } = self;
+            let Self {
+                w,
+                h,
+                collection,
+                connection,
+            } = self;
             let (wid, hid) = (w.id(), h.id());
-            let we = w.walks.start(hid, collection, WalkKind::Commit).unwrap();
+            let we = w
+                .walks
+                .start_on(hid, connection, collection, WalkKind::Commit, None)
+                .unwrap();
             assert_eq!(we.offer_role(), Some(OfferRole::Send));
             let he = h
                 .walks
-                .start_incoming(
+                .join_on(
                     wid,
+                    connection,
                     collection,
                     WalkKind::Commit,
                     Algorithm::Prefix,
@@ -459,7 +475,12 @@ mod persisted {
             let (w, _) = end(ws, hid, failed(ho));
             let (h, again) = end(hs, wid, failed(wo));
             (
-                Self { w, h, collection },
+                Self {
+                    w,
+                    h,
+                    collection,
+                    connection,
+                },
                 Synced {
                     run,
                     w: wo,
@@ -469,11 +490,13 @@ mod persisted {
             )
         }
 
-        /// The connection closes: both sides carry their agreement over.
+        /// The connection closes, and the next one is made: both sides carry
+        /// their agreement over.
         fn close(&mut self) {
             let (wid, hid) = (self.w.id(), self.h.id());
             self.w.walks.closed(hid);
             self.h.walks.closed(wid);
+            self.connection += 1;
         }
 
         fn write(&mut self, records: &[CollectionRecord]) {
@@ -651,6 +674,7 @@ mod persisted {
                 failure: None,
                 refused: false,
                 peer_failed: false,
+                basis: Default::default(),
                 skipped: 0,
             },
             crate::clock::mono_now(),
@@ -703,6 +727,81 @@ mod persisted {
         let (_, cheap) = lane.sync(&r.new[10..20]);
         assert_eq!(cheap.h, Some(Outcome::Confirmed));
         assert_eq!(cheap.run.w.values, 10);
+    }
+
+    /// Set which way C flows between `node` and its one peer.
+    fn direct(node: &mut Node, sends: bool) {
+        node.health.update(|health| {
+            for peering in &mut health.peerings {
+                peering.sends = sends;
+                peering.receives = !sends;
+            }
+        });
+    }
+
+    /// F1. Former G = {a, x}. The writer is restored with only {a} and no
+    /// carried G; the hub still carries {a, x}, which it holds, and
+    /// announces it to a writer that does not receive. The writer's whole
+    /// tree {a} confirms on both sides, and the hub must not keep {a, x} as
+    /// its base: the writer never held x since the restore. When the roles
+    /// are later reversed on the same connection, the hub's delta must
+    /// still carry x back to the writer.
+    #[test]
+    fn a_carried_agreement_the_peer_did_not_announce_is_not_kept() {
+        let r = records(1_000, 0, 0);
+        let (a, x) = r.shared.split_at(500);
+        let (mut lane, first) = Lane::new(&r, 1_000, 0).sync(&r.shared);
+        assert_eq!(first.h, Some(Outcome::Confirmed));
+        lane.agree();
+        lane.close();
+        // Restored from a backup holding only {a}, with no walks memory.
+        let (mut writer, _) = node(WRITER, HUB, true);
+        for record in a {
+            writer.store.insert(*record).unwrap();
+        }
+        writer.observe();
+        lane.w = writer;
+        let (mut lane, restored) = lane.sync(&[]);
+        assert_eq!(restored.w, Some(Outcome::Confirmed));
+        assert_eq!(restored.h, Some(Outcome::Confirmed));
+        assert_eq!(restored.run.h.agreed, 1, "the hub announced its carried G");
+        assert_eq!(lane.w.records(lane.collection).len(), 500);
+
+        // The roles are reversed on the same connection: the hub sends C,
+        // the writer receives it.
+        let Lane {
+            mut w,
+            mut h,
+            collection,
+            connection,
+        } = lane;
+        direct(&mut w, false);
+        direct(&mut h, true);
+        let (wid, hid) = (w.id(), h.id());
+        let he = h
+            .walks
+            .start_on(wid, connection, collection, WalkKind::Commit, None)
+            .unwrap();
+        assert_eq!(he.offer_role(), Some(OfferRole::Send));
+        let we = w
+            .walks
+            .join_on(
+                hid,
+                connection,
+                collection,
+                WalkKind::Commit,
+                Algorithm::Prefix,
+                Some(OfferRole::Send),
+            )
+            .unwrap();
+        let mut hs = Side::with(h, he);
+        let mut ws = Side::with(w, we);
+        ws.useful = x.iter().map(|r| r.fingerprint().raw()).collect();
+        let run = pump_any(&mut hs, &mut ws, x.len());
+        assert_eq!(hs.exchange.outcome(), Some(Outcome::Confirmed));
+        assert_eq!(ws.exchange.outcome(), Some(Outcome::Confirmed));
+        assert_eq!(run.landed, x.len(), "x came back to the writer");
+        assert_eq!(ws.node.records(collection).len(), 1_000);
     }
 
     /// Before and after. `cargo test -p triblespace-net

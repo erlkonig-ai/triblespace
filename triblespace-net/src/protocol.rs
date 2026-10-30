@@ -55,7 +55,12 @@ use crate::transport::PeerId;
 /// walk, and lands a kept grant only once R's descriptor is resident and
 /// validates it. The digest kinds `0x02` to `0x05` are skipped as unknown,
 /// and grants are no longer part of a collection's pushes or its root.
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/33";
+/// Generation 34 adds the walk frame AGREED (`0x0c`): a Prefix side whose
+/// agreed tree was carried over from a closed connection announces it, and
+/// subtracts it from its delta only against a peer holding the same tree.
+/// Generation 33 skips unknown walk frame kinds, so it would land such a
+/// delta against a tree it lacks and silently miss records; it is refused.
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/34";
 
 // Stream type tags — first byte on each stream, read before any admission
 // permit is taken. An unknown tag resets only its own stream.

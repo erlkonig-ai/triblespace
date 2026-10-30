@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- ALPN `/triblespace/pile-sync/34`: Prefix carries an agreed tree over a
+  closed connection. A side using one announces it with the walk frame AGREED
+  (`0x0c`) before its root SUBTREE; a receiver whose own agreed tree differs
+  fails the exchange, and a carried tree enters the next agreement only when
+  both sides announced the same one. Agreed trees are tagged with the
+  connection they were agreed on, so an exchange on a newer connection treats
+  them as carried even before the old connection's close is processed, and a
+  late end from an older exchange clears only the tree it used. Generation 33
+  skips unknown walk frames and is refused at the handshake.
 - Grant gossip by participation, in the unreleased ALPN33 candidate: one
   passive mechanism for the grants over every resource R, with no routing by
   resource kind. A grant over R is shown to every node that takes part in R

@@ -1096,6 +1096,7 @@ async fn riblt_runtime_one_way_walks_use_prefix_and_refuse_incoming_riblt() {
     let reset = Arc::new(Mutex::new(None));
     task.incoming(
         peer.id(),
+        0,
         collection,
         WalkKind::Commit,
         Algorithm::CachedRiblt,
@@ -1281,6 +1282,7 @@ async fn riblt_runtime_simultaneous_open_tie_break_preserves_winners_explicit_al
             let reset = Arc::new(Mutex::new(None));
             task.incoming(
                 peer.id(),
+                0,
                 collection,
                 WalkKind::Commit,
                 incoming,
@@ -1344,7 +1346,14 @@ async fn riblt_runtime_task_retains_prefix_agreement_but_releases_cached_source_
         local
             .walks
             .agreed
-            .replace(&Entry::with_value(&agreement_key, source));
+            .replace(&Entry::with_value(
+                &agreement_key,
+                crate::walk::Agreement {
+                    connection: 0,
+                    stamp: 0,
+                    tree: source,
+                },
+            ));
         local.walks.algorithm = match selected {
             Algorithm::Prefix => Algorithm::CachedRiblt,
             Algorithm::CachedRiblt => Algorithm::Prefix,
