@@ -11,6 +11,8 @@
 //! | 0x09 | RIBLT_ROOT    | hash32, u64                     |
 //! | 0x0a | RIBLT_CELL    | index:u32, symbol32, hash:u64, count:i64 |
 //! | 0x0b | HAVE          | offered depth:u8, prefix32, hash32, u64 |
+//! | 0x0c | AGREED        | hash32, u64                     |
+//! | 0x0d | RIBLT_STOP    | empty                           |
 //!
 //! SUBTREE has exactly73 payload bytes, or78 bytes with the ordinary five-byte
 //! frame header. Integers are big-endian. Prefix bytes outside depth are zero;
@@ -22,12 +24,29 @@
 //! A kind or OPEN walk kind not understood is skipped. A known payload must
 //! decode completely and canonically; malformed frames end only the exchange.
 //! Unknown OPEN algorithms are refused. Prefix=0 and CachedRiblt=1 are separate
-//! explicit ALPN33 algorithms. Prefix offer profiles 2/3 additionally bind the
+//! explicit ALPN34 algorithms. Prefix offer profiles 2/3 additionally bind the
 //! opener's send/receive-only role; profile 0 always remains pull Prefix.
 //! This is not an old-wire compatibility negotiation.
+//! A Prefix side whose agreed tree G was carried over from a closed
+//! connection sends AGREED (G's root and count, exactly 40 payload bytes)
+//! before its root SUBTREE; G agreed on the current connection is held by
+//! both and goes unannounced. A receiving side takes a delta against an
+//! announced G only when its own G is that same tree; otherwise the exchange
+//! fails, both forget G, and the next exchange is the full walk. A carried G
+//! enters the next agreement only when both sides announced that same tree.
+//! A peer that does not know this frame would skip it, which is why AGREED
+//! came with generation 34: a generation-33 peer is refused at the handshake.
 //! Cached RIBLT derives its checksum key from OPEN locally; ROOT is exactly
 //! 40 payload bytes. DONE/LANDED belong only to Prefix. Cached completion uses
 //! clean write-half FIN after proof, actual landing and all owed frame writes.
+//! The two ROOT counts of a typed component (Commit, Derive) assign cached
+//! roles: the larger side streams no cells and decodes the smaller side's;
+//! on its first exact proof against the peer ROOT it sends RIBLT_STOP, then
+//! pushes VALUEs the peer lacks and sends VALUE_REQUEST for the ones it
+//! lacks. The smaller side streams until STOP, refuses any incoming cell,
+//! and after STOP serves requests only from its advertised source. Equal
+//! counts and References stay symmetric. RIBLT_STOP also came with
+//! generation 34: a generation-33 peer would skip it and keep streaming.
 
 use triblespace_core::collection::CollectionHandle;
 
@@ -46,8 +65,12 @@ pub const SUBTREE_BYTES: usize = 1 + 32 + 32 + 8;
 pub const FRAME_RIBLT_ROOT: u8 = 0x09;
 pub const FRAME_RIBLT_CELL: u8 = 0x0a;
 pub const FRAME_HAVE: u8 = 0x0b;
+pub const FRAME_AGREED: u8 = 0x0c;
+/// Cached asymmetric discovery: the larger side has proven the smaller side's
+/// set from its cells and asks it to stop streaming. Empty payload.
+pub const FRAME_RIBLT_STOP: u8 = 0x0d;
 
-/// Explicit ALPN33 discovery profile. CachedRiblt is the default for mutually
+/// Explicit ALPN34 discovery profile. CachedRiblt is the default for mutually
 /// authorized peers. Prefix remains selectable and is required
 /// when either direction lacks collection READ authority. Unknown profiles are
 /// refused, never interpreted as Prefix or as successful cache exhaustion.
@@ -114,6 +137,10 @@ pub(crate) enum Frame {
     },
     Done,
     Landed,
+    /// The agreed tree G this side's delta is taken against.
+    Agreed {
+        summary: PatchSummary,
+    },
     RibltRoot {
         summary: PatchSummary,
     },
@@ -123,6 +150,8 @@ pub(crate) enum Frame {
         hash: u64,
         count: i64,
     },
+    /// The larger side's proof of the smaller side's whole set: stop cells.
+    RibltStop,
 }
 
 impl Frame {
@@ -168,6 +197,10 @@ impl Frame {
                 push_summary(&mut payload, *summary);
                 FRAME_RIBLT_ROOT
             }
+            Self::Agreed { summary } => {
+                push_summary(&mut payload, *summary);
+                FRAME_AGREED
+            }
             Self::RibltCell {
                 index,
                 symbol,
@@ -180,6 +213,7 @@ impl Frame {
                 payload.extend_from_slice(&count.to_be_bytes());
                 FRAME_RIBLT_CELL
             }
+            Self::RibltStop => FRAME_RIBLT_STOP,
         };
         (kind, payload)
     }
@@ -253,12 +287,20 @@ impl Frame {
             FRAME_RIBLT_ROOT => Self::RibltRoot {
                 summary: rest.summary()?,
             },
+            FRAME_AGREED => {
+                let summary = rest.summary()?;
+                if summary.root().is_none() {
+                    return Err(Malformed("AGREED names a nonempty agreed tree"));
+                }
+                Self::Agreed { summary }
+            }
             FRAME_RIBLT_CELL => Self::RibltCell {
                 index: u32::from_be_bytes(rest.take(4)?.try_into().unwrap()),
                 symbol: rest.hash()?,
                 hash: u64::from_be_bytes(rest.take(8)?.try_into().unwrap()),
                 count: i64::from_be_bytes(rest.take(8)?.try_into().unwrap()),
             },
+            FRAME_RIBLT_STOP => Self::RibltStop,
             _ => return Ok(None),
         };
         if !rest.0.is_empty() {

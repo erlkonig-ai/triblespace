@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- ALPN `/triblespace/pile-sync/34`: Prefix carries an agreed tree over a
+  closed connection. A side using one announces it with the walk frame AGREED
+  (`0x0c`) before its root SUBTREE; a receiver whose own agreed tree differs
+  fails the exchange, and a carried tree enters the next agreement only when
+  both sides announced the same one. Agreed trees are tagged with the
+  connection they were agreed on, so an exchange on a newer connection treats
+  them as carried even before the old connection's close is processed, and a
+  late end from an older exchange clears only the tree it used. A carried
+  tree is kept only by a confirmed exchange: one cancelled, replaced or cut
+  before its outcome is known forgets it, at the cost of one full walk, so a
+  tree the peer refused is never offered again. A refused carried tree is
+  followed at once by the full walk from whichever side ends with the
+  refusal (the refuser, or the announcer reading its FAILED reset), at most
+  once per peer, collection, kind and connection. A connection's close
+  cancels only the exchanges on that connection, so the late close of a
+  replaced connection leaves the replacement and its carried tree alone. A
+  carried tree is forgotten 24 hours after its connection closed. Generation
+  33 skips unknown walk frames and is refused at the handshake.
+- ALPN `/triblespace/pile-sync/34` (same cutover as AGREED): cached RIBLT
+  assigns roles from the two ROOT counts of a typed component. The larger
+  side streams no cells, decodes the smaller side's (a raw decode against
+  the empty set alongside the residual decoder), and on its first exact
+  proof against the peer ROOT writes RIBLT_STOP (`0x0d`), then pushes what
+  the peer lacks and sends VALUE_REQUEST for every remote key. The smaller
+  side streams until STOP and proves completion against the peer ROOT; until
+  STOP it counts each cell it writes as hearing from the silent decoder, so
+  a decode longer than the 60 s walk deadline completes, while a decoder
+  that stops reading still ends the exchange through the stalled write's
+  deadline. Equal counts and References stay symmetric. Per exchange of one Commit
+  component with |A| = 10,000 and B a subset of 0 to 1,000 keys (two
+  production drivers, real codec, 5 ms one-way link at 1 frame per ms), the
+  smaller side's cells fall from 22,457-24,783 to 1,158-2,540, the larger
+  side's to zero, and the bytes by 42-44%.
 - Grant gossip by participation, in the unreleased ALPN33 candidate: one
   passive mechanism for the grants over every resource R, with no routing by
   resource kind. A grant over R is shown to every node that takes part in R

@@ -10,6 +10,20 @@
 //! Its local landing readiness permits FIN independently of peer FIN. The
 //! driver drains all outgoing frames, half-closes, and continues receiving;
 //! fresh late-body insertion debt must settle before final confirmation.
+//!
+//! The two ROOT counts assign cached roles. Equal counts, and References,
+//! stay symmetric as above. Otherwise the larger side is the decoder: it
+//! streams no cells, feeds the smaller side's cells both to its residual
+//! decoder and to a raw decode of the peer's own set
+//! ([`crate::riblt_shortcut`]), and on the first exact proof against the peer
+//! ROOT writes RIBLT_STOP, then pushes what the peer lacks as VALUEs and
+//! requests what it lacks with VALUE_REQUEST in the ordinary request window.
+//! A raw decode that fails or misses the ROOT is abandoned; the residual
+//! decoder decides as before. The smaller side streams until STOP, refuses
+//! any cell, serves requests only after STOP and only from its advertised
+//! source, and proves completion with the same exact summary over the keys
+//! requested from it and the values pushed to it. Neither side's FIN can
+//! precede its proof; the decoder's also waits for STOP's write receipt.
 //! Prefix mode retains the continuous FIFO delta protocol described below.
 //!
 //! Each connection retains sound common-held agreement G. Asymmetric final
@@ -40,8 +54,15 @@
 //! stream writes/finish succeed in the driver. Failure forgets reusable G;
 //! already landed values remain. Publication lag creates an empty difference
 //! for already agreed keys and cannot shrink G. Within a connection held trees
-//! are assumed to grow. A receive-only side advertises the empty delta and
-//! serves no value, including no private pinned digest/count.
+//! are assumed to grow. A G carried over from a closed connection is not known
+//! to be held by both: its user announces it (AGREED), and a receiver whose own
+//! G differs fails the exchange ([`Failure::StaleAgreement`]). A carried G
+//! enters the next agreement, and the peer's reported root, only when both
+//! sides announced that same tree; otherwise the agreement is the two deltas
+//! alone, no worse than a fresh full walk. Only a confirmed exchange keeps a
+//! carried G: one cancelled or cut before its outcome is known forgets it. A
+//! receive-only side advertises the empty delta and serves no value,
+//! including no private pinned digest/count.
 //!
 //! State grows on demand within explicit budgets: FIFO positions, received
 //! commitments, matched announcements, and peer-delta leaves each have at
@@ -69,6 +90,8 @@ use crate::patch_repair::PatchSummary;
 use crate::protocol::RawHash;
 use crate::riblt_cache::{CacheError, Cell, Generation, KeySymbol, cell_bound};
 use crate::riblt_decode::{DecodeError, ResidualDecoder};
+use crate::riblt_shortcut::{Shortcut, Split};
+use crate::riblt_store::Records;
 use crate::walk::{
     Admit, KEY_BYTES, MAX_WALK_REQUESTS, MAX_WALK_UNLANDED, Value, WalkKind, admit_fetched,
     admit_missing, admit_value, decode_proof, node_summary, value,
@@ -84,6 +107,10 @@ use prefix_offer::Offers;
 #[cfg(test)]
 #[path = "prefix_offer_tests.rs"]
 mod prefix_offer_tests;
+
+#[cfg(test)]
+#[path = "prefix_reconnect_tests.rs"]
+mod prefix_reconnect_tests;
 
 #[cfg(test)]
 #[path = "riblt_completion_tests.rs"]
@@ -142,6 +169,16 @@ impl Tree {
 
     pub(crate) fn summary(&self) -> PatchSummary {
         self.at(&[]).unwrap_or_else(empty)
+    }
+
+    /// An empty tree of this one's kind and collection.
+    pub(crate) fn emptied(&self) -> Self {
+        match self {
+            Self::Commit(_) => Self::Commit(PATCH::new()),
+            Self::Derive(_) => Self::Derive(PATCH::new()),
+            Self::Authorization(collection, _) => Self::Authorization(*collection, PATCH::new()),
+            Self::References(_) => Self::References(PATCH::new()),
+        }
     }
 
     /// Exact native summary after sparse inserts, without unknown typed bodies.
@@ -471,6 +508,12 @@ pub(crate) enum Failure {
     ResourceLimit,
     /// A poisoned cache or local count invariant failure.
     CacheUnavailable,
+    /// The peer took its delta against an agreed tree G this side does not
+    /// hold as its own G: a persisted agreement went stale (the peer or this
+    /// side was reset, restored or replaced, or an earlier exchange ended
+    /// confirmed on one side only). Both sides forget G, and the next
+    /// exchange is the full walk.
+    StaleAgreement,
 }
 
 impl From<CacheError> for Failure {
@@ -491,7 +534,21 @@ impl From<DecodeError> for Failure {
     }
 }
 
+/// The connection an exchange ran on, and the stored agreement it took its
+/// G from, if any ([`crate::walk::Walks`]): an end is settled against the
+/// agreement it was based on, never a newer one.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Basis {
+    pub(crate) connection: u64,
+    pub(crate) agreement: Option<u64>,
+    /// That G was carried over from another connection and announced: the
+    /// peer may refuse it, so only a confirmation keeps it.
+    pub(crate) carried: bool,
+}
+
 pub(crate) struct Ended {
+    /// What the exchange was based on.
+    pub(crate) basis: Basis,
     pub(crate) sends: bool,
     pub(crate) receives: bool,
     /// Directional receipt: peer LANDED (Prefix) or valid FIN (cached),
@@ -500,7 +557,8 @@ pub(crate) struct Ended {
     pub(crate) landed: bool,
     /// Physical pinned observation, not the advertised delta summary.
     pub(crate) root: PatchSummary,
-    /// Logical peer held view G ∪ Δpeer, not a physical publication frontier.
+    /// Logical peer held view: the shared base (the G both sides hold, as
+    /// in the agreement) ∪ Δpeer, not a physical publication frontier.
     pub(crate) peer_root: Option<PatchSummary>,
     /// Prefix reuses G; whole-source cached exchanges use the union only while
     /// retiring this task and never keep a second per-neighbour source pin.
@@ -510,6 +568,9 @@ pub(crate) struct Ended {
     pub(crate) failure: Option<Failure>,
     /// The peer reset the stream as refused.
     pub(crate) refused: bool,
+    /// The peer reset the stream as failed: it decided this exchange failed,
+    /// possibly over our agreed tree, which is then forgotten here too.
+    pub(crate) peer_failed: bool,
     /// Received values a grant walk skipped.
     pub(crate) skipped: u64,
 }
@@ -540,6 +601,14 @@ pub(crate) struct Exchange<R> {
     /// Advertised source: prefix mode's pinned \ G, cached mode's whole source,
     /// or empty when directionality forbids sending.
     delta: Tree,
+    /// G was carried over from a closed connection: it is announced
+    /// (AGREED) before the root SUBTREE, because only the current
+    /// connection's G is known to be held by both.
+    announce: bool,
+    agreed_sent: bool,
+    basis: Basis,
+    /// The G the peer announced its delta against, if it did.
+    peer_agreed: Option<PatchSummary>,
     /// Essential protocol membership proof of ONLY the peer's delta. This
     /// shares known immutable trees; it is not a catalogue of the local store.
     peer: Tree,
@@ -564,6 +633,27 @@ pub(crate) struct Exchange<R> {
     outcome: Option<Outcome>,
 }
 
+/// Who streams cells in a cached exchange, fixed when the peer ROOT arrives.
+/// Typed components with unequal counts split the work: the larger side
+/// decodes the smaller side's cells without streaming its own, then STOPs it.
+/// Equal counts, and References (which have no VALUE frames to carry the
+/// larger side's push), stay symmetric.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Role {
+    Symmetric,
+    /// The larger side: silent, decodes, sends STOP, pushes and requests.
+    Decoder,
+    /// The smaller side: streams until STOP, then serves and receives.
+    Streamer,
+}
+
+/// The decoder's difference when the raw decode proved it: what to push and
+/// what to request, in place of the residual decoder's windows.
+struct Proven {
+    pushes: Records<[u8; KEY_BYTES]>,
+    remotes: Records<[u8; KEY_BYTES]>,
+}
+
 /// Per-exchange residual decoder only: no full encoder or copied cell prefix.
 /// The peer membership proof is the existing native `Exchange::peer` PATCH.
 /// `cache` is the exchange's only lease on its generation (`pinned` keeps
@@ -586,6 +676,49 @@ struct Riblt {
     /// [`cell_bound`] of the two ROOT counts, set when the peer ROOT arrives:
     /// neither side sends or accepts a cell at or beyond it.
     bound: usize,
+    /// Whether unequal counts may assign asymmetric roles.
+    asymmetric: bool,
+    role: Role,
+    /// Decoder: the raw decode of the peer's own cells, until it proves or
+    /// is abandoned.
+    shortcut: Option<Shortcut>,
+    /// Decoder: the raw decode's split, when it proved first.
+    split: Option<Proven>,
+    /// Decoder: STOP handed to the driver, and written whole.
+    stop_queued: bool,
+    stop_written: bool,
+    /// Streamer: the decoder's STOP arrived.
+    stopped: bool,
+    /// Streamer: local keys the decoder requested, each once.
+    served: PATCH<32, IdentitySchema, ()>,
+    /// Test fault: flip a symbol bit in the raw-decode copy of this cell only.
+    #[cfg(test)]
+    raw_fault: Option<usize>,
+}
+
+impl Riblt {
+    /// The i-th local-only key to push.
+    fn local_key(&self, i: usize) -> Option<[u8; KEY_BYTES]> {
+        match &self.split {
+            Some(split) => split.pushes.get(i),
+            None => self.decoder.local().get(i).map(|s| s.symbol.0),
+        }
+    }
+
+    /// The i-th remote-only key to obtain.
+    fn remote_key(&self, i: usize) -> Option<[u8; KEY_BYTES]> {
+        match &self.split {
+            Some(split) => split.remotes.get(i),
+            None => self.decoder.remote().get(i).map(|s| s.symbol.0),
+        }
+    }
+
+    fn remote_len(&self) -> usize {
+        match &self.split {
+            Some(split) => split.remotes.len(),
+            None => self.decoder.remote().len(),
+        }
+    }
 }
 
 impl<R: BlobStoreGet + Clone> Exchange<R> {
@@ -621,6 +754,10 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
             receives,
             agreed,
             delta,
+            announce: false,
+            agreed_sent: false,
+            basis: Basis::default(),
+            peer_agreed: None,
             peer: Tree::empty(kind, collection),
             snapshot: None,
             root_sent: false,
@@ -683,8 +820,38 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
             values: PATCH::new(),
             eager: 0,
             bound: 0,
+            asymmetric: true,
+            role: Role::Symmetric,
+            shortcut: None,
+            split: None,
+            stop_queued: false,
+            stop_written: false,
+            stopped: false,
+            served: PATCH::new(),
+            #[cfg(test)]
+            raw_fault: None,
         });
         exchange
+    }
+
+    /// Keep today's symmetric cached exchange whatever the counts.
+    #[cfg(test)]
+    pub(crate) fn symmetric(mut self) -> Self {
+        self.riblt.as_mut().expect("a cached exchange").asymmetric = false;
+        self
+    }
+
+    /// Corrupt the raw decode's copy of one received cell, and only that.
+    #[cfg(test)]
+    pub(crate) fn fault_raw_cell(mut self, index: usize) -> Self {
+        self.riblt.as_mut().expect("a cached exchange").raw_fault = Some(index);
+        self
+    }
+
+    /// The cached role, once the peer ROOT fixed it.
+    #[cfg(test)]
+    pub(crate) fn role(&self) -> Option<Role> {
+        self.riblt.as_ref().map(|r| r.role)
     }
 
     /// A grant walk on a link peered for R keeps what it receives over R.
@@ -722,7 +889,12 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
             offers.next_body()?
         } else {
             let r = self.riblt.as_mut()?;
-            let key = r.decoder.local().get(r.eager)?.symbol.0;
+            // The decoder's partial residual recoveries wait for its proof:
+            // the streamer accepts pushes only after STOP.
+            if r.role == Role::Decoder && !r.stop_queued {
+                return None;
+            }
+            let key = r.local_key(r.eager)?;
             r.eager += 1;
             key
         };
@@ -763,6 +935,20 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
         outs
     }
 
+    /// The decoder's STOP is wholly written: a precondition of its FIN.
+    pub(crate) fn on_stop_written(&mut self) -> Vec<Out> {
+        if let Some(riblt) = &mut self.riblt {
+            if riblt.stop_queued {
+                riblt.stop_written = true;
+            } else {
+                self.fail(Failure::Protocol);
+            }
+        }
+        let mut outs = Vec::new();
+        self.settle(&mut outs);
+        outs
+    }
+
     /// Current cached semantic readiness, not a FIN receipt. It never waits for
     /// peer FIN; the driver must still drain owed bodies and finish successfully.
     pub(crate) fn ready_to_finish(&self) -> bool {
@@ -795,10 +981,23 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
     /// Matching residual systems peel symmetrically only through the prefix
     /// actually written locally. Exact native root/count additionally discharges
     /// the probabilistic checksum, including upstream's zero-cell shortcut.
+    /// The decoder stops at its own proof, having streamed nothing, and the
+    /// streamer at the decoder's STOP, before it holds a proof.
     pub(crate) fn discovery_stopped(&self) -> bool {
+        self.riblt.as_ref().is_some_and(|r| match r.role {
+            Role::Symmetric => r.decoded_at.is_some_and(|prefix| r.written >= prefix) && r.proven,
+            Role::Decoder => r.proven,
+            Role::Streamer => r.stopped,
+        })
+    }
+
+    /// A cached streamer before the decoder's STOP. Its peer is silent by
+    /// design until then, for as long as its decode takes, so the driver
+    /// counts each cell written as hearing from it.
+    pub(crate) fn streaming(&self) -> bool {
         self.riblt
             .as_ref()
-            .is_some_and(|r| r.decoded_at.is_some_and(|prefix| r.written >= prefix) && r.proven)
+            .is_some_and(|r| r.role == Role::Streamer && !r.stopped)
     }
 
     pub(crate) fn receives(&self) -> bool {
@@ -834,6 +1033,9 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
                 return None;
             }
             let r = self.riblt.as_mut().unwrap();
+            if r.role == Role::Decoder {
+                return None;
+            }
             if r.generated >= r.bound {
                 self.fail(Failure::ResourceLimit);
                 return None;
@@ -855,6 +1057,13 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
                     self.fail(error.into());
                     return None;
                 }
+            }
+        }
+        if self.announce && !self.agreed_sent {
+            self.agreed_sent = true;
+            let summary = self.agreed_summary();
+            if summary.root().is_some() {
+                return Some(Frame::Agreed { summary });
             }
         }
         if self.offers.as_ref().is_some_and(Offers::full) {
@@ -980,13 +1189,13 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
             return !self.peer_done
                 && (!r.proven || (self.kind != WalkKind::References
                     && (!self.wanted.is_empty() || !self.requests.is_empty()
-                        || r.remote_queued < r.decoder.remote().len())));
+                        || r.remote_queued < r.remote_len())));
         }
         !self.peer_done
             || !self.requests.is_empty()
             || self.offers.as_ref().is_some_and(Offers::awaits)
             || self.riblt.as_ref().is_some_and(|r| {
-                !self.wanted.is_empty() || r.remote_queued < r.decoder.remote().len()
+                !self.wanted.is_empty() || r.remote_queued < r.remote_len()
             })
     }
 
@@ -996,16 +1205,14 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
             self.union_tree()
                 .without_keys(self.excluded.iter().copied())
         });
+        let base = self.peer_root.and_then(|_| self.shared_base().cloned());
         let peer_root = self.peer_root.map(|_| {
-            let mut peer = self
-                .agreed
-                .as_deref()
-                .cloned()
-                .unwrap_or_else(|| Tree::empty(self.kind, self.collection));
+            let mut peer = base.unwrap_or_else(|| Tree::empty(self.kind, self.collection));
             peer.union(self.peer);
             peer.summary()
         });
         Ended {
+            basis: self.basis,
             sends: self.sends,
             receives: self.receives,
             confirmed: self.landed_received,
@@ -1023,14 +1230,53 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
                 _ => None,
             },
             refused: false,
+            peer_failed: false,
             skipped: self.skipped,
         }
     }
 
+    fn agreed_summary(&self) -> PatchSummary {
+        self.agreed
+            .as_ref()
+            .map_or_else(empty, |tree| tree.summary())
+    }
+
+    /// The connection this exchange runs on, for one that carries no
+    /// agreement (cached, grant): what a connection's close cancels.
+    pub(crate) fn on_connection(mut self, connection: u64) -> Self {
+        self.basis.connection = connection;
+        self
+    }
+
+    /// This exchange runs on `basis`. Its G was agreed on another connection
+    /// when `carried`: announce it, so the peer takes our delta only if it
+    /// holds that same G.
+    pub(crate) fn based(mut self, basis: Basis, carried: bool) -> Self {
+        self.announce = carried && self.agreed.is_some();
+        self.basis = Basis {
+            carried: self.announce,
+            ..basis
+        };
+        self
+    }
+
+    pub(crate) fn basis(&self) -> Basis {
+        self.basis
+    }
+
+    /// The G both sides hold: a G carried over from a closed connection only
+    /// when the peer announced that same tree, so both sides checked they
+    /// hold it. The agreement and the peer's reported root build on this.
+    fn shared_base(&self) -> Option<&Tree> {
+        let unshared = self.announce && self.peer_agreed != Some(self.agreed_summary());
+        self.agreed.as_deref().filter(|_| !unshared)
+    }
+
+    /// The agreement this exchange ends with: its shared base plus both
+    /// deltas; without one, just the two deltas, which both sides landed.
     fn union_tree(&self) -> Tree {
         let mut union = self
-            .agreed
-            .as_deref()
+            .shared_base()
             .cloned()
             .unwrap_or_else(|| Tree::empty(self.kind, self.collection));
         union.union(self.delta.clone());
@@ -1050,11 +1296,36 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
                     return Err(Failure::ResourceLimit);
                 }
                 self.peer_root = Some(summary);
-                r.bound = cell_bound(self.delta.summary().leaf_count(), summary.leaf_count());
+                let local = self.delta.summary().leaf_count();
+                r.bound = cell_bound(local, summary.leaf_count());
                 if summary == self.delta.summary() {
                     r.decoded_at = Some(0);
                     r.proven = true;
+                } else if r.asymmetric && self.kind != WalkKind::References {
+                    r.role = match local.cmp(&summary.leaf_count()) {
+                        std::cmp::Ordering::Greater => Role::Decoder,
+                        std::cmp::Ordering::Less => Role::Streamer,
+                        std::cmp::Ordering::Equal => Role::Symmetric,
+                    };
                 }
+                if r.role == Role::Decoder {
+                    let key = r.cache.as_ref().ok_or(Failure::Protocol)?.key();
+                    let mut shortcut = Shortcut::new(key, summary);
+                    // An empty peer ROOT needs no cell at all.
+                    if let Some(split) = shortcut.empty_peer(&self.delta) {
+                        return self.adopt(split, outs);
+                    }
+                    r.shortcut = Some(shortcut);
+                }
+                Ok(())
+            }
+            Frame::RibltStop => {
+                self.arriving()?;
+                let r = self.riblt.as_mut().ok_or(Failure::Protocol)?;
+                if r.role != Role::Streamer || r.stopped {
+                    return Err(Failure::Protocol);
+                }
+                r.stopped = true;
                 Ok(())
             }
             Frame::RibltCell {
@@ -1065,6 +1336,10 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
             } => {
                 self.arriving()?;
                 let r = self.riblt.as_mut().ok_or(Failure::Protocol)?;
+                // The smaller side streams; it never decodes.
+                if r.role == Role::Streamer {
+                    return Err(Failure::Protocol);
+                }
                 if index as usize != r.received
                     || count < 0
                     || count as u64 > self.peer_root.unwrap().leaf_count()
@@ -1079,6 +1354,21 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
                 // still ordered. Bodies never enter decoder windows.
                 if r.decoded_at.is_some() {
                     return Ok(());
+                }
+                if let Some(shortcut) = &mut r.shortcut {
+                    #[allow(unused_mut)]
+                    let mut raw = Cell {
+                        symbol: KeySymbol(symbol),
+                        hash,
+                        count,
+                    };
+                    #[cfg(test)]
+                    if r.raw_fault == Some(index as usize) {
+                        raw.symbol.0[0] ^= 1;
+                    }
+                    if let Some(split) = shortcut.add(raw, &self.delta) {
+                        return self.adopt(split, outs);
+                    }
                 }
                 let local = r
                     .cache
@@ -1115,6 +1405,11 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
                         return Err(Failure::CountMismatch);
                     }
                     r.proven = true;
+                    if r.role == Role::Decoder {
+                        r.shortcut = None;
+                        r.stop_queued = true;
+                        outs.push(Out::Send(Frame::RibltStop));
+                    }
                 }
                 drop_local(&mut self.peer, &self.delta, &local)
             }
@@ -1220,6 +1515,18 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
                     if r.values.get(&key).is_some() {
                         return Ok(());
                     }
+                    match r.role {
+                        // The streamer pushes nothing it was not asked for.
+                        Role::Decoder if self.requests.get(&key).is_none() => {
+                            return Err(Failure::Protocol);
+                        }
+                        // Pushes follow STOP and name only keys missing here.
+                        Role::Streamer if !r.stopped => return Err(Failure::Protocol),
+                        Role::Streamer if self.delta.at(&key).is_some() => {
+                            return Err(Failure::BadNode);
+                        }
+                        _ => {}
+                    }
                     if r.values.len() >= FLOOD_LOCATORS as u64 {
                         return Err(Failure::ResourceLimit);
                     }
@@ -1278,7 +1585,24 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
                 Ok(())
             }
             Frame::ValueRequest { key } => {
-                if !self.sends || self.riblt.is_some() || self.offers.is_some() {
+                if let Some(r) = &self.riblt {
+                    // Only the streamer serves, after STOP, each key once, and
+                    // only from its advertised source.
+                    if r.role != Role::Streamer || !r.stopped || r.served.get(&key).is_some() {
+                        return Err(Failure::Protocol);
+                    }
+                    let bytes = self
+                        .delta_value(key)
+                        .and_then(|value| value.bytes(self.collection))
+                        .ok_or(Failure::Protocol)?;
+                    let r = self.riblt.as_mut().expect("checked above");
+                    r.served.insert(&Entry::new(&key));
+                    // The decoder lacks it: it leaves the peer's membership.
+                    self.peer = self.peer.without_keys([key]);
+                    outs.push(Out::Send(Frame::Value { key, bytes }));
+                    return Ok(());
+                }
+                if !self.sends || self.offers.is_some() {
                     return Err(Failure::Protocol);
                 }
                 // Only the immutable advertised delta serves requests, never
@@ -1299,6 +1623,19 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
                     .ok_or(Failure::Protocol)?
                     .have(&prefix, summary)?;
                 self.queue.retain(|queued| !queued.starts_with(&prefix));
+                Ok(())
+            }
+            Frame::Agreed { summary } => {
+                if self.riblt.is_some() || self.peer_root.is_some() || self.peer_agreed.is_some() {
+                    return Err(Failure::Protocol);
+                }
+                self.peer_agreed = Some(summary);
+                // The peer's delta omits a G carried over from a closed
+                // connection. That is sound here only if this side holds the
+                // same G; one it lost, never had, or moved past is refused.
+                if self.receives && summary != self.agreed_summary() {
+                    return Err(Failure::StaleAgreement);
+                }
                 Ok(())
             }
             Frame::Done => {
@@ -1444,6 +1781,10 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
         if self.remember(key)? {
             return Ok(());
         }
+        self.want(key)
+    }
+
+    fn want(&mut self, key: [u8; KEY_BYTES]) -> Result<(), Failure> {
         if self.wanted.len() >= FLOOD_WANTED {
             return Err(Failure::Protocol);
         }
@@ -1537,6 +1878,40 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
         }
     }
 
+    /// The decoder's raw decode proved the peer's whole set: push what the
+    /// peer lacks, request what this side lacks, and STOP the stream.
+    fn adopt(&mut self, split: Split, outs: &mut Vec<Out>) -> Result<(), Failure> {
+        let r = self.riblt.as_mut().ok_or(Failure::Protocol)?;
+        let mut proven = Proven {
+            pushes: Records::default(),
+            remotes: Records::default(),
+        };
+        let mut stored = Ok(());
+        split.local_only.for_each_key(|key| {
+            if stored.is_ok() {
+                stored = proven.pushes.push(&key);
+            }
+        });
+        for key in &split.remote_only {
+            if stored.is_ok() {
+                stored = proven.remotes.push(key);
+            }
+        }
+        stored.map_err(|_| Failure::ResourceLimit)?;
+        // Membership of the peer's set: the shared part now, its own keys as
+        // their values arrive. The residual decoder's partial work is moot.
+        self.peer = self.delta.difference(&split.local_only);
+        r.decoder = ResidualDecoder::with_key(r.cache.as_ref().ok_or(Failure::Protocol)?.key());
+        r.local = 0;
+        r.split = Some(proven);
+        r.shortcut = None;
+        r.decoded_at = Some(r.received);
+        r.proven = true;
+        r.stop_queued = true;
+        outs.push(Out::Send(Frame::RibltStop));
+        Ok(())
+    }
+
     fn fail(&mut self, failure: Failure) {
         self.outcome = Some(Outcome::Failed(failure));
     }
@@ -1563,15 +1938,24 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
             let Some(r) = &mut self.riblt else {
                 break;
             };
-            let Some(item) = r.decoder.remote().get(r.remote_queued) else {
+            // The decoder requests only after its proof and STOP: the
+            // streamer serves nothing before STOP.
+            if r.role == Role::Decoder && !r.stop_queued {
+                break;
+            }
+            let Some(key) = r.remote_key(r.remote_queued) else {
                 break;
             };
-            let key = item.symbol.0;
             r.remote_queued += 1;
+            // The decoder requests every remote key, even one a newer
+            // snapshot already holds: the streamer drops a key from its view
+            // of this side only when it is requested, and its exact proof is
+            // against the advertised ROOT, not this side's live store.
+            let decoder = r.role == Role::Decoder;
             if self.delta.at(&key).is_some() {
                 return self.fail(Failure::BadNode);
             }
-            if let Err(failure) = self.leaf(key) {
+            if let Err(failure) = if decoder { self.want(key) } else { self.leaf(key) } {
                 return self.fail(failure);
             }
         }
@@ -1588,7 +1972,8 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
                 }
                 None => {
                     self.requests.insert(&Entry::new(&key));
-                    if self.riblt.is_none() && self.offers.is_none() {
+                    let decoder = self.riblt.as_ref().is_some_and(|r| r.role == Role::Decoder);
+                    if (self.riblt.is_none() && self.offers.is_none()) || decoder {
                         outs.push(Out::Send(Frame::ValueRequest { key }));
                     }
                 }
@@ -1597,22 +1982,46 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
         if self
             .riblt
             .as_ref()
-            .is_some_and(|r| r.decoded_at.is_some() && r.remote_queued == r.decoder.remote().len())
+            .is_some_and(|r| r.decoded_at.is_some() && r.remote_queued == r.remote_len())
             && self.wanted.is_empty()
             && self.requests.is_empty()
             && self.peer_root != Some(self.peer.summary())
         {
             return self.fail(Failure::CountMismatch);
         }
+        // The streamer decodes nothing: the decoder's requests and pushes
+        // after STOP rebuild its view, and the exact completion summary over
+        // them proves it, once its incremental root matches the peer ROOT.
+        if let Some(r) = &mut self.riblt
+            && r.role == Role::Streamer
+            && r.stopped
+            && !r.proven
+            && self.peer_root == Some(self.peer.summary())
+        {
+            match decoded_summary(
+                &self.delta,
+                r.served.iter().copied(),
+                r.values.iter().copied(),
+            ) {
+                Ok(summary) if Some(summary) == self.peer_root => r.proven = true,
+                Ok(_) => return self.fail(Failure::CountMismatch),
+                Err(failure) => return self.fail(failure),
+            }
+        }
         if !self.landed_sent
             && match &self.riblt {
-                Some(r) => r.root_written && self.discovery_stopped(),
+                Some(r) => {
+                    r.root_written
+                        && self.discovery_stopped()
+                        && r.proven
+                        && (r.role != Role::Decoder || r.stop_written)
+                }
                 None => self.peer_done,
             }
             && self
                 .riblt
                 .as_ref()
-                .is_none_or(|r| r.remote_queued == r.decoder.remote().len())
+                .is_none_or(|r| r.remote_queued == r.remote_len())
             && self.wanted.is_empty()
             && self.requests.is_empty()
             && self.fetching == 0
@@ -1672,17 +2081,24 @@ pub(crate) mod tests {
         for (kind, foreign) in [(WalkKind::Commit, derive), (WalkKind::Derive, commit)] {
             let key = foreign.fingerprint().raw();
             let declared = PatchSummary::new(Some(<Blake3Merkle as PatchHash>::leaf(&key)), 1).unwrap();
-            for mode in 0..3 {
+            // Mode 3 is the cached streamer: the empty side against a larger
+            // peer receives pushes only after the decoder's STOP.
+            for mode in 0..4 {
                 let pin = local.pinned(collection);
                 let mut exchange = match mode {
                     0 => Exchange::start(collection, kind, pin, None, true, true),
                     1 => Exchange::start_one_way(collection, kind, pin, None, false, true),
+                    2 => Exchange::start_riblt(collection, kind, pin).symmetric(),
                     _ => Exchange::start_riblt(collection, kind, pin),
                 };
-                if mode == 2 {
+                if mode >= 2 {
                     exchange.on_frame(Frame::RibltRoot {
                         summary: declared,
                     }, Some(local.snapshot()));
+                    if mode == 3 {
+                        assert_eq!(exchange.role(), Some(Role::Streamer));
+                        exchange.on_frame(Frame::RibltStop, Some(local.snapshot()));
+                    }
                 } else {
                     exchange.on_frame(root(declared), Some(local.snapshot()));
                     exchange.on_frame(leaf(key), Some(local.snapshot()));
@@ -3494,8 +3910,11 @@ pub(crate) mod tests {
         assert_eq!(bound, 2 + crate::riblt_cache::CELL_HEADROOM);
         assert_eq!(cell_bound(u64::MAX, 1), u32::MAX as usize + 1);
 
-        // Receiving: a stream that never decodes is refused at the bound.
-        let mut receiver = Exchange::start_riblt(collection, kind, local.pinned(collection));
+        // Receiving: a stream that never decodes is refused at the bound. The
+        // empty side is the streamer under roles, so this receiver is pinned
+        // symmetric; the sender below is that streamer.
+        let mut receiver =
+            Exchange::start_riblt(collection, kind, local.pinned(collection)).symmetric();
         receiver.on_frame(Frame::RibltRoot { summary }, Some(local.snapshot()));
         let undecodable = |index: usize| Frame::RibltCell {
             index: index as u32,

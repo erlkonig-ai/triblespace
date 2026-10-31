@@ -692,6 +692,31 @@ fn seventeen_neighbours_hold_recon_while_blob_streams_run() {
     });
 }
 
+/// A generation-33 peer skips the walk frame kinds it does not know, AGREED
+/// (0x0c) among them, and would land a delta taken against an agreed tree it
+/// does not hold. The host refuses it at the handshake, so mixed versions
+/// fail closed; a peer on the current generation stays connected.
+#[test]
+fn a_generation_33_peer_which_skips_agreed_is_refused_at_the_handshake() {
+    run(async |clock| {
+        let net = SimNet::new(0x5EC0_0034, SimConfig::default());
+        let host_key = key(12);
+        let host_id = id(&host_key);
+        let mut host = bring_up(net.join(&host_key), &host_key, MemoryRepo::default());
+        let peers: &mut [&mut Peer<MemoryRepo>] = &mut [&mut host];
+        let old = net.join(&key(13)).transport;
+        let old = old
+            .dial(host_id, b"/triblespace/pile-sync/33")
+            .await
+            .unwrap();
+        let current = net.join(&key(14)).transport;
+        let current = current.dial(host_id, PILE_SYNC_ALPN).await.unwrap();
+        advance(&clock, peers, 1).await;
+        assert!(closed(&old), "a generation-33 peer was accepted");
+        assert!(!closed(&current));
+    });
+}
+
 /// A peer that stops reading `recon/1` loses its connection. It peers with a
 /// host for a collection and then asks to peer for a collection the host
 /// does not hold, thousands of times over, a thousand a second, reading

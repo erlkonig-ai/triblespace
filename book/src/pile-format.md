@@ -500,7 +500,7 @@ without framing or another tag. A record fingerprint is BLAKE3 of the complete
 canonical assertion, signature included. It names an assertion, not a member
 blob or an invented entity. Different authors or signatures remain distinct.
 Only COMMIT and DERIVE replicate; MERGE and MAP remain host-local claims.
-AUTH's existing complete prefix-signed proof grammar is unchanged. ALPN33
+AUTH's existing complete prefix-signed proof grammar is unchanged. ALPN34
 remains this unreleased candidate's boundary from deployed32.
 
 The in-memory fixed-record index stores ordinary typed `View` values in PATCH

@@ -1138,9 +1138,9 @@ fn demand_shallow_full_preserve_exact_wants_and_only_hydrate_selected_roots_with
     }
 }
 
-/// Transport generation 33 separates COMMIT and DERIVE trees on `walk/1`.
-/// Generation 32's mixed inventory is refused at the handshake; the current
-/// generation is served.
+/// Transport generation 34 adds AGREED (a carried Prefix agreement) and
+/// RIBLT_STOP (cached RIBLT roles). Generation 33, which would skip both, is
+/// refused at the handshake; the current generation is served.
 #[test]
 fn a_previous_generation_peer_is_refused() {
     let _guard = test_guard();
@@ -1161,7 +1161,7 @@ fn a_previous_generation_peer_is_refused() {
         let server_id = server_key.verifying_key().to_bytes();
         assert_eq!(
             triblespace_net::protocol::PILE_SYNC_ALPN,
-            b"/triblespace/pile-sync/33"
+            b"/triblespace/pile-sync/34"
         );
         let current = client
             .transport
@@ -1177,7 +1177,7 @@ fn a_previous_generation_peer_is_refused() {
         assert!(answer.is_ok(), "{answer:?}");
         let previous = client
             .transport
-            .dial(server_id, b"/triblespace/pile-sync/32")
+            .dial(server_id, b"/triblespace/pile-sync/33")
             .await
             .unwrap();
         let refused = tokio::time::timeout(
@@ -1186,6 +1186,6 @@ fn a_previous_generation_peer_is_refused() {
         )
         .await
         .expect("a refused connection fails promptly");
-        assert!(refused.is_err(), "generation 29 must not be served");
+        assert!(refused.is_err(), "generation 33 must not be served");
     }));
 }

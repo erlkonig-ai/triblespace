@@ -496,6 +496,12 @@ impl<C> Connection<C> {
         &self.handle.state
     }
 
+    /// This connection's id: unique within the table, and larger for a
+    /// connection made later.
+    pub(crate) fn id(&self) -> u64 {
+        self.state().id
+    }
+
     /// The key that dialled this connection.
     pub fn dialler(&self) -> PeerId {
         self.state().dialler
@@ -1046,10 +1052,10 @@ async fn accept_loop<T: Transport, S: Service>(
     if let Some(table) = shared.upgrade() {
         table.table.lock().unwrap().remove(&state);
         if state.announced.load(Ordering::SeqCst) {
-            // The walks forget what the peer confirmed and what landed
-            // from it.
+            // The walks cancel this connection's exchanges (not those of a
+            // connection that replaced it) and carry what was agreed on it.
             if let Some(walks) = table.walks.get() {
-                walks.closed(state.peer);
+                walks.closed(state.peer, state.id);
             }
             let service = table.service.clone();
             drop(table);
@@ -1157,6 +1163,7 @@ async fn stream<T: Transport, S: Service>(
                 ) => {
                     walks.incoming(
                         state.peer,
+                        state.id,
                         collection,
                         kind,
                         algorithm,

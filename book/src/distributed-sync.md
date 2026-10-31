@@ -465,7 +465,8 @@ Each neighbour exchanges one kind of one selected collection on a bidirectional
 `walk/1` stream: COMMIT records, DERIVE records, or (between Full neighbours)
 held references. Grants are not pushed on the timer; they travel by grant
 walks, which grant gossip opens where listed roots differ (*Grant exchange*). Either side may open it. Each sends its own immutable delta
-against the last agreement on this connection; both directions share the stream.
+against the last agreement with that peer, made on this connection or carried
+over from an earlier one; both directions share the stream.
 Nothing is broadcast or forwarded merely because it arrived.
 
 Each selected collection retains its existing Trickle-style timer: two to sixty
@@ -475,7 +476,8 @@ exchange is landing it; a new grant restarts nothing. A successful changed recei
 intermediate snapshot. Held-set changes wait for the ordinary timer. A successful
 exchange followed by genuinely new local keys starts another immediately; a
 lagging published subset of the agreement does not. Failed exchanges wait for the
-timer. Timer inputs are physical serving observations, not delta roots.
+timer, except a refused carried agreement (below), which is followed at once by
+the full walk, once per connection. Timer inputs are physical serving observations, not delta roots.
 
 The walks task uses only current connections and never dials. At most one exchange
 per peer, collection and kind runs at a time. Simultaneous opens preserve the
@@ -486,20 +488,58 @@ neither). Active peering flags determine
 send/receive directions; credentials provide fallback admission only when there
 is no active peering. A false send flag cannot be widened by another grant.
 
-An agreement G is immutable PATCH state scoped to peer, collection, kind and
-connection. Prefix retains it only after both LANDEDs and successful actual
-writes and stream finish. Cached mode uses the verified union transiently after
-both gated FINs, then releases it. Failure clears local G
-without retracting landed values; close/deselection clears it and retires running
-drivers, so a stale completion cannot restore it. G is not durable. Fresh
-connections may compare full sets again, with equal-prefix pruning.
+An agreement G is immutable PATCH state scoped to peer, collection and kind,
+tagged with the id of the connection it was agreed on and a stamp. Prefix
+retains it only after both LANDEDs and successful actual writes and stream
+finish. Cached mode uses the verified union transiently after both gated FINs,
+then releases it, together with any Prefix G for the component. Failure clears
+local G without retracting landed values; deselection clears it and retires
+running drivers, so a stale completion cannot restore it. G lives in memory
+only: a restart forgets it.
+
+G outlives the connection it was agreed on, as a carried G. An exchange on that
+connection uses G unannounced. An exchange on any other connection (a redial,
+or a replacement racing the old connection's close) uses G only while this
+side still holds every key in it, and announces it: AGREED (`0x0c`, G's root
+and count) goes before the root SUBTREE. A receiving side whose own G is not
+that same tree fails the exchange with StaleAgreement: it lost G (restart),
+never had it, or moved past it. The shared-base rule: a carried G enters the
+exchange's new agreement only when the peer announced the same tree;
+otherwise the new agreement is the two deltas alone, so every kept base is
+held by both, and the base reported as received is that shared base.
+
+A carried G is kept only by a confirmed exchange. An exchange on a carried G
+that fails, is cut, or is replaced before its outcome is known forgets the
+agreement it was based on, matched by stamp, so a late end never clears a
+newer agreement; the task forgets it at the moment it cancels such an
+exchange, so a re-open racing the end cannot pin it again. An exchange that
+had already taken G keeps its copy, which counts only if the peer announces
+the same tree. A refused G is followed at once by the full walk, G-less, from
+whichever side ends with the refusal: the refuser on its StaleAgreement, or
+the announcer on reading the FAILED reset of its carried exchange (the
+refuser's own re-open may have been reset as a duplicate). Such an immediate
+re-open happens at most once per peer, collection, kind and connection;
+later refusals wait for the timer, so a peer that announces or refuses a G
+every time cannot drive a tight loop.
+
+A connection's close is keyed by its id. It cancels only the exchanges
+running on that connection, cached and grant walks included, so the late
+close of a replaced connection leaves the replacement's exchanges, and the
+carried G they confirm, alone. What is kept per peer rather than per
+connection (health pairs, queued grant walks, the unknown-resource budget)
+is cleared only once no connection to the peer remains. A carried G is
+forgotten at the first close of any connection more than 24 hours after its
+own connection closed (`CARRIED_AGREEMENT_TTL`), which bounds the trees kept
+for peers that never return by the peers seen to close in a day.
 
 Successful symmetric exchanges compute the same union. An asymmetric final
 finish failure may clear G on only one side: these sound common-held lower bounds
 can temporarily differ, particularly while publication lags. Delta commitments
 remain independent and valid; ordinary publication and later exchanges can
-converge the bookkeeping. There is no base-negotiation or distributed durable
-receipt added here.
+converge the bookkeeping. A G kept by one side only is never announced as
+shared: on a later connection the other side refuses it or the shared-base rule
+drops it. Beyond AGREED's equality check there is no base negotiation and no
+durable receipt.
 
 ## Walk streams
 
@@ -528,10 +568,12 @@ resource32 || proof-id32 key. Integers are big-endian.
 | `0x09` | RIBLT_ROOT | hash32, leaf-count:u64 |
 | `0x0a` | RIBLT_CELL | index:u32, symbol32, checksum:u64, count:i64 |
 | `0x0b` | HAVE | exact offered depth:u8, prefix32, hash32, leaf-count:u64 |
+| `0x0c` | AGREED | hash32, leaf-count:u64 (nonempty carried agreed tree) |
+| `0x0d` | RIBLT_STOP | empty (cached decoder has proven the peer's set) |
 
 DONE/LANDED are Prefix-only; cached RIBLT refuses them and uses the gated FIN
-semantics below. RIBLT_ROOT has 40 payload bytes (45 framed), with no repeated
-profile key. This remains the unreleased ALPN33 boundary, not compatibility
+semantics below. AGREED is Prefix-only and RIBLT_STOP is cached-only. RIBLT_ROOT has 40 payload bytes (45 framed), with no repeated
+profile key. This remains the unreleased ALPN34 boundary, not compatibility
 with earlier private33 variants or deployed32.
 
 Every SUBTREE payload is 73 bytes, 78 including the frame header, regardless of
@@ -654,7 +696,7 @@ liveness or throughput.
 
 ### Cached full-component discovery
 
-This source-only ALPN33 candidate defaults to cached RIBLT for mutually
+This source-only ALPN34 candidate defaults to cached RIBLT for mutually
 authorized locally opened streams, through both the CLI and
 `Algorithm::default()`. Explicit `trible pile net sync --walk-algorithm prefix`
 or `PeerConfig::walk_algorithm = Algorithm::Prefix` retains the Prefix option;
@@ -757,6 +799,40 @@ the remote-only key PATCH, sharing all unchanged native subtree summaries. It
 checks the exact peer root/count without waiting for unknown typed bodies and
 without a copied full-source key inventory. Typed peer reconstruction and canonical signature
 admission independently guard final landing.
+
+The two ROOT counts assign roles in a cached exchange of a typed component
+(Commit, Derive) whose counts differ. The side with more keys is the
+decoder: it streams no cells, and feeds the smaller side's cells both to its
+residual decoder and to a raw decode against the empty set, which recovers
+the smaller side's whole set in about 1.37 |B| cells instead of about 1.37 d,
+where d >= |A| - |B|. The raw decode is trusted only whole: any decoder error,
+a symbol peeled with a negative count, or a recovered summary that is not the
+peer ROOT abandons it, and the residual decoder decides. On its first exact
+proof against the peer ROOT the decoder writes RIBLT_STOP (`0x0d`, empty),
+then pushes the values the peer lacks and requests every remote key with
+VALUE_REQUEST inside the ordinary request window, held or not, because the
+streamer rebuilds the decoder's set only from what it is pushed and asked
+for. Partial residual recoveries push and request nothing before STOP. The
+decoder may FIN only once STOP is written, its pushes drained and every
+requested value landed. The smaller side streams until STOP and refuses any
+incoming cell; after STOP it serves requests only from its advertised
+source, each key once, accepts pushes only for keys it lacks, and proves
+completion when its incremental view matches the peer ROOT. A FIN on either
+side before its proof fails, and a lying ROOT fails with a count mismatch
+and never produces STOP. Equal counts stay symmetric, and so do References,
+which have no VALUE frame to carry the decoder's push.
+
+Before STOP the decoder sends nothing, for as long as its decode takes: about
+1.37 |B| cells at whatever rate the link carries them, which exceeds the
+60-second walk deadline on a large set (|B| = 60,000 at 1,000 cells a second)
+or a slow link. So the streamer's peer-silence deadline runs from the later of
+the last frame heard and the last cell it wrote. A written cell is evidence
+that the decoder still reads: a decoder that stops reading stalls the
+streamer's writes on transport backpressure, and a write without byte
+progress for the walk deadline fails the exchange; a decoder that reads but
+never proves is ended by the cell bound. No keepalive frame exists. Every
+other wait, the decoder's and both sides' after STOP, keeps the frame
+deadline.
 
 Once this exact proof holds, stop coded output only when the **complete locally
 written** cell prefix reaches the decoded incoming prefix. Opposite residual
@@ -1536,7 +1612,13 @@ guarantee.
 
 ## Wire surface
 
-The ALPN is `/triblespace/pile-sync/33`, an unreleased generation. It
+The ALPN is `/triblespace/pile-sync/34`, an unreleased generation.
+Generation 34 adds two walk frames as one cutover: AGREED (`0x0c`), with
+which a Prefix side announces an agreed tree carried over from a closed
+connection, and RIBLT_STOP (`0x0d`), with which the larger side of a cached
+RIBLT exchange ends the smaller side's cell stream. Generation 33 skips
+unknown walk frames, so it would land a delta against a tree it lacks and
+stream cells past a STOP; it is refused at the handshake. Generation 33
 separates the COMMIT and DERIVE trees, and replaces the grant digest exchange
 with grant gossip by participation: GRANT_ROOTS listings on `recon/1` and a
 grant walk per resource on `walk/1`, Prefix only, whose receiver skips what it

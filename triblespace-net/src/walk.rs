@@ -6,10 +6,19 @@
 //! tree the two agreed on last time, breadth first and without waiting, and
 //! lands the other's ([`crate::exchange`]). Both LANDEDs crossing confirms
 //! it, and the agreed tree for that peer, collection and kind becomes the
-//! prior agreement plus both deltas, which both hold; an exchange that ends any
-//! other way forgets it, and what landed stays. Agreed trees are forgotten
-//! for a peer when a connection to it closes, and for a collection when it
-//! is deselected; none is persisted.
+//! prior agreement plus both deltas, which both hold; an exchange either side
+//! decided failed forgets it, and what landed stays. Agreed trees outlive the
+//! connection they were agreed on, in this node's memory only, tagged with
+//! that connection's id, and are forgotten for a collection when it is
+//! deselected. On any other connection (the old one closed, or the peer
+//! opened a new one before this side saw the close) a tree is carried: it is
+//! offered only while this side still holds every key in it, and only with
+//! the peer's assent: a side that subtracts G announces it (AGREED), and a
+//! receiver that does not hold the same G fails the exchange, after which
+//! both forget it and the next exchange is the full walk. A carried G enters
+//! the next agreement only when both sides announced it. An exchange the
+//! network interrupted keeps the prior G, which both still hold; a replaced
+//! exchange that ends late forgets only the G it was based on.
 //!
 //! The kinds of tree are the collection's records and the blobs it holds, as
 //! handles without values, and the grants over any resource R (keyed by
@@ -51,6 +60,8 @@
 //! not require peer FIN; all owed outgoing frames finish first, then the receive
 //! direction and local insertion/fetch work remain live. Only clean EOF is a
 //! peer completion promise. Prefix's DONE/LANDED and late requests are unchanged.
+//! A cached streamer, whose decoder is silent until RIBLT_STOP, counts each
+//! cell it writes as hearing from the peer (see `walk_cached`).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -86,7 +97,7 @@ use crate::connection::{
     ConnectionTable, FrameError, RESET_WALK_DUPLICATE, RESET_WALK_FAILED, RESET_WALK_REFUSED,
     Service, open_walk, read_frame, write_frame,
 };
-use crate::exchange::{Ended, Exchange, Out, Outcome, Pinned, Tree};
+use crate::exchange::{Basis, Ended, Exchange, Out, Outcome, Pinned, Tree};
 use crate::grants::{
     GrantEvent, GrantOutcome, GrantWalkEnd, MAX_UNKNOWN_RESOURCES_PER_LINK, NotStarted,
 };
@@ -196,8 +207,15 @@ impl Reader<'_> {
 }
 
 /// An exchange ends after this long without a frame from the peer while one
-/// is owed, and a blob fetch after this long without progress.
+/// is owed (a cached streamer before STOP: without a frame or a written
+/// cell), and a blob fetch after this long without progress.
 pub(crate) const WALK_DEADLINE: Duration = Duration::from_secs(60);
+/// How long an agreement outlives the close of the connection it was agreed
+/// on. Within it the next connection announces it (carried G); past it, the
+/// next close forgets it, and that peer's next exchange is the full walk. A
+/// day covers a device that reconnects overnight; it bounds the trees kept
+/// for peers that never come back by the peers seen to close in one day.
+pub(crate) const CARRIED_AGREEMENT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Value requests and blob fetches one exchange keeps in flight.
 pub(crate) const MAX_WALK_REQUESTS: usize = 64;
 /// Grant walks one peer runs at once; the rest wait in order.
@@ -239,9 +257,32 @@ pub(crate) struct Walks<R> {
     /// The collections the last snapshot selected: one that leaves the
     /// selection is forgotten.
     selected: PATCH<32, IdentitySchema, ()>,
-    /// Connection-scoped sound common-held keys: prior acknowledged base
-    /// plus both completed deltas, possibly ahead of lagging physical pins.
-    agreed: PATCH<65, IdentitySchema, Arc<Tree>>,
+    /// Sound common-held keys: prior acknowledged base plus both completed
+    /// deltas, possibly ahead of lagging physical pins, with the connection
+    /// they were agreed on. On any other connection the tree is carried: a
+    /// cache of shared state, never trusted blindly.
+    agreed: PATCH<65, IdentitySchema, Agreement>,
+    /// The last [`Agreement::stamp`] given.
+    stamps: u64,
+    /// The connection on which each key last re-opened at once after a
+    /// refused G: at most once per key and connection.
+    reopened: PATCH<65, IdentitySchema, u64>,
+}
+
+/// What a peer and this side agreed on for one collection and kind.
+#[derive(Clone)]
+pub(crate) struct Agreement {
+    /// The id of the connection it was agreed on. An exchange on that
+    /// connection uses it unannounced; one on any other connection announces
+    /// it (AGREED), and only while this side still holds every key in it.
+    pub(crate) connection: u64,
+    /// Which agreement this is: an exchange's end settles only the agreement
+    /// it was based on ([`Basis`]), never one stored after it started.
+    pub(crate) stamp: u64,
+    pub(crate) tree: Arc<Tree>,
+    /// When the connection it was agreed on closed: it is carried from
+    /// then on, and forgotten [`CARRIED_AGREEMENT_TTL`] later.
+    pub(crate) closed_at: Option<Mono>,
 }
 
 impl<R: BlobStoreGet + Clone> Walks<R> {
@@ -252,6 +293,8 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
             snapshot: None,
             selected: PATCH::new(),
             agreed: PATCH::new(),
+            stamps: 0,
+            reopened: PATCH::new(),
         }
     }
 
@@ -260,23 +303,51 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
         self
     }
 
-    /// Start an exchange of C's `kind` tree with `peer`, against what they
-    /// agreed on: none when C is not selected and active here, this side neither
-    /// sends C to the peer nor receives C from it, or `kind` is
-    /// [`WalkKind::References`] and C's held set is unknown here (an incoming
-    /// exchange is refused alike). [`Walks::ended`] ends it.
+    /// [`Walks::start_on`] the one connection a test does not name.
+    #[cfg(test)]
     pub(crate) fn start(
         &self,
         peer: PeerId,
         collection: CollectionHandle,
         kind: WalkKind,
     ) -> Option<Exchange<R>> {
-        self.start_selected(peer, collection, kind, None)
+        self.start_on(peer, 0, collection, kind, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn start_selected(
         &self,
         peer: PeerId,
+        collection: CollectionHandle,
+        kind: WalkKind,
+        requested: Option<crate::walk_stream::Algorithm>,
+    ) -> Option<Exchange<R>> {
+        self.start_on(peer, 0, collection, kind, requested)
+    }
+
+    /// [`Walks::join_on`] the one connection a test does not name.
+    #[cfg(test)]
+    pub(crate) fn start_incoming(
+        &self,
+        peer: PeerId,
+        collection: CollectionHandle,
+        kind: WalkKind,
+        algorithm: crate::walk_stream::Algorithm,
+        offer: Option<crate::walk_stream::OfferRole>,
+    ) -> Option<Exchange<R>> {
+        self.join_on(peer, 0, collection, kind, algorithm, offer)
+    }
+
+    /// Start an exchange of C's `kind` tree with `peer`, against what they
+    /// agreed on: none when C is not selected and active here, this side neither
+    /// sends C to the peer nor receives C from it, or `kind` is
+    /// [`WalkKind::References`] and C's held set is unknown here (an incoming
+    /// exchange is refused alike). [`Walks::ended`] ends it. It runs on
+    /// `connection`, the id of the connection its stream is opened on.
+    pub(crate) fn start_on(
+        &self,
+        peer: PeerId,
+        connection: u64,
         collection: CollectionHandle,
         kind: WalkKind,
         requested: Option<crate::walk_stream::Algorithm>,
@@ -292,7 +363,7 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
             } else {
                 Exchange::start_one_way(collection, kind, pinned, None, false, true)
             };
-            return Some(exchange.peered(peered));
+            return Some(exchange.peered(peered).on_connection(connection));
         }
         self.selected.get(&collection.raw)?;
         let pinned = self.exchangeable(collection, kind)?;
@@ -305,29 +376,58 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
         if requested == Some(crate::walk_stream::Algorithm::CachedRiblt) && !(sends && receives) {
             return None;
         }
-        let agreed = self
-            .agreed
-            .get(&agreed_key(peer, collection.raw, kind))
-            .cloned();
+        let (agreed, carried, basis) = self.agreement(peer, connection, collection, kind, &pinned);
         Some(
             if sends
                 && receives
                 && requested.unwrap_or(self.algorithm) == crate::walk_stream::Algorithm::CachedRiblt
             {
-                Exchange::start_riblt(collection, kind, pinned)
+                Exchange::start_riblt(collection, kind, pinned).on_connection(connection)
             } else if sends != receives {
                 Exchange::start_one_way(collection, kind, pinned, agreed, sends, receives)
+                    .based(basis, carried)
             } else {
                 Exchange::start(collection, kind, pinned, agreed, sends, receives)
+                    .based(basis, carried)
             },
         )
     }
 
-    /// OPEN commits to the body protocol before driver registration. Ordinary
-    /// Prefix never infers eager acceptance from our local authorization view.
-    fn start_incoming(
+    /// What this side and `peer` agreed on for C's `kind` tree, for an
+    /// exchange on `connection`: one agreed on that connection, or one
+    /// carried over from another (closed, or replaced) while this side still
+    /// holds every key in it, which is then announced. A carried tree this
+    /// side no longer holds (its store was reset or restored) is not offered,
+    /// and the peer then refuses its own (AGREED).
+    fn agreement(
         &self,
         peer: PeerId,
+        connection: u64,
+        collection: CollectionHandle,
+        kind: WalkKind,
+        pinned: &CollectionSnapshot,
+    ) -> (Option<Arc<Tree>>, bool, Basis) {
+        let mut basis = Basis {
+            connection,
+            ..Default::default()
+        };
+        let Some(agreed) = self.agreed.get(&agreed_key(peer, collection.raw, kind)) else {
+            return (None, false, basis);
+        };
+        let carried = agreed.connection != connection;
+        if carried && Tree::pinned(kind, pinned.repair()).has_new_keys(&agreed.tree) {
+            return (None, false, basis);
+        }
+        basis.agreement = Some(agreed.stamp);
+        (Some(agreed.tree.clone()), carried, basis)
+    }
+
+    /// OPEN commits to the body protocol before driver registration. Ordinary
+    /// Prefix never infers eager acceptance from our local authorization view.
+    pub(crate) fn join_on(
+        &self,
+        peer: PeerId,
+        connection: u64,
         collection: CollectionHandle,
         kind: WalkKind,
         algorithm: crate::walk_stream::Algorithm,
@@ -352,7 +452,7 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
                 }
                 Some(OfferRole::Receive) => return None,
             };
-            return Some(exchange.peered(peered));
+            return Some(exchange.peered(peered).on_connection(connection));
         }
         self.selected.get(&collection.raw)?;
         let pinned = self.exchangeable(collection, kind)?;
@@ -362,17 +462,15 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
         if !sends && !receives {
             return None;
         }
-        let agreed = self
-            .agreed
-            .get(&agreed_key(peer, collection.raw, kind))
-            .cloned();
+        let (agreed, carried, basis) = self.agreement(peer, connection, collection, kind, &pinned);
         match (algorithm, offer) {
             (Algorithm::CachedRiblt, None) if sends && receives => {
-                Some(Exchange::start_riblt(collection, kind, pinned))
+                Some(Exchange::start_riblt(collection, kind, pinned).on_connection(connection))
             }
-            (Algorithm::Prefix, None) => Some(Exchange::start(
-                collection, kind, pinned, agreed, sends, receives,
-            )),
+            (Algorithm::Prefix, None) => Some(
+                Exchange::start(collection, kind, pinned, agreed, sends, receives)
+                    .based(basis, carried),
+            ),
             (Algorithm::Prefix, Some(role))
                 if kind != WalkKind::References
                     && match role {
@@ -380,9 +478,10 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
                         OfferRole::Receive => sends && !receives,
                     } =>
             {
-                Some(Exchange::start_one_way(
-                    collection, kind, pinned, agreed, sends, receives,
-                ))
+                Some(
+                    Exchange::start_one_way(collection, kind, pinned, agreed, sends, receives)
+                        .based(basis, carried),
+                )
             }
             _ => None,
         }
@@ -393,9 +492,14 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
     /// it received, landed after actual LANDED write/gated FIN; the agreed
     /// tree is set when the exchange confirmed and forgotten otherwise.
     /// Returns whether to exchange again at once: a confirmed exchange of a
-    /// tree that moved from the agreed one since. A failed exchange is left
-    /// to C's timer however the tree moved: repeating it at once would retry
-    /// a neighbour that cannot land it as fast as the attempts fail.
+    /// tree that moved from the agreed one since, or a refused G (this side's
+    /// StaleAgreement, or the peer's FAILED reset of an exchange that
+    /// announced a carried G), whose retry is the full walk, G-less. A
+    /// refused G re-opens at once at most once per key and connection, so a
+    /// peer that announces or refuses a G every time waits for the timer.
+    /// Any other failed exchange is left to C's timer however the tree moved:
+    /// repeating it at once would retry a neighbour that cannot land it as
+    /// fast as the attempts fail.
     pub(crate) fn ended(
         &mut self,
         peer: PeerId,
@@ -405,6 +509,7 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
         now: Mono,
     ) -> bool {
         let key = agreed_key(peer, collection.raw, kind);
+        let stale = ended.failure == Some(crate::exchange::Failure::StaleAgreement);
         let confirmed = ended
             .agreed
             .as_ref()
@@ -431,8 +536,17 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
             });
         }
         let Some(agreed) = ended.agreed else {
-            self.agreed.remove(&key);
-            return false;
+            // Interrupted by the network, a prior G agreed on this
+            // connection is still held by both and stays. Decided failed by
+            // either side, it is forgotten, so a G the peer refused is never
+            // offered to it again; a stale G is followed at once by the full
+            // walk. A carried G the peer may have refused is kept only by a
+            // confirmation: ended without one, however, it is forgotten.
+            if ended.failure.is_some() || ended.peer_failed || ended.basis.carried {
+                self.agreed.remove(&key);
+            }
+            let refused = stale || (ended.peer_failed && ended.basis.carried);
+            return refused && self.reopen_once(key, ended.basis.connection);
         };
         let current = match kind {
             WalkKind::Authorization => self
@@ -446,7 +560,14 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
         // The key stays constant across exchanges; replace must publish the
         // new attached tree even though PATCH set equality observes keys only.
         if ended.retain_agreement {
-            self.agreed.replace(&Entry::with_value(&key, agreed));
+            self.stamps += 1;
+            let agreement = Agreement {
+                connection: ended.basis.connection,
+                stamp: self.stamps,
+                tree: agreed,
+                closed_at: None,
+            };
+            self.agreed.replace(&Entry::with_value(&key, agreement));
         } else {
             // Cached mode never subtracts G. A prior Prefix agreement is also
             // released once this explicitly selected whole-source walk ends.
@@ -455,12 +576,106 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
         moved
     }
 
-    /// A connection to `peer` closed: what they agreed on is forgotten. A
-    /// peer that restarted holds no agreed trees, and an exchange against
-    /// one it lacks fails the count proof until both forget it; forgetting
-    /// costs the next exchange the delta against nothing, which the peer's
-    /// announcements prune.
-    pub(crate) fn closed(&mut self, peer: PeerId) {
+    /// An exchange another one replaced ended late (its connection closed, or
+    /// the peer opened the same exchange again, possibly on a newer
+    /// connection), after the replacement may have started or ended. Health
+    /// and a confirmed agreement are the replacement's to settle; a failure
+    /// either side decided, or any unconfirmed end of an exchange on a
+    /// carried G, still forgets the agreement the late exchange was based
+    /// on, unless a newer one was stored since.
+    pub(crate) fn superseded(
+        &mut self,
+        peer: PeerId,
+        collection: CollectionHandle,
+        kind: WalkKind,
+        ended: &Ended,
+    ) {
+        if ended.agreed.is_none()
+            && (ended.failure.is_some() || ended.peer_failed || ended.basis.carried)
+        {
+            self.forget(peer, collection, kind, ended.basis);
+        }
+    }
+
+    /// An exchange on `basis` was cancelled (replaced, or its connection
+    /// closed) before its outcome was known. A carried G it announced may be
+    /// one the peer refused, so it is forgotten now, before a later
+    /// exchange can take it; an exchange that already took it keeps its
+    /// copy, which counts only if the peer announced the same tree.
+    pub(crate) fn cancelled(
+        &mut self,
+        peer: PeerId,
+        collection: CollectionHandle,
+        kind: WalkKind,
+        basis: Basis,
+    ) {
+        if basis.carried {
+            self.forget(peer, collection, kind, basis);
+        }
+    }
+
+    /// Forget the agreement `basis` was taken from, if it is still the one
+    /// stored.
+    fn forget(&mut self, peer: PeerId, collection: CollectionHandle, kind: WalkKind, basis: Basis) {
+        let key = agreed_key(peer, collection.raw, kind);
+        if basis.agreement.is_some()
+            && self.agreed.get(&key).map(|agreed| agreed.stamp) == basis.agreement
+        {
+            self.agreed.remove(&key);
+        }
+    }
+
+    /// Whether a refused G under `key` on `connection` may re-open at once:
+    /// the first time on that connection only.
+    fn reopen_once(&mut self, key: [u8; 65], connection: u64) -> bool {
+        if self.reopened.get(&key) == Some(&connection) {
+            return false;
+        }
+        self.reopened.replace(&Entry::with_value(&key, connection));
+        true
+    }
+
+    /// Connection `connection` to `peer` closed at `now`. What they agreed on
+    /// it stays, tagged with that connection: the next connection announces
+    /// it (carried G), for [`CARRIED_AGREEMENT_TTL`]. A peer that restarted
+    /// holds no agreed trees, and refuses an exchange against one it lacks
+    /// (AGREED); both then forget it, and the next exchange is the delta
+    /// against nothing. Every close also forgets the agreements, any peer's,
+    /// whose connection closed more than [`CARRIED_AGREEMENT_TTL`] before
+    /// `now`, and the connection's immediate re-open allowances.
+    pub(crate) fn closed(&mut self, peer: PeerId, connection: u64, now: Mono) {
+        let keys = self.agreed.iter().copied().collect::<Vec<[u8; 65]>>();
+        for key in keys {
+            let Some(agreement) = self.agreed.get(&key).cloned() else {
+                continue;
+            };
+            match agreement.closed_at {
+                None if key[..32] == peer && agreement.connection == connection => {
+                    let closed = Agreement {
+                        closed_at: Some(now),
+                        ..agreement
+                    };
+                    self.agreed.replace(&Entry::with_value(&key, closed));
+                }
+                Some(at) if now.duration_since(at) > CARRIED_AGREEMENT_TTL => {
+                    self.agreed.remove(&key);
+                }
+                _ => {}
+            }
+        }
+        let spent = self
+            .reopened
+            .iter()
+            .filter(|key| key[..32] == peer && self.reopened.get(key) == Some(&connection))
+            .copied()
+            .collect::<Vec<[u8; 65]>>();
+        for key in spent {
+            self.reopened.remove(&key);
+        }
+    }
+
+    /// `peer` has no connection left: its health pairs are disconnected.
+    pub(crate) fn disconnected(&mut self, peer: PeerId) {
         self.health.update(|health| {
             for collection in &mut health.collections {
                 for pair in collection.peers.iter_mut().filter(|pair| pair.peer == peer) {
@@ -468,15 +683,6 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
                 }
             }
         });
-        let dropped = self
-            .agreed
-            .iter()
-            .filter(|key| key[..32] == peer)
-            .copied()
-            .collect::<Vec<_>>();
-        for key in dropped {
-            self.agreed.remove(&key);
-        }
     }
 
     /// Take the latest serving snapshot: what new exchanges pin and are
@@ -874,10 +1080,10 @@ impl WalksHandle {
         });
     }
 
-    /// A connection to `peer` closed: what the peer and this side agreed on
-    /// is forgotten.
-    pub(crate) fn closed(&self, peer: PeerId) {
-        let _ = self.0.send(Command::Closed { peer });
+    /// Connection `connection` to `peer` closed: its exchanges are
+    /// cancelled, and what was agreed on it is carried to the next.
+    pub(crate) fn closed(&self, peer: PeerId, connection: u64) {
+        let _ = self.0.send(Command::Closed { peer, connection });
     }
 
     /// A `walk/1` stream `peer` opened for C's `kind` tree, after its tag
@@ -887,6 +1093,7 @@ impl WalksHandle {
     pub(crate) fn incoming(
         &self,
         peer: PeerId,
+        connection: u64,
         collection: CollectionHandle,
         kind: WalkKind,
         algorithm: crate::walk_stream::Algorithm,
@@ -896,6 +1103,7 @@ impl WalksHandle {
     ) {
         let incoming = Command::Incoming {
             peer,
+            connection,
             collection,
             kind,
             algorithm,
@@ -919,13 +1127,16 @@ pub(crate) enum Command {
         collection: CollectionHandle,
         kind: WalkKind,
     },
-    /// A connection to the peer closed.
-    Closed { peer: PeerId },
+    /// A connection to the peer closed, by its id: a replacement connection
+    /// may already be running exchanges, which its close leaves alone.
+    Closed { peer: PeerId, connection: u64 },
     /// A `walk/1` stream `peer` opened on its connection, after its tag and
     /// Open frame: an exchange of C's tree of `kind`, read from `recv` and
     /// written on `send`.
     Incoming {
         peer: PeerId,
+        /// The id of the connection the stream arrived on.
+        connection: u64,
         collection: CollectionHandle,
         kind: WalkKind,
         algorithm: crate::walk_stream::Algorithm,
@@ -1063,6 +1274,9 @@ struct Running {
     opened: bool,
     /// Its landing acknowledgements.
     acks: mpsc::UnboundedSender<(u64, u64)>,
+    /// What its exchange was based on, and the connection it runs on (every
+    /// exchange's, cached and grant walks included).
+    basis: Basis,
     /// Dropped to replace it: the driver resets the stream.
     _replace: oneshot::Sender<()>,
 }
@@ -1128,8 +1342,29 @@ where
                 collection,
                 kind,
             } => self.open(peer, collection, kind),
-            Command::Closed { peer } => {
-                self.running.retain(|(other, _, _), _| *other != peer);
+            Command::Closed { peer, connection } => {
+                // Only the exchanges on the closed connection: a late close
+                // of a replaced connection must not cancel the exchanges,
+                // and forget the carried G, of the connection that replaced it.
+                let closed: Vec<Key> = self
+                    .running
+                    .iter()
+                    .filter(|((other, _, _), running)| {
+                        *other == peer && running.basis.connection == connection
+                    })
+                    .map(|(key, _)| *key)
+                    .collect();
+                for key in closed {
+                    if let Some(running) = self.running.remove(&key) {
+                        self.cancelled(key, &running);
+                    }
+                }
+                self.walks.closed(peer, connection, crate::clock::mono_now());
+                // What is per link, not per connection, goes only once no
+                // connection to the peer is left.
+                if self.connections.is_connected(peer) {
+                    return;
+                }
                 self.grant_queue.forget(peer);
                 let charged: Vec<[u8; 64]> = self
                     .unknown_joins
@@ -1140,17 +1375,18 @@ where
                 for key in charged {
                     self.unknown_joins.remove(&key);
                 }
-                self.walks.closed(peer);
+                self.walks.disconnected(peer);
             }
             Command::Incoming {
                 peer,
+                connection,
                 collection,
                 kind,
                 algorithm,
                 offer,
                 send,
                 recv,
-            } => self.incoming(peer, collection, kind, algorithm, offer, send, recv),
+            } => self.incoming(peer, connection, collection, kind, algorithm, offer, send, recv),
             Command::Ended {
                 id,
                 peer,
@@ -1189,9 +1425,15 @@ where
                         landed: current && !duplicate && ended.landed,
                     });
                 }
-                // A replaced exchange, or one the peer reset for the stream
-                // it opened at the same time, settles nothing.
-                if !current || duplicate {
+                // One the peer reset for the stream it opened at the same
+                // time settles nothing. A replaced exchange settles only a
+                // failure of the agreement it was based on: its replacement
+                // may run on a newer connection, before this one's close.
+                if duplicate {
+                    return;
+                }
+                if !current {
+                    self.walks.superseded(peer, collection, kind, &ended);
                     return;
                 }
                 // A confirmed exchange of a tree that moved meanwhile is
@@ -1229,7 +1471,10 @@ where
             };
             return not_started(self, why);
         }
-        let Some(exchange) = self.walks.start(peer, collection, kind) else {
+        let Some(exchange) = self
+            .walks
+            .start_on(peer, connection.id(), collection, kind, None)
+        else {
             return not_started(self, NotStarted::StartDeclined);
         };
         let (driver, acked, replaced) = self.register(key, true, &exchange);
@@ -1303,6 +1548,7 @@ where
     fn incoming(
         &mut self,
         peer: PeerId,
+        connection: u64,
         collection: CollectionHandle,
         kind: WalkKind,
         algorithm: crate::walk_stream::Algorithm,
@@ -1325,7 +1571,7 @@ where
         }
         let Some(exchange) = self
             .walks
-            .start_incoming(peer, collection, kind, algorithm, offer)
+            .join_on(peer, connection, collection, kind, algorithm, offer)
         else {
             send.reset(RESET_WALK_REFUSED);
             recv.stop(RESET_WALK_REFUSED);
@@ -1393,15 +1639,16 @@ where
         self.next_id += 1;
         let (acks, acked) = mpsc::unbounded_channel();
         let (replace, replaced) = oneshot::channel();
-        self.running.insert(
-            key,
-            Running {
-                id,
-                opened,
-                acks,
-                _replace: replace,
-            },
-        );
+        let running = Running {
+            id,
+            opened,
+            acks,
+            basis: exchange.basis(),
+            _replace: replace,
+        };
+        if let Some(replaced) = self.running.insert(key, running) {
+            self.cancelled(key, &replaced);
+        }
         let (peer, collection, kind) = (key.0, CollectionHandle::new(key.1), key.2);
         if exchange.receives() {
             let _ = self.events.send(Event::Receiving { collection, kind });
@@ -1418,6 +1665,13 @@ where
             kind,
         };
         (driver, acked, replaced)
+    }
+
+    /// A running exchange was cancelled before its end: `running`'s stream
+    /// is reset once it is dropped.
+    fn cancelled(&mut self, key: Key, running: &Running) {
+        let (peer, collection, kind) = (key.0, CollectionHandle::new(key.1), key.2);
+        self.walks.cancelled(peer, collection, kind, running.basis);
     }
 }
 
@@ -1600,6 +1854,7 @@ where
     let mut heard_at = tokio::time::Instant::now();
     let mut duplicate = false;
     let mut refused = false;
+    let mut peer_failed = false;
     let failed = 'drive: loop {
         match exchange.outcome() {
             Some(Outcome::Confirmed) => break false,
@@ -1668,6 +1923,7 @@ where
                 Some(Err(code)) => {
                     duplicate = code == Some(RESET_WALK_DUPLICATE);
                     refused = code == Some(RESET_WALK_REFUSED);
+                    peer_failed = code == Some(RESET_WALK_FAILED);
                     break 'drive true;
                 }
                 None => break 'drive true,
@@ -1750,6 +2006,7 @@ where
     let mut ended = exchange.end();
     ended.landed = landed_written;
     ended.refused = refused;
+    ended.peer_failed = peer_failed;
     if failed || !finished || !landed_written {
         // A queued LANDED is not a write receipt. The peer's independent
         // receipt can still count our push, but no shared agreement survives.
@@ -1821,6 +2078,8 @@ async fn read_stream(
 struct Written {
     root: bool,
     cells: usize,
+    /// A cached decoder's STOP is on the wire.
+    stop: bool,
 }
 
 type Reset = futures::future::Fuse<oneshot::Receiver<u32>>;
@@ -1901,7 +2160,11 @@ async fn write_stream_inner(
                         }
                         if !broken {
                             receipt.root |= matches!(frame, Frame::RibltRoot { .. });
-                            let notify = matches!(frame, Frame::RibltCell { .. } | Frame::RibltRoot { .. });
+                            receipt.stop |= matches!(frame, Frame::RibltStop);
+                            let notify = matches!(
+                                frame,
+                                Frame::RibltCell { .. } | Frame::RibltRoot { .. } | Frame::RibltStop
+                            );
                             if let Frame::RibltCell { index, .. } = frame {
                                 receipt.cells = index as usize + 1;
                             }
@@ -2170,12 +2433,13 @@ pub(crate) mod tests {
         all.into_iter().collect()
     }
 
-    /// What a peer and this side agreed on is forgotten when a connection to
-    /// it closes, so a peer that restarted is not held to a tree it lost;
-    /// and a collection's agreed trees, for every peer, when the collection
-    /// is deselected.
+    /// What a peer and this side agreed on outlives the connection it was
+    /// agreed on, and on any other connection is offered only with the peer's
+    /// assent (AGREED), so a peer that restarted is not held to a tree it
+    /// lost; a collection's agreed trees are forgotten for every peer when
+    /// the collection is deselected.
     #[test]
-    fn agreed_trees_are_forgotten_when_a_peering_ends_or_a_collection_is_dropped() {
+    fn agreed_trees_are_carried_over_a_closed_connection_and_dropped_with_the_collection() {
         let mut node = Node::new(63);
         let kept = node.hold("kept", open());
         let dropped = node.hold("dropped", open());
@@ -2200,6 +2464,8 @@ pub(crate) mod tests {
                     agreed: Some(Arc::new(Tree::pinned(kind, pinned.repair()))),
                     failure: None,
                     refused: false,
+                    peer_failed: false,
+                    basis: Default::default(),
                     skipped: 0,
                 };
                 assert!(!node.walks.ended(peer, collection, kind, ended, now));
@@ -2216,12 +2482,17 @@ pub(crate) mod tests {
             assert!(remembered(&node, peer, collection));
         }
 
-        // A connection to A closes: A's trees go, B's stay.
-        node.walks.closed(a);
-        assert!(!remembered(&node, a, kept));
-        assert!(!remembered(&node, a, dropped));
-        assert!(remembered(&node, b, kept));
-        assert!(remembered(&node, b, dropped));
+        // A connection to A closes: A's trees are carried over to the next
+        // connection (1), offered (announced) only there; B's stay current
+        // on connection 0.
+        node.walks.closed(a, 0, crate::clock::mono_now());
+        for (peer, collection) in pairs {
+            assert!(remembered(&node, peer, collection));
+        }
+        let (agreed, carried, _) = node.walks.agreement(a, 1, kept, kind, &node.pinned(kept));
+        assert!(agreed.is_some() && carried);
+        let (agreed, carried, _) = node.walks.agreement(b, 0, kept, kind, &node.pinned(kept));
+        assert!(agreed.is_some() && !carried);
 
         // One collection is deselected: its trees go for every peer, and
         // the other's stay, over this observation and the next.
@@ -2233,6 +2504,12 @@ pub(crate) mod tests {
         assert!(!remembered(&node, b, dropped));
         assert!(remembered(&node, a, kept));
         assert!(remembered(&node, b, kept));
+        node.walks.closed(a, 0, crate::clock::mono_now());
+        node.walks.closed(b, 0, crate::clock::mono_now());
+        assert!(remembered(&node, a, kept) && remembered(&node, b, kept));
+        node.select(kept, false);
+        node.observe();
+        assert!(!remembered(&node, a, kept) && !remembered(&node, b, kept));
 
         // Health saw every end: eight confirmed pushes and landed receives
         // for A, and the agreed root is each collection's own.
@@ -2322,8 +2599,14 @@ pub(crate) mod tests {
         assert!(!refused(&node, WalkKind::References));
     }
 
+    /// An exchange the network interrupted keeps the prior G, which both
+    /// sides still hold: a write-only device that loses its link mid-walk
+    /// does not pay a full walk for it. One this side or the peer decided
+    /// failed forgets it, and the next exchange is the delta against
+    /// nothing.
     #[test]
-    fn a_failed_exchange_forgets_an_already_agreed_tree() {
+    fn an_interrupted_exchange_keeps_the_agreed_tree_and_a_failed_one_forgets_it() {
+        use crate::exchange::Failure;
         let mut node = Node::new(98);
         let collection = node.hold("forget after failure", open());
         node.commit(collection, 1);
@@ -2332,6 +2615,12 @@ pub(crate) mod tests {
         let kind = WalkKind::Commit;
         let pinned = node.pinned(collection);
         let root = summary(kind, pinned.repair());
+        let remembered = |node: &Node| {
+            node.walks
+                .agreed
+                .get(&agreed_key(peer, collection.raw, kind))
+                .is_some()
+        };
         node.walks.ended(
             peer,
             collection,
@@ -2347,30 +2636,40 @@ pub(crate) mod tests {
                 agreed: Some(Arc::new(Tree::pinned(kind, pinned.repair()))),
                 failure: None,
                 refused: false,
+                peer_failed: false,
+                basis: Default::default(),
                 skipped: 0,
             },
             crate::clock::mono_now(),
         );
+        assert!(remembered(&node));
+        // Interrupted before either LANDED: no new agreement, the old kept.
         let mut exchange = node.walks.start(peer, collection, kind).unwrap();
-        assert!(
-            node.walks
-                .agreed
-                .get(&agreed_key(peer, collection.raw, kind))
-                .is_some()
-        );
-        // Connection interrupted before either LANDED, after a previously
-        // confirmed exchange. The end is not a confirmation of old memory.
         assert!(matches!(exchange.next_delta(), Some(Frame::Subtree { .. })));
         let ended = exchange.end();
         assert!(!ended.confirmed && ended.agreed.is_none());
+        assert!(
+            !node
+                .walks
+                .ended(peer, collection, kind, ended, crate::clock::mono_now())
+        );
+        assert!(remembered(&node));
+        // Against it, an unchanged tree is an empty delta.
+        let mut exchange = node.walks.start(peer, collection, kind).unwrap();
+        assert_eq!(
+            exchange.next_delta(),
+            Some(Frame::Subtree {
+                prefix: Vec::new(),
+                summary: PatchSummary::new(None, 0).unwrap(),
+            })
+        );
+
+        // The peer reset the stream as failed: forgotten.
+        let mut ended = exchange.end();
+        ended.peer_failed = true;
         node.walks
             .ended(peer, collection, kind, ended, crate::clock::mono_now());
-        assert!(
-            node.walks
-                .agreed
-                .get(&agreed_key(peer, collection.raw, kind))
-                .is_none()
-        );
+        assert!(!remembered(&node));
         let health = node.health.snapshot();
         let pair = health
             .collections
@@ -2387,6 +2686,145 @@ pub(crate) mod tests {
         assert!(
             matches!(retry.next_delta(), Some(Frame::Subtree { prefix, .. }) if prefix.len()==KEY_BYTES)
         );
+
+        // A failure this side decided forgets it too; a stale agreement is
+        // followed at once by the full walk.
+        let ended = retry.end();
+        assert!(
+            !node
+                .walks
+                .ended(peer, collection, kind, ended, crate::clock::mono_now())
+        );
+        for (failure, again) in [(Failure::Protocol, false), (Failure::StaleAgreement, true)] {
+            node.walks.ended(
+                peer,
+                collection,
+                kind,
+                Ended {
+                    retain_agreement: true,
+                    sends: true,
+                    receives: true,
+                    confirmed: true,
+                    landed: true,
+                    root,
+                    peer_root: Some(root),
+                    agreed: Some(Arc::new(Tree::pinned(kind, pinned.repair()))),
+                    failure: None,
+                    refused: false,
+                    peer_failed: false,
+                    basis: Default::default(),
+                    skipped: 0,
+                },
+                crate::clock::mono_now(),
+            );
+            let mut ended = node.walks.start(peer, collection, kind).unwrap().end();
+            ended.failure = Some(failure);
+            assert_eq!(
+                node.walks
+                    .ended(peer, collection, kind, ended, crate::clock::mono_now()),
+                again
+            );
+            assert!(!remembered(&node), "{failure:?}");
+        }
+    }
+
+    /// Review A1. A peer that answers every exchange with an AGREED this side
+    /// does not hold (lying, or broken) makes every exchange fail
+    /// StaleAgreement. Each refusal may re-open at once only once per key
+    /// per connection; later ones wait for the timer, and a new connection
+    /// earns one more.
+    #[test]
+    fn a_peer_announcing_an_agreement_this_side_lacks_reopens_once_per_connection() {
+        let mut node = Node::new(123);
+        let collection = node.hold("lying peer", open());
+        node.commit(collection, 1);
+        node.observe();
+        let peer = Node::new(124).id();
+        let kind = WalkKind::Commit;
+        let lie = PatchSummary::new(Some([7; 32]), 3).unwrap();
+        let mut reopened = Vec::new();
+        for connection in [2, 2, 2, 3, 3] {
+            let mut exchange = node
+                .walks
+                .join_on(
+                    peer,
+                    connection,
+                    collection,
+                    kind,
+                    crate::walk_stream::Algorithm::Prefix,
+                    None,
+                )
+                .unwrap();
+            exchange.on_frame(Frame::Agreed { summary: lie }, Some(node.snapshot()));
+            assert_eq!(
+                exchange.outcome(),
+                Some(Outcome::Failed(crate::exchange::Failure::StaleAgreement))
+            );
+            let ended = exchange.end();
+            reopened.push(
+                node.walks
+                    .ended(peer, collection, kind, ended, crate::clock::mono_now()),
+            );
+        }
+        assert_eq!(reopened, [true, false, false, true, false]);
+    }
+
+    /// Review R3. An agreement whose connection closed is carried for
+    /// CARRIED_AGREEMENT_TTL, and forgotten at the first close of any
+    /// connection after that; one on a connection still open stays.
+    #[test]
+    fn a_carried_agreement_is_forgotten_a_day_after_its_connection_closed() {
+        let mut node = Node::new(125);
+        let collection = node.hold("carried ttl", open());
+        node.commit(collection, 1);
+        node.observe();
+        let (a, b) = (Node::new(126).id(), Node::new(127).id());
+        let kind = WalkKind::Commit;
+        let pinned = node.pinned(collection);
+        let tree = Arc::new(Tree::pinned(kind, pinned.repair()));
+        let g = tree.summary();
+        for (peer, connection) in [(a, 1), (b, 5)] {
+            node.walks.ended(
+                peer,
+                collection,
+                kind,
+                Ended {
+                    basis: Basis {
+                        connection,
+                        ..Default::default()
+                    },
+                    retain_agreement: true,
+                    sends: true,
+                    receives: true,
+                    confirmed: true,
+                    landed: true,
+                    root: g,
+                    peer_root: Some(g),
+                    agreed: Some(tree.clone()),
+                    failure: None,
+                    refused: false,
+                    peer_failed: false,
+                    skipped: 0,
+                },
+                crate::clock::mono_now(),
+            );
+        }
+        let held = |node: &Node, peer, connection| {
+            let (agreed, carried, _) =
+                node.walks
+                    .agreement(peer, connection, collection, kind, &pinned);
+            agreed.map(|_| carried)
+        };
+        let t0 = crate::clock::mono_now();
+        node.walks.closed(a, 1, t0);
+        // Within the TTL another close leaves it: carried on connection 2.
+        node.walks.closed(b, 9, t0 + CARRIED_AGREEMENT_TTL);
+        assert_eq!(held(&node, a, 2), Some(true));
+        // Past it, any close forgets it; b's, on open connection 5, stays.
+        node.walks
+            .closed(b, 9, t0 + CARRIED_AGREEMENT_TTL + Duration::from_secs(1));
+        assert_eq!(held(&node, a, 2), None);
+        assert_eq!(held(&node, b, 5), Some(false));
     }
 
     /// Walk streams driven through the walks task over the simulated
@@ -2681,6 +3119,7 @@ pub(crate) mod tests {
                 let reset = Arc::new(Mutex::new(None));
                 self.walks.incoming(
                     peer,
+                    0,
                     collection,
                     WalkKind::Commit,
                     crate::walk_stream::Algorithm::Prefix,
@@ -3386,7 +3825,10 @@ pub(crate) mod tests {
                 };
                 task.observe(snapshot);
             } else {
-                task.command(Command::Closed { peer });
+                task.command(Command::Closed {
+                    peer,
+                    connection: 0,
+                });
             }
             assert!(task.running.is_empty());
             assert_eq!(
@@ -3410,6 +3852,8 @@ pub(crate) mod tests {
                     agreed: Some(Arc::new(Tree::pinned(kind, pinned.repair()))),
                     failure: None,
                     refused: false,
+                    peer_failed: false,
+                    basis: Default::default(),
                     skipped: 0,
                 },
             });
@@ -3502,6 +3946,609 @@ pub(crate) mod tests {
             stale_completion_is_ignored(true).await;
         }
 
+        /// F2. A peer's replacement connection (2) opens its walk before this
+        /// side processed the end of the exchange still running on the old
+        /// connection (1), or the old connection's close. The G agreed on
+        /// connection 1 is announced on connection 2, where the peer may have
+        /// restarted. The old exchange's late failure still forgets the G it
+        /// was based on, unless a newer exchange already stored another,
+        /// which the late end leaves alone.
+        async fn a_replacement_races_the_old_end(newer_first: bool) {
+            let net = SimNet::new(0x3A3F, SimConfig::default());
+            let mut node = Node::new(107);
+            let collection = node.hold("replacement race", open());
+            node.commit(collection, 1);
+            node.observe();
+            let snapshot = node.snapshot();
+            let pinned = node.pinned(collection);
+            let hosted = Hosted::new(node, &net);
+            let (landing, _landings) = mpsc::unbounded_channel();
+            let (events, _events) = mpsc::unbounded_channel();
+            let mut task = Task {
+                connections: hosted.table.clone(),
+                snapshots: hosted.lander.snapshots.subscribe(),
+                walks: Walks::new(hosted.lander.node.lock().unwrap().health.clone())
+                    .with_algorithm(crate::walk_stream::Algorithm::Prefix),
+                commands: hosted.walks.clone(),
+                landing,
+                events,
+                grants: mpsc::unbounded_channel().0,
+                grant_queue: GrantQueue::default(),
+                unknown_joins: PATCH::new(),
+                running: HashMap::new(),
+                next_id: 0,
+            };
+            task.observe(snapshot);
+            let peer = Node::new(108).id();
+            let kind = WalkKind::Commit;
+            let key = (peer, collection.raw, kind);
+            let tree = Arc::new(Tree::pinned(kind, pinned.repair()));
+            let g = tree.summary();
+            let confirmed = |connection| Ended {
+                basis: Basis {
+                    connection,
+                    ..Default::default()
+                },
+                retain_agreement: true,
+                sends: true,
+                receives: true,
+                confirmed: true,
+                landed: true,
+                root: g,
+                peer_root: Some(g),
+                agreed: Some(tree.clone()),
+                failure: None,
+                refused: false,
+                peer_failed: false,
+                skipped: 0,
+            };
+            let stored = |task: &Task<_, _, _>| {
+                task.walks
+                    .agreed
+                    .get(&agreed_key(peer, collection.raw, kind))
+                    .is_some()
+            };
+            let now = crate::clock::mono_now();
+            // G agreed on connection 1, and an exchange still running there.
+            task.walks.ended(peer, collection, kind, confirmed(1), now);
+            let old = task.walks.start_on(peer, 1, collection, kind, None).unwrap();
+            let (old_driver, _acks, _replaced) = task.register(key, false, &old);
+
+            // Connection 2's walk arrives first and replaces it.
+            let (mut script, driven) = tokio::io::duplex(1 << 16);
+            let (recv, send) = tokio::io::split(driven);
+            let reset = Arc::new(Mutex::new(None));
+            task.command(Command::Incoming {
+                peer,
+                connection: 2,
+                collection,
+                kind,
+                algorithm: crate::walk_stream::Algorithm::Prefix,
+                offer: None,
+                send: Box::new(Tx(send, reset.clone())),
+                recv: Box::new(Rx(recv, reset.clone())),
+            });
+            let new_id = task.running[&key].id;
+            assert_ne!(new_id, old_driver.id, "replaced");
+            let (frame, payload) = crate::connection::read_frame(&mut script)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                Frame::decode(frame, &payload).unwrap(),
+                Some(Frame::Agreed { summary: g }),
+                "a G agreed on another connection is announced"
+            );
+
+            if newer_first {
+                // Connection 2's exchange confirms first.
+                task.command(Command::Ended {
+                    id: new_id,
+                    peer,
+                    collection,
+                    kind,
+                    ended: confirmed(2),
+                    duplicate: false,
+                });
+                assert!(stored(&task));
+            }
+            // The old exchange's end arrives late: the peer failed it.
+            let mut ended = old.end();
+            ended.peer_failed = true;
+            task.command(Command::Ended {
+                id: old_driver.id,
+                peer,
+                collection,
+                kind,
+                ended,
+                duplicate: false,
+            });
+            if newer_first {
+                let (agreed, carried, _) =
+                    task.walks.agreement(peer, 2, collection, kind, &pinned);
+                assert!(
+                    agreed.is_some() && !carried,
+                    "a late end leaves connection 2's agreement alone"
+                );
+            } else {
+                assert!(!stored(&task), "a late failure still forgets its G");
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_late_failure_from_a_replaced_connection_forgets_the_g_it_used() {
+            a_replacement_races_the_old_end(false).await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_late_end_from_a_replaced_connection_leaves_a_newer_agreement() {
+            a_replacement_races_the_old_end(true).await;
+        }
+
+        /// A walks task this test drives by hand, over `hosted`'s table and
+        /// snapshots: the ends of its exchanges come back on the receiver,
+        /// to be handed to the task in the order the test chooses.
+        fn hand_driven(
+            hosted: &Hosted,
+            snapshot: StoreSnapshot<MemoryRepoSnapshot>,
+        ) -> (
+            Task<Tapped, NoRequests, MemoryRepoSnapshot>,
+            mpsc::UnboundedReceiver<Command>,
+        ) {
+            let (commands, commanded) = mpsc::unbounded_channel();
+            let mut task = Task {
+                connections: hosted.table.clone(),
+                snapshots: hosted.lander.snapshots.subscribe(),
+                walks: Walks::new(hosted.lander.node.lock().unwrap().health.clone())
+                    .with_algorithm(crate::walk_stream::Algorithm::Prefix),
+                commands: WalksHandle(commands),
+                landing: mpsc::unbounded_channel().0,
+                events: mpsc::unbounded_channel().0,
+                grants: mpsc::unbounded_channel().0,
+                grant_queue: GrantQueue::default(),
+                unknown_joins: PATCH::new(),
+                running: HashMap::new(),
+                next_id: 0,
+            };
+            task.observe(snapshot);
+            (task, commanded)
+        }
+
+        /// The first frame a driver wrote to the scripted peer's end.
+        async fn first_frame(script: &mut DuplexStream) -> Frame {
+            let (kind, payload) = crate::connection::read_frame(script)
+                .await
+                .unwrap()
+                .unwrap();
+            Frame::decode(kind, &payload).unwrap().unwrap()
+        }
+
+        /// The peer opens C's commit exchange on connection 2 and the task
+        /// joins it, through its real driver: the scripted peer's end.
+        fn reopen(
+            task: &mut Task<Tapped, NoRequests, MemoryRepoSnapshot>,
+            peer: PeerId,
+            collection: CollectionHandle,
+        ) -> DuplexStream {
+            let (script, driven) = tokio::io::duplex(1 << 16);
+            let (recv, send) = tokio::io::split(driven);
+            let reset = Arc::new(Mutex::new(None));
+            task.command(Command::Incoming {
+                peer,
+                connection: 2,
+                collection,
+                kind: WalkKind::Commit,
+                algorithm: crate::walk_stream::Algorithm::Prefix,
+                offer: None,
+                send: Box::new(Tx(send, reset.clone())),
+                recv: Box::new(Rx(recv, reset)),
+            });
+            script
+        }
+
+        /// This side, G agreed with `peer` on connection 1, opens C's commit
+        /// exchange on connection 2 as `Task::open` does once the stream is
+        /// open, and its real driver runs: the scripted peer's end and the
+        /// exchange's id.
+        fn open_carried(
+            task: &mut Task<Tapped, NoRequests, MemoryRepoSnapshot>,
+            peer: PeerId,
+            collection: CollectionHandle,
+            tree: Arc<Tree>,
+        ) -> (DuplexStream, u64) {
+            let kind = WalkKind::Commit;
+            let g = tree.summary();
+            task.walks.ended(
+                peer,
+                collection,
+                kind,
+                Ended {
+                    basis: Basis {
+                        connection: 1,
+                        ..Default::default()
+                    },
+                    retain_agreement: true,
+                    sends: true,
+                    receives: true,
+                    confirmed: true,
+                    landed: true,
+                    root: g,
+                    peer_root: Some(g),
+                    agreed: Some(tree),
+                    failure: None,
+                    refused: false,
+                    peer_failed: false,
+                    skipped: 0,
+                },
+                crate::clock::mono_now(),
+            );
+            let exchange = task
+                .walks
+                .start_on(peer, 2, collection, kind, None)
+                .unwrap();
+            let (driver, acked, replaced) =
+                task.register((peer, collection.raw, kind), true, &exchange);
+            let id = driver.id;
+            let (script, driven) = tokio::io::duplex(1 << 16);
+            let (recv, send) = tokio::io::split(driven);
+            let reset = Arc::new(Mutex::new(None));
+            tokio::spawn(async move {
+                let (ended, duplicate) = drive(
+                    &driver,
+                    exchange,
+                    Box::new(Tx(send, reset.clone())),
+                    Box::new(Rx(recv, reset)),
+                    acked,
+                    replaced,
+                )
+                .await;
+                driver.ended(ended, duplicate);
+            });
+            (script, id)
+        }
+
+        /// The next end a driver reported: its id, and the command.
+        async fn next_end(commanded: &mut mpsc::UnboundedReceiver<Command>) -> (u64, Command) {
+            let command = commanded.recv().await.unwrap();
+            let Command::Ended { id, .. } = &command else {
+                panic!("only ends come back");
+            };
+            (*id, command)
+        }
+
+        /// R1. The peer refused this side's carried G (AGREED) on connection
+        /// 2, reset the stream as failed and opened the exchange again at
+        /// once, and its re-open reached this side before the FAILED reset
+        /// did: the replaced driver ends with no failure classification. The
+        /// re-open joined before anything ended, so it announces the same G,
+        /// and the peer refuses it too; its next re-open must be the full
+        /// walk, whichever order the late ends reach the task in.
+        async fn a_reopen_beats_the_failed_reset(ends_first: bool) {
+            let net = SimNet::new(0x3A40, SimConfig::default());
+            let mut node = Node::new(115);
+            let collection = node.hold("reopen race", open());
+            node.commit(collection, 1);
+            node.observe();
+            let snapshot = node.snapshot();
+            let pinned = node.pinned(collection);
+            let hosted = Hosted::new(node, &net);
+            // The peer holds the smaller id: its open replaces this side's.
+            let peer = (116..)
+                .map(|byte| Node::new(byte).id())
+                .find(|id| *id < hosted.peer)
+                .unwrap();
+            let (mut task, mut commanded) = hand_driven(&hosted, snapshot);
+            let kind = WalkKind::Commit;
+            let tree = Arc::new(Tree::pinned(kind, pinned.repair()));
+            let g = tree.summary();
+
+            let (mut first, first_id) = open_carried(&mut task, peer, collection, tree);
+            assert_eq!(first_frame(&mut first).await, Frame::Agreed { summary: g });
+            // The peer refuses: its FAILED reset is still on its way when
+            // its re-open arrives.
+            let mut second = reopen(&mut task, peer, collection);
+            let second_id = task.running[&(peer, collection.raw, kind)].id;
+            assert_eq!(
+                first_frame(&mut second).await,
+                Frame::Agreed { summary: g },
+                "the one extra refusal: joined before any end"
+            );
+            let mut pending = vec![first_id, second_id];
+            if ends_first {
+                let (id, end) = next_end(&mut commanded).await;
+                assert_eq!(id, first_id);
+                let Command::Ended { ended, .. } = &end else {
+                    unreachable!()
+                };
+                assert!(
+                    ended.agreed.is_none() && ended.failure.is_none() && !ended.peer_failed,
+                    "replaced before the FAILED reset was read: no verdict"
+                );
+                task.command(end);
+                pending.retain(|pending| *pending != id);
+            }
+            // The peer refuses that one too, and re-opens before its reset
+            // is read again.
+            let mut third = reopen(&mut task, peer, collection);
+            let frame = first_frame(&mut third).await;
+            assert!(
+                matches!(&frame, Frame::Subtree { prefix, summary }
+                    if prefix.is_empty() && *summary == g),
+                "the third exchange is the full walk, unannounced: {frame:?}"
+            );
+            while !pending.is_empty() {
+                let (id, end) = next_end(&mut commanded).await;
+                task.command(end);
+                pending.retain(|pending| *pending != id);
+            }
+            let (agreed, _, _) = task.walks.agreement(peer, 2, collection, kind, &pinned);
+            assert!(agreed.is_none(), "the refused G is not offered again");
+            drop((first, second, third));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_reopen_that_beats_the_failed_reset_cannot_repin_the_refused_g() {
+            a_reopen_beats_the_failed_reset(false).await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_replaced_exchange_without_a_verdict_forgets_its_carried_g() {
+            a_reopen_beats_the_failed_reset(true).await;
+        }
+
+        /// R1, without a replacement: the stream of an exchange on a carried
+        /// G ends with no reset code (the peer's FAILED lost with its
+        /// connection). Unknown outcome: the carried G is forgotten.
+        #[tokio::test(start_paused = true)]
+        async fn a_carried_exchange_cut_without_a_verdict_forgets_its_g() {
+            let net = SimNet::new(0x3A41, SimConfig::default());
+            let mut node = Node::new(117);
+            let collection = node.hold("cut carried", open());
+            node.commit(collection, 1);
+            node.observe();
+            let snapshot = node.snapshot();
+            let pinned = node.pinned(collection);
+            let hosted = Hosted::new(node, &net);
+            let peer = Node::new(118).id();
+            let (mut task, mut commanded) = hand_driven(&hosted, snapshot);
+            let kind = WalkKind::Commit;
+            let tree = Arc::new(Tree::pinned(kind, pinned.repair()));
+            let g = tree.summary();
+            let (mut script, id) = open_carried(&mut task, peer, collection, tree);
+            assert_eq!(first_frame(&mut script).await, Frame::Agreed { summary: g });
+            drop(script);
+            let (ended_id, end) = next_end(&mut commanded).await;
+            assert_eq!(ended_id, id);
+            let Command::Ended { ended, .. } = &end else {
+                unreachable!()
+            };
+            assert!(ended.agreed.is_none() && ended.failure.is_none() && !ended.peer_failed);
+            task.command(end);
+            let (agreed, _, _) = task.walks.agreement(peer, 2, collection, kind, &pinned);
+            assert!(agreed.is_none(), "an unknown outcome forgets a carried G");
+        }
+
+        /// Review C1. The peer redialled: connection 2 replaced connection 1,
+        /// and connection 1's accept loop ends (drained or idle) only after
+        /// connection 2's exchange on the carried G began. The peer answers
+        /// in kind (same AGREED, empty delta, DONE), so the exchange is one
+        /// LANDED from confirming. `stale_close` then hands the task
+        /// connection 1's Closed before that LANDED arrives.
+        async fn late_close(stale_close: bool) -> (Option<u32>, bool) {
+            let net = SimNet::new(0x3A42, SimConfig::default());
+            let mut node = Node::new(119);
+            let collection = node.hold("late close", open());
+            node.commit(collection, 1);
+            node.observe();
+            let snapshot = node.snapshot();
+            let pinned = node.pinned(collection);
+            let hosted = Hosted::new(node, &net);
+            let peer = Node::new(120).id();
+            let (mut task, mut commanded) = hand_driven(&hosted, snapshot);
+            let kind = WalkKind::Commit;
+            let tree = Arc::new(Tree::pinned(kind, pinned.repair()));
+            let g = tree.summary();
+            task.walks.ended(
+                peer,
+                collection,
+                kind,
+                Ended {
+                    basis: Basis {
+                        connection: 1,
+                        ..Default::default()
+                    },
+                    retain_agreement: true,
+                    sends: true,
+                    receives: true,
+                    confirmed: true,
+                    landed: true,
+                    root: g,
+                    peer_root: Some(g),
+                    agreed: Some(tree),
+                    failure: None,
+                    refused: false,
+                    peer_failed: false,
+                    skipped: 0,
+                },
+                crate::clock::mono_now(),
+            );
+            let exchange = task
+                .walks
+                .start_on(peer, 2, collection, kind, None)
+                .unwrap();
+            let (driver, acked, replaced) =
+                task.register((peer, collection.raw, kind), true, &exchange);
+            let id = driver.id;
+            let (mut script, driven) = tokio::io::duplex(1 << 16);
+            let (recv, send) = tokio::io::split(driven);
+            let reset = Arc::new(Mutex::new(None));
+            {
+                let reset = reset.clone();
+                tokio::spawn(async move {
+                    let (ended, duplicate) = drive(
+                        &driver,
+                        exchange,
+                        Box::new(Tx(send, reset.clone())),
+                        Box::new(Rx(recv, reset)),
+                        acked,
+                        replaced,
+                    )
+                    .await;
+                    driver.ended(ended, duplicate);
+                });
+            }
+            assert_eq!(first_frame(&mut script).await, Frame::Agreed { summary: g });
+            let empty = PatchSummary::new(None, 0).unwrap();
+            assert_eq!(
+                first_frame(&mut script).await,
+                Frame::Subtree {
+                    prefix: Vec::new(),
+                    summary: empty
+                }
+            );
+            assert_eq!(first_frame(&mut script).await, Frame::Done);
+            for frame in [
+                Frame::Agreed { summary: g },
+                Frame::Subtree {
+                    prefix: Vec::new(),
+                    summary: empty,
+                },
+                Frame::Done,
+            ] {
+                let (kind, payload) = frame.encode();
+                write_frame(&mut script, kind, &payload).await.unwrap();
+            }
+            assert_eq!(first_frame(&mut script).await, Frame::Landed);
+            if stale_close {
+                // Connection 1's accept loop ended.
+                task.command(Command::Closed {
+                    peer,
+                    connection: 1,
+                });
+            }
+            let (landed, payload) = Frame::Landed.encode();
+            let _ = write_frame(&mut script, landed, &payload).await;
+            let (ended_id, end) = next_end(&mut commanded).await;
+            assert_eq!(ended_id, id);
+            task.command(end);
+            let (agreed, carried, _) = task.walks.agreement(peer, 2, collection, kind, &pinned);
+            let code = *reset.lock().unwrap();
+            eprintln!(
+                "LATE_CLOSE stale_close={stale_close} reset={code:?} agreed_on_2={} carried={carried}",
+                agreed.is_some()
+            );
+            drop(script);
+            (code, agreed.is_some())
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn an_old_connections_late_close_leaves_the_replacement_and_its_carried_g() {
+            let (code, kept) = late_close(true).await;
+            assert_eq!(code, None, "the replacement is not reset");
+            assert!(kept, "confirmed: the carried G is kept for connection 2");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_carried_exchange_on_a_replacement_connection_confirms() {
+            let (code, kept) = late_close(false).await;
+            assert_eq!(code, None);
+            assert!(kept, "confirmed: the agreement is kept for connection 2");
+        }
+
+        /// Review L2. R1's "a stale G is followed at once by the full walk",
+        /// in the id order R1's tests do not cover: this side holds the
+        /// SMALLER id and opened the carried exchange; the peer refused it
+        /// (StaleAgreement), reset it FAILED and opened again at once, and
+        /// that re-open reaches this side before the end of its own
+        /// exchange. This side's opened stream outranks it, so the re-open is
+        /// reset as a duplicate (the peer then settles nothing), and this
+        /// side's own end is peer_failed, not StaleAgreement. That end, on a
+        /// carried G, re-opens at once: the full walk, G-less.
+        #[tokio::test(start_paused = true)]
+        async fn a_refusers_reopen_reset_as_duplicate_is_followed_by_this_sides_reopen() {
+            let net = SimNet::new(0x3A43, SimConfig::default());
+            let mut node = Node::new(121);
+            let collection = node.hold("refuser larger", open());
+            node.commit(collection, 1);
+            node.observe();
+            let snapshot = node.snapshot();
+            let pinned = node.pinned(collection);
+            let hosted = Hosted::new(node, &net);
+            // The peer holds the LARGER id: this side's opened stream wins.
+            let peer = (122..)
+                .map(|byte| Node::new(byte).id())
+                .find(|id| *id > hosted.peer)
+                .unwrap();
+            let (mut task, _commanded) = hand_driven(&hosted, snapshot);
+            let kind = WalkKind::Commit;
+            let key = (peer, collection.raw, kind);
+            let tree = Arc::new(Tree::pinned(kind, pinned.repair()));
+            let g = tree.summary();
+            task.walks.ended(
+                peer,
+                collection,
+                kind,
+                Ended {
+                    basis: Basis {
+                        connection: 1,
+                        ..Default::default()
+                    },
+                    retain_agreement: true,
+                    sends: true,
+                    receives: true,
+                    confirmed: true,
+                    landed: true,
+                    root: g,
+                    peer_root: Some(g),
+                    agreed: Some(tree),
+                    failure: None,
+                    refused: false,
+                    peer_failed: false,
+                    skipped: 0,
+                },
+                crate::clock::mono_now(),
+            );
+            // This side opened the exchange on connection 2, carried G.
+            let mine = task
+                .walks
+                .start_on(peer, 2, collection, kind, None)
+                .unwrap();
+            assert!(mine.basis().carried);
+            let (driver, _acks, _replaced) = task.register(key, true, &mine);
+            let mine_id = driver.id;
+            // The peer's immediate re-open arrives first.
+            let (_script, driven) = tokio::io::duplex(1 << 16);
+            let (recv, send) = tokio::io::split(driven);
+            let reset = Arc::new(Mutex::new(None));
+            task.command(Command::Incoming {
+                peer,
+                connection: 2,
+                collection,
+                kind,
+                algorithm: crate::walk_stream::Algorithm::Prefix,
+                offer: None,
+                send: Box::new(Tx(send, reset.clone())),
+                recv: Box::new(Rx(recv, reset.clone())),
+            });
+            let code = *reset.lock().unwrap();
+            assert_eq!(code, Some(RESET_WALK_DUPLICATE), "the re-open is reset as a duplicate");
+            assert_eq!(task.running[&key].id, mine_id);
+            // Then this side's own end: the peer's FAILED reset. The task
+            // removes the current entry and asks the walks whether to open
+            // again at once (Task::command, Command::Ended); a hand-driven
+            // task has no connection, so ask the walks directly rather than
+            // infer it from `running`, which would pass vacuously.
+            let mut ended = mine.end();
+            ended.peer_failed = true;
+            task.running.remove(&key);
+            let again = task
+                .walks
+                .ended(peer, collection, kind, ended, crate::clock::mono_now());
+            let (agreed, _, _) = task.walks.agreement(peer, 2, collection, kind, &pinned);
+            assert!(agreed.is_none(), "G is forgotten");
+            assert!(again, "a FAILED end on a carried G re-opens at once");
+        }
+
         #[tokio::test(start_paused = true)]
         async fn a_deselected_but_active_collection_refuses_new_open_and_incoming() {
             let net = SimNet::new(0x3A2B, SimConfig::default());
@@ -3551,6 +4598,7 @@ pub(crate) mod tests {
             let reset = Arc::new(Mutex::new(None));
             task.command(Command::Incoming {
                 peer: other.peer,
+                connection: 0,
                 collection,
                 kind,
                 algorithm: crate::walk_stream::Algorithm::Prefix,
@@ -4595,6 +5643,8 @@ pub(crate) mod tests {
                     }),
                     failure,
                     refused,
+                    peer_failed: false,
+                    basis: Default::default(),
                     skipped: 0,
                 }
             };
@@ -4758,6 +5808,7 @@ pub(crate) mod tests {
             let reset = Arc::new(Mutex::new(None));
             task.command(Command::Incoming {
                 peer,
+                connection: 0,
                 collection: resource,
                 kind: WalkKind::Authorization,
                 algorithm: crate::walk_stream::Algorithm::Prefix,
@@ -4793,6 +5844,8 @@ pub(crate) mod tests {
                     agreed: None,
                     failure: None,
                     refused: false,
+                    peer_failed: false,
+                    basis: Default::default(),
                     skipped: 0,
                 },
                 duplicate: false,
@@ -4841,7 +5894,10 @@ pub(crate) mod tests {
             let (reset, _another) = join(&mut task, other.id(), absent(9_999));
             assert_eq!(*reset.lock().unwrap(), None, "another peer has its own budget");
             end_grant_walk(&mut task, other.id(), absent(9_999));
-            task.command(Command::Closed { peer: stranger });
+            task.command(Command::Closed {
+                peer: stranger,
+                connection: 0,
+            });
             let (reset, _again) = join(&mut task, stranger, absent(9_999));
             assert_eq!(*reset.lock().unwrap(), None, "a closed connection's budget is gone");
         }

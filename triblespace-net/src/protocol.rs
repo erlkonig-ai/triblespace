@@ -55,7 +55,17 @@ use crate::transport::PeerId;
 /// walk, and lands a kept grant only once R's descriptor is resident and
 /// validates it. The digest kinds `0x02` to `0x05` are skipped as unknown,
 /// and grants are no longer part of a collection's pushes or its root.
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/33";
+/// Generation 34 adds two walk frames, one per discovery algorithm, and they
+/// ship as one cutover. AGREED (`0x0c`): a Prefix side whose agreed tree was
+/// carried over from a closed connection announces it, and subtracts it from
+/// its delta only against a peer holding the same tree. RIBLT_STOP (`0x0d`):
+/// cached RIBLT assigns roles from the two ROOT counts, and the larger side
+/// of a typed component streams no cells, decodes the smaller side's, ends
+/// its stream with RIBLT_STOP, then pushes what the peer lacks and requests
+/// what it lacks. Generation 33 skips unknown walk frame kinds, so it would
+/// land a Prefix delta against a tree it lacks and silently miss records, and
+/// would ignore STOP and stream cells to its cell bound; it is refused.
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/34";
 
 // Stream type tags — first byte on each stream, read before any admission
 // permit is taken. An unknown tag resets only its own stream.
