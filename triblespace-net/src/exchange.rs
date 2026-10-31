@@ -991,6 +991,15 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
         })
     }
 
+    /// A cached streamer before the decoder's STOP. Its peer is silent by
+    /// design until then, for as long as its decode takes, so the driver
+    /// counts each cell written as hearing from it.
+    pub(crate) fn streaming(&self) -> bool {
+        self.riblt
+            .as_ref()
+            .is_some_and(|r| r.role == Role::Streamer && !r.stopped)
+    }
+
     pub(crate) fn receives(&self) -> bool {
         self.receives
     }
@@ -1230,6 +1239,13 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
         self.agreed
             .as_ref()
             .map_or_else(empty, |tree| tree.summary())
+    }
+
+    /// The connection this exchange runs on, for one that carries no
+    /// agreement (cached, grant): what a connection's close cancels.
+    pub(crate) fn on_connection(mut self, connection: u64) -> Self {
+        self.basis.connection = connection;
+        self
     }
 
     /// This exchange runs on `basis`. Its G was agreed on another connection

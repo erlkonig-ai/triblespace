@@ -465,7 +465,8 @@ Each neighbour exchanges one kind of one selected collection on a bidirectional
 `walk/1` stream: COMMIT records, DERIVE records, or (between Full neighbours)
 held references. Grants are not pushed on the timer; they travel by grant
 walks, which grant gossip opens where listed roots differ (*Grant exchange*). Either side may open it. Each sends its own immutable delta
-against the last agreement on this connection; both directions share the stream.
+against the last agreement with that peer, made on this connection or carried
+over from an earlier one; both directions share the stream.
 Nothing is broadcast or forwarded merely because it arrived.
 
 Each selected collection retains its existing Trickle-style timer: two to sixty
@@ -475,7 +476,8 @@ exchange is landing it; a new grant restarts nothing. A successful changed recei
 intermediate snapshot. Held-set changes wait for the ordinary timer. A successful
 exchange followed by genuinely new local keys starts another immediately; a
 lagging published subset of the agreement does not. Failed exchanges wait for the
-timer. Timer inputs are physical serving observations, not delta roots.
+timer, except a refused carried agreement (below), which is followed at once by
+the full walk, once per connection. Timer inputs are physical serving observations, not delta roots.
 
 The walks task uses only current connections and never dials. At most one exchange
 per peer, collection and kind runs at a time. Simultaneous opens preserve the
@@ -486,20 +488,58 @@ neither). Active peering flags determine
 send/receive directions; credentials provide fallback admission only when there
 is no active peering. A false send flag cannot be widened by another grant.
 
-An agreement G is immutable PATCH state scoped to peer, collection, kind and
-connection. Prefix retains it only after both LANDEDs and successful actual
-writes and stream finish. Cached mode uses the verified union transiently after
-both gated FINs, then releases it. Failure clears local G
-without retracting landed values; close/deselection clears it and retires running
-drivers, so a stale completion cannot restore it. G is not durable. Fresh
-connections may compare full sets again, with equal-prefix pruning.
+An agreement G is immutable PATCH state scoped to peer, collection and kind,
+tagged with the id of the connection it was agreed on and a stamp. Prefix
+retains it only after both LANDEDs and successful actual writes and stream
+finish. Cached mode uses the verified union transiently after both gated FINs,
+then releases it, together with any Prefix G for the component. Failure clears
+local G without retracting landed values; deselection clears it and retires
+running drivers, so a stale completion cannot restore it. G lives in memory
+only: a restart forgets it.
+
+G outlives the connection it was agreed on, as a carried G. An exchange on that
+connection uses G unannounced. An exchange on any other connection (a redial,
+or a replacement racing the old connection's close) uses G only while this
+side still holds every key in it, and announces it: AGREED (`0x0c`, G's root
+and count) goes before the root SUBTREE. A receiving side whose own G is not
+that same tree fails the exchange with StaleAgreement: it lost G (restart),
+never had it, or moved past it. The shared-base rule: a carried G enters the
+exchange's new agreement only when the peer announced the same tree;
+otherwise the new agreement is the two deltas alone, so every kept base is
+held by both, and the base reported as received is that shared base.
+
+A carried G is kept only by a confirmed exchange. An exchange on a carried G
+that fails, is cut, or is replaced before its outcome is known forgets the
+agreement it was based on, matched by stamp, so a late end never clears a
+newer agreement; the task forgets it at the moment it cancels such an
+exchange, so a re-open racing the end cannot pin it again. An exchange that
+had already taken G keeps its copy, which counts only if the peer announces
+the same tree. A refused G is followed at once by the full walk, G-less, from
+whichever side ends with the refusal: the refuser on its StaleAgreement, or
+the announcer on reading the FAILED reset of its carried exchange (the
+refuser's own re-open may have been reset as a duplicate). Such an immediate
+re-open happens at most once per peer, collection, kind and connection;
+later refusals wait for the timer, so a peer that announces or refuses a G
+every time cannot drive a tight loop.
+
+A connection's close is keyed by its id. It cancels only the exchanges
+running on that connection, cached and grant walks included, so the late
+close of a replaced connection leaves the replacement's exchanges, and the
+carried G they confirm, alone. What is kept per peer rather than per
+connection (health pairs, queued grant walks, the unknown-resource budget)
+is cleared only once no connection to the peer remains. A carried G is
+forgotten at the first close of any connection more than 24 hours after its
+own connection closed (`CARRIED_AGREEMENT_TTL`), which bounds the trees kept
+for peers that never return by the peers seen to close in a day.
 
 Successful symmetric exchanges compute the same union. An asymmetric final
 finish failure may clear G on only one side: these sound common-held lower bounds
 can temporarily differ, particularly while publication lags. Delta commitments
 remain independent and valid; ordinary publication and later exchanges can
-converge the bookkeeping. There is no base-negotiation or distributed durable
-receipt added here.
+converge the bookkeeping. A G kept by one side only is never announced as
+shared: on a later connection the other side refuses it or the shared-base rule
+drops it. Beyond AGREED's equality check there is no base negotiation and no
+durable receipt.
 
 ## Walk streams
 
@@ -781,6 +821,18 @@ completion when its incremental view matches the peer ROOT. A FIN on either
 side before its proof fails, and a lying ROOT fails with a count mismatch
 and never produces STOP. Equal counts stay symmetric, and so do References,
 which have no VALUE frame to carry the decoder's push.
+
+Before STOP the decoder sends nothing, for as long as its decode takes: about
+1.37 |B| cells at whatever rate the link carries them, which exceeds the
+60-second walk deadline on a large set (|B| = 60,000 at 1,000 cells a second)
+or a slow link. So the streamer's peer-silence deadline runs from the later of
+the last frame heard and the last cell it wrote. A written cell is evidence
+that the decoder still reads: a decoder that stops reading stalls the
+streamer's writes on transport backpressure, and a write without byte
+progress for the walk deadline fails the exchange; a decoder that reads but
+never proves is ended by the cell bound. No keepalive frame exists. Every
+other wait, the decoder's and both sides' after STOP, keeps the frame
+deadline.
 
 Once this exact proof holds, stop coded output only when the **complete locally
 written** cell prefix reaches the decoded incoming prefix. Opposite residual

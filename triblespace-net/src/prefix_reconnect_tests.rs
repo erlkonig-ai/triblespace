@@ -494,8 +494,9 @@ mod persisted {
         /// their agreement over.
         fn close(&mut self) {
             let (wid, hid) = (self.w.id(), self.h.id());
-            self.w.walks.closed(hid);
-            self.h.walks.closed(wid);
+            let now = crate::clock::mono_now();
+            self.w.walks.closed(hid, self.connection, now);
+            self.h.walks.closed(wid, self.connection, now);
             self.connection += 1;
         }
 
@@ -679,7 +680,7 @@ mod persisted {
             },
             crate::clock::mono_now(),
         );
-        hub.walks.closed(wid);
+        hub.walks.closed(wid, 0, crate::clock::mono_now());
         lane.h = hub;
         lane.write(&r.new[..10]);
         let (lane, refused) = lane.sync(&r.new[..10]);

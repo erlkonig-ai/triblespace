@@ -1186,6 +1186,6 @@ fn a_previous_generation_peer_is_refused() {
         )
         .await
         .expect("a refused connection fails promptly");
-        assert!(refused.is_err(), "generation 29 must not be served");
+        assert!(refused.is_err(), "generation 33 must not be served");
     }));
 }

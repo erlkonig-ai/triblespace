@@ -1370,6 +1370,7 @@ async fn riblt_runtime_task_retains_prefix_agreement_but_releases_cached_source_
                     connection: 0,
                     stamp: 0,
                     tree: source,
+                    closed_at: None,
                 },
             ));
         local.walks.algorithm = match selected {
@@ -2377,4 +2378,126 @@ fn riblt_asym_roles_refuse_out_of_place_frames() {
         Some(b.snapshot()),
     );
     assert_eq!(streamer.outcome(), Some(Outcome::Failed(Failure::BadNode)));
+}
+
+// ---- The streamer's deadline while the decoder is silent (review L1). ----
+//
+// Before STOP the decoder sends nothing, by design, for as long as its decode
+// takes: about 1.37 cells per key of the smaller side, at whatever rate the
+// link carries them. The streamer's evidence that the decoder is alive is its
+// own cells being consumed: transport backpressure stalls a write to a peer
+// that stopped reading, and a stalled write fails after WALK_DEADLINE. So the
+// streamer counts each written cell as progress, and the cell bound ends a
+// decoder that reads forever without proving.
+
+fn symmetric(exchange: Exchange<MemoryRepoSnapshot>) -> Exchange<MemoryRepoSnapshot> {
+    exchange.symmetric()
+}
+
+/// 100 ms a frame (about 570 B/s of cells): the decoder needs about
+/// 1.37 * 1,000 of B's cells, about 137 s of link time, silent throughout.
+const SLOW_LINK: LinkModel = LinkModel {
+    latency: Duration::from_millis(5),
+    per_frame: Duration::from_millis(100),
+};
+
+/// Review L1, slow link: |A| = 2,000, |B| = 1,000 a subset. Before the fix
+/// the streamer's read deadline expired 60 s into the silent decode, before
+/// any STOP, and every retry repeated it.
+#[tokio::test(start_paused = true)]
+async fn riblt_asym_a_decode_longer_than_the_walk_deadline_converges_on_a_slow_link() {
+    let mut pair = asym_pair(2000, 1000, 0);
+    let run = exchange_through_codec(&mut pair, SLOW_LINK, unchanged).await;
+    report("slow_asym_a2000_b1000", &run, SLOW_LINK);
+    assert_union(&mut pair, &run, 2000);
+    assert_eq!(run.a_sent.of(FRAME_RIBLT_CELL), 0, "the decoder stayed silent");
+    assert_eq!(run.a_sent.of(FRAME_STOP_KIND), 1);
+    assert!(run.elapsed > WALK_DEADLINE, "{:?}", run.elapsed);
+
+    let mut pair = asym_pair(2000, 1000, 0);
+    let run = exchange_through_codec(&mut pair, SLOW_LINK, symmetric).await;
+    report("slow_symmetric_a2000_b1000", &run, SLOW_LINK);
+    assert_union(&mut pair, &run, 2000);
+}
+
+/// Review L1, the default link (5 ms one way, 1 frame per ms): |A| = 120,000,
+/// |B| = 60,000 a subset. The decode needs about 82,000 of B's cells, over
+/// 80 s of link time. The measured row: time to converge, asymmetric against
+/// symmetric.
+#[tokio::test(start_paused = true)]
+async fn riblt_asym_large_sets_converge_on_the_default_link() {
+    let mut pair = asym_pair(120_000, 60_000, 0);
+    let run = exchange_through_codec(&mut pair, LINK, unchanged).await;
+    report("large_asym_a120000_b60000", &run, LINK);
+    assert_union(&mut pair, &run, 120_000);
+    assert_eq!(run.a_sent.of(FRAME_RIBLT_CELL), 0, "the decoder stayed silent");
+    assert_eq!(run.a_sent.of(FRAME_STOP_KIND), 1);
+    assert!(run.elapsed > WALK_DEADLINE, "{:?}", run.elapsed);
+
+    let mut pair = asym_pair(120_000, 60_000, 0);
+    let run = exchange_through_codec(&mut pair, LINK, symmetric).await;
+    report("large_symmetric_a120000_b60000", &run, LINK);
+    assert_union(&mut pair, &run, 120_000);
+}
+
+/// A decoder that stops reading is still detected: the streamer's writes
+/// stall on transport backpressure, and the stalled write fails after
+/// WALK_DEADLINE. Its silence alone ends nothing.
+#[tokio::test(start_paused = true)]
+async fn riblt_asym_a_streamer_whose_decoder_stops_reading_ends_after_the_deadline() {
+    let pair = asym_pair(10_000, 5_000, 0);
+    // A 4 KiB pipe holds a few dozen cells.
+    let mut run = driven_exchange(
+        &pair.b,
+        &pair.a,
+        pair.collection,
+        4096,
+        |tx| Box::new(tx),
+        cached(&pair.b, pair.collection),
+    );
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        receive_frame(&mut run.recv).await,
+        root(&pair.b, pair.collection)
+    );
+    send_frame(&mut run.send, root(&pair.a, pair.collection)).await;
+    // Read nothing more and send nothing: a hung or vanished decoder.
+    let (ended, _) = run.done.await.unwrap();
+    let took = tokio::time::Instant::now() - started;
+    assert!(!ended.confirmed && !ended.landed && ended.agreed.is_none());
+    assert!(
+        took >= WALK_DEADLINE && took < WALK_DEADLINE + Duration::from_secs(5),
+        "{took:?}"
+    );
+    assert_eq!(*run.reset.lock().unwrap(), Some(RESET_WALK_FAILED));
+}
+
+/// A decoder that reads every cell and never proves (nor STOPs) is ended by
+/// the cell bound, not by a deadline: the streamer stops at the bound.
+#[tokio::test(start_paused = true)]
+async fn riblt_asym_a_streamer_whose_decoder_reads_but_never_stops_ends_at_the_cell_bound() {
+    let pair = asym_pair(100, 50, 0);
+    let mut run = asym_scripted(&pair.b, &pair.a, pair.collection);
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        receive_frame(&mut run.recv).await,
+        root(&pair.b, pair.collection)
+    );
+    send_frame(&mut run.send, root(&pair.a, pair.collection)).await;
+    let drained = tokio::spawn(async move { drain_frames(&mut run.recv).await });
+    let (ended, _) = run.done.await.unwrap();
+    let took = tokio::time::Instant::now() - started;
+    assert_eq!(ended.failure, Some(Failure::ResourceLimit));
+    assert!(!ended.confirmed && ended.agreed.is_none());
+    assert!(took < WALK_DEADLINE, "{took:?}");
+    let cells = drained
+        .await
+        .unwrap()
+        .iter()
+        .filter(|frame| matches!(frame, Frame::RibltCell { .. }))
+        .count();
+    // The driver resets at the bound, so the last queued cells may not
+    // reach the wire.
+    let bound = crate::riblt_cache::cell_bound(50, 100);
+    assert!(cells <= bound && cells + 4 >= bound, "{cells} of {bound}");
 }

@@ -1,6 +1,15 @@
 //! Cached-only completion: local readiness permits a write half-close without
 //! waiting for peer FIN. The reader and local landing/fetch work remain alive.
 //! Prefix deliberately keeps its independent DONE/LANDED/request semantics.
+//!
+//! The peer-silence deadline ([`WALK_DEADLINE`]) runs from the last frame
+//! heard, except on a streamer before the decoder's STOP: the decoder sends
+//! nothing until its proof, for as long as its decode takes, so there the
+//! deadline runs from the later of the last frame heard and the last cell
+//! written. A written cell is evidence that the decoder still reads: a peer
+//! that stops reading stalls the write on transport backpressure, and a
+//! stalled write fails after [`WALK_DEADLINE`] without byte progress. A
+//! decoder that reads without ever proving is ended by the cell bound.
 
 use super::*;
 
@@ -149,6 +158,11 @@ where
                     Vec::new()
                 } else {
                     let written = *progressed.borrow_and_update();
+                    // The decoder is silent until STOP: its reading our
+                    // cells is what we hear of it (see the module doc).
+                    if exchange.streaming() {
+                        heard_at = tokio::time::Instant::now();
+                    }
                     let mut outs = exchange.on_written(written.cells);
                     if written.root { outs.extend(exchange.on_root_written()); }
                     if written.stop { outs.extend(exchange.on_stop_written()); }
