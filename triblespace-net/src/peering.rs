@@ -602,6 +602,25 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
         dials
     }
 
+    /// Live connections already named by a selected collection's candidate
+    /// order. Reuse that order, not the direction of the connection: a peer
+    /// the pile chose may reconnect inbound after its former route failed.
+    /// An unsolicited caller alone contributes no candidate.
+    fn route_candidates(&self) -> impl Iterator<Item = PeerId> + '_ {
+        self.links
+            .values()
+            .filter(|link| !link.closed() && !link.retired())
+            .filter(|link| {
+                self.meshes.iter().any(|(raw, mesh)| {
+                    mesh.order.peers.contains(&link.peer())
+                        && self.snapshot.as_ref().is_some_and(|snapshot| {
+                            snapshot.selected(CollectionHandle::new(*raw)).is_some()
+                        })
+                })
+            })
+            .map(Link::peer)
+    }
+
     /// Set each connection's neighbour flag and publish the peerings, if
     /// anything changed since the last call. Returns whether it did.
     pub(crate) fn publish(&mut self, health: &Health) -> bool {
@@ -1318,7 +1337,9 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
 /// observations, refill its neighbour sets every [`PEERING_TICK`], start
 /// pushes through `walks` when a collection's schedule fires, and publish
 /// what changed into `health`. A collection's DHT providers are looked up
-/// through `find_providers`. The pushes received here arrive on `received`,
+/// through `find_providers`. Live peers in its existing candidate orders are
+/// re-noted through `note_route`, subject to the routing table's cooldown.
+/// The pushes received here arrive on `received`,
 /// for the schedules, and what grant walks report on `walked`, for the grant
 /// exchange, which opens grant walks through `walks` too. Landed grants and
 /// fetched definitions go through `admissions`.
@@ -1326,6 +1347,7 @@ pub(crate) async fn run<T: Transport, S: Service, R>(
     connections: ConnectionTable<T, S>,
     mut snapshots: tokio::sync::watch::Receiver<Option<StoreSnapshot<R>>>,
     mut events: tokio::sync::mpsc::Receiver<ReconEvent>,
+    mut note_route: impl FnMut(PeerId),
     mut find_providers: impl FnMut(CollectionHandle) -> BoxFuture<'static, Vec<PeerId>>,
     walks: WalksHandle,
     mut received: tokio::sync::mpsc::UnboundedReceiver<walk::Event>,
@@ -1406,6 +1428,9 @@ pub(crate) async fn run<T: Transport, S: Service, R>(
                         let connected = connections.connect(peer).await.is_ok();
                         let _ = dialled.send((peer, connected));
                     });
+                }
+                for peer in peerings.route_candidates() {
+                    note_route(peer);
                 }
             }
         }
@@ -2476,6 +2501,7 @@ mod tests {
                     table.clone(),
                     observed,
                     recon,
+                    |_| {},
                     |_| futures::future::ready(Vec::new()).boxed(),
                     WalksHandle(walks),
                     received,

@@ -1188,6 +1188,16 @@ the signer of a record it holds finds the collection's other providers, tier
 opening or by the requests it carries: anybody can dial with a fresh key, as a
 process that asks its pile's daemon with a key per call does.
 
+On each peering tick, a live connection whose key already occurs in a
+currently selected collection's candidate order is re-noted as an unverified
+DHT candidate, irrespective of which side dialled. This reuses the existing
+peering order without rescanning records or keeping another peer inventory.
+Re-noting respects the routing failure cooldown and does not mark a peer
+verified; normal direct-response promotion still applies. An unsolicited
+inbound caller absent from those orders
+still makes no route. Thus an inbound reconnection to a peer the pile already
+selected can restore publication after a disconnected lookup removed its route.
+
 A process whose pile names no peer, such as a foreground reader, has one first
 contact: the pile's sync daemon. `PeerConfig::daemon` names it by its key, the
 key the pile's configuration is written under; the daemon itself leaves it
@@ -1202,8 +1212,9 @@ removes its route and cools the identity for a minute, so gossip cannot
 restore it at once. If the connection to that peer is still up, the route
 only cools: a responder that has fallen behind under load is slow, not gone,
 and the route returns when the cooldown lapses. Routes otherwise come back
-only through a lookup, a provider PUT or fetch, or a newly dialled
-connection. So when a lookup finds no eligible route at all, the host first
+through a lookup, a provider PUT or fetch, a newly dialled connection, or
+re-noting a selected peering candidate whose live connection remains. When a
+lookup finds no eligible route at all, the host first
 notes its daemon again, subject to the daemon's own cooldown. If there is
 still no seed, the cooling routes of its live connections are queried as
 fallback seeds; each route is selected as a fallback at most once per ten

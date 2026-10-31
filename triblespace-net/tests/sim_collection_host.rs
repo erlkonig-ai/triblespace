@@ -887,6 +887,94 @@ fn a_healed_partition_recovers_without_dht_or_restart() {
 }
 
 #[test]
+fn selected_inbound_reconnection_restores_provider_publication() {
+    let _guard = test_guard();
+    let clock = virtual_clock();
+    clock.reset();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    runtime.block_on(local.run_until(async {
+        let net = SimNet::new(0xC011_EC76, SimConfig::default());
+        let local_key = key(61);
+        let remote_key = key(62);
+        let stranger_key = key(63);
+        let local_id = local_key.verifying_key().to_bytes();
+        let remote_id = remote_key.verifying_key().to_bytes();
+        let stranger_id = stranger_key.verifying_key().to_bytes();
+        // Both piles independently name the other through the selected
+        // collection's policy; the stranger is absent from that evidence.
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(remote_key.verifying_key()),
+            AdmissionPolicy::direct(local_key.verifying_key()),
+        );
+        let mut local_store = MemoryRepo::default();
+        let collection = register(&mut local_store, policy.clone()).handle();
+        select(&mut local_store, &local_key, collection);
+        let mut remote_store = MemoryRepo::default();
+        assert_eq!(register(&mut remote_store, policy).handle(), collection);
+        select(&mut remote_store, &remote_key, collection);
+        let mut publisher = bring_up(&net, &local_key, local_store, None);
+        let mut remote = bring_up(&net, &remote_key, remote_store, None);
+        publisher.activate_collection(collection);
+        remote.activate_collection(collection);
+        advance(&clock, &mut [&mut publisher, &mut remote], 15).await;
+        let acknowledged = publisher.health().publication.acknowledged;
+        assert!(acknowledged > 0, "the initial route must publish remotely");
+
+        // The partition closes the actual connection. New work makes a
+        // FIND_VALUE fail while disconnected, removing the former route.
+        net.partition(local_id, remote_id);
+        publisher
+            .put::<UnknownBlob, _>(Bytes::from_source(b"after partition".to_vec()))
+            .unwrap();
+        publisher.refresh();
+        advance(&clock, &mut [&mut publisher, &mut remote], 75).await;
+        let stalled = publisher.health().publication.clone();
+        assert!(stalled.topology_paused);
+        assert!(stalled.unavailable > 0);
+        assert_eq!(stalled.acknowledged, acknowledged);
+
+        // This caller reaches the publisher through an ordinary authenticated
+        // inbound connection. Its own successful publication proves the
+        // connection works, but must not make it a route for the publisher.
+        let mut stranger_store = MemoryRepo::default();
+        stranger_store
+            .put::<UnknownBlob, _>(Bytes::from_source(b"stranger".to_vec()))
+            .unwrap();
+        let mut stranger = bring_up(&net, &stranger_key, stranger_store, Some(local_id));
+        advance(&clock, &mut [&mut publisher, &mut remote, &mut stranger], 75).await;
+        assert!(stranger.health().publication.acknowledged > 0);
+        assert_eq!(net.dial_count(local_id, stranger_id), 0);
+        assert_eq!(publisher.health().publication.acknowledged, acknowledged);
+        assert!(publisher.health().publication.topology_paused);
+
+        // Only the remote can establish a replacement connection. The local
+        // host must reuse that inbound connection without a restart, new
+        // selection, grant, or configured daemon to restore its DHT route.
+        net.stall_dials(remote_id);
+        net.heal(local_id, remote_id);
+        advance(&clock, &mut [&mut publisher, &mut remote, &mut stranger], 150).await;
+        assert!(
+            publisher.health().peerings.iter().any(|peering| {
+                peering.peer == remote_id && peering.collection == collection && peering.peered
+            }),
+            "the selected peer must reconnect before testing publication"
+        );
+        let recovered = publisher.health().publication.clone();
+        assert!(
+            recovered.acknowledged > acknowledged,
+            "selected inbound reconnection must restore publication: {recovered:?}"
+        );
+        assert!(!recovered.topology_paused);
+        assert_eq!(net.dial_count(local_id, stranger_id), 0);
+    }));
+}
+
+#[test]
 fn durable_bearer_want_materializes_without_any_collection() {
     let _guard = test_guard();
     let clock = virtual_clock();

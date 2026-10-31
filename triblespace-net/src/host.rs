@@ -1234,6 +1234,9 @@ async fn host_loop<T: Transport, R>(
         connections.clone(),
         wiring.snapshot.clone(),
         recon_rx,
+        move |peer| {
+            candidates.lock().unwrap().note_candidate(peer);
+        },
         move |collection: CollectionHandle| {
             let client = finder.clone();
             let lookups = lookups.clone();

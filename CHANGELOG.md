@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   34, which is a different, deployed and rejected profile (carried agreed
   tree, asymmetric RIBLT roles). No live deployment.
 
+- Restore DHT candidates from live connections already named by selected
+  collections' peering orders, including inbound reconnections after route
+  loss. Preserve failure cooldowns, direct-response verification, and exclusion
+  of unsolicited inbound callers; reuse existing peering state. Cover recovery
+  and caller exclusion with a deterministic full-host partition regression.
+
 - Canonical migration/refresh relies on explicit operator-frozen input custody,
   not a host-wide opener observation. Preserve source/refresh identity and full
   BLAKE3 checks for accidental changes, original-author verification, audits and
