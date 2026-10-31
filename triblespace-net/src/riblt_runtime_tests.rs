@@ -1809,9 +1809,29 @@ async fn exchange_through_codec(
     link: LinkModel,
     prepare: fn(Exchange<MemoryRepoSnapshot>) -> Exchange<MemoryRepoSnapshot>,
 ) -> Exchanged {
+    exchange_publishing(pair, link, prepare, None).await
+}
+
+/// As [`exchange_through_codec`], and at virtual time `publish` after the
+/// start A's store publishes every record only B held, observes, and hands
+/// the newer snapshot to A's driver: an ordinary concurrent publication that
+/// A's exchange, pinned before it, did not advertise.
+async fn exchange_publishing(
+    pair: &mut Pair,
+    link: LinkModel,
+    prepare: fn(Exchange<MemoryRepoSnapshot>) -> Exchange<MemoryRepoSnapshot>,
+    publish: Option<Duration>,
+) -> Exchanged {
     let net = SimNet::new(0xA5E7, SimConfig::default());
     let collection = pair.collection;
-    let (a_driver, _a_snapshots, mut a_landings) = side_driver(&pair.a, &pair.b, collection, &net);
+    let a_held = pair.a.records(collection);
+    let mut b_only: Vec<NetEvent> = pair
+        .b
+        .records(collection)
+        .difference(&a_held)
+        .map(|record| NetEvent::CollectionRecord(*record))
+        .collect();
+    let (a_driver, a_snapshots, mut a_landings) = side_driver(&pair.a, &pair.b, collection, &net);
     let (b_driver, _b_snapshots, mut b_landings) = side_driver(&pair.b, &pair.a, collection, &net);
     let a_exchange = prepare(cached(&pair.a, collection));
     let b_exchange = prepare(cached(&pair.b, collection));
@@ -1868,8 +1888,26 @@ async fn exchange_through_codec(
         (ended, tokio::time::Instant::now())
     });
     let (mut a_end, mut b_end) = (None, None);
+    let mut unpublished = publish.is_some();
+    let publication = tokio::time::sleep_until(started + publish.unwrap_or_default());
+    tokio::pin!(publication);
+    // The harness does not carry a reset across its pumps, so a side left
+    // waiting on a failed peer would wait forever: bound it in virtual time.
+    let stuck = tokio::time::sleep_until(started + Duration::from_secs(600));
+    tokio::pin!(stuck);
     while a_end.is_none() || b_end.is_none() {
         tokio::select! {
+            () = &mut stuck => panic!(
+                "no convergence within 600 s virtual: larger side {:?}, smaller side {:?}",
+                a_end.as_ref().map(|((ended, _), _): &((Ended, bool), _)| ended.failure),
+                b_end.as_ref().map(|((ended, _), _): &((Ended, bool), _)| ended.failure),
+            ),
+            () = &mut publication, if unpublished => {
+                unpublished = false;
+                assert_eq!(pair.a.insert(std::mem::take(&mut b_only)).1, 0);
+                pair.a.observe();
+                let _ = a_snapshots.send(Some(pair.a.snapshot()));
+            }
             Some((_, events)) = a_landings.recv() => {
                 let _ = a_acked.send(pair.a.insert(events));
             }
@@ -2179,6 +2217,34 @@ async fn riblt_asym_a_corrupted_raw_decode_falls_back_to_the_residual_decode() {
         "{}",
         run.b_sent.of(FRAME_RIBLT_CELL)
     );
+}
+
+/// The decoder's store publishes B's own records after its pin and before it
+/// decodes. The decoder already holds them, yet the streamer's view of A
+/// loses each key only when the decoder names it, so the decoder still
+/// requests every remote key: without that the streamer rebuilds A u B, never
+/// the advertised A, cannot prove, and refuses the decoder's FIN. Raw decode
+/// and the residual fallback alike.
+#[tokio::test(start_paused = true)]
+async fn riblt_asym_decoder_publishing_the_streamers_keys_mid_exchange_converges() {
+    fn faulted(exchange: Exchange<MemoryRepoSnapshot>) -> Exchange<MemoryRepoSnapshot> {
+        exchange.fault_raw_cell(0)
+    }
+    let cases: [(&str, fn(Exchange<MemoryRepoSnapshot>) -> Exchange<MemoryRepoSnapshot>); 2] =
+        [("raw", unchanged), ("residual", faulted)];
+    for (case, prepare) in cases {
+        let mut pair = asym_pair(2000, 90, 10);
+        let run = exchange_publishing(&mut pair, LINK, prepare, Some(Duration::from_millis(2)))
+            .await;
+        report(&format!("published_{case}_b100"), &run, LINK);
+        assert_union(&mut pair, &run, 2010);
+        assert_eq!(run.a_sent.of(FRAME_RIBLT_CELL), 0);
+        assert_eq!(run.a_sent.of(FRAME_STOP_KIND), 1);
+        // Requested although held: the request is the membership signal.
+        assert_eq!(run.a_sent.of(FRAME_VALUE_REQUEST), 10, "{case}");
+        assert_eq!(run.b_sent.of(FRAME_VALUE), 10, "{case}");
+        assert_eq!(run.a_sent.of(FRAME_VALUE), 2000 - 90, "{case}");
+    }
 }
 
 /// The same fixtures with roles switched off: today's exchange, measured

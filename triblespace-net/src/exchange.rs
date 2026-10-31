@@ -1668,6 +1668,10 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
         if self.remember(key)? {
             return Ok(());
         }
+        self.want(key)
+    }
+
+    fn want(&mut self, key: [u8; KEY_BYTES]) -> Result<(), Failure> {
         if self.wanted.len() >= FLOOD_WANTED {
             return Err(Failure::Protocol);
         }
@@ -1830,10 +1834,15 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
                 break;
             };
             r.remote_queued += 1;
+            // The decoder requests every remote key, even one a newer
+            // snapshot already holds: the streamer drops a key from its view
+            // of this side only when it is requested, and its exact proof is
+            // against the advertised ROOT, not this side's live store.
+            let decoder = r.role == Role::Decoder;
             if self.delta.at(&key).is_some() {
                 return self.fail(Failure::BadNode);
             }
-            if let Err(failure) = self.leaf(key) {
+            if let Err(failure) = if decoder { self.want(key) } else { self.leaf(key) } {
                 return self.fail(failure);
             }
         }
