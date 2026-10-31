@@ -19,6 +19,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before its outcome is known forgets it, at the cost of one full walk, so a
   tree the peer refused is never offered again. Generation 33 skips unknown
   walk frames and is refused at the handshake.
+- ALPN `/triblespace/pile-sync/34` (same cutover as AGREED): cached RIBLT
+  assigns roles from the two ROOT counts of a typed component. The larger
+  side streams no cells, decodes the smaller side's (a raw decode against
+  the empty set alongside the residual decoder), and on its first exact
+  proof against the peer ROOT writes RIBLT_STOP (`0x0d`), then pushes what
+  the peer lacks and sends VALUE_REQUEST for every remote key. The smaller
+  side streams until STOP and proves completion against the peer ROOT. Equal
+  counts and References stay symmetric. Per exchange of one Commit
+  component with |A| = 10,000 and B a subset of 0 to 1,000 keys (two
+  production drivers, real codec, 5 ms one-way link at 1 frame per ms), the
+  smaller side's cells fall from 22,457-24,783 to 1,158-2,540, the larger
+  side's to zero, and the bytes by 42-44%.
 - Grant gossip by participation, in the unreleased ALPN33 candidate: one
   passive mechanism for the grants over every resource R, with no routing by
   resource kind. A grant over R is shown to every node that takes part in R

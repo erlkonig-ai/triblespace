@@ -529,9 +529,10 @@ resource32 || proof-id32 key. Integers are big-endian.
 | `0x0a` | RIBLT_CELL | index:u32, symbol32, checksum:u64, count:i64 |
 | `0x0b` | HAVE | exact offered depth:u8, prefix32, hash32, leaf-count:u64 |
 | `0x0c` | AGREED | hash32, leaf-count:u64 (nonempty carried agreed tree) |
+| `0x0d` | RIBLT_STOP | empty (cached decoder has proven the peer's set) |
 
 DONE/LANDED are Prefix-only; cached RIBLT refuses them and uses the gated FIN
-semantics below. RIBLT_ROOT has 40 payload bytes (45 framed), with no repeated
+semantics below. AGREED is Prefix-only and RIBLT_STOP is cached-only. RIBLT_ROOT has 40 payload bytes (45 framed), with no repeated
 profile key. This remains the unreleased ALPN34 boundary, not compatibility
 with earlier private33 variants or deployed32.
 
@@ -758,6 +759,28 @@ the remote-only key PATCH, sharing all unchanged native subtree summaries. It
 checks the exact peer root/count without waiting for unknown typed bodies and
 without a copied full-source key inventory. Typed peer reconstruction and canonical signature
 admission independently guard final landing.
+
+The two ROOT counts assign roles in a cached exchange of a typed component
+(Commit, Derive) whose counts differ. The side with more keys is the
+decoder: it streams no cells, and feeds the smaller side's cells both to its
+residual decoder and to a raw decode against the empty set, which recovers
+the smaller side's whole set in about 1.37 |B| cells instead of about 1.37 d,
+where d >= |A| - |B|. The raw decode is trusted only whole: any decoder error,
+a symbol peeled with a negative count, or a recovered summary that is not the
+peer ROOT abandons it, and the residual decoder decides. On its first exact
+proof against the peer ROOT the decoder writes RIBLT_STOP (`0x0d`, empty),
+then pushes the values the peer lacks and requests every remote key with
+VALUE_REQUEST inside the ordinary request window, held or not, because the
+streamer rebuilds the decoder's set only from what it is pushed and asked
+for. Partial residual recoveries push and request nothing before STOP. The
+decoder may FIN only once STOP is written, its pushes drained and every
+requested value landed. The smaller side streams until STOP and refuses any
+incoming cell; after STOP it serves requests only from its advertised
+source, each key once, accepts pushes only for keys it lacks, and proves
+completion when its incremental view matches the peer ROOT. A FIN on either
+side before its proof fails, and a lying ROOT fails with a count mismatch
+and never produces STOP. Equal counts stay symmetric, and so do References,
+which have no VALUE frame to carry the decoder's push.
 
 Once this exact proof holds, stop coded output only when the **complete locally
 written** cell prefix reaches the decoded incoming prefix. Opposite residual
@@ -1538,9 +1561,12 @@ guarantee.
 ## Wire surface
 
 The ALPN is `/triblespace/pile-sync/34`, an unreleased generation.
-Generation 34 adds the walk frame AGREED (`0x0c`), with which a Prefix side
-announces an agreed tree carried over from a closed connection; generation 33
-skips unknown walk frames, so it is refused at the handshake. Generation 33
+Generation 34 adds two walk frames as one cutover: AGREED (`0x0c`), with
+which a Prefix side announces an agreed tree carried over from a closed
+connection, and RIBLT_STOP (`0x0d`), with which the larger side of a cached
+RIBLT exchange ends the smaller side's cell stream. Generation 33 skips
+unknown walk frames, so it would land a delta against a tree it lacks and
+stream cells past a STOP; it is refused at the handshake. Generation 33
 separates the COMMIT and DERIVE trees, and replaces the grant digest exchange
 with grant gossip by participation: GRANT_ROOTS listings on `recon/1` and a
 grant walk per resource on `walk/1`, Prefix only, whose receiver skips what it

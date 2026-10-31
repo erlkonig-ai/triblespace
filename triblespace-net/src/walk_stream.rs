@@ -12,6 +12,7 @@
 //! | 0x0a | RIBLT_CELL    | index:u32, symbol32, hash:u64, count:i64 |
 //! | 0x0b | HAVE          | offered depth:u8, prefix32, hash32, u64 |
 //! | 0x0c | AGREED        | hash32, u64                     |
+//! | 0x0d | RIBLT_STOP    | empty                           |
 //!
 //! SUBTREE has exactly73 payload bytes, or78 bytes with the ordinary five-byte
 //! frame header. Integers are big-endian. Prefix bytes outside depth are zero;
@@ -38,6 +39,14 @@
 //! Cached RIBLT derives its checksum key from OPEN locally; ROOT is exactly
 //! 40 payload bytes. DONE/LANDED belong only to Prefix. Cached completion uses
 //! clean write-half FIN after proof, actual landing and all owed frame writes.
+//! The two ROOT counts of a typed component (Commit, Derive) assign cached
+//! roles: the larger side streams no cells and decodes the smaller side's;
+//! on its first exact proof against the peer ROOT it sends RIBLT_STOP, then
+//! pushes VALUEs the peer lacks and sends VALUE_REQUEST for the ones it
+//! lacks. The smaller side streams until STOP, refuses any incoming cell,
+//! and after STOP serves requests only from its advertised source. Equal
+//! counts and References stay symmetric. RIBLT_STOP also came with
+//! generation 34: a generation-33 peer would skip it and keep streaming.
 
 use triblespace_core::collection::CollectionHandle;
 
@@ -57,6 +66,9 @@ pub const FRAME_RIBLT_ROOT: u8 = 0x09;
 pub const FRAME_RIBLT_CELL: u8 = 0x0a;
 pub const FRAME_HAVE: u8 = 0x0b;
 pub const FRAME_AGREED: u8 = 0x0c;
+/// Cached asymmetric discovery: the larger side has proven the smaller side's
+/// set from its cells and asks it to stop streaming. Empty payload.
+pub const FRAME_RIBLT_STOP: u8 = 0x0d;
 
 /// Explicit ALPN34 discovery profile. CachedRiblt is the default for mutually
 /// authorized peers. Prefix remains selectable and is required
@@ -138,6 +150,8 @@ pub(crate) enum Frame {
         hash: u64,
         count: i64,
     },
+    /// The larger side's proof of the smaller side's whole set: stop cells.
+    RibltStop,
 }
 
 impl Frame {
@@ -199,6 +213,7 @@ impl Frame {
                 payload.extend_from_slice(&count.to_be_bytes());
                 FRAME_RIBLT_CELL
             }
+            Self::RibltStop => FRAME_RIBLT_STOP,
         };
         (kind, payload)
     }
@@ -285,6 +300,7 @@ impl Frame {
                 hash: u64::from_be_bytes(rest.take(8)?.try_into().unwrap()),
                 count: i64::from_be_bytes(rest.take(8)?.try_into().unwrap()),
             },
+            FRAME_RIBLT_STOP => Self::RibltStop,
             _ => return Ok(None),
         };
         if !rest.0.is_empty() {
