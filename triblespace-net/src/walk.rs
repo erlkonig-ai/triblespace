@@ -3549,11 +3549,13 @@ pub(crate) mod tests {
             let (_script, driven) = tokio::io::duplex(1024);
             let (recv, send) = tokio::io::split(driven);
             let reset = Arc::new(Mutex::new(None));
+            // Both sides are open both ways, so cached RIBLT is the profile a
+            // selected collection would join: only deselection refuses it.
             task.command(Command::Incoming {
                 peer: other.peer,
                 collection,
                 kind,
-                algorithm: crate::walk_stream::Algorithm::Prefix,
+                algorithm: crate::walk_stream::Algorithm::CachedRiblt,
                 offer: None,
                 send: Box::new(Tx(send, reset.clone())),
                 recv: Box::new(Rx(recv, reset.clone())),
