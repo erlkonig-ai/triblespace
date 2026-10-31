@@ -12,10 +12,10 @@ use triblespace_core::blob::{
     encodings::{simplearchive::SimpleArchive, UnknownBlob},
     Blob,
 };
-use triblespace_core::collection::{Collection, CollectionRead};
+use triblespace_core::collection::Collection;
 use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::metadata;
-use triblespace_core::repo::pile::{record_kind, Pile, PileFile, PileRecords};
+use triblespace_core::repo::pile::{Pile, PileFile, PileRecords};
 use triblespace_core::repo::{BlobStorePut, SnapshotSource};
 use triblespace_core::trible::TribleSet;
 
@@ -238,7 +238,11 @@ fn a_tombstone_before_a_later_head_does_not_hide_the_live_branch_choice() {
     let destination = dir.path().join("candidate.pile");
     let original = legacy(&source);
     let branch = inspect(&source).unwrap().legacy_branches[0];
-    let mut bytes = envelope(&record_kind::KIND_PIN_TOMBSTONE);
+    // Existing physical kind from core repo/pile/record_kind.rs; this module
+    // is deliberately private, so the integration fixture pins its bytes.
+    let mut bytes = envelope(&hex_literal::hex!(
+        "8D9F27E76D3620EEC29B781F841E9EF77F2607B40DC702FE3DAED007E9228CA5"
+    ));
     let raw: [u8; 16] = branch.into();
     bytes[64..80].copy_from_slice(&raw);
     bytes.extend_from_slice(&original);
