@@ -23,11 +23,13 @@ use triblespace_core::repo::pile::{
 };
 use triblespace_core::repo::SnapshotSource;
 
+use crate::migration::{checkpoint, CanonicalOutcome, Progress, Stage};
+
 #[cfg(test)]
 mod admission_tests;
 #[cfg(test)]
 mod conversion_tests;
-pub(super) mod frame;
+pub(crate) mod frame;
 mod legacy32;
 #[cfg(test)]
 mod rehearsal_tests;
@@ -197,14 +199,18 @@ fn paths(args: &Args, source: &Path) -> Result<()> {
         "dry-run writes no report file; use stdout"
     );
     let partial = partial_path(&args.into);
-    let outputs: Vec<_> = [&args.into, &partial]
+    let outputs: Vec<_> = [args.into.as_path(), partial.as_path()]
         .into_iter()
-        .chain(args.report.iter())
+        .chain(args.report.iter().map(PathBuf::as_path))
         .collect();
     let inputs: Vec<_> = [source, args.key.as_path()]
         .into_iter()
         .chain(args.refreshes.iter().map(PathBuf::as_path))
         .collect();
+    fresh_paths(&outputs, &inputs)
+}
+
+fn fresh_paths(outputs: &[&Path], inputs: &[&Path]) -> Result<()> {
     let mut seen: Vec<PathBuf> = Vec::new(); // Ephemeral path validation, not retained data.
     for output in outputs {
         let output_name = normalized(output)?;
@@ -212,7 +218,7 @@ fn paths(args: &Args, source: &Path) -> Result<()> {
             !seen.contains(&output_name),
             "output/report paths alias each other"
         );
-        for input in &inputs {
+        for input in inputs {
             ensure!(
                 output_name != normalized(input)?,
                 "output/report aliases input {}",
@@ -235,21 +241,30 @@ fn paths(args: &Args, source: &Path) -> Result<()> {
     Ok(())
 }
 
-struct Report(Option<File>);
+enum Report {
+    File(File),
+    Stdout,
+    Silent,
+}
 impl Report {
     fn event(&mut self, value: Value) -> Result<()> {
+        if matches!(self, Self::Silent) {
+            return Ok(());
+        }
         let mut line = serde_json::to_vec(&value)?;
         line.push(b'\n');
-        match &mut self.0 {
-            Some(file) => file.write_all(&line)?,
-            None => std::io::stdout().lock().write_all(&line)?,
+        match self {
+            Self::File(file) => file.write_all(&line)?,
+            Self::Stdout => std::io::stdout().lock().write_all(&line)?,
+            Self::Silent => unreachable!(),
         }
         Ok(())
     }
     fn sync(&mut self) -> Result<()> {
-        match &mut self.0 {
-            Some(file) => file.sync_all()?,
-            None => std::io::stdout().flush()?,
+        match self {
+            Self::File(file) => file.sync_all()?,
+            Self::Stdout => std::io::stdout().flush()?,
+            Self::Silent => {}
         }
         Ok(())
     }
@@ -257,6 +272,106 @@ impl Report {
 struct Refresh {
     source: Source,
     snapshot: PileFileSnapshot,
+}
+
+struct RewriteOptions<'a> {
+    into: &'a Path,
+    dry_run: bool,
+    retain_unconverted_caches: bool,
+}
+
+#[derive(Debug)]
+struct MissingRefreshes {
+    authors: BTreeSet<[u8; 32]>,
+    assertions: u64,
+}
+impl std::fmt::Display for MissingRefreshes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} required assertion(s) unresolved; partial is NOT completion",
+            self.assertions
+        )
+    }
+}
+impl std::error::Error for MissingRefreshes {}
+
+fn open_refreshes(paths: &[PathBuf]) -> Result<Vec<Refresh>> {
+    paths
+        .iter()
+        .map(|path| {
+            let frozen = Source::open(path, None)?;
+            let mut pile =
+                PileFile::open_read_only(path).map_err(|e| anyhow!("open refresh: {e:?}"))?;
+            let snapshot = pile
+                .snapshot()
+                .map_err(|e| anyhow!("snapshot refresh: {e:?}"));
+            pile.close().map_err(|e| anyhow!("close refresh: {e:?}"))?;
+            Ok(Refresh {
+                source: frozen,
+                snapshot: snapshot?,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn prepare_native(
+    source_path: &Path,
+    destination: &Path,
+    signer: &SigningKey,
+    refresh_paths: &[PathBuf],
+    progress: &mut impl FnMut(Progress) -> bool,
+) -> Result<CanonicalOutcome> {
+    let partial = partial_path(destination);
+    let inputs: Vec<_> = [source_path]
+        .into_iter()
+        .chain(refresh_paths.iter().map(PathBuf::as_path))
+        .collect();
+    fresh_paths(&[destination, partial.as_path()], &inputs)?;
+    checkpoint(progress, Stage::HashSource, 0, 0)?;
+    let source = Source::open(source_path, None)?;
+    checkpoint(
+        progress,
+        Stage::HashSource,
+        source.bytes.len() as u64,
+        source.bytes.len() as u64,
+    )?;
+    let refreshes = open_refreshes(refresh_paths)?;
+    let options = RewriteOptions {
+        into: destination,
+        dry_run: false,
+        retain_unconverted_caches: true,
+    };
+    match rewrite(
+        &source,
+        &options,
+        Mode::Rewrite,
+        Stop::Never,
+        signer,
+        &refreshes,
+        &mut Report::Silent,
+        progress,
+    ) {
+        Ok((emitted_assertions, retained_original_caches)) => Ok(CanonicalOutcome::Converted {
+            destination: destination.to_owned(),
+            source_hash: source.hash,
+            emitted_assertions,
+            retained_original_caches,
+        }),
+        Err(error) => {
+            if let Some(missing) = error.downcast_ref::<MissingRefreshes>() {
+                source.check()?;
+                for refresh in &refreshes {
+                    refresh.source.check()?;
+                }
+                Ok(CanonicalOutcome::ForeignRefreshRequired {
+                    authors: missing.authors.iter().copied().collect(),
+                })
+            } else {
+                Err(error)
+            }
+        }
+    }
 }
 #[derive(Default, Debug, PartialEq, Eq)]
 struct Ids {
@@ -277,31 +392,31 @@ fn execute(source_path: PathBuf, args: Args, mode: Mode, stop: Stop) -> Result<(
     let source = Source::open(&source_path, Some(expected))?;
     let key = triblespace_core::signing_key_file::load_existing(&args.key)
         .context("load explicit existing signer")?;
-    let mut refreshes = Vec::new();
-    for path in &args.refreshes {
-        let frozen = Source::open(path, None)?;
-        let mut pile =
-            PileFile::open_read_only(path).map_err(|e| anyhow!("open refresh: {e:?}"))?;
-        let snapshot = pile
-            .snapshot()
-            .map_err(|e| anyhow!("snapshot refresh: {e:?}"));
-        pile.close().map_err(|e| anyhow!("close refresh: {e:?}"))?;
-        refreshes.push(Refresh {
-            source: frozen,
-            snapshot: snapshot?,
-        });
-    }
-    let mut report = Report(
-        args.report
-            .as_ref()
-            .map(|p| super::super::compact::create_fresh_destination(p))
-            .transpose()?,
-    );
+    let refreshes = open_refreshes(&args.refreshes)?;
+    let mut report = match &args.report {
+        Some(path) => Report::File(super::super::compact::create_fresh_destination(path)?),
+        None => Report::Stdout,
+    };
     report.event(json!({"event":"begin", "operation":format!("{mode:?}"), "source":source.path,
         "source_hash":hex::encode(source.hash), "source_bytes":source.bytes.len(),
         "author":hex::encode(key.verifying_key().to_bytes()), "retain_source":true,
         "refreshes":refreshes.iter().map(|r| json!({"path":r.source.path,"hash":hex::encode(r.source.hash)})).collect::<Vec<_>>() }))?;
-    let result = rewrite(&source, &args, mode, stop, &key, &refreshes, &mut report);
+    let options = RewriteOptions {
+        into: &args.into,
+        dry_run: args.dry_run,
+        retain_unconverted_caches: args.retain_unconverted_caches,
+    };
+    let result = rewrite(
+        &source,
+        &options,
+        mode,
+        stop,
+        &key,
+        &refreshes,
+        &mut report,
+        &mut |_| true,
+    )
+    .map(|_| ());
     if let Err(error) = &result {
         report.event(json!({"event":"unsuccessful", "error":format!("{error:#}"),
             "destination_exists":args.into.exists(), "partial":partial_path(&args.into),
@@ -313,13 +428,14 @@ fn execute(source_path: PathBuf, args: Args, mode: Mode, stop: Stop) -> Result<(
 
 fn rewrite(
     source: &Source,
-    args: &Args,
+    args: &RewriteOptions<'_>,
     mode: Mode,
     stop: Stop,
     key: &SigningKey,
     refreshes: &[Refresh],
     report: &mut Report,
-) -> Result<()> {
+    progress: &mut impl FnMut(Progress) -> bool,
+) -> Result<(u64, u64)> {
     let partial = partial_path(&args.into);
     let mut raw = if args.dry_run {
         None
@@ -334,9 +450,17 @@ fn rewrite(
     let mut retained_inert_occurrences = 0u64;
     let mut retained_inert_bytes = 0usize;
     let mut blocked = 0u64;
+    let mut missing_refreshes = BTreeSet::new();
+    let mut missing_assertions = 0u64;
     // Pass one: validate every source frame. Copy only the exact allowlist.
     for framed in source.records()? {
         let framed = framed.map_err(|e| anyhow!("source framing: {e:?}"))?;
+        checkpoint(
+            progress,
+            Stage::Canonical,
+            framed.offset as u64,
+            source.bytes.len() as u64,
+        )?;
         let bytes = &source.bytes[framed.offset..framed.offset + framed.len];
         if mode == Mode::Refresh && !supported(framed.content) {
             report.event(
@@ -407,6 +531,12 @@ fn rewrite(
         let mut retained_caches = 0;
         for framed in source.records()? {
             let framed = framed.map_err(|e| anyhow!("source framing: {e:?}"))?;
+            checkpoint(
+                progress,
+                Stage::Canonical,
+                framed.offset as u64,
+                source.bytes.len() as u64,
+            )?;
             match framed.content {
                 PileRecordContent::Opaque {
                     kind: OpaqueKind::Described(kind),
@@ -465,6 +595,8 @@ fn rewrite(
                                 }
                                 if records.is_empty() {
                                     blocked += 1;
+                                    missing_assertions += 1;
+                                    missing_refreshes.insert(old.author);
                                     disposition = "missing-exact-foreign-refresh";
                                 } else {
                                     disposition = "exact-foreign-refresh";
@@ -527,6 +659,13 @@ fn rewrite(
         .transpose();
     let (emitted, retained_caches) = converted?;
     closed?;
+    if blocked != 0 && blocked == missing_assertions {
+        return Err(MissingRefreshes {
+            authors: missing_refreshes,
+            assertions: blocked,
+        }
+        .into());
+    }
     ensure!(
         blocked == 0,
         "{blocked} required assertion(s) unresolved; partial is NOT completion"
@@ -536,7 +675,13 @@ fn rewrite(
         refresh.source.check()?;
     }
     if !args.dry_run {
-        audit(&partial, &expected, copied_bytes, copied.finalize())?;
+        audit_with_progress(
+            &partial,
+            &expected,
+            copied_bytes,
+            copied.finalize(),
+            progress,
+        )?;
     }
     report.event(json!({"event":"verified", "operation":format!("{mode:?}"),"emitted_occurrences":emitted,
         "distinct_current_assertions":expected.records.len(),"retained_original_caches":retained_caches,
@@ -548,6 +693,12 @@ fn rewrite(
         "controlled interruption before publication"
     );
     if !args.dry_run {
+        checkpoint(
+            progress,
+            Stage::Ready,
+            source.bytes.len() as u64,
+            source.bytes.len() as u64,
+        )?;
         source.check()?;
         for refresh in refreshes {
             refresh.source.check()?;
@@ -581,7 +732,8 @@ fn rewrite(
         .context("output verified/published but final report failed")?;
     report
         .sync()
-        .context("output verified/published but report sync failed")
+        .context("output verified/published but report sync failed")?;
+    Ok((emitted, retained_caches))
 }
 
 fn foundation(record: CollectionRecord) -> bool {
@@ -664,12 +816,24 @@ fn validate_frame(content: PileRecordContent, raw: &[u8], all: &[u8]) -> Result<
     Ok(())
 }
 
+#[cfg(test)]
 fn audit(
     path: &Path,
     expected: &Ids,
     copied_bytes: usize,
     copied_hash: blake3::Hash,
 ) -> Result<()> {
+    audit_with_progress(path, expected, copied_bytes, copied_hash, &mut |_| true)
+}
+
+fn audit_with_progress(
+    path: &Path,
+    expected: &Ids,
+    copied_bytes: usize,
+    copied_hash: blake3::Hash,
+    progress: &mut impl FnMut(Progress) -> bool,
+) -> Result<()> {
+    checkpoint(progress, Stage::Audit, 0, 0)?;
     let frames = PileRecords::open(path).map_err(|e| anyhow!("audit frames: {e:?}"))?;
     let bytes = frames.bytes().clone();
     let mut actual = Ids::default();
@@ -682,6 +846,12 @@ fn audit(
     );
     for framed in frames {
         let framed = framed.map_err(|e| anyhow!("audit framing: {e:?}"))?;
+        checkpoint(
+            progress,
+            Stage::Audit,
+            framed.offset as u64,
+            bytes.len() as u64,
+        )?;
         let raw = &bytes[framed.offset..framed.offset + framed.len];
         ensure!(
             !matches!(framed.content, PileRecordContent::Opaque { .. }),
@@ -723,6 +893,7 @@ fn audit(
             .records()
             .map_err(|e| anyhow!("audit records: {e:?}"))?
         {
+            checkpoint(progress, Stage::Audit, 0, 0)?;
             add(
                 &mut indexed,
                 record

@@ -2861,6 +2861,16 @@ impl PileRecords {
     pub fn bytes(&self) -> &Bytes {
         &self.bytes
     }
+
+    /// Whether a decoded record from this reader uses the current physical
+    /// envelope. This says nothing about its semantic kind or authority.
+    pub fn has_current_framing(&self, record: &PileRecord) -> bool {
+        record
+            .offset
+            .checked_add(FRAME_MAGIC_LEN)
+            .and_then(|end| self.bytes.get(record.offset..end))
+            .is_some_and(|prefix| prefix == FRAME_MAGIC)
+    }
 }
 
 impl Iterator for PileRecords {
@@ -5734,6 +5744,9 @@ pub struct PileReframeStats {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum PileReframeError {
+    /// The owner cancelled at a record boundary. Any partial destination is
+    /// not a completed rewrite; the source remains unchanged.
+    Cancelled,
     /// The source could not be read.
     Source(ReadError),
     /// A variable-width record's payload was absent or malformed in the source.
@@ -5771,6 +5784,7 @@ pub enum PileReframeError {
 impl std::fmt::Display for PileReframeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Cancelled => write!(f, "pile reframe cancelled"),
             Self::Source(error) => write!(f, "failed to read source pile: {error}"),
             Self::SourcePayload { offset } => {
                 write!(f, "record at byte {offset} has no readable payload")
@@ -5807,7 +5821,8 @@ impl Error for PileReframeError {
             Self::Collection(error) => Some(error),
             Self::CapabilityProof(error) => Some(error),
             Self::Flush(error) => Some(error),
-            Self::SourcePayload { .. }
+            Self::Cancelled
+            | Self::SourcePayload { .. }
             | Self::OpaqueRecord { .. }
             | Self::DestinationNotEmpty { .. } => None,
         }
@@ -5863,6 +5878,18 @@ pub fn reframe_into(
     source: &Path,
     destination: &mut PileFile,
 ) -> Result<PileReframeStats, PileReframeError> {
+    reframe_into_with_progress(source, destination, |_, _| true)
+}
+
+/// The same rewrite with an owner cancellation/progress checkpoint. Returning
+/// false stops at the next checkpoint, retaining an incomplete destination.
+/// Completed/total bytes describe the copy pass; preflight reports zero.
+/// A single record's payload write and the final flush are not preemptible.
+pub fn reframe_into_with_progress(
+    source: &Path,
+    destination: &mut PileFile,
+    mut progress: impl FnMut(usize, usize) -> bool,
+) -> Result<PileReframeStats, PileReframeError> {
     let existing = destination
         .refresh()
         .map(|()| destination.applied_length)
@@ -5872,9 +5899,16 @@ pub fn reframe_into(
     }
 
     let mut records = PileRecords::open(source).map_err(PileReframeError::Source)?;
+    let total = records.bytes().len();
+    if !progress(0, total) {
+        return Err(PileReframeError::Cancelled);
+    }
     // Inspect the same immutable prefix we will copy. An unknown kind may own
     // state or references, so discovering one after partial output is too late.
     for record in records.by_ref() {
+        if !progress(0, total) {
+            return Err(PileReframeError::Cancelled);
+        }
         let record = record.map_err(PileReframeError::Source)?;
         if let PileRecordContent::Opaque { kind } = record.content {
             return Err(PileReframeError::OpaqueRecord {
@@ -5892,6 +5926,9 @@ pub fn reframe_into(
             None => break,
             Some(record) => record.map_err(PileReframeError::Source)?,
         };
+        if !progress(record.offset, total) {
+            return Err(PileReframeError::Cancelled);
+        }
         match record.content {
             PileRecordContent::Blob {
                 // The original insertion timestamp is deliberately not carried
@@ -5989,6 +6026,9 @@ pub fn reframe_into(
     }
 
     for identity in retired_wants.iter_ordered() {
+        if !progress(total, total) {
+            return Err(PileReframeError::Cancelled);
+        }
         let Ok(request) = WantRequest::from_bytes(*identity) else {
             continue;
         };
@@ -5998,6 +6038,9 @@ pub fn reframe_into(
     stats.wants = output_wants.iter().count();
 
     destination.flush().map_err(PileReframeError::Flush)?;
+    if !progress(total, total) {
+        return Err(PileReframeError::Cancelled);
+    }
     Ok(stats)
 }
 
