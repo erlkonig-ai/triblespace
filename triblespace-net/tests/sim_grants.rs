@@ -81,7 +81,6 @@ fn bring_up(net: &SimNet, key: &SigningKey, store: MemoryRepo) -> Peer<MemoryRep
     tokio::task::spawn_local(host::run_host(
         harness,
         PeerConfig {
-            walk_algorithm: Default::default(),
             daemon: None,
             provider_publication_budget: Some(0),
             bind: None,

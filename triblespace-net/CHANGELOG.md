@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `/triblespace/pile-sync/35`: one walk per direction for data, with nothing
+  to configure. A data tree (COMMIT, DERIVE, References) walked both ways is
+  cached RIBLT, one walked one way is Prefix (the offer profiles 2/3, or
+  profile 0 for References). `PeerConfig::walk_algorithm` is removed, and an
+  incoming OPEN asking for a two-way Prefix walk of data is refused with a
+  logged warning instead of being accepted. Grant walks are unchanged: they
+  stay Prefix as the one deliberate exception. The ALPN changes because the
+  accepted wire semantics narrow: 35 is 33 minus two-way data Prefix. It skips
+  34, which is a different, deployed and rejected profile (carried agreed
+  tree, asymmetric RIBLT roles). No live deployment.
+
 - Grant gossip by participation, in the unreleased ALPN33 candidate: one
   passive mechanism for the grants over every resource R, with no routing by
   resource kind. A grant over R is shown to every node that takes part in R

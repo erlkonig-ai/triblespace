@@ -55,7 +55,14 @@ use crate::transport::PeerId;
 /// walk, and lands a kept grant only once R's descriptor is resident and
 /// validates it. The digest kinds `0x02` to `0x05` are skipped as unknown,
 /// and grants are no longer part of a collection's pushes or its root.
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/33";
+/// Generation 35 is generation 33 minus the two-way Prefix walk of data: the
+/// directions alone decide a data walk (cached RIBLT both ways, Prefix one
+/// way), and an OPEN asking for two-way Prefix on COMMIT, DERIVE or
+/// References is refused. A generation-33 peer may still open such a walk, so
+/// the narrowed acceptance needs a handshake boundary. Generation 34 is a
+/// different, deployed and rejected profile (a carried agreed tree and
+/// asymmetric RIBLT roles), so this skips it rather than reusing its number.
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/35";
 
 // Stream type tags — first byte on each stream, read before any admission
 // permit is taken. An unknown tag resets only its own stream.

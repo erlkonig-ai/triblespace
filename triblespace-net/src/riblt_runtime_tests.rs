@@ -1056,7 +1056,6 @@ async fn riblt_runtime_one_way_walks_use_prefix_and_refuse_incoming_riblt() {
     let collection = local.hold("riblt-one-way-privacy", policy);
     local.commit(collection, 99);
     local.observe();
-    local.walks.algorithm = Algorithm::CachedRiblt;
     let mut exchange = local
         .walks
         .start(peer.id(), collection, WalkKind::Commit)
@@ -1218,7 +1217,7 @@ fn riblt_runtime_more_than_one_body_window_cannot_finish_at_an_empty_current_win
 }
 
 #[tokio::test(start_paused = true)]
-async fn riblt_runtime_simultaneous_open_tie_break_preserves_winners_explicit_algorithm() {
+async fn riblt_runtime_simultaneous_open_tie_break_keeps_cached_and_refuses_two_way_prefix() {
     let low_first = Node::new(191).id() < Node::new(192).id();
     for local_is_lower in [true, false] {
         for incoming in [Algorithm::Prefix, Algorithm::CachedRiblt] {
@@ -1232,17 +1231,13 @@ async fn riblt_runtime_simultaneous_open_tie_break_preserves_winners_explicit_al
             let peer = Node::new(other);
             assert_eq!(local.id() < peer.id(), local_is_lower);
             let collection = local.hold("riblt-mixed-profile-collision", open());
-            local.walks.algorithm = match incoming {
-                Algorithm::Prefix => Algorithm::CachedRiblt,
-                Algorithm::CachedRiblt => Algorithm::Prefix,
-            };
             assert_eq!(
                 local
                     .walks
                     .start(peer.id(), collection, WalkKind::Commit)
                     .unwrap()
                     .algorithm(),
-                local.walks.algorithm
+                Algorithm::CachedRiblt
             );
             let net = SimNet::new(0xC013, SimConfig::default());
             let harness = net.join(&local.key);
@@ -1288,7 +1283,20 @@ async fn riblt_runtime_simultaneous_open_tie_break_preserves_winners_explicit_al
                 Box::new(Tx(send, reset.clone())),
                 Box::new(Rx(recv, reset.clone())),
             );
-            if local_is_lower {
+            if !local_is_lower && incoming == Algorithm::Prefix {
+                // Not a duplicate to reset: a two-way Prefix walk of data is
+                // refused before registration, and the local walk runs on.
+                assert_eq!(task.running[&exchange_key].id, 777);
+                assert!(task.running[&exchange_key].opened);
+                assert!(matches!(
+                    old_replaced.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ));
+                assert_eq!(*reset.lock().unwrap(), Some(RESET_WALK_REFUSED));
+                let mut bytes = Vec::new();
+                read.read_to_end(&mut bytes).await.unwrap();
+                assert!(bytes.is_empty(), "a refused walk writes no root");
+            } else if local_is_lower {
                 assert_eq!(task.running[&exchange_key].id, 777);
                 assert!(task.running[&exchange_key].opened);
                 assert!(matches!(
@@ -1308,11 +1316,8 @@ async fn riblt_runtime_simultaneous_open_tie_break_preserves_winners_explicit_al
                 assert_ne!(task.running[&exchange_key].id, 777);
                 let first = receive_frame(&mut read).await;
                 assert!(
-                    match incoming {
-                        Algorithm::Prefix => matches!(first, Frame::Subtree { .. }),
-                        Algorithm::CachedRiblt => matches!(first, Frame::RibltRoot { .. }),
-                    },
-                    "incoming winner owns the algorithm despite opposite local preference"
+                    matches!(first, Frame::RibltRoot { .. }),
+                    "the incoming winner's two-way walk is cached RIBLT"
                 );
                 task.running.remove(&exchange_key);
                 assert!(matches!(
@@ -1326,7 +1331,9 @@ async fn riblt_runtime_simultaneous_open_tie_break_preserves_winners_explicit_al
 
 #[tokio::test(start_paused = true)]
 async fn riblt_runtime_task_retains_prefix_agreement_but_releases_cached_source_pin() {
-    for selected in [Algorithm::Prefix, Algorithm::CachedRiblt] {
+    // Two-way data walks are cached RIBLT only; one-way Prefix keeps its G
+    // (prefix_offer and walk tests).
+    for selected in [Algorithm::CachedRiblt] {
         let mut local = Node::new(211);
         let peer = Node::new(212).id();
         let collection = local.hold("riblt-no-retained-peer-source", open());
@@ -1345,10 +1352,6 @@ async fn riblt_runtime_task_retains_prefix_agreement_but_releases_cached_source_
             .walks
             .agreed
             .replace(&Entry::with_value(&agreement_key, source));
-        local.walks.algorithm = match selected {
-            Algorithm::Prefix => Algorithm::CachedRiblt,
-            Algorithm::CachedRiblt => Algorithm::Prefix,
-        };
         let health = local.health.clone();
         let net = SimNet::new(0xC014, SimConfig::default());
         let harness = net.join(&local.key);

@@ -34,7 +34,6 @@ fn bring_up(net: &SimNet, key: &SigningKey, store: MemoryRepo) -> Peer<MemoryRep
     tokio::task::spawn_local(host::run_host(
         net.join(key),
         PeerConfig {
-            walk_algorithm: Default::default(),
             daemon: None,
             // This test measures repair recovery, not the timing of provider
             // publication.

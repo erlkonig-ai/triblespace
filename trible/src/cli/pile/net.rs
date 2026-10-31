@@ -69,21 +69,6 @@ impl From<ReplicationArg> for ReplicationMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub(crate) enum WalkAlgorithmArg {
-    Prefix,
-    CachedRiblt,
-}
-
-impl From<WalkAlgorithmArg> for triblespace_net::walk_stream::Algorithm {
-    fn from(value: WalkAlgorithmArg) -> Self {
-        match value {
-            WalkAlgorithmArg::Prefix => Self::Prefix,
-            WalkAlgorithmArg::CachedRiblt => Self::CachedRiblt,
-        }
-    }
-}
-
 #[derive(Parser)]
 pub enum Command {
     /// Show this node's network identity.
@@ -219,11 +204,6 @@ pub enum Command {
         /// Retries and renewals consume the same budget as first publication.
         #[arg(long, value_name = "ATTEMPTS")]
         provider_publication_budget: Option<u64>,
-        /// Opening preference for mutually authorized peers; inbound streams may
-        /// choose either supported algorithm. One-way authorization uses prefix;
-        /// cache exhaustion is an exchange failure.
-        #[arg(long, value_enum, default_value = "cached-riblt")]
-        walk_algorithm: WalkAlgorithmArg,
         /// Publish local, timestamped swarm-health observations using the node key.
         /// The health collection is not automatically activated for sync.
         #[arg(long)]
@@ -297,7 +277,6 @@ pub fn run(command: Command) -> Result<()> {
             key,
             replication,
             provider_publication_budget,
-            walk_algorithm,
             health,
             health_collection,
             telemetry,
@@ -309,7 +288,6 @@ pub fn run(command: Command) -> Result<()> {
             key,
             replication.into(),
             provider_publication_budget,
-            walk_algorithm.into(),
             health,
             health_collection,
             telemetry,
@@ -516,7 +494,6 @@ fn run_sync(
     key_path: Option<PathBuf>,
     replication: ReplicationMode,
     provider_publication_budget: Option<u64>,
-    walk_algorithm: triblespace_net::walk_stream::Algorithm,
     health: bool,
     health_collection_value: Option<String>,
     telemetry_options: telemetry::Options,
@@ -588,7 +565,6 @@ fn run_sync(
         pile,
         key.clone(),
         PeerConfig {
-            walk_algorithm,
             // This is the daemon others contact first.
             daemon: None,
             provider_publication_budget,
@@ -1127,7 +1103,6 @@ mod tests {
             super::open_pile(&daemon_path, None).unwrap(),
             key.clone(),
             PeerConfig {
-                walk_algorithm: Default::default(),
                 daemon: None,
                 provider_publication_budget: Some(0),
                 // One loopback socket on a port the system picks.
@@ -1154,7 +1129,6 @@ mod tests {
             super::open_pile(&reader_path, None).unwrap(),
             SigningKey::from_bytes(&[0x52; 32]),
             PeerConfig {
-                walk_algorithm: Default::default(),
                 daemon: Some(key.verifying_key()),
                 provider_publication_budget: Some(0),
                 bind: None,
@@ -1385,43 +1359,17 @@ mod tests {
     }
 
     #[test]
-    fn walk_algorithm_defaults_to_cached_riblt_and_preserves_explicit_selection() {
-        for (args, expected) in [
-            (
-                vec!["net", "sync", "test.pile"],
-                triblespace_net::walk_stream::Algorithm::CachedRiblt,
-            ),
-            (
-                vec!["net", "sync", "test.pile", "--walk-algorithm", "prefix"],
-                triblespace_net::walk_stream::Algorithm::Prefix,
-            ),
-            (
-                vec![
-                    "net",
-                    "sync",
-                    "test.pile",
-                    "--walk-algorithm",
-                    "cached-riblt",
-                ],
-                triblespace_net::walk_stream::Algorithm::CachedRiblt,
-            ),
-        ] {
-            let Command::Sync { walk_algorithm, .. } = Command::try_parse_from(args).unwrap()
-            else {
-                panic!("expected sync");
-            };
-            assert_eq!(
-                triblespace_net::walk_stream::Algorithm::from(walk_algorithm),
-                expected
-            );
+    fn sync_has_no_walk_algorithm_option() {
+        assert!(Command::try_parse_from(["net", "sync", "test.pile"]).is_ok());
+        for algorithm in ["prefix", "cached-riblt"] {
+            assert!(Command::try_parse_from([
+                "net",
+                "sync",
+                "test.pile",
+                "--walk-algorithm",
+                algorithm
+            ])
+            .is_err());
         }
-        assert!(Command::try_parse_from([
-            "net",
-            "sync",
-            "test.pile",
-            "--walk-algorithm",
-            "unknown"
-        ])
-        .is_err());
     }
 }

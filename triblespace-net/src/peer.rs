@@ -1160,7 +1160,6 @@ mod tests {
 
     fn foreground_config() -> PeerConfig {
         PeerConfig {
-            walk_algorithm: Default::default(),
             daemon: None,
             provider_publication_budget: Some(0),
             bind: None,

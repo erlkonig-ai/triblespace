@@ -71,13 +71,11 @@ pub(crate) type ActiveCollections = PATCH<32, IdentitySchema>;
 /// selection, not configuration, and whom it syncs with comes from the
 /// pile too: the keys its records and grants name, then the DHT those peers
 /// seed.
+///
+/// How a collection tree is walked is not configured either: the directions
+/// decide it (cached RIBLT both ways, Prefix one way; see the `walk` module).
 #[derive(Clone)]
 pub struct PeerConfig {
-    /// Opening preference for mutually authorized exchanges. Incoming streams
-    /// may explicitly select either supported algorithm. One-way
-    /// authorization always uses Prefix; cached symmetric cells would reveal
-    /// the receive-only side's private holdings.
-    pub walk_algorithm: crate::walk_stream::Algorithm,
     /// The key of this pile's sync daemon: the key its configuration is
     /// written under, which the daemon runs as. A process whose pile names
     /// no peer reaches the DHT through it. Its first lookup dials the
@@ -1215,7 +1213,7 @@ async fn host_loop<T: Transport, R>(
     let (walks, received, walked) = crate::walk::spawn(
         connections.clone(),
         wiring.snapshot.clone(),
-        crate::walk::Walks::new(wiring.health.clone()).with_algorithm(config.walk_algorithm),
+        crate::walk::Walks::new(wiring.health.clone()),
         wiring.lander.clone(),
     );
     let provider_client = ProviderClient {

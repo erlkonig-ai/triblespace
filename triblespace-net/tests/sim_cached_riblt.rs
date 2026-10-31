@@ -29,7 +29,7 @@ use triblespace_net::reconcile::ReplicationMode;
 use triblespace_net::transport::sim::{Crossed, SimConfig, SimNet, Taps};
 use triblespace_net::transport::{Harness, Transport};
 use triblespace_net::walk_stream::{
-    Algorithm, FRAME_DONE, FRAME_LANDED, FRAME_RIBLT_CELL, FRAME_RIBLT_ROOT, FRAME_SUBTREE,
+    FRAME_DONE, FRAME_LANDED, FRAME_OPEN, FRAME_RIBLT_CELL, FRAME_RIBLT_ROOT, FRAME_SUBTREE,
     FRAME_VALUE, FRAME_VALUE_REQUEST,
 };
 
@@ -120,14 +120,12 @@ fn host<T: Transport>(
     harness: Harness<T>,
     signer: &SigningKey,
     store: MemoryRepo,
-    algorithm: Algorithm,
 ) -> Peer<MemoryRepo> {
     let (sender, receiver, wiring) =
         host::wire(EndpointId::from_bytes(&signer.verifying_key().to_bytes()).unwrap());
     tokio::task::spawn_local(host::run_host(
         harness,
         PeerConfig {
-            walk_algorithm: algorithm,
             daemon: None,
             provider_publication_budget: Some(0),
             bind: None,
@@ -297,8 +295,8 @@ fn cached_riblt_two_hosts_land_records_auth_and_held_blobs_then_reconnect() {
         grant(&mut a_store, &a_key, collection, 173);
         grant(&mut b_store, &b_key, collection, 174);
         let (a_harness, taps) = net.tap(&a_key);
-        let mut a = host(a_harness, &a_key, a_store, Algorithm::CachedRiblt);
-        let mut b = host(net.join(&b_key), &b_key, b_store, Algorithm::CachedRiblt);
+        let mut a = host(a_harness, &a_key, a_store);
+        let mut b = host(net.join(&b_key), &b_key, b_store);
         a.activate_collection(collection);
         b.activate_collection(collection);
         a.set_replication(ReplicationMode::Full, [collection]);
@@ -367,8 +365,11 @@ fn cached_riblt_two_hosts_land_records_auth_and_held_blobs_then_reconnect() {
     });
 }
 
+/// Two hosts that each read and write the collection, with no configuration
+/// at all: every data walk either of them opens is cached RIBLT, and no
+/// Prefix frame crosses outside grant walks.
 #[test]
-fn cached_riblt_and_prefix_preferences_interoperate_on_explicit_incoming_selection() {
+fn two_way_hosts_without_configuration_walk_data_only_as_cached_riblt() {
     run(async |clock| {
         let net = SimNet::new(0xCACE_0032, SimConfig::default());
         let (a_key, b_key) = (key(181), key(182));
@@ -386,8 +387,8 @@ fn cached_riblt_and_prefix_preferences_interoperate_on_explicit_incoming_selecti
         commit(&mut a_store, &a_key, collection, 1);
         commit(&mut b_store, &b_key, collection, 2);
         let (harness, taps) = net.tap(&a_key);
-        let mut a = host(harness, &a_key, a_store, Algorithm::CachedRiblt);
-        let mut b = host(net.join(&b_key), &b_key, b_store, Algorithm::Prefix);
+        let mut a = host(harness, &a_key, a_store);
+        let mut b = host(net.join(&b_key), &b_key, b_store);
         a.activate_collection(collection);
         b.activate_collection(collection);
         until(&clock, 240, || {
@@ -397,13 +398,38 @@ fn cached_riblt_and_prefix_preferences_interoperate_on_explicit_incoming_selecti
                 && confirmed(&b, a_id, collection, 2, 0)
         })
         .await;
-        // Periodic walks originate on both hosts; an incoming explicit profile
-        // is honored independently of the recipient's locally opened preference.
+        // Periodic walks originate on both hosts: wait until each side has
+        // opened data walks, then check every data walk stream.
         until(&clock, 240, || {
-            let frames = taps.since(0, b_id, TAG_WALK);
-            frames.iter().any(|frame| frame.kind == FRAME_RIBLT_ROOT)
-                && frames.iter().any(|frame| frame.kind == FRAME_SUBTREE)
+            let frames = component_frames(&taps, 0, b_id);
+            [true, false].into_iter().all(|sent| {
+                frames
+                    .iter()
+                    .any(|frame| frame.kind == FRAME_OPEN && frame.sent == sent)
+            })
         })
         .await;
+        let frames = component_frames(&taps, 0, b_id);
+        let mut streams: Vec<u64> = frames
+            .iter()
+            .filter(|frame| frame.kind == FRAME_OPEN)
+            .map(|frame| frame.stream)
+            .collect();
+        streams.sort_unstable();
+        streams.dedup();
+        assert!(streams.len() >= 2);
+        for stream in streams {
+            let frames: Vec<_> = frames.iter().filter(|frame| frame.stream == stream).collect();
+            assert!(
+                frames.iter().all(|frame| !matches!(
+                    frame.kind,
+                    FRAME_SUBTREE | FRAME_DONE | FRAME_LANDED | FRAME_VALUE_REQUEST
+                )),
+                "a two-way data walk carries no Prefix frame: {frames:?}"
+            );
+        }
+        let (roots, _, _, requests) = walk_counts(&taps, 0, b_id);
+        assert!(roots > 0, "cached discovery ran");
+        assert_eq!(requests, 0);
     });
 }

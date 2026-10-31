@@ -6,8 +6,31 @@ use crate::exchange::Failure;
 use crate::walk_stream::Algorithm;
 use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, HeldStore};
 
+/// Captured log output of the current thread while `f` runs.
+fn logged(f: impl FnOnce()) -> String {
+    #[derive(Clone, Default)]
+    struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Buffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let buffer = Buffer::default();
+    let writer = buffer.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+    String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap()
+}
+
 #[test]
-fn default_two_way_walks_use_cached_riblt_and_explicit_prefix_still_works() {
+fn two_way_walks_are_cached_riblt_without_configuration() {
     let mut local = Node::new(181);
     let peer = Node::new(182);
     let collection = local.hold("default two-way selection", open());
@@ -19,26 +42,19 @@ fn default_two_way_walks_use_cached_riblt_and_explicit_prefix_still_works() {
     walks.observe(local.snapshot());
 
     for kind in [WalkKind::Commit, WalkKind::Derive, WalkKind::References] {
+        let exchange = walks.start(peer.id(), collection, kind).unwrap();
+        assert_eq!(exchange.algorithm(), Algorithm::CachedRiblt);
+        assert_eq!(exchange.offer_role(), None);
         assert_eq!(
             walks
-                .start(peer.id(), collection, kind)
+                .start_incoming(peer.id(), collection, kind, Algorithm::CachedRiblt, None)
                 .unwrap()
                 .algorithm(),
             Algorithm::CachedRiblt,
         );
-        for requested in [Algorithm::Prefix, Algorithm::CachedRiblt] {
-            assert_eq!(
-                walks
-                    .start_selected(peer.id(), collection, kind, Some(requested))
-                    .unwrap()
-                    .algorithm(),
-                requested,
-                "incoming explicit selection is independent of the opening default",
-            );
-        }
     }
 
-    // Grant walks are Prefix only, whatever the default or the request.
+    // Grant walks are Prefix, the deliberate exception (grant_walk_tests).
     assert_eq!(
         walks
             .start(peer.id(), collection, WalkKind::Authorization)
@@ -46,37 +62,44 @@ fn default_two_way_walks_use_cached_riblt_and_explicit_prefix_still_works() {
             .algorithm(),
         Algorithm::Prefix,
     );
-    assert!(
-        walks
-            .start_selected(
-                peer.id(),
-                collection,
-                WalkKind::Authorization,
-                Some(Algorithm::CachedRiblt),
-            )
-            .is_none()
-    );
+}
 
-    let prefix = walks.with_algorithm(Algorithm::Prefix);
-    assert_eq!(
-        prefix
-            .start(peer.id(), collection, WalkKind::Commit)
-            .unwrap()
-            .algorithm(),
-        Algorithm::Prefix,
-    );
-    assert_eq!(
-        prefix
-            .start_selected(
-                peer.id(),
-                collection,
-                WalkKind::Commit,
-                Some(Algorithm::CachedRiblt),
-            )
-            .unwrap()
-            .algorithm(),
-        Algorithm::CachedRiblt,
-    );
+#[test]
+fn an_incoming_two_way_prefix_walk_of_data_is_refused_and_logged() {
+    let mut local = Node::new(185);
+    let peer = Node::new(186);
+    let collection = local.hold("two-way prefix refused", open());
+    local.commit(collection, 3);
+    local.store.track_held([collection]);
+    local.observe();
+    let mut walks = Walks::new(local.health.clone());
+    walks.observe(local.snapshot());
+
+    for kind in [WalkKind::Commit, WalkKind::Derive, WalkKind::References] {
+        let mut joined = None;
+        let log = logged(|| {
+            joined = Some(
+                walks
+                    .start_incoming(peer.id(), collection, kind, Algorithm::Prefix, None)
+                    .is_some(),
+            );
+        });
+        assert_eq!(joined, Some(false), "{kind:?}: two-way Prefix of data is refused");
+        assert!(
+            log.contains("refused walk: two-way Prefix of a data tree"),
+            "{kind:?}: the refusal is logged: {log:?}"
+        );
+    }
+
+    // A grant walk asking for the same profile is joined as before.
+    let log = logged(|| {
+        assert!(
+            walks
+                .start_incoming(peer.id(), collection, WalkKind::Authorization, Algorithm::Prefix, None)
+                .is_some()
+        );
+    });
+    assert!(!log.contains("refused walk"));
 }
 
 #[test]

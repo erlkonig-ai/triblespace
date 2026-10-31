@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+- `pile net sync` drops `--walk-algorithm`: the directions decide each data
+  walk (cached RIBLT both ways, Prefix one way), and the daemon speaks
+  `/triblespace/pile-sync/35`, which refuses a two-way Prefix walk of data.
+  A command line that still passes `--walk-algorithm` fails to parse.
+
 ### Changed
 
 - Native applications can inspect and prepare a fresh pile through

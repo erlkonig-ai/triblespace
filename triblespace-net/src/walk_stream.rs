@@ -21,9 +21,13 @@
 //!
 //! A kind or OPEN walk kind not understood is skipped. A known payload must
 //! decode completely and canonically; malformed frames end only the exchange.
-//! Unknown OPEN algorithms are refused. Prefix=0 and CachedRiblt=1 are separate
-//! explicit ALPN33 algorithms. Prefix offer profiles 2/3 additionally bind the
-//! opener's send/receive-only role; profile 0 always remains pull Prefix.
+//! Unknown OPEN algorithms are refused. Under ALPN35 the profile byte names
+//! the walk the directions already decided, never a choice: 1 (CachedRiblt)
+//! is a two-way data walk; 2/3 (Prefix offer, opener sends/receives) is a
+//! one-way COMMIT or DERIVE walk; 0 (pull Prefix, no offer role) is a grant
+//! walk, or a one-way References walk. Profile 0 on COMMIT or DERIVE, and on
+//! References where the receiver both sends and receives, would be a two-way
+//! Prefix walk of data and is refused (`walk::Walks::start_incoming`).
 //! This is not an old-wire compatibility negotiation.
 //! Cached RIBLT derives its checksum key from OPEN locally; ROOT is exactly
 //! 40 payload bytes. DONE/LANDED belong only to Prefix. Cached completion uses
@@ -47,15 +51,14 @@ pub const FRAME_RIBLT_ROOT: u8 = 0x09;
 pub const FRAME_RIBLT_CELL: u8 = 0x0a;
 pub const FRAME_HAVE: u8 = 0x0b;
 
-/// Explicit ALPN33 discovery profile. CachedRiblt is the default for mutually
-/// authorized peers. Prefix remains selectable and is required
-/// when either direction lacks collection READ authority. Unknown profiles are
-/// refused, never interpreted as Prefix or as successful cache exhaustion.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum Algorithm {
+/// The discovery profile an OPEN names. It is derived, never configured: a
+/// data tree walked both ways is CachedRiblt, one walked one way and every
+/// grant walk is Prefix. Unknown profiles are refused, never interpreted as
+/// Prefix or as successful cache exhaustion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Algorithm {
     Prefix,
     /// Exact raw32 SipHash24/mapping recipe documented in riblt_cache.
-    #[default]
     CachedRiblt,
 }
 
@@ -274,8 +277,7 @@ mod tests {
     use crate::recon::MAX_RECON_FRAME_BYTES;
 
     #[test]
-    fn default_is_cached_riblt_without_changing_explicit_wire_selection() {
-        assert_eq!(Algorithm::default(), Algorithm::CachedRiblt);
+    fn profile_bytes_are_unchanged() {
         assert_eq!(Algorithm::Prefix.wire(None), 0);
         assert_eq!(Algorithm::CachedRiblt.wire(None), 1);
         assert_eq!(Algorithm::read(0), Ok((Algorithm::Prefix, None)));

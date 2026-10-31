@@ -33,7 +33,7 @@ fn prefix_offer_open_roles_roundtrip_and_reject_wrong_components() {
 }
 
 #[test]
-fn prefix_offer_open_role_mismatch_refused_and_pull_never_infers_eager() {
+fn prefix_offer_open_role_mismatch_and_data_pull_are_refused() {
     for receive_only in [false, true] {
         let mut local = Node::new(221);
         let peer = Node::new(222);
@@ -76,14 +76,12 @@ fn prefix_offer_open_role_mismatch_refused_and_pull_never_infers_eager() {
                 )
                 .unwrap();
             assert_eq!(accepted.offer_role(), Some(wrong));
-            let pull = local
-                .walks
-                .start_incoming(peer.id(), collection, kind, Algorithm::Prefix, None)
-                .unwrap();
-            assert_eq!(
-                pull.offer_role(),
-                None,
-                "wire mode 0 never infers eager acceptance"
+            assert!(
+                local
+                    .walks
+                    .start_incoming(peer.id(), collection, kind, Algorithm::Prefix, None)
+                    .is_none(),
+                "profile 0 on COMMIT/DERIVE asks for two-way Prefix and is refused"
             );
             assert!(
                 local

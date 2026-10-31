@@ -11,6 +11,13 @@
 //! for a peer when a connection to it closes, and for a collection when it
 //! is deselected; none is persisted.
 //!
+//! Which walk a data tree (COMMIT, DERIVE, References) takes follows from the
+//! directions alone, and nothing configures it: where this side both sends to
+//! and receives from the peer it is cached RIBLT (the `cached` driver module),
+//! where it only sends or only receives it is the one-way Prefix walk above
+//! (an offer, for COMMIT and DERIVE). A two-way Prefix walk of a data tree is
+//! neither opened nor joined.
+//!
 //! The kinds of tree are the collection's records and the blobs it holds, as
 //! handles without values, and the grants over any resource R (keyed by
 //! proof id under R) from the grant index: a held reference a side lacks is
@@ -233,7 +240,6 @@ pub(crate) enum Event {
 /// collection and kind, and whether each neighbour is sent or received
 /// from.
 pub(crate) struct Walks<R> {
-    algorithm: crate::walk_stream::Algorithm,
     health: Health,
     snapshot: Option<StoreSnapshot<R>>,
     /// The collections the last snapshot selected: one that leaves the
@@ -244,20 +250,26 @@ pub(crate) struct Walks<R> {
     agreed: PATCH<65, IdentitySchema, Arc<Tree>>,
 }
 
+/// Log an incoming OPEN that asks for a two-way Prefix walk of a data tree,
+/// which is refused: two-way data walks are cached RIBLT, decided by the
+/// directions alone.
+fn refuse_bilateral_prefix(peer: PeerId, collection: CollectionHandle, kind: WalkKind) {
+    tracing::warn!(
+        peer = %hex::encode(&peer[..8]),
+        collection = %hex::encode(&collection.raw[..8]),
+        ?kind,
+        "refused walk: two-way Prefix of a data tree; two-way data walks are cached RIBLT"
+    );
+}
+
 impl<R: BlobStoreGet + Clone> Walks<R> {
     pub(crate) fn new(health: Health) -> Self {
         Self {
             health,
-            algorithm: crate::walk_stream::Algorithm::default(),
             snapshot: None,
             selected: PATCH::new(),
             agreed: PATCH::new(),
         }
-    }
-
-    pub(crate) fn with_algorithm(mut self, algorithm: crate::walk_stream::Algorithm) -> Self {
-        self.algorithm = algorithm;
-        self
     }
 
     /// Start an exchange of C's `kind` tree with `peer`, against what they
@@ -265,26 +277,23 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
     /// sends C to the peer nor receives C from it, or `kind` is
     /// [`WalkKind::References`] and C's held set is unknown here (an incoming
     /// exchange is refused alike). [`Walks::ended`] ends it.
+    ///
+    /// The directions alone choose the walk of a data tree, and nothing
+    /// configures it: both ways is cached RIBLT, one way is the Prefix offer
+    /// (References: Prefix without an offer role). Grant walks are Prefix.
     pub(crate) fn start(
         &self,
         peer: PeerId,
         collection: CollectionHandle,
         kind: WalkKind,
     ) -> Option<Exchange<R>> {
-        self.start_selected(peer, collection, kind, None)
-    }
-
-    pub(crate) fn start_selected(
-        &self,
-        peer: PeerId,
-        collection: CollectionHandle,
-        kind: WalkKind,
-        requested: Option<crate::walk_stream::Algorithm>,
-    ) -> Option<Exchange<R>> {
         if kind == WalkKind::Authorization {
-            if requested == Some(crate::walk_stream::Algorithm::CachedRiblt) {
-                return None;
-            }
+            // Grants are the one deliberate Prefix exception for a two-way
+            // exchange, a current choice: the grant Prefix walk consumes the
+            // incrementally maintained, structurally shared grant PATCH
+            // directly, and the grant path has no prepared-cell integration
+            // of the kind data RIBLT uses (the data cell cache). A reasoned
+            // constant, not a configuration point.
             let (pinned, peered) = self.grant_pin(peer, collection)?;
             let sends = self.participates(peer, collection);
             let exchange = if sends {
@@ -302,29 +311,25 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
         if !sends && !receives {
             return None;
         }
-        if requested == Some(crate::walk_stream::Algorithm::CachedRiblt) && !(sends && receives) {
-            return None;
+        if sends && receives {
+            return Some(Exchange::start_riblt(collection, kind, pinned));
         }
         let agreed = self
             .agreed
             .get(&agreed_key(peer, collection.raw, kind))
             .cloned();
-        Some(
-            if sends
-                && receives
-                && requested.unwrap_or(self.algorithm) == crate::walk_stream::Algorithm::CachedRiblt
-            {
-                Exchange::start_riblt(collection, kind, pinned)
-            } else if sends != receives {
-                Exchange::start_one_way(collection, kind, pinned, agreed, sends, receives)
-            } else {
-                Exchange::start(collection, kind, pinned, agreed, sends, receives)
-            },
-        )
+        Some(Exchange::start_one_way(
+            collection, kind, pinned, agreed, sends, receives,
+        ))
     }
 
     /// OPEN commits to the body protocol before driver registration. Ordinary
     /// Prefix never infers eager acceptance from our local authorization view.
+    ///
+    /// A data tree walk follows the directions, never the opener's choice:
+    /// cached RIBLT both ways, the Prefix offer one way, and References one
+    /// way as profile 0. Profile 0 that would be a two-way Prefix walk of
+    /// data is refused, and the refusal logged: neither side may pick it.
     fn start_incoming(
         &self,
         peer: PeerId,
@@ -335,7 +340,8 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
     ) -> Option<Exchange<R>> {
         use crate::walk_stream::{Algorithm, OfferRole};
         if kind == WalkKind::Authorization {
-            // Prefix only. The opener's role decides the direction: an
+            // Prefix only, the deliberate exception (see `Walks::start`).
+            // The opener's role decides the direction: an
             // opener that only receives is joined by a sender, or refused.
             if algorithm != Algorithm::Prefix {
                 return None;
@@ -354,6 +360,10 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
             };
             return Some(exchange.peered(peered));
         }
+        if (algorithm, offer) == (Algorithm::Prefix, None) && kind != WalkKind::References {
+            refuse_bilateral_prefix(peer, collection, kind);
+            return None;
+        }
         self.selected.get(&collection.raw)?;
         let pinned = self.exchangeable(collection, kind)?;
         let reader = self.snapshot.as_ref()?.store();
@@ -370,9 +380,14 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
             (Algorithm::CachedRiblt, None) if sends && receives => {
                 Some(Exchange::start_riblt(collection, kind, pinned))
             }
-            (Algorithm::Prefix, None) => Some(Exchange::start(
+            // References carry no offer role: profile 0 is their one-way walk.
+            (Algorithm::Prefix, None) if sends != receives => Some(Exchange::start(
                 collection, kind, pinned, agreed, sends, receives,
             )),
+            (Algorithm::Prefix, None) => {
+                refuse_bilateral_prefix(peer, collection, kind);
+                None
+            }
             (Algorithm::Prefix, Some(role))
                 if kind != WalkKind::References
                     && match role {
@@ -448,8 +463,8 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
         if ended.retain_agreement {
             self.agreed.replace(&Entry::with_value(&key, agreed));
         } else {
-            // Cached mode never subtracts G. A prior Prefix agreement is also
-            // released once this explicitly selected whole-source walk ends.
+            // Cached mode never subtracts G. A prior one-way Prefix agreement
+            // is also released once a two-way whole-source walk ends.
             self.agreed.remove(&key);
         }
         moved
@@ -1920,6 +1935,23 @@ async fn write_stream_inner(
 #[path = "walk_cached.rs"]
 mod cached;
 
+#[cfg(test)]
+impl<R: BlobStoreGet + Clone> Walks<R> {
+    /// [`Walks::start`], kept only where it starts the `requested` walk.
+    pub(crate) fn start_selected(
+        &self,
+        peer: PeerId,
+        collection: CollectionHandle,
+        kind: WalkKind,
+        requested: Option<crate::walk_stream::Algorithm>,
+    ) -> Option<Exchange<R>> {
+        let exchange = self.start(peer, collection, kind)?;
+        requested
+            .is_none_or(|requested| requested == exchange.algorithm())
+            .then_some(exchange)
+    }
+}
+
 #[cfg(all(test, feature = "sim"))]
 #[path = "riblt_runtime_tests.rs"]
 mod riblt_runtime_tests;
@@ -1999,9 +2031,7 @@ pub(crate) mod tests {
                     .collection(CONFIG_COLLECTION_NAME, private_policy(key.verifying_key()))
                     .unwrap();
                 Self {
-                    // This shared fixture exercises the Prefix exchange.
-                    walks: Walks::new(health.clone())
-                        .with_algorithm(crate::walk_stream::Algorithm::Prefix),
+                    walks: Walks::new(health.clone()),
                     health,
                     key,
                     store,
@@ -2324,8 +2354,14 @@ pub(crate) mod tests {
 
     #[test]
     fn a_failed_exchange_forgets_an_already_agreed_tree() {
+        // Agreement is kept by one-way Prefix walks only: this side sends,
+        // the peer may read but not write.
         let mut node = Node::new(98);
-        let collection = node.hold("forget after failure", open());
+        let policy = triblespace_core::collection::CollectionPolicy::new(
+            triblespace_core::collection::AdmissionPolicy::Open,
+            triblespace_core::collection::AdmissionPolicy::direct(node.key.verifying_key()),
+        );
+        let collection = node.hold("forget after failure", policy);
         node.commit(collection, 1);
         node.observe();
         let peer = Node::new(99).id();
@@ -2339,7 +2375,7 @@ pub(crate) mod tests {
             Ended {
                 retain_agreement: true,
                 sends: true,
-                receives: true,
+                receives: false,
                 confirmed: true,
                 landed: true,
                 root,
@@ -2352,6 +2388,10 @@ pub(crate) mod tests {
             crate::clock::mono_now(),
         );
         let mut exchange = node.walks.start(peer, collection, kind).unwrap();
+        assert_eq!(
+            exchange.offer_role(),
+            Some(crate::walk_stream::OfferRole::Send)
+        );
         assert!(
             node.walks
                 .agreed
@@ -2414,7 +2454,10 @@ pub(crate) mod tests {
         use crate::landing::Land;
         use crate::protocol::{TAG_BLOB, TAG_WALK, serve_get_blob};
         use crate::transport::sim::{Crossed, SimConfig, SimNet, Tapped, Taps};
-        use crate::walk_stream::{FRAME_DONE, FRAME_LANDED, FRAME_OPEN, FRAME_VALUE_REQUEST};
+        use crate::walk_stream::{
+            FRAME_DONE, FRAME_HAVE, FRAME_LANDED, FRAME_OPEN, FRAME_RIBLT_CELL, FRAME_RIBLT_ROOT,
+            FRAME_SUBTREE, FRAME_VALUE, FRAME_VALUE_REQUEST,
+        };
 
         // Test-only classifications decoded from the actual uniform payload,
         // not wire kinds. This keeps root/branch/key assertions distinct.
@@ -2645,8 +2688,7 @@ pub(crate) mod tests {
                         accepting.accept(incoming.conn);
                     }
                 });
-                let walks = Walks::new(node.health.clone())
-                    .with_algorithm(crate::walk_stream::Algorithm::Prefix);
+                let walks = Walks::new(node.health.clone());
                 let lander = Arc::new(Lander {
                     node: Mutex::new(node),
                     snapshots,
@@ -2665,7 +2707,8 @@ pub(crate) mod tests {
                 }
             }
 
-            /// Open a scripted stream for C's records from `peer`; the
+            /// Open a scripted stream for C's records from `peer`, which
+            /// offers them one way (profile 2, the opener sends); the
             /// opener's halves, and where the task's reset of it is noted.
             fn open(
                 &self,
@@ -2684,7 +2727,7 @@ pub(crate) mod tests {
                     collection,
                     WalkKind::Commit,
                     crate::walk_stream::Algorithm::Prefix,
-                    None,
+                    Some(crate::walk_stream::OfferRole::Send),
                     Box::new(Tx(send, reset.clone())),
                     Box::new(Rx(recv, reset.clone())),
                 );
@@ -2864,7 +2907,8 @@ pub(crate) mod tests {
 
         /// A sender holding `blobs` in C, served `pause` apart in `piece`s,
         /// and an empty receiver, connected: the sender, its references
-        /// root and the handles held.
+        /// root and the handles held. C goes one way, sender to receiver,
+        /// so its References walk is Prefix (profile 0) with DONE/LANDED.
         fn holding(
             net: &SimNet,
             bytes: (u8, u8),
@@ -2879,7 +2923,9 @@ pub(crate) mod tests {
             Node,
         ) {
             let mut sender = Node::new(bytes.0);
-            let collection = sender.hold("held", open());
+            let mut receiver = Node::new(bytes.1);
+            let policy = one_way(&sender, &receiver);
+            let collection = sender.hold("held", policy.clone());
             sender.store.track_held([collection]);
             let handles = blobs
                 .iter()
@@ -2908,8 +2954,7 @@ pub(crate) mod tests {
                 piece,
                 one_at_a_time: Arc::default(),
             });
-            let mut receiver = Node::new(bytes.1);
-            receiver.hold("held", open());
+            receiver.hold("held", policy);
             receiver.store.track_held([collection]);
             receiver.observe();
             (sender, collection, root, handles, receiver)
@@ -2958,13 +3003,21 @@ pub(crate) mod tests {
             None
         }
 
-        /// A scripted peer: stream `sender`'s whole records tree of C over
-        /// the stream, breadth first and heeding no announcement, leaving
-        /// out the leaf `omit` names; then answer value requests until the
-        /// task says everything landed or ends the stream, or `cut` values
-        /// were answered, sending LANDED for the task's own delta once its
-        /// DONE is in. Returns whether the task's LANDED came, and how many
-        /// value requests were heard.
+        /// The policy of a collection `writer` sends one way to `reader`:
+        /// only the reader reads, only the writer writes.
+        fn one_way(writer: &Node, reader: &Node) -> CollectionPolicy {
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(reader.key.verifying_key()),
+                AdmissionPolicy::direct(writer.key.verifying_key()),
+            )
+        }
+
+        /// A scripted one-way sender: offer `sender`'s whole records tree of
+        /// C over the stream as a real offer exchange would, leaving out the
+        /// leaf `omit` names (its announcement and its body), and taking
+        /// receipts as they come; stop once LANDED is in, the stream ends,
+        /// or `cut` bodies were written. Returns whether LANDED came, and
+        /// how many bodies were written.
         async fn stream(
             sender: &Node,
             collection: CollectionHandle,
@@ -2973,71 +3026,73 @@ pub(crate) mod tests {
             cut: usize,
             omit: Option<[u8; 32]>,
         ) -> (bool, usize) {
-            let kind = WalkKind::Commit;
-            let overlay = sender.serving().collection(collection).unwrap();
-            let overlay = overlay.repair();
-            let mut answered = 0;
-            let mut heard = 0;
-            let value = |key| Frame::Value {
-                key,
-                bytes: value(kind, overlay, key)
-                    .unwrap()
-                    .bytes(collection)
-                    .unwrap(),
-            };
-            let mut exchange = Exchange::<MemoryRepoSnapshot>::start(
+            let snapshot = sender.snapshot();
+            let mut exchange = Exchange::<MemoryRepoSnapshot>::start_one_way(
                 collection,
-                kind,
+                WalkKind::Commit,
                 sender.pinned(collection),
                 None,
                 true,
                 false,
             );
-            while let Some(frame) = exchange.next_delta() {
-                if let Frame::Subtree { prefix, .. } = &frame
-                    && prefix.len() == 32
-                    && omit == Some(prefix.as_slice().try_into().unwrap())
-                {
-                    continue;
-                }
-                write(send, frame).await;
-            }
+            let mut outbox = VecDeque::new();
+            let mut bodies = 0;
             loop {
-                match read(recv).await {
-                    Some(Frame::Landed) => return (true, heard),
-                    Some(Frame::ValueRequest { key }) => {
-                        heard += 1;
-                        if answered == cut {
-                            return (false, heard);
+                while let Some(frame) = outbox
+                    .pop_front()
+                    .or_else(|| exchange.next_body())
+                    .or_else(|| exchange.next_delta())
+                {
+                    let omitted = match &frame {
+                        Frame::Subtree { prefix, .. } => {
+                            prefix.len() == 32 && omit.is_some_and(|key| key[..] == prefix[..])
                         }
-                        answered += 1;
-                        // A request read after the task ended the exchange
-                        // can no longer be answered.
-                        if !try_write(send, value(key)).await {
-                            return (false, heard);
+                        Frame::Value { key, .. } => omit == Some(*key),
+                        _ => false,
+                    };
+                    if omitted {
+                        continue;
+                    }
+                    if matches!(frame, Frame::Value { .. }) {
+                        if bodies == cut {
+                            return (false, bodies);
+                        }
+                        bodies += 1;
+                    }
+                    if !try_write(send, frame).await {
+                        return (false, bodies);
+                    }
+                }
+                let Some(frame) = read(recv).await else {
+                    return (false, bodies);
+                };
+                let landed = frame == Frame::Landed;
+                for out in exchange.on_frame(frame, Some(snapshot.clone())) {
+                    if let Out::Send(frame) = out {
+                        outbox.push_back(frame);
+                    }
+                }
+                if landed {
+                    while let Some(frame) = outbox.pop_front() {
+                        if !try_write(send, frame).await {
+                            return (false, bodies);
                         }
                     }
-                    Some(Frame::Done) => {
-                        if !try_write(send, Frame::Landed).await {
-                            return (false, heard);
-                        }
-                    }
-                    Some(Frame::Subtree { .. }) => {}
-                    Some(other) => panic!("waiting for Landed: {other:?}"),
-                    None => return (false, heard),
+                    return (true, bodies);
                 }
             }
         }
 
-        /// A stream from an admitted peer lands through the landing task and
-        /// ends with both LANDEDs and a finished stream; one from a peer the
-        /// task neither sends to nor receives from is refused.
+        /// A one-way stream from an admitted peer lands through the landing
+        /// task and ends with both LANDEDs and a finished stream; one from a
+        /// peer the task neither sends to nor receives from is refused.
         #[tokio::test]
         async fn an_incoming_stream_lands_through_the_task_or_is_refused() {
             let mut sender = Node::new(50);
             let mut receiver = Node::new(51);
-            let collection = sender.hold("stream", open());
-            receiver.hold("stream", open());
+            let policy = one_way(&sender, &receiver);
+            let collection = sender.hold("stream", policy.clone());
+            receiver.hold("stream", policy);
             let owner = Node::new(52);
             let private = CollectionPolicy::new(
                 AdmissionPolicy::direct(owner.key.verifying_key()),
@@ -3056,16 +3111,16 @@ pub(crate) mod tests {
             let mut receiving = Hosted::new(receiver, &SimNet::new(1, SimConfig::default()));
 
             let (mut send, mut recv, landed) = receiving.open(sender.id(), collection);
-            let (confirmed, heard) =
+            let (confirmed, bodies) =
                 stream(&sender, collection, &mut send, &mut recv, usize::MAX, None).await;
             assert!(confirmed);
-            assert_eq!(heard, 150, "the fifty held are not asked for");
+            assert!((150..=200).contains(&bodies), "{bodies} bodies");
             assert!(read(&mut recv).await.is_none(), "the stream finished");
             assert_eq!(*landed.lock().unwrap(), None);
             assert_eq!(receiving.records(collection), records);
             let health = receiving.health(collection, sender.id()).unwrap();
             assert!(health.receives.last_ok && health.receives.ok == 1);
-            assert!(health.pushes.last_ok && health.pushes.ok == 1);
+            assert_eq!(health.pushes.ok + health.pushes.failed, 0, "receive only");
             let root = summary(
                 WalkKind::Commit,
                 sender.serving().collection(collection).unwrap().repair(),
@@ -3089,13 +3144,13 @@ pub(crate) mod tests {
                 })
             );
 
-            // The same tree again: the root is held whole, and every node
-            // the scripted peer still streams is in flight waste.
+            // The same tree again: everything is held, and it confirms
+            // without landing anything new.
             let (mut send, mut recv, _) = receiving.open(sender.id(), collection);
-            let (confirmed, heard) =
+            let (confirmed, _) =
                 stream(&sender, collection, &mut send, &mut recv, usize::MAX, None).await;
             assert!(confirmed);
-            assert_eq!(heard, 0);
+            assert_eq!(receiving.records(collection), records);
 
             let (_send, _recv, refusal) = receiving.open(sender.id(), refused);
             assert_eq!(reset(&refusal).await, Some(RESET_WALK_REFUSED));
@@ -3109,8 +3164,9 @@ pub(crate) mod tests {
         async fn a_replaced_or_failed_stream_is_reset() {
             let mut sender = Node::new(53);
             let mut receiver = Node::new(54);
-            let collection = sender.hold("replaced", open());
-            receiver.hold("replaced", open());
+            let policy = one_way(&sender, &receiver);
+            let collection = sender.hold("replaced", policy.clone());
+            receiver.hold("replaced", policy);
             let records = (0..20)
                 .map(|data| sender.commit(collection, data))
                 .collect::<Vec<_>>();
@@ -3135,7 +3191,7 @@ pub(crate) mod tests {
 
             // The second streams every leaf but one.
             let omitted = records[0].fingerprint().raw();
-            let (confirmed, heard) = stream(
+            let (confirmed, bodies) = stream(
                 &sender,
                 collection,
                 &mut second,
@@ -3145,15 +3201,12 @@ pub(crate) mod tests {
             )
             .await;
             assert!(!confirmed);
+            assert_eq!(bodies, 19);
             assert_eq!(reset(&second_reset).await, Some(RESET_WALK_FAILED));
-            // Its value requests went out before the end failed it.
-            let mut requested = heard;
+            // The receiver never asks for a value in an offer.
             while let Some(frame) = read(&mut second_recv).await {
-                if matches!(frame, Frame::ValueRequest { .. }) {
-                    requested += 1;
-                }
+                assert!(!matches!(frame, Frame::ValueRequest { .. }));
             }
-            assert_eq!(requested, 19);
             for _ in 0..500 {
                 if receiving
                     .health(collection, sender.id())
@@ -3166,10 +3219,8 @@ pub(crate) mod tests {
             assert!(receiving.records(collection).len() < 20);
             let health = receiving.health(collection, sender.id()).unwrap();
             assert_eq!((health.receives.ok, health.receives.failed), (0, 1));
-            // The scripted peer already acknowledged our empty outgoing
-            // delta. Its omitted incoming leaf fails reception/agreement,
-            // not that independently successful directional write receipt.
-            assert_eq!((health.pushes.ok, health.pushes.failed), (1, 0));
+            // This side only receives: there is no push to count.
+            assert_eq!((health.pushes.ok, health.pushes.failed), (0, 0));
             assert!(!health.receives.last_ok);
         }
 
@@ -3206,11 +3257,29 @@ pub(crate) mod tests {
         }
 
         /// Two hosted nodes on a net with a fixed latency: `full` holds
-        /// `records` of C, `empty` none.
+        /// `records` of C, `empty` none. Both read and write C, so its data
+        /// walks are cached RIBLT.
         fn pair(
             seed: u64,
             bytes: (u8, u8),
             records: u64,
+        ) -> (
+            SimNet,
+            Hosted,
+            Hosted,
+            CollectionHandle,
+            Vec<CollectionRecord>,
+        ) {
+            pair_with(seed, bytes, records, false)
+        }
+
+        /// [`pair`], where with `one_way` only `full` writes C and only
+        /// `empty` reads it: its walks are the one-way Prefix offer.
+        fn pair_with(
+            seed: u64,
+            bytes: (u8, u8),
+            records: u64,
+            one_way: bool,
         ) -> (
             SimNet,
             Hosted,
@@ -3225,24 +3294,28 @@ pub(crate) mod tests {
                 },
             );
             let mut full = Node::new(bytes.0);
-            let collection = full.hold("pair", open());
+            let mut empty = Node::new(bytes.1);
+            let policy = if one_way {
+                self::one_way(&full, &empty)
+            } else {
+                open()
+            };
+            let collection = full.hold("pair", policy.clone());
             let records = (0..records)
                 .map(|data| full.commit(collection, data))
                 .collect::<Vec<_>>();
             full.observe();
             let full = Hosted::new(full, &net);
-            let mut empty = Node::new(bytes.1);
-            empty.hold("pair", open());
+            empty.hold("pair", policy);
             empty.observe();
             let empty = Hosted::new(empty, &net);
             (net, full, empty, collection, records)
         }
 
-        /// A first sync to an empty peer: the full side streams its whole
-        /// tree without waiting for anything, the empty side sends only its
-        /// ROOT, its DONE, a request per value and LANDED, and the full
-        /// side had written its last NODE before the first frame after the
-        /// empty side's ROOT arrived.
+        /// A first sync to an empty peer that reads and writes C: one cached
+        /// RIBLT exchange, in which the full side sends every record's body
+        /// once and unasked, and the empty side sends none, and no Prefix
+        /// frame crosses.
         #[tokio::test(start_paused = true)]
         async fn first_sync_to_an_empty_peer_streams_without_waiting() {
             let (_net, full, empty, collection, records) = pair(0x3A1E, (55, 56), 300);
@@ -3251,99 +3324,27 @@ pub(crate) mod tests {
             let health = full.exchange(empty.peer, collection, kind).await;
             assert!(health.pushes.last_ok, "{health:?}");
             assert_eq!((health.pushes.ok, health.pushes.failed), (1, 0));
-            assert_eq!(empty.records(collection).len(), 300);
+            assert_eq!(empty.records(collection).len(), records.len());
 
-            let crossed = walked(&full.taps, 0, empty.peer);
-            let (sent, heard) = split(&crossed);
-            assert_eq!(count(&heard, FRAME_ROOT), 1);
-            assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 300);
-            assert_eq!(count(&heard, FRAME_DONE), 1);
-            assert_eq!(count(&heard, FRAME_LANDED), 1);
-            assert_eq!(heard.len(), 303, "{heard:?}");
-            assert_eq!(count(&heard, FRAME_NODE) + count(&heard, FRAME_LEAF), 0);
-            let mut expected = Vec::new();
-            let pinned = full.lander.node.lock().unwrap().pinned(collection);
-            branches(pinned.repair().records().commits(), Vec::new(), &mut expected);
-            assert!(expected.len() > 1);
-            assert_eq!(
-                count(&sent, FRAME_ROOT) + count(&sent, FRAME_NODE),
-                expected.len()
-            );
-            assert_eq!(count(&sent, FRAME_LEAF), records.len());
-
-            // Zero waits. Stream data crosses the simulated transport
-            // without latency, so the tap's order is the two tasks'
-            // interleaving; the witness is a scripted empty peer that
-            // sends its ROOT and DONE and then reads nothing until the full
-            // side's DONE is in: the whole delta arrives before the peer
-            // sends anything else, which a side that waited for a reply
-            // could never finish.
-            let stranger = Node::new(57).id();
-            let before = full.health(collection, stranger);
-            let (mut send, mut recv, _) = full.open(stranger, collection);
-            write(
-                &mut send,
-                Frame::Subtree {
-                    prefix: Vec::new(),
-                    summary: PatchSummary::new(None, 0).unwrap(),
-                },
-            )
-            .await;
-            write(&mut send, Frame::Done).await;
-            let mut delta = Vec::new();
-            loop {
-                let frame = read(&mut recv).await.expect("the delta");
-                let done = frame == Frame::Done;
-                delta.push(frame);
-                if done {
-                    break;
+            let (sent, heard) = crossed(&full.taps, 0, empty.peer);
+            assert_eq!(count(&sent, FRAME_VALUE), records.len());
+            assert_eq!(count(&heard, FRAME_VALUE), 0);
+            assert_eq!(count(&sent, FRAME_RIBLT_ROOT), 1);
+            assert_eq!(count(&heard, FRAME_RIBLT_ROOT), 1);
+            assert!(count(&sent, FRAME_RIBLT_CELL) > 0);
+            for kinds in [&sent, &heard] {
+                for prefix_only in [
+                    FRAME_ROOT,
+                    FRAME_NODE,
+                    FRAME_LEAF,
+                    FRAME_VALUE_REQUEST,
+                    FRAME_DONE,
+                    FRAME_LANDED,
+                    FRAME_HAVE,
+                ] {
+                    assert_eq!(count(kinds, prefix_only), 0, "{kinds:?}");
                 }
             }
-            assert!(matches!(delta[0], Frame::Subtree { .. }));
-            let nodes = delta
-                .iter()
-                .filter(|frame| matches!(frame, Frame::Subtree {prefix,..} if prefix.len()<32))
-                .count();
-            let leaves = delta
-                .iter()
-                .filter_map(|frame| match frame {
-                    Frame::Subtree { prefix: key, .. } if key.len() == 32 => {
-                        Some(key.as_slice().try_into().unwrap())
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(nodes, expected.len());
-            assert_eq!(leaves.len(), records.len());
-            assert!(
-                delta.iter().all(|frame| !matches!(
-                    frame,
-                    Frame::Value { .. } | Frame::ValueRequest { .. }
-                ))
-            );
-            // Now the values, and both LANDEDs.
-            for key in &leaves {
-                write(&mut send, Frame::ValueRequest { key: *key }).await;
-            }
-            let mut values = 0;
-            let mut landed = delta.contains(&Frame::Landed);
-            while values < leaves.len() || !landed {
-                match read(&mut recv).await.expect("the values") {
-                    Frame::Value { .. } => values += 1,
-                    Frame::Landed => landed = true,
-                    other => panic!("waiting for values: {other:?}"),
-                }
-            }
-            write(&mut send, Frame::Landed).await;
-            assert!(read(&mut recv).await.is_none(), "the stream finished");
-            let health = full.ended(stranger, collection, before).await;
-            assert!(health.pushes.last_ok, "{health:?}");
-            eprintln!(
-                "W8_EMPTY leaves={} nodes={} peer_frames={} delta_reply_waits=0 witness=scripted_peer_withholds_value_requests_until_DONE",
-                leaves.len(),
-                nodes,
-                heard.len()
-            );
         }
 
         async fn stale_completion_is_ignored(deselect: bool) {
@@ -3360,8 +3361,7 @@ pub(crate) mod tests {
             let mut task = Task {
                 connections: hosted.table.clone(),
                 snapshots: hosted.lander.snapshots.subscribe(),
-                walks: Walks::new(hosted.lander.node.lock().unwrap().health.clone())
-                    .with_algorithm(crate::walk_stream::Algorithm::Prefix),
+                walks: Walks::new(hosted.lander.node.lock().unwrap().health.clone()),
                 commands: hosted.walks.clone(),
                 landing,
                 events,
@@ -3962,12 +3962,13 @@ pub(crate) mod tests {
         }
 
         /// The task's driver over a simulated connection into another
-        /// task's, both ways. (a) Fifty records to an empty peer: all land,
-        /// both LANDEDs cross, and both sides confirm the same agreed root.
-        /// (b) The agreed tree again: ROOT then DONE each way, answered with
-        /// LANDED alone. (c) A peer holding forty of the fifty from
-        /// elsewhere asks for exactly the ten missing values. (d) A peer
-        /// with no current connection gets no exchange at all.
+        /// task's, both ways, as cached RIBLT. (a) Fifty records to an empty
+        /// peer: all land, each body once and unasked, and both sides
+        /// confirm the same root. (b) Equal sets again: one ROOT each way
+        /// and no cell or body; a record the peer then commits comes back as
+        /// its one body. (c) A peer holding forty of the fifty from
+        /// elsewhere is sent exactly the missing values. (d) A peer with no
+        /// current connection gets no exchange at all.
         #[tokio::test(start_paused = true)]
         async fn an_exchange_over_a_connection_lands_confirms_and_prunes() {
             let (net, sender, mut empty, collection, records) = pair(0x3A1F, (57, 58), 50);
@@ -3992,9 +3993,9 @@ pub(crate) mod tests {
             assert_eq!((health.pushes.ok, health.pushes.failed), (1, 0));
             assert_eq!(health.confirmed.commits, Some(root));
             let (sent, heard) = crossed(&sender.taps, from, empty.peer);
-            assert_eq!(heard.last(), Some(&FRAME_LANDED));
-            assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 50);
-            assert_eq!(count(&sent, FRAME_LEAF), 50);
+            assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 0);
+            assert_eq!(count(&sent, FRAME_VALUE), 50);
+            assert_eq!(count(&heard, FRAME_VALUE), 0);
             assert_eq!(empty.records(collection), all);
             let other = empty.health(collection, sender.peer).unwrap();
             assert!(other.receives.last_ok && other.pushes.last_ok, "{other:?}");
@@ -4013,25 +4014,24 @@ pub(crate) mod tests {
                 })
             );
 
-            // (b) The agreed tree is ROOT then DONE each way, answered with
-            // LANDED alone.
+            // (b) Equal sets: one ROOT each way, no cell, no body.
             let from = sender.taps.len();
             let health = sender.exchange(empty.peer, collection, kind).await;
             assert_eq!((health.pushes.ok, health.pushes.failed), (2, 0));
             let (sent, heard) = crossed(&sender.taps, from, empty.peer);
-            assert_eq!(sent, [FRAME_OPEN, FRAME_ROOT, FRAME_DONE, FRAME_LANDED]);
-            assert_eq!(heard, [FRAME_ROOT, FRAME_DONE, FRAME_LANDED]);
+            assert_eq!(sent, [FRAME_OPEN, FRAME_RIBLT_ROOT]);
+            assert_eq!(heard, [FRAME_RIBLT_ROOT]);
 
-            // The peer commits a record of its own: its delta is that
-            // record's path, which lands here, and the sender's is nothing.
+            // The peer commits a record of its own: it comes back as one
+            // body, and nothing goes the other way.
             let own = empty.commit(collection, 1_000);
             let from = sender.taps.len();
             let health = sender.exchange(empty.peer, collection, kind).await;
             assert_eq!((health.pushes.ok, health.pushes.failed), (3, 0));
             let (sent, heard) = crossed(&sender.taps, from, empty.peer);
-            assert_eq!(count(&sent, FRAME_NODE), 0);
-            assert_eq!(count(&sent, FRAME_VALUE_REQUEST), 1);
-            assert_eq!(count(&heard, FRAME_LEAF), 1);
+            assert_eq!(count(&sent, FRAME_VALUE), 0);
+            assert_eq!(count(&heard, FRAME_VALUE), 1);
+            assert_eq!(count(&sent, FRAME_VALUE_REQUEST), 0);
             assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 0);
             assert!(
                 sender
@@ -4041,7 +4041,7 @@ pub(crate) mod tests {
             );
             assert_eq!(sender.records(collection).len(), 51);
 
-            // (c) A peer that holds forty of the fifty asks for ten.
+            // (c) A peer that holds forty of the fifty is sent the rest.
             let mut partial = Node::new(59);
             partial.hold("pair", open());
             for record in &records[..40] {
@@ -4055,9 +4055,9 @@ pub(crate) mod tests {
             assert!(health.pushes.last_ok, "{health:?}");
             let (sent, heard) = crossed(&sender.taps, from, partial.peer);
             // The ten of the fifty, and the peer's own record landed above.
-            assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 11);
-            assert_eq!(count(&sent, FRAME_VALUE_REQUEST), 0);
-            assert!(count(&sent, FRAME_LEAF) >= 11);
+            assert_eq!(count(&sent, FRAME_VALUE), 11);
+            assert_eq!(count(&heard, FRAME_VALUE), 0);
+            assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 0);
             assert_eq!(partial.records(collection).len(), 51);
             assert!(partial.records(collection).is_superset(&all));
 
@@ -4068,25 +4068,16 @@ pub(crate) mod tests {
             assert!(sender.health(collection, stranger).is_none());
         }
 
-        /// Two peers holding the same 300 records agree on them in one
-        /// exchange; then each commits ten of its own and A opens one
-        /// bidirectional stream. On it each side's delta is the
-        /// root NODE, which announces the shared subtrees, plus the nodes on
-        /// the paths to its own ten; exactly ten values are asked for each
-        /// way, and both sides agree on the union.
+        /// A one-way Prefix offer against an agreed tree: after A has
+        /// offered B its 300 records once, A commits ten more and offers
+        /// again. Its delta is the agreed tree's difference, so the shared
+        /// subtrees cost nothing beyond the root path: A announces exactly
+        /// the nodes on the paths to its ten, ten leaves and ten bodies, and
+        /// B asks for nothing.
         #[tokio::test(start_paused = true)]
         async fn a_shared_subtree_costs_one_frame_per_direction() {
-            let (_net, a, b, collection, records) = pair(0x3A22, (62, 63), 300);
+            let (_net, a, b, collection, _) = pair_with(0x3A22, (62, 63), 300, true);
             let kind = WalkKind::Commit;
-            {
-                let mut node = b.lander.node.lock().unwrap();
-                for record in &records {
-                    node.store.insert(*record).unwrap();
-                }
-                node.observe();
-                let snapshot = node.snapshot();
-                b.lander.snapshots.send_replace(Some(snapshot));
-            }
             let _connection = a.table.connect(b.peer).await.unwrap();
             let health = a.exchange(b.peer, collection, kind).await;
             assert!(health.pushes.last_ok, "{health:?}");
@@ -4095,62 +4086,43 @@ pub(crate) mod tests {
                 a.lander.node.lock().unwrap().pinned(collection).repair(),
             );
             assert_eq!(health.confirmed.commits, Some(shared));
-            assert_eq!(
-                b.health(collection, a.peer).unwrap().confirmed.commits,
-                Some(shared)
-            );
+            assert_eq!(b.records(collection).len(), 300);
 
-            let own_a = (0..10)
+            let own = (0..10)
                 .map(|data| a.commit(collection, 1_000 + data))
                 .collect::<Vec<_>>();
-            let own_b = (0..10)
-                .map(|data| b.commit(collection, 2_000 + data))
-                .collect::<Vec<_>>();
-            let from = [a.taps.len(), b.taps.len()];
-            let before = [a.health(collection, b.peer), b.health(collection, a.peer)];
-            a.walks.open(b.peer, collection, kind);
-            let health_a = a.ended(b.peer, collection, before[0].clone()).await;
-            let health_b = b.ended(a.peer, collection, before[1].clone()).await;
-            assert!(
-                health_a.pushes.last_ok && health_a.receives.last_ok,
-                "{health_a:?}"
-            );
-            assert!(
-                health_b.pushes.last_ok && health_b.receives.last_ok,
-                "{health_b:?}"
-            );
-            assert_eq!((health_a.pushes.ok, health_a.pushes.failed), (2, 0));
-            assert_eq!((health_b.pushes.ok, health_b.pushes.failed), (2, 0));
-            assert_eq!(health_a.confirmed.commits, health_b.confirmed.commits);
-            assert_eq!(a.records(collection).len(), 320);
+            let from = a.taps.len();
+            let health = a.exchange(b.peer, collection, kind).await;
+            assert!(health.pushes.last_ok, "{health:?}");
+            assert_eq!((health.pushes.ok, health.pushes.failed), (2, 0));
+            let received = b.health(collection, a.peer).unwrap();
+            assert!(received.receives.last_ok, "{received:?}");
+            assert_eq!(health.confirmed.commits, received.confirmed.commits);
             assert_eq!(b.records(collection), a.records(collection));
+            assert_eq!(b.records(collection).len(), 310);
 
-            for (side, from, own, other) in
-                [(&a, from[0], &own_a, b.peer), (&b, from[1], &own_b, a.peer)]
-            {
-                let (sent, heard) = crossed(&side.taps, from, other);
-                assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 10);
-                assert_eq!(count(&sent, FRAME_VALUE_REQUEST), 10);
-                let pinned = side.lander.node.lock().unwrap().pinned(collection);
-                let expected = paths(pinned.repair().records().commits(), own);
-                assert!(expected.contains(&Vec::new()));
-                assert_eq!(
-                    count(&sent, FRAME_ROOT) + count(&sent, FRAME_NODE),
-                    expected.len(),
-                    "{sent:?}"
-                );
-                assert_eq!(count(&sent, FRAME_LEAF), 10);
-                eprintln!(
-                    "W8_AGREED_SHARED peer={other:?} nodes={} leaves=10 value_requests_sent=10 value_requests_received=10 fixture=prior_agreement_plus_10_unique_each scheduler=sim_zero_stream_latency",
-                    expected.len()
-                );
-            }
+            let (sent, heard) = crossed(&a.taps, from, b.peer);
+            let pinned = a.lander.node.lock().unwrap().pinned(collection);
+            let expected = paths(pinned.repair().records().commits(), &own);
+            assert!(expected.contains(&Vec::new()));
+            assert_eq!(
+                count(&sent, FRAME_ROOT) + count(&sent, FRAME_NODE),
+                expected.len(),
+                "{sent:?}"
+            );
+            assert_eq!(count(&sent, FRAME_LEAF), 10);
+            assert_eq!(count(&sent, FRAME_VALUE), 10);
+            assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 0);
+            assert_eq!(count(&heard, FRAME_LEAF) + count(&heard, FRAME_NODE), 0);
+            eprintln!(
+                "W8_AGREED_SHARED one_way nodes={} leaves=10 values=10 value_requests=0 fixture=prior_agreement_plus_10 scheduler=sim_zero_stream_latency",
+                expected.len()
+            );
         }
 
-        /// After one exchange, seven records appended on one side and three
-        /// on the other go out as the nodes on their paths alone: seven and
-        /// three values are asked for, and both sides agree on the same
-        /// root before and after.
+        /// After one cached RIBLT exchange, seven records appended on one
+        /// side and three on the other cross as exactly seven and three
+        /// bodies, unasked, and both sides confirm the same union.
         #[tokio::test(start_paused = true)]
         async fn an_incremental_exchange_skips_what_was_agreed_and_lands_only_the_new() {
             let (_net, a, b, collection, _) = pair(0x3A23, (64, 65), 300);
@@ -4171,7 +4143,7 @@ pub(crate) mod tests {
             let three = (0..3)
                 .map(|data| b.commit(collection, 2_000 + data))
                 .collect::<Vec<_>>();
-            let from = [a.taps.len(), b.taps.len()];
+            let from = a.taps.len();
             let health = a.exchange(b.peer, collection, kind).await;
             assert!(health.pushes.last_ok, "{health:?}");
             let health_b = b.health(collection, a.peer).unwrap();
@@ -4183,33 +4155,22 @@ pub(crate) mod tests {
             assert_ne!(health.confirmed.commits, agreed);
             assert_eq!(a.records(collection).len(), 310);
             assert_eq!(b.records(collection), a.records(collection));
-            for (side, from, own, other, asked) in [
-                (&a, from[0], &seven, b.peer, 3),
-                (&b, from[1], &three, a.peer, 7),
-            ] {
-                let (sent, heard) = crossed(&side.taps, from, other);
-                assert_eq!(count(&heard, FRAME_VALUE_REQUEST), own.len());
-                assert_eq!(count(&sent, FRAME_VALUE_REQUEST), asked);
-                let pinned = side.lander.node.lock().unwrap().pinned(collection);
-                let expected = paths(pinned.repair().records().commits(), own);
-                assert_eq!(
-                    count(&sent, FRAME_ROOT) + count(&sent, FRAME_NODE),
-                    expected.len(),
-                    "{sent:?}"
-                );
-                assert_eq!(count(&sent, FRAME_LEAF), own.len());
-                eprintln!(
-                    "W8_INCREMENTAL peer={other:?} nodes={} leaves={} value_requests_sent={asked} value_requests_received={} scheduler=sim_zero_stream_latency",
-                    expected.len(),
-                    own.len(),
-                    own.len()
-                );
-            }
+            let (sent, heard) = crossed(&a.taps, from, b.peer);
+            assert_eq!(count(&sent, FRAME_VALUE), seven.len());
+            assert_eq!(count(&heard, FRAME_VALUE), three.len());
+            assert_eq!(count(&sent, FRAME_VALUE_REQUEST), 0);
+            assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 0);
+            assert_eq!(count(&sent, FRAME_SUBTREE) + count(&heard, FRAME_SUBTREE), 0);
+            eprintln!(
+                "W8_INCREMENTAL cached values_sent={} values_received={} value_requests=0 scheduler=sim_zero_stream_latency",
+                seven.len(),
+                three.len()
+            );
         }
 
-        /// Both sides open an exchange of the same tree within one round
-        /// trip: the stream the smaller peer id opened survives and lands,
-        /// the other is reset at both ends and counted nowhere.
+        /// Both sides open a cached RIBLT exchange of the same tree within
+        /// one round trip: the stream the smaller peer id opened survives and
+        /// lands, the other is reset and counted nowhere.
         #[tokio::test(start_paused = true)]
         async fn simultaneous_opens_keep_the_smaller_peer_s_stream() {
             let (_net, a, b, collection, _) = pair(0x3A24, (66, 67), 100);
@@ -4240,7 +4201,7 @@ pub(crate) mod tests {
                 assert_eq!(count(&sent, FRAME_OPEN), 1);
                 assert_eq!(count(&heard, FRAME_OPEN), 1);
             }
-            // On the smaller side, the stream that carried LANDED both ways
+            // On the smaller side, the stream that carried a ROOT both ways
             // is the one it opened; on the larger side, the one it accepted.
             for (side, other, opened) in
                 [(smaller, larger.peer, true), (larger, smaller.peer, false)]
@@ -4251,18 +4212,18 @@ pub(crate) mod tests {
                     .map(|crossed| crossed.stream)
                     .collect::<BTreeSet<_>>();
                 assert_eq!(streams.len(), 2);
-                let landed = |stream, sent| {
+                let rooted = |stream, sent| {
                     crossed.iter().any(|crossed| {
                         crossed.stream == stream
                             && crossed.sent == sent
-                            && crossed.kind == FRAME_LANDED
+                            && crossed.kind == FRAME_RIBLT_ROOT
                     })
                 };
                 let survivor = streams
                     .iter()
                     .copied()
-                    .find(|stream| landed(*stream, true) && landed(*stream, false))
-                    .expect("one stream carried LANDED both ways");
+                    .find(|stream| rooted(*stream, true) && rooted(*stream, false))
+                    .expect("one stream carried a ROOT both ways");
                 let open = crossed
                     .iter()
                     .find(|crossed| crossed.stream == survivor && crossed.kind == FRAME_OPEN)
@@ -4273,19 +4234,20 @@ pub(crate) mod tests {
                     .copied()
                     .find(|stream| *stream != survivor)
                     .unwrap();
-                assert!(!landed(loser, true) && !landed(loser, false));
+                assert!(!(rooted(loser, true) && rooted(loser, false)));
                 assert!(
                     !crossed
                         .iter()
-                        .any(|crossed| crossed.stream == loser && crossed.kind == FRAME_DONE)
+                        .any(|crossed| crossed.stream == loser && crossed.kind == FRAME_VALUE),
+                    "no body crosses on the reset stream"
                 );
             }
         }
 
-        /// An exchange cut after some values landed leaves them, fails both
-        /// ways and forgets the agreed tree. The next exchange, driven by
-        /// the walks task over a connection, asks for exactly the rest, and
-        /// it lands.
+        /// A one-way offer cut after some values landed leaves them, fails
+        /// and agrees on nothing. The next offer, driven by the walks task
+        /// over a connection, carries at least the rest and at most the
+        /// whole tree, nobody asks for anything, and it lands.
         #[tokio::test(start_paused = true)]
         async fn an_exchange_cut_mid_way_leaves_what_landed_and_the_next_asks_for_the_rest() {
             let net = SimNet::new(
@@ -4296,14 +4258,15 @@ pub(crate) mod tests {
             );
             let kind = WalkKind::Commit;
             let mut sender = Node::new(68);
-            let collection = sender.hold("cut", open());
+            let mut receiver = Node::new(69);
+            let policy = one_way(&sender, &receiver);
+            let collection = sender.hold("cut", policy.clone());
             let records = (0..300)
                 .map(|data| sender.commit(collection, data))
                 .collect::<BTreeSet<_>>();
             sender.observe();
             let root = summary(kind, sender.pinned(collection).repair());
-            let mut receiver = Node::new(69);
-            receiver.hold("cut", open());
+            receiver.hold("cut", policy);
             receiver.observe();
             let receiver = Hosted::new(receiver, &net);
 
@@ -4344,12 +4307,12 @@ pub(crate) mod tests {
             assert!(landed > 0 && landed < 300, "{landed} landed");
             let health = receiver.health(collection, sender.id()).unwrap();
             assert!(!health.receives.last_ok && health.received.commits.is_none());
-            // The scripted peer LANDED our empty delta before cutting its
-            // own. That directional push succeeded, but no union was agreed.
-            assert!(health.pushes.last_ok && health.confirmed.commits.is_none());
+            // This side only receives, and no union was agreed.
+            assert_eq!(health.pushes.ok + health.pushes.failed, 0);
+            assert!(health.confirmed.commits.is_none());
 
-            // The sender agreed on nothing, and the next exchange asks only
-            // for the rest.
+            // The sender agreed on nothing, and the next offer carries the
+            // rest.
             let sender = Hosted::new(sender, &net);
             assert!(sender.health(collection, receiver.peer).is_none());
             let _connection = sender.table.connect(receiver.peer).await.unwrap();
@@ -4358,13 +4321,13 @@ pub(crate) mod tests {
             assert!(health.pushes.last_ok, "{health:?}");
             assert_eq!(health.confirmed.commits, Some(root));
             let (sent, heard) = crossed(&sender.taps, from, receiver.peer);
-            assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 300 - landed);
-            assert!((300 - landed..=300).contains(&count(&sent, FRAME_LEAF)));
+            assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 0);
+            assert!((300 - landed..=300).contains(&count(&sent, FRAME_VALUE)));
             assert_eq!(receiver.records(collection), records);
         }
 
-        /// Open a scripted stream from `sender` to `receiver` and stream
-        /// until fifty values were answered: the halves, still open, and the
+        /// Open a scripted offer from `sender` to `receiver` and stream
+        /// until fifty bodies were written: the halves, still open, and the
         /// task's reset of the stream once they drop.
         async fn receiving_cut(
             receiver: &Hosted,

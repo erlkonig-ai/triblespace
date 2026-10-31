@@ -508,9 +508,12 @@ The opener writes the stream tag and OPEN naming collection, kind (COMMIT
 OPEN names in the collection's place, references `2`, DERIVE `3`) and profile (`0` pull Prefix, `1` cached
 RIBLT, `2` offer Prefix with opener sending, `3` offer Prefix with opener receiving).
 OPEN remains 34 bytes. Profiles 2/3 require Records or AUTH and the opposite
-locally authorized one-way role before driver registration. Profile 0 always
-uses pull semantics, even under a one-way local authorization view. Unknown
-profiles and inconsistent offer roles are refused, not guessed from data frames.
+locally authorized one-way role before driver registration. Profile 0 is pull
+Prefix: a grant walk, or a References walk the receiver takes part in one way
+only. Profile 0 on COMMIT or DERIVE, or on References where the receiver both
+sends and receives, would be a two-way Prefix walk of data; it is refused with
+a logged warning (*One path per direction*). Unknown profiles and inconsistent
+offer roles are refused, not guessed from data frames.
 The accept loop hands both halves to
 the walks task. Missing OPEN within ten seconds, or no task, resets the stream.
 Frames have a one-byte kind, big-endian u32 payload length, then at most 64 KiB.
@@ -531,8 +534,8 @@ resource32 || proof-id32 key. Integers are big-endian.
 
 DONE/LANDED are Prefix-only; cached RIBLT refuses them and uses the gated FIN
 semantics below. RIBLT_ROOT has 40 payload bytes (45 framed), with no repeated
-profile key. This remains the unreleased ALPN33 boundary, not compatibility
-with earlier private33 variants or deployed32.
+profile key. This is the unreleased ALPN35 boundary, not compatibility
+with earlier private33 variants, the deployed and rejected 34, or deployed32.
 
 Every SUBTREE payload is 73 bytes, 78 including the frame header, regardless of
 fanout. Depth is 0..32; all prefix bytes outside depth must be zero. Depth0 is the
@@ -585,8 +588,8 @@ values. Offer-mode receipts only repeat commitments the sender already offered.
 ### One-way typed offers
 
 Locally opened one-way Records and AUTH exchanges select offer profile 2/3.
-References retain their existing exact-fetch/landing path; two-way Prefix and
-CachedRiblt are unchanged. Each generated SUBTREE commitment is registered under
+References retain their existing exact-fetch/landing path; two-way
+CachedRiblt is unchanged. Each generated SUBTREE commitment is registered under
 its exact prefix/hash/count on this stream, before writer completion. A nonempty
 HAVE must match such a registered commitment; not-yet-generated or mismatched
 receipts fail the exchange. Registration is neither a completed-write receipt
@@ -654,19 +657,28 @@ liveness or throughput.
 
 ### Cached full-component discovery
 
-This source-only ALPN33 candidate defaults to cached RIBLT for mutually
-authorized locally opened streams, through both the CLI and
-`Algorithm::default()`. Explicit `trible pile net sync --walk-algorithm prefix`
-or `PeerConfig::walk_algorithm = Algorithm::Prefix` retains the Prefix option;
-`--walk-algorithm cached-riblt` remains accepted too. This changes the source
-default only, not a live daemon or its configuration. Incoming streams
-explicitly choose either supported algorithm
-regardless of the local opening preference. With simultaneous opens, the existing
-lower-peer-id survivor determines which explicit algorithm runs. Cached symmetric RIBLT is
-refused unless both send and receive are authorized for this collection. Local
-opens with one-way authority choose prefix, so receive-only holdings never enter
-symmetric equations. Collection/component admission and reference eligibility
-are otherwise unchanged.
+#### One path per direction
+
+How a data tree (COMMIT, DERIVE, References) is walked is not configured and
+not chosen by either side: the directions decide it. Where this side both
+sends a collection to the peer and receives it from the peer, every data walk
+is cached RIBLT; where it only sends or only receives, the walk is Prefix, as a
+one-way offer (profile 2/3) for COMMIT and DERIVE and as profile 0 for
+References. There is no `PeerConfig` field, CLI flag or environment variable
+for it. An incoming OPEN asking for a two-way Prefix walk of data is refused
+and the refusal logged, never silently accepted. With simultaneous opens, the
+existing lower-peer-id survivor keeps its stream; both name the same profile.
+Cached symmetric RIBLT is refused unless both send and receive are authorized
+for this collection, so receive-only holdings never enter symmetric equations.
+Collection/component admission and reference eligibility are otherwise
+unchanged.
+
+Grant walks are the one deliberate Prefix exception for a two-way exchange.
+This is a current choice, not a limitation of RIBLT: the grant Prefix walk
+consumes the incrementally maintained, structurally shared grant PATCH
+directly, and the grant path has no prepared-cell integration of the kind data
+RIBLT uses (the data cell cache below already reuses its encoding
+incrementally). It is a reasoned constant, not a configuration point.
 
 Each published collection observation owns three separate latest cache Arcs:
 COMMIT, DERIVE and positive resident References. Grant walks are Prefix only
@@ -1536,8 +1548,12 @@ guarantee.
 
 ## Wire surface
 
-The ALPN is `/triblespace/pile-sync/33`, an unreleased generation. It
-separates the COMMIT and DERIVE trees, and replaces the grant digest exchange
+The ALPN is `/triblespace/pile-sync/35`, an unreleased generation: the
+accepted semantics of generation 33 minus the two-way Prefix walk of data,
+which it refuses (*One path per direction*). Generation 34 is a different,
+deployed and rejected profile (a carried agreed tree and asymmetric RIBLT
+roles), not an ancestor of 35; both 33 and 34 are refused at the handshake.
+Generation 33 separates the COMMIT and DERIVE trees, and replaces the grant digest exchange
 with grant gossip by participation: GRANT_ROOTS listings on `recon/1` and a
 grant walk per resource on `walk/1`, Prefix only, whose receiver skips what it
 cannot use and lands a grant only once its descriptor validates it; the

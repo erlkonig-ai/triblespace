@@ -62,7 +62,6 @@ async fn bring_up(
 ) -> (Peer<MemoryRepo>, JoinHandle<()>) {
     let id = endpoint.id();
     let config = PeerConfig {
-        walk_algorithm: Default::default(),
         daemon: daemon.map(|daemon| VerifyingKey::from_bytes(daemon.as_bytes()).unwrap()),
         provider_publication_budget,
         bind: None,

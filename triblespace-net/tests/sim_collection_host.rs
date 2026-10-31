@@ -115,7 +115,6 @@ fn bring_up_with_publication_budget(
     tokio::task::spawn_local(host::run_host(
         harness,
         PeerConfig {
-            walk_algorithm: Default::default(),
             daemon: daemon.map(|daemon| VerifyingKey::from_bytes(&daemon).unwrap()),
             provider_publication_budget,
             bind: None,
@@ -1138,8 +1137,9 @@ fn demand_shallow_full_preserve_exact_wants_and_only_hydrate_selected_roots_with
     }
 }
 
-/// Transport generation 33 separates COMMIT and DERIVE trees on `walk/1`.
-/// Generation 32's mixed inventory is refused at the handshake; the current
+/// Transport generation 35 refuses the two-way Prefix walk of data that
+/// generation 33 accepted; 34 is a different, rejected profile, and 32 mixes
+/// COMMIT and DERIVE. All three are refused at the handshake; the current
 /// generation is served.
 #[test]
 fn a_previous_generation_peer_is_refused() {
@@ -1161,7 +1161,7 @@ fn a_previous_generation_peer_is_refused() {
         let server_id = server_key.verifying_key().to_bytes();
         assert_eq!(
             triblespace_net::protocol::PILE_SYNC_ALPN,
-            b"/triblespace/pile-sync/33"
+            b"/triblespace/pile-sync/35"
         );
         let current = client
             .transport
@@ -1175,17 +1175,19 @@ fn a_previous_generation_peer_is_refused() {
         .await
         .expect("the current generation answers");
         assert!(answer.is_ok(), "{answer:?}");
-        let previous = client
-            .transport
-            .dial(server_id, b"/triblespace/pile-sync/32")
+        for previous in [
+            b"/triblespace/pile-sync/34",
+            b"/triblespace/pile-sync/33",
+            b"/triblespace/pile-sync/32",
+        ] {
+            let previous = client.transport.dial(server_id, previous).await.unwrap();
+            let refused = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                triblespace_net::protocol::op_find_value(&previous, &[7; 32]),
+            )
             .await
-            .unwrap();
-        let refused = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            triblespace_net::protocol::op_find_value(&previous, &[7; 32]),
-        )
-        .await
-        .expect("a refused connection fails promptly");
-        assert!(refused.is_err(), "generation 29 must not be served");
+            .expect("a refused connection fails promptly");
+            assert!(refused.is_err(), "an earlier generation must not be served");
+        }
     }));
 }

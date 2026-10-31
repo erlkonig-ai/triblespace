@@ -1654,7 +1654,6 @@ async fn zero_announcement_budget_still_answers_resident_self_hints() {
             let host = tokio::task::spawn_local(run_host(
                 server_harness,
                 PeerConfig {
-                    walk_algorithm: Default::default(),
                     // The server's one route: the client.
                     daemon: Some(ed25519_dalek::VerifyingKey::from_bytes(&client_id).unwrap()),
                     provider_publication_budget: Some(0),

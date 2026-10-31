@@ -42,7 +42,9 @@ use triblespace_net::transport::sim::{
     Crossed, SimConfig, SimConn, SimNet, SimRecvStream, SimSendStream, Taps,
 };
 use triblespace_net::transport::{Conn, Harness, PeerId, RecvStream, SendStream, Transport};
-use triblespace_net::walk_stream::{Algorithm, FRAME_OPEN as FRAME_WALK_OPEN, FRAME_VALUE_REQUEST};
+use triblespace_net::walk_stream::{
+    FRAME_OPEN as FRAME_WALK_OPEN, FRAME_RIBLT_ROOT, FRAME_SUBTREE, FRAME_VALUE, FRAME_VALUE_REQUEST,
+};
 
 // Test-only leaf classification from the uniform SUBTREE depth, not a wire kind.
 const FRAME_LEAF: u8 = 254;
@@ -90,20 +92,10 @@ fn bring_up<T: Transport>(
     key: &SigningKey,
     store: MemoryRepo,
 ) -> Peer<MemoryRepo> {
-    bring_up_with_algorithm(harness, key, store, Algorithm::default())
-}
-
-fn bring_up_with_algorithm<T: Transport>(
-    harness: Harness<T>,
-    key: &SigningKey,
-    store: MemoryRepo,
-    algorithm: Algorithm,
-) -> Peer<MemoryRepo> {
     let (sender, receiver, wiring) = host::wire(EndpointId::from_bytes(&id(key)).unwrap());
     tokio::task::spawn_local(host::run_host(
         harness,
         PeerConfig {
-            walk_algorithm: algorithm,
             daemon: None,
             provider_publication_budget: Some(0),
             bind: None,
@@ -428,10 +420,10 @@ fn one_hundred_thirty_collections_converge_both_ways_within_the_push_estimate() 
 /// A partition ends the peering with its connection, and nothing is pushed
 /// to a peer without one: the confirmed root stays as the last landed push
 /// left it, with no failed push. Records appended meanwhile go out when the
-/// pair peers again after the heal, and that push asks only for them: the
-/// receiver's HELD prunes everything it landed before.
+/// pair peers again after the heal, and that walk carries only them: cached
+/// RIBLT decodes the difference, not the whole tree.
 #[test]
-fn a_partition_ends_the_peering_and_the_push_after_the_heal_asks_only_for_what_was_appended() {
+fn a_partition_ends_the_peering_and_the_walk_after_the_heal_carries_only_what_was_appended() {
     const BEFORE: usize = 400;
     const APPENDED: usize = 100;
     run(async |clock| {
@@ -454,15 +446,10 @@ fn a_partition_ends_the_peering_and_the_push_after_the_heal_asks_only_for_what_w
         select(&mut owner_store, &owner_key, collection);
         select(&mut reader_store, &reader_key, collection);
         let (harness, taps) = net.tap(&owner_key);
-        // This fixture counts Prefix requests and subtree leaves.
-        let mut owner =
-            bring_up_with_algorithm(harness, &owner_key, owner_store, Algorithm::Prefix);
-        let mut reader = bring_up_with_algorithm(
-            net.join(&reader_key),
-            &reader_key,
-            reader_store,
-            Algorithm::Prefix,
-        );
+        // Both read the open collection: its walks are cached RIBLT, which
+        // carries each record the reader lacks once, as an eager body.
+        let mut owner = bring_up(harness, &owner_key, owner_store);
+        let mut reader = bring_up(net.join(&reader_key), &reader_key, reader_store);
         owner.activate_collection(collection);
         reader.activate_collection(collection);
         until(
@@ -477,8 +464,11 @@ fn a_partition_ends_the_peering_and_the_push_after_the_heal_asks_only_for_what_w
         let confirmed = pair(&owner, collection, reader_id).unwrap();
         assert!(confirmed.pushes.last_ok, "{confirmed:?}");
         let (sent, heard) = walked(&taps, 0, reader_id);
-        assert_eq!(count(&heard, FRAME_VALUE_REQUEST), BEFORE);
-        assert_eq!(count(&sent, FRAME_LEAF), BEFORE);
+        assert_eq!(count(&sent, FRAME_VALUE), BEFORE);
+        assert_eq!(count(&heard, FRAME_VALUE), 0);
+        assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 0);
+        assert_eq!(count(&sent, FRAME_SUBTREE) + count(&heard, FRAME_SUBTREE), 0);
+        assert!(count(&sent, FRAME_RIBLT_ROOT) > 0);
 
         // Cut, and appended while cut: no push runs, none fails.
         net.partition(owner_id, reader_id);
@@ -516,14 +506,14 @@ fn a_partition_ends_the_peering_and_the_push_after_the_heal_asks_only_for_what_w
         .await;
         advance(&clock, &mut [&mut owner, &mut reader], 5).await;
         let (sent, heard) = walked(&taps, from, reader_id);
-        assert_eq!(count(&heard, FRAME_VALUE_REQUEST), APPENDED);
-        assert!(count(&sent, FRAME_LEAF) < BEFORE + APPENDED);
+        assert_eq!(count(&sent, FRAME_VALUE), APPENDED);
+        assert_eq!(count(&heard, FRAME_VALUE), 0);
         let healed = pair(&owner, collection, reader_id).unwrap();
         assert!(healed.pushes.last_ok && healed.pushes.ok > confirmed.pushes.ok);
         assert_eq!(healed.pushes.failed, 0);
         assert_ne!(healed.confirmed.commits, confirmed.confirmed.commits);
         println!(
-            "the first push asked for {BEFORE} values; after the partition the next asked for \
+            "the first push carried {BEFORE} values; after the partition the next carried \
              {APPENDED}"
         );
     });
@@ -531,11 +521,10 @@ fn a_partition_ends_the_peering_and_the_push_after_the_heal_asks_only_for_what_w
 
 /// Three roots of one collection. Y holds three hundred records and X those
 /// and three hundred more; Z holds nothing and reaches Y first, which
-/// pushes it Y's three hundred. When Z then peers with X, X's push is pruned
-/// by what Z already holds: Z asks for exactly X's own three hundred, and
-/// fewer leaves than the whole tree cross.
+/// pushes it Y's three hundred. When Z then peers with X, their cached RIBLT
+/// walk decodes only the difference: exactly X's own three hundred cross.
 #[test]
-fn a_receiver_holding_a_subtree_from_a_third_peer_prunes_it() {
+fn a_receiver_holding_records_from_a_third_peer_receives_only_the_difference() {
     run(async |clock| {
         let net = SimNet::new(0x5EC0_0009, SimConfig::default());
         let [x_key, y_key, z_key] = [70, 71, 72].map(key);
@@ -563,10 +552,9 @@ fn a_receiver_holding_a_subtree_from_a_third_peer_prunes_it() {
         net.partition(x_id, z_id);
         net.partition(x_id, y_id);
         let (harness, taps) = net.tap(&x_key);
-        // Pruned subtree/request counts are the explicit Prefix contract.
-        let mut x = bring_up_with_algorithm(harness, &x_key, x_store, Algorithm::Prefix);
-        let mut y = bring_up_with_algorithm(net.join(&y_key), &y_key, y_store, Algorithm::Prefix);
-        let mut z = bring_up_with_algorithm(net.join(&z_key), &z_key, z_store, Algorithm::Prefix);
+        let mut x = bring_up(harness, &x_key, x_store);
+        let mut y = bring_up(net.join(&y_key), &y_key, y_store);
+        let mut z = bring_up(net.join(&z_key), &z_key, z_store);
         for host in [&mut x, &mut y, &mut z] {
             host.activate_collection(collection);
         }
@@ -592,10 +580,10 @@ fn a_receiver_holding_a_subtree_from_a_third_peer_prunes_it() {
         .await;
         advance(&clock, &mut [&mut x, &mut y, &mut z], 5).await;
         let (sent, heard) = walked(&taps, 0, z_id);
-        assert_eq!(count(&heard, FRAME_VALUE_REQUEST), 300);
-        let leaves = count(&sent, FRAME_LEAF);
-        assert!((300..600).contains(&leaves), "{leaves} leaves crossed");
-        println!("X pushed {leaves} leaves to Z, which asked for 300 values");
+        assert_eq!(count(&sent, FRAME_VALUE), 300, "only X's own records cross");
+        assert_eq!(count(&heard, FRAME_VALUE), 0);
+        assert_eq!(count(&sent, FRAME_SUBTREE) + count(&heard, FRAME_SUBTREE), 0);
+        println!("X sent Z its own 300 values and none Z held from Y");
     });
 }
 

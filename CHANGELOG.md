@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `/triblespace/pile-sync/35`: one walk per direction for data, with nothing
+  to configure. A data tree (COMMIT, DERIVE, References) walked both ways is
+  cached RIBLT, one walked one way is Prefix (the offer profiles 2/3, or
+  profile 0 for References). `PeerConfig::walk_algorithm` is removed, and an
+  incoming OPEN asking for a two-way Prefix walk of data is refused with a
+  logged warning instead of being accepted. Grant walks are unchanged: they
+  stay Prefix as the one deliberate exception. The ALPN changes because the
+  accepted wire semantics narrow: 35 is 33 minus two-way data Prefix. It skips
+  34, which is a different, deployed and rejected profile (carried agreed
+  tree, asymmetric RIBLT roles). No live deployment.
+
 - Canonical migration/refresh relies on explicit operator-frozen input custody,
   not a host-wide opener observation. Preserve source/refresh identity and full
   BLAKE3 checks for accidental changes, original-author verification, audits and

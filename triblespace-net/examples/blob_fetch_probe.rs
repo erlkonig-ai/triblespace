@@ -40,7 +40,6 @@ async fn main() -> Result<()> {
     let signing_key = SigningKey::from_bytes(&entropy);
     let secret = SecretKey::from_bytes(&signing_key.to_bytes());
     let config = PeerConfig {
-        walk_algorithm: Default::default(),
         daemon: Some(contact),
         provider_publication_budget: Some(0),
         bind: None,
