@@ -24,10 +24,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use serde_json::Value;
-use triblespace_core::repo::pile::{OpaqueKind, PileRecordContent, PileRecords};
 use triblespace_core::repo::SnapshotSource;
-
-use super::canonical::frame;
 
 /// Exit status when the operator must record a choice and rerun.
 pub const EXIT_CHOICE_NEEDED: i32 = 2;
@@ -54,43 +51,25 @@ struct Kinds {
     deployed32: usize,
     /// Every other opaque frame, by its kind bytes in hex.
     dead_end: BTreeMap<String, usize>,
-    /// Legacy branches whose last pin record is a head, in first-seen order.
+    /// Legacy branches whose last pin record is a head, in id order.
     live_branches: Vec<String>,
 }
 
 fn kinds(path: &Path) -> Result<Kinds> {
-    let mut kinds = Kinds::default();
-    let mut order = Vec::new();
-    let mut live = std::collections::HashMap::new();
-    let records =
-        PileRecords::open(path).map_err(|error| super::super::pile_read_error(path, error))?;
-    for record in records {
-        let record = record.map_err(|error| super::super::pile_read_error(path, error))?;
-        match record.content {
-            PileRecordContent::Opaque { kind } => match kind {
-                OpaqueKind::Described(raw) if frame::supported(raw) => kinds.deployed32 += 1,
-                other => {
-                    *kinds
-                        .dead_end
-                        .entry(hex::encode_upper(other.as_bytes()))
-                        .or_default() += 1
-                }
-            },
-            PileRecordContent::Branch { branch_id, .. } => {
-                let id = format!("{branch_id:X}");
-                if !live.contains_key(&id) {
-                    order.push(id.clone());
-                }
-                live.insert(id, true);
+    let inspection = crate::migration::inspect(path)?;
+    Ok(Kinds {
+        deployed32: inspection.requirements.iter().filter_map(|requirement| {
+            match requirement {
+                crate::migration::Requirement::Canonical { records } => Some(*records),
+                _ => None,
             }
-            PileRecordContent::BranchTombstone { branch_id } => {
-                live.insert(format!("{branch_id:X}"), false);
-            }
-            _ => {}
-        }
-    }
-    kinds.live_branches = order.into_iter().filter(|id| live[id]).collect();
-    Ok(kinds)
+        }).sum(),
+        dead_end: inspection.unsupported.into_iter().map(|unsupported| {
+            (hex::encode_upper(unsupported.kind.as_bytes()), unsupported.occurrences)
+        }).collect(),
+        live_branches: inspection.legacy_branches.into_iter()
+            .map(|id| format!("{id:X}")).collect(),
+    })
 }
 
 enum BranchChoice {

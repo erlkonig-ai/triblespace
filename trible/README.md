@@ -98,6 +98,14 @@ Run `trible <COMMAND>` to invoke a subcommand.
 Migration lives in a separate binary, `trible-migrate`, built from this package
 alongside `trible`:
 
+Native owners can use `trible::migration::inspect` and `prepare` without
+constructing CLI arguments or parsing output. Preparation requires a frozen
+source and fresh destination, retains the source, and returns typed current,
+converted, choice-required or unsupported outcomes; it never activates storage.
+`Current` describes physical framing, not adoption of retained legacy branches
+or understanding of every application schema. The returned legacy pins remain
+explicit. The CLI's existing decisions-file and resume behavior is unchanged.
+
 - `trible-migrate <PILE> list` — list known migrations and whether they are needed for this pile.
 - `trible-migrate <PILE> run <MIGRATION>` — run one explicitly named migration.
   Pass `--dry-run` to preview changes. In particular, `monotone-wants` is a

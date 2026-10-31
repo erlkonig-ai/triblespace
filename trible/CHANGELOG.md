@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- Native applications can inspect and prepare a fresh pile through
+  `trible::migration`, sharing the CLI's converters without argv or stdout
+  parsing. Sources remain retained; branch and authorship choices are explicit,
+  and prepared storage is never activated by the library.
 - `trible-migrate clean` and `trible-migrate lattice-v3` refuse a source that
   holds frames of the deployed /32 collection kinds (COMMIT, MERGE, DERIVE,
   MAP), before writing anything and whatever `--drop-unknown` or `--dry-run`

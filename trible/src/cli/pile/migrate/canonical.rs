@@ -27,7 +27,7 @@ use triblespace_core::repo::SnapshotSource;
 mod admission_tests;
 #[cfg(test)]
 mod conversion_tests;
-pub(super) mod frame;
+pub(crate) mod frame;
 mod legacy32;
 #[cfg(test)]
 mod rehearsal_tests;

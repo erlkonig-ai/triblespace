@@ -5,4 +5,5 @@
 #[doc(hidden)]
 pub mod cli;
 pub mod maintenance;
+pub mod migration;
 pub mod process;
