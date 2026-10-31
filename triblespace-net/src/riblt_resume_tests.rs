@@ -462,3 +462,29 @@ fn a_resume_the_root_did_not_promise_or_a_second_one_fails() {
         assert_eq!(a.outcome(), Some(Outcome::Failed(Failure::Protocol)));
     }
 }
+
+/// Equal roots, and the peer's FIN confirms the exchange before our promised
+/// RESUME was taken: it is still sent, and readiness waits for it.
+#[test]
+fn a_promised_resume_is_sent_even_after_an_equal_root_confirmation() {
+    let fixture = Fixture::new();
+    let cache = ResumeCache::new(RESUME_BUDGET_BYTES);
+    let mut a = fixture.side(&fixture.a, &a_set(), None);
+    let profile = a.riblt.as_ref().unwrap().profile;
+    let other = PatchSummary::new(Some([0xCD; 32]), 9).unwrap();
+    let mut cells = Records::default();
+    cells.push(&CellFrame { index: 0, cell: Cell::default() }).unwrap();
+    cache.keep((profile, other), cells);
+    a = a.resuming(cache.clone());
+    let root = a.delta.summary();
+    assert_eq!(a.next_delta(), Some(Frame::RibltRoot { summary: root, resume: true }));
+    assert!(a.on_root_written().is_empty());
+    a.on_frame(Frame::RibltRoot { summary: root, resume: false }, Some(fixture.a.snapshot()));
+    assert!(!a.ready_to_finish(), "the RESUME is still owed");
+    a.on_fin();
+    assert_eq!(a.outcome(), Some(Outcome::Confirmed));
+    assert_eq!(a.next_delta(), Some(Frame::RibltResume { held: 0, root }));
+    assert_eq!(a.next_delta(), None);
+    assert!(a.ready_to_finish());
+    assert_eq!(cache.held(&(profile, other)), 1, "an unrelated entry stays");
+}

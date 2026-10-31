@@ -127,11 +127,17 @@ where
                     peer_fin = true;
                     exchange.on_fin()
                 }
-                Ok(Some(Err(code))) => {
+                Ok(Some(Err(ReadEnd::Malformed))) => {
+                    // The peer broke the walk: a failure of the exchange's own.
+                    exchange.malformed();
+                    stopped = Some(("malformed or truncated frame", None));
+                    break 'drive true;
+                }
+                Ok(Some(Err(ReadEnd::Reset(code)))) => {
                     duplicate = code == Some(RESET_WALK_DUPLICATE);
                     stopped = Some(match code {
                         Some(_) => ("peer reset the stream", code),
-                        None => ("stream ended, truncated or malformed", None),
+                        None => ("stream ended or stalled", None),
                     });
                     break 'drive true;
                 }
@@ -226,7 +232,17 @@ where
     (ended, duplicate)
 }
 
-type Incoming = Result<Option<Frame>, Option<u32>>;
+type Incoming = Result<Option<Frame>, ReadEnd>;
+
+/// Why the reader stopped short of a clean FIN.
+enum ReadEnd {
+    /// The stream failed under it: reset (with the peer's code, if it reset
+    /// the stream), lost, or starved of credit. An interruption.
+    Reset(Option<u32>),
+    /// A known frame did not decode, or a frame was truncated or oversized:
+    /// the peer broke the protocol.
+    Malformed,
+}
 
 /// `Err` when the deadline passes first: the peer went quiet while the walk
 /// awaited it, which is not the same fact as the stream failing.
@@ -248,12 +264,13 @@ async fn read(mut recv: Box<dyn RecvStream>, frames: mpsc::Sender<Incoming>) {
             Ok(Some((kind, payload))) => match Frame::decode(kind, &payload) {
                 Ok(Some(frame)) => Ok(Some(frame)),
                 Ok(None) => continue,
-                Err(_) => Err(None),
+                Err(_) => Err(ReadEnd::Malformed),
             },
             Ok(None) => Ok(None),
             Err(error) => Err(match error {
-                FrameError::Transport(error) => reset_code(&error),
-                FrameError::Violation(_) | FrameError::Stalled => None,
+                FrameError::Transport(error) => ReadEnd::Reset(reset_code(&error)),
+                FrameError::Violation(_) => ReadEnd::Malformed,
+                FrameError::Stalled => ReadEnd::Reset(None),
             }),
         };
         let ended = !matches!(frame, Ok(Some(_)));

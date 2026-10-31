@@ -73,8 +73,9 @@ impl super::SendStream for iroh::endpoint::SendStream {
     /// The owned buffer goes to the stream as it is. `write_many_chunks`
     /// takes a fully written chunk out of the slice (leaving `bytes` empty)
     /// and splits a partly written one in place (leaving the unwritten
-    /// suffix), and is cancel safe; noq still copies the bytes into its own
-    /// send buffer.
+    /// suffix), and is cancel safe. noq may copy and coalesce small chunks
+    /// into its send buffer and can retain a larger owned chunk as it is,
+    /// holding its owner until the bytes are acknowledged or abandoned.
     fn write_owned<'a>(&'a mut self, bytes: &'a mut bytes::Bytes) -> super::WriteOwned<'a> {
         Box::pin(async move {
             if bytes.is_empty() {

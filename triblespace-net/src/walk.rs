@@ -2091,6 +2091,180 @@ mod cell_write_tests {
         }
     }
 
+    /// What a [`Scripted`] stream does once its byte budget is spent.
+    #[derive(Clone, Copy)]
+    enum Then {
+        /// Pending forever, with no wake-up: no progress at all.
+        Stall,
+        /// `Ok(0)`.
+        Zero,
+        /// This error.
+        Fail(io::ErrorKind),
+    }
+
+    struct Script {
+        wire: Vec<u8>,
+        budget: usize,
+        then: Then,
+        reset: Option<u32>,
+        finished: bool,
+    }
+
+    /// A stream that accepts `budget` bytes and then does `then`, observable
+    /// from outside after the writer took it.
+    struct Scripted(Arc<std::sync::Mutex<Script>>);
+
+    impl Scripted {
+        fn new(budget: usize, then: Then) -> (Box<dyn SendStream>, Arc<std::sync::Mutex<Script>>) {
+            let script = Arc::new(std::sync::Mutex::new(Script {
+                wire: Vec::new(),
+                budget,
+                then,
+                reset: None,
+                finished: false,
+            }));
+            (Box::new(Self(script.clone())), script)
+        }
+    }
+
+    impl AsyncWrite for Scripted {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let mut script = self.0.lock().unwrap();
+            assert!(script.reset.is_none(), "nothing is written after a reset");
+            if script.budget > 0 {
+                let n = bytes.len().min(script.budget);
+                script.budget -= n;
+                script.wire.extend_from_slice(&bytes[..n]);
+                return Poll::Ready(Ok(n));
+            }
+            match script.then {
+                Then::Stall => Poll::Pending,
+                Then::Zero => Poll::Ready(Ok(0)),
+                Then::Fail(kind) => Poll::Ready(Err(kind.into())),
+            }
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.0.lock().unwrap().finished = true;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl SendStream for Scripted {
+        fn reset(&mut self, code: u32) {
+            self.0.lock().unwrap().reset = Some(code);
+        }
+    }
+
+    fn expected(generation: &Generation, first: usize, cells: usize) -> Vec<u8> {
+        (first..first + cells)
+            .flat_map(|index| encoded_cell_frame(index, &generation.cell(index).unwrap()))
+            .collect()
+    }
+
+    /// A run whose stream stops making progress fails by the walk deadline
+    /// and has reported only the frames written whole.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_without_write_progress_fails_by_the_deadline() {
+        let generation = generation();
+        let frames = generation.frames(0, 10).unwrap();
+        let (mut send, script) = Scripted::new(2 * CELL_FRAME_BYTES + 10, Then::Stall);
+        let mut receipts = Vec::new();
+        let started = tokio::time::Instant::now();
+        let error = write_cells(&mut *send, 0, frames, |done| receipts.push(done))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), WALK_DEADLINE);
+        assert_eq!(receipts, vec![2]);
+        assert_eq!(script.lock().unwrap().wire, expected(&generation, 0, 10)[..2 * CELL_FRAME_BYTES + 10]);
+    }
+
+    /// The whole writer: a run that fails mid-way (an error, or a write of
+    /// zero bytes) reports only the completed frames, marks the stream
+    /// broken, writes nothing more and resets instead of finishing.
+    #[tokio::test]
+    async fn a_run_failing_mid_way_marks_the_stream_broken() {
+        for then in [Then::Fail(io::ErrorKind::ConnectionReset), Then::Zero] {
+            let generation = generation();
+            let (mut send, script) = Scripted::new(3 * CELL_FRAME_BYTES + 5, then);
+            let (frames, queued) = mpsc::channel(4);
+            let (_reset, resetting) = oneshot::channel::<u32>();
+            let mut resetting = futures::FutureExt::fuse(resetting);
+            let (failed, mut write_failed) = oneshot::channel();
+            let (progress, receipts) = watch::channel(Written::default());
+            frames
+                .send(Frame::RibltCells { first: 0, frames: generation.frames(0, 10).unwrap() })
+                .await
+                .unwrap();
+            frames
+                .send(Frame::RibltCells { first: 10, frames: generation.frames(10, 10).unwrap() })
+                .await
+                .unwrap();
+            drop(frames);
+            let ended =
+                write_stream_inner(&mut send, queued, &mut resetting, failed, Some(progress)).await;
+            assert_eq!(ended, (false, false));
+            assert!(write_failed.try_recv().is_ok(), "the driver hears the failure");
+            assert_eq!(receipts.borrow().cells, 3);
+            let script = script.lock().unwrap();
+            assert_eq!(script.wire.len(), 3 * CELL_FRAME_BYTES + 5, "nothing after the failure");
+            assert_eq!(script.reset, Some(RESET_WALK_FAILED));
+            assert!(!script.finished);
+        }
+    }
+
+    /// A reset during a run abandons the rest of it: the accepted prefix is
+    /// all that was written, and the stream is reset, never finished.
+    #[tokio::test(start_paused = true)]
+    async fn a_reset_mid_run_abandons_the_rest() {
+        let generation = generation();
+        let (mut send, script) = Scripted::new(4 * CELL_FRAME_BYTES + 7, Then::Stall);
+        let (frames, queued) = mpsc::channel(4);
+        let (reset, resetting) = oneshot::channel::<u32>();
+        let mut resetting = futures::FutureExt::fuse(resetting);
+        let (failed, _write_failed) = oneshot::channel();
+        let (progress, receipts) = watch::channel(Written::default());
+        frames
+            .send(Frame::RibltCells { first: 0, frames: generation.frames(0, 10).unwrap() })
+            .await
+            .unwrap();
+        let writer = tokio::spawn(async move {
+            write_stream_inner(&mut send, queued, &mut resetting, failed, Some(progress)).await
+        });
+        tokio::time::sleep(WALK_DEADLINE / 2).await;
+        assert_eq!(receipts.borrow().cells, 4);
+        reset.send(RESET_WALK_FAILED).unwrap();
+        assert_eq!(writer.await.unwrap(), (false, false));
+        drop(frames);
+        let script = script.lock().unwrap();
+        assert_eq!(script.wire, expected(&generation, 0, 10)[..4 * CELL_FRAME_BYTES + 7]);
+        assert_eq!(script.reset, Some(RESET_WALK_FAILED));
+        assert!(!script.finished);
+    }
+
+    /// A run is a view of the generation's mapped chunk and outlives it: the
+    /// bytes still arrive intact after the generation is dropped.
+    #[tokio::test]
+    async fn a_run_outlives_its_generation() {
+        let generation = generation();
+        let first = 7;
+        let frames = generation.frames(first, 30).unwrap();
+        let wanted = expected(&generation, first, 30);
+        let weak = Arc::downgrade(&generation);
+        drop(generation);
+        assert!(weak.upgrade().is_none(), "nothing else holds the generation");
+        let mut stream = Trickle { wire: Vec::new(), step: 100, ready: false, calls: 0 };
+        write_cells(&mut stream, first as u32, frames, |_| {}).await.unwrap();
+        assert_eq!(stream.wire, wanted);
+    }
+
     /// A stream error ends the run; no receipt claims the unwritten frame.
     #[tokio::test]
     async fn a_failed_owned_write_reports_no_more_cells() {

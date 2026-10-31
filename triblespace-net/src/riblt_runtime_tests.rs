@@ -570,6 +570,28 @@ fn driven_with_writer(
     capacity: usize,
     wrap: impl FnOnce(Tx) -> Box<dyn SendStream>,
 ) -> Driven {
+    driven_exchange(local, peer, collection, capacity, wrap, receiver(local, collection))
+}
+
+/// The local side resumes through `cache`, as a host's walks do.
+fn driven_resuming(
+    local: &Node,
+    peer: &Node,
+    collection: CollectionHandle,
+    cache: &Arc<crate::riblt_resume::ResumeCache>,
+) -> Driven {
+    let exchange = receiver(local, collection).resuming(cache.clone());
+    driven_exchange(local, peer, collection, 1 << 16, |tx| Box::new(tx), exchange)
+}
+
+fn driven_exchange(
+    local: &Node,
+    peer: &Node,
+    collection: CollectionHandle,
+    capacity: usize,
+    wrap: impl FnOnce(Tx) -> Box<dyn SendStream>,
+    exchange: Exchange<MemoryRepoSnapshot>,
+) -> Driven {
     let net = SimNet::new(0xC011, SimConfig::default());
     let harness = net.join(&local.key);
     let (snapshots, observed) = watch::channel(Some(local.snapshot()));
@@ -591,7 +613,6 @@ fn driven_with_writer(
     let reset = Arc::new(Mutex::new(None));
     let tx = wrap(Tx(send, reset.clone()));
     let rx = Rx(recv, reset.clone());
-    let exchange = receiver(local, collection);
     let (acked, acks) = mpsc::unbounded_channel();
     let (replace, replaced) = oneshot::channel();
     let done = tokio::spawn(async move {
@@ -1638,4 +1659,101 @@ fn riblt_runtime_reference_difference_beyond_retired_budgets_converges() {
         peak.0,
         peak.1,
     );
+}
+
+/// The peer's cells `[0, n)` for its current root, as a cut exchange leaves them.
+fn cached_peer_prefix(
+    cache: &Arc<crate::riblt_resume::ResumeCache>,
+    peer: &Node,
+    collection: CollectionHandle,
+    n: usize,
+) -> PatchSummary {
+    let generation = peer.pinned(collection).cache(WalkKind::Commit);
+    let mut cells = crate::riblt_store::Records::default();
+    for index in 0..n {
+        let cell = generation.cell(index).unwrap();
+        cells
+            .push(&crate::riblt_cache::CellFrame { index: index as u32, cell })
+            .unwrap();
+    }
+    cache.keep((generation.key(), generation.summary()), cells);
+    generation.summary()
+}
+
+/// The peer's ROOT promises a RESUME and never sends it. Replaying our cached
+/// prefix of its cells already decodes and proves the difference, so only our
+/// own cells are held back, and nothing else is owed by the peer: for a
+/// local-only record no VALUE comes back. That wait still has the frame
+/// deadline. Driver level, with the actual walk_cached reader and deadline.
+#[tokio::test(start_paused = true)]
+async fn riblt_runtime_a_promised_resume_that_never_comes_fails_by_the_deadline() {
+    let (empty, full, collection, record) = pair();
+    let cache = crate::riblt_resume::ResumeCache::new(crate::riblt_resume::RESUME_BUDGET_BYTES);
+    let empty_root = cached_peer_prefix(&cache, &empty, collection, 16);
+    let mut run = driven_resuming(&full, &empty, collection, &cache);
+    assert_eq!(
+        receive_frame(&mut run.recv).await,
+        Frame::RibltRoot {
+            summary: full.pinned(collection).cache(WalkKind::Commit).summary(),
+            resume: true,
+        }
+    );
+    send_frame(&mut run.send, Frame::RibltRoot { summary: empty_root, resume: true }).await;
+    // Our claim and the eager body of the decoded local-only record, in
+    // either order; then nothing, because no cell may precede the RESUME.
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        seen.push(receive_frame(&mut run.recv).await);
+    }
+    assert!(seen.contains(&Frame::RibltResume { held: 16, root: empty_root }));
+    assert!(seen.iter().any(|frame| matches!(frame,
+        Frame::Value { key, .. } if *key == record.fingerprint().raw())));
+    let ended = tokio::time::timeout(3 * WALK_DEADLINE, run.done)
+        .await
+        .expect("an owed RESUME is a bounded wait")
+        .unwrap();
+    assert!(!ended.0.landed && !ended.0.confirmed && ended.0.agreed.is_none());
+    assert_eq!(*run.reset.lock().unwrap(), Some(RESET_WALK_FAILED));
+}
+
+/// Cells received before a malformed frame are not kept for resuming; the
+/// same cells before a silent cut are.
+#[tokio::test(start_paused = true)]
+async fn riblt_runtime_a_malformed_frame_drops_the_recorded_cells_a_cut_keeps_them() {
+    for malformed in [false, true] {
+        let (local, peer, collection, _) = pair();
+        let cache =
+            crate::riblt_resume::ResumeCache::new(crate::riblt_resume::RESUME_BUDGET_BYTES);
+        let mut run = driven_resuming(&local, &peer, collection, &cache);
+        assert!(matches!(receive_frame(&mut run.recv).await, Frame::RibltRoot { resume: false, .. }));
+        send_frame(&mut run.send, root(&peer, collection)).await;
+        // Well-formed cells that never decode.
+        for index in 0..3 {
+            send_frame(&mut run.send, Frame::RibltCell {
+                index,
+                symbol: [0xA5; 32],
+                hash: 0,
+                count: 0,
+            }).await;
+        }
+        if malformed {
+            write_frame(&mut run.send, crate::walk_stream::FRAME_RIBLT_CELL, &[1, 2, 3])
+                .await
+                .unwrap();
+        }
+        let ended = tokio::time::timeout(3 * WALK_DEADLINE, run.done)
+            .await
+            .expect("the walk ends")
+            .unwrap();
+        assert!(!ended.0.confirmed && ended.0.agreed.is_none());
+        let generation = peer.pinned(collection).cache(WalkKind::Commit);
+        let held = cache.held(&(generation.key(), generation.summary()));
+        if malformed {
+            assert_eq!(ended.0.failure, Some(Failure::Protocol));
+            assert_eq!(held, 0, "a self-decided failure drops what it recorded");
+        } else {
+            assert_eq!(ended.0.failure, None);
+            assert_eq!(held, 3, "a cut keeps the cells it received");
+        }
+    }
 }

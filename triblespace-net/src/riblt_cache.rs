@@ -22,9 +22,12 @@
 //! frame, framing included ([`CELL_FRAME_BYTES`]), so a contiguous run of
 //! cells is sent as one immutable view of the mapped chunk
 //! ([`Generation::frames`]) instead of being re-encoded cell by cell. That
-//! removes only our own encoding and copies: QUIC encrypts every packet in
-//! user space, so the transport still copies and coalesces these bytes into
-//! its send buffer, and no kernel zero-copy (sendfile) is possible below it.
+//! removes only our own encoding and copies. noq may copy and coalesce small
+//! chunks into its send buffer and can retain larger owned chunks as they
+//! are (more than 1,452 bytes in noq 1.0.1: a whole 64-cell run of 3,648
+//! bytes), which keeps the mapped chunk alive until noq releases it; the
+//! frozen or copy-on-write chunk makes that longer lifetime sound. There is
+//! no kernel zero-copy (sendfile): QUIC encrypts every packet in user space.
 
 use std::hash::Hasher;
 use std::sync::{Arc, Mutex};

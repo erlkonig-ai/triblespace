@@ -17,10 +17,24 @@
 //! An exchange takes its entry out while it runs (a concurrent exchange with
 //! a peer of the same root then starts from 0), keeps it after an exchange
 //! that was cut off, and drops it after a successful exchange or one that
-//! failed for a reason of its own: a cut is the only ending whose cells are
-//! worth keeping, and cells that failed a proof must not be offered again.
-//! Entries beyond [`RESUME_BUDGET_BYTES`] are evicted oldest first; a miss
-//! only means a stream starts from 0, never a failure.
+//! failed for a reason of its own (including a malformed or truncated frame
+//! from the peer): a cut is the only ending whose cells are worth keeping,
+//! and cells that failed a proof must not be offered again. Entries beyond
+//! [`RESUME_BUDGET_BYTES`] are evicted oldest first; a miss only means a
+//! stream starts from 0, never a failure.
+//!
+//! A ROOT that announces a resume promises exactly one RIBLT_RESUME on any
+//! stream that is not reset, even once the exchange is confirmed (equal
+//! roots, peer FIN first); readiness to finish waits for it.
+//!
+//! Accepted limit: the cells are not verified against the root until
+//! decoding completes. Because entries are keyed by root and shared across
+//! peer identities, a dishonest peer can plant a structurally valid but wrong
+//! prefix under an honest peer's root and cut the stream; an honest reconnect
+//! with that root then fails or redoes work. The final exact root proof still
+//! prevents any false confirmation, and the failed exchange discards the
+//! entry it took, so integrity holds and repeated poisoning needs the prefix
+//! planted again.
 //!
 //! [`Generation::key`]: crate::riblt_cache::Generation::key
 
@@ -33,9 +47,13 @@ use crate::patch_repair::PatchSummary;
 use crate::riblt_cache::CellFrame;
 use crate::riblt_store::Records;
 
-/// Mapped chunk-file bytes all entries of one host may reserve together:
+/// Mapped chunk-file bytes the KEPT entries of one host may reserve together:
 /// 64 MiB, about 1.1 million cells, or a difference of about 800,000 keys
 /// cut off once. Chunks are 912 KiB, so a small entry costs a whole chunk.
+/// Entries taken into running exchanges and their recordings are not
+/// counted: each running cached exchange may hold one taken entry and its
+/// own recording, which stops at this budget, so a host's total is at most
+/// this budget times one plus its running cached exchanges.
 pub(crate) const RESUME_BUDGET_BYTES: usize = 64 << 20;
 
 /// The profile key of the generation the cells were checked against, and

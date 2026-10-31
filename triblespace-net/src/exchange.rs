@@ -863,7 +863,17 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
     /// Current cached semantic readiness, not a FIN receipt. It never waits for
     /// peer FIN; the driver must still drain owed bodies and finish successfully.
     pub(crate) fn ready_to_finish(&self) -> bool {
-        self.riblt.is_some() && self.landed_sent && !matches!(self.outcome, Some(Outcome::Failed(_)))
+        self.riblt.as_ref().is_some_and(|r| r.owed_resume.is_none())
+            && self.landed_sent
+            && !matches!(self.outcome, Some(Outcome::Failed(_)))
+    }
+
+    /// The peer sent a malformed or truncated known frame: a failure of this
+    /// exchange's own, so the cells it recorded are not kept for resuming.
+    pub(crate) fn malformed(&mut self) {
+        if self.outcome.is_none() {
+            self.fail(Failure::Protocol);
+        }
     }
 
     /// Clean EOF is the cached peer's landing promise, not our insertion ACK.
@@ -874,6 +884,11 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
             return outs;
         }
         if self.peer_done || !self.riblt.as_ref().is_some_and(|r| r.proven) {
+            self.fail(Failure::Protocol);
+            return outs;
+        }
+        // Our cells wait for a RESUME the peer promised and can no longer send.
+        if self.riblt.as_ref().is_some_and(|r| r.awaiting_resume) && !self.discovery_stopped() {
             self.fail(Failure::Protocol);
             return outs;
         }
@@ -909,6 +924,15 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
     /// Cached mode first exchanges explicit profile/root frames, then streams
     /// indexed cells until exact proof and the complete-written frontier meet.
     pub(crate) fn next_delta(&mut self) -> Option<Frame> {
+        // A promised RESUME is owed after our ROOT on every stream that is not
+        // reset: when the roots are equal and no cell follows, and even once
+        // a peer FIN has confirmed the exchange.
+        if self.root_sent
+            && !matches!(self.outcome, Some(Outcome::Failed(_)))
+            && let Some(resume) = self.riblt.as_mut().and_then(|r| r.owed_resume.take())
+        {
+            return Some(resume);
+        }
         if self.outcome.is_some() || self.done_sent {
             return None;
         }
@@ -924,10 +948,6 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
                     summary: self.delta.summary(),
                     resume: resume.is_some_and(|resume| resume.announced),
                 });
-            }
-            // Owed even when the roots are equal and no cell follows.
-            if let Some(resume) = self.riblt.as_mut().unwrap().owed_resume.take() {
-                return Some(resume);
             }
             if self.discovery_stopped() {
                 return None;
@@ -1077,8 +1097,11 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
         if let Some(r) = &self.riblt {
             // FIN/landing alone has no frame-progress deadline. References'
             // pending cursor is local fetch work, not an owed VALUE frame.
+            // A promised RESUME that holds back our cells is a remote frame
+            // owed like any other, even once replayed cells proved the peer.
+            let resume_owed = r.awaiting_resume && !self.discovery_stopped();
             return !self.peer_done
-                && (!r.proven || (self.kind != WalkKind::References
+                && (resume_owed || !r.proven || (self.kind != WalkKind::References
                     && (!self.wanted.is_empty() || !self.requests.is_empty()
                         || r.remote_queued < r.decoder.remote().len())));
         }

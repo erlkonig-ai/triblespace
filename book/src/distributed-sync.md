@@ -811,10 +811,12 @@ a chunk. Each run is one owned buffer handed to the transport seam's
 `SendStream::write_owned`, which the QUIC adapter passes to the stream's
 `write_many_chunks` as it is; write receipts count whole frames only, a
 reset abandons the rest of a run, and FIN follows the last owned write as it
-follows any other. This removes our own per-cell encoding and copies, not the
-transport's: QUIC encrypts each packet in user space, so the stream still
-copies the bytes into its send buffer, and kernel zero-copy (sendfile) is not
-possible. The bytes on the wire are unchanged: 52 payload bytes, 57 framed
+follows any other. This removes our own per-cell encoding and copies. noq may
+copy and coalesce small chunks into its send buffer and can retain larger
+owned chunks as they are (above 1,452 bytes in noq 1.0.1, so a whole 64-cell
+run), keeping the mapped chunk alive until it releases them; freezing and
+copy-on-write keep that sound. Kernel zero-copy (sendfile) is not possible:
+QUIC encrypts each packet in user space. The bytes on the wire are unchanged: 52 payload bytes, 57 framed
 bytes per cell. Root, OPEN, control frames and bodies are additional traffic.
 
 #### Resuming a cut-off exchange
@@ -834,8 +836,13 @@ connections.
 
 - A ROOT carries `resume = 1` when the cache holds any entry for this
   profile; that is the only bit it discloses. It promises exactly one
-  RIBLT_RESUME, sent once the peer's ROOT is heard and never before our own
-  ROOT, and the peer sends no cell before it arrives.
+  RIBLT_RESUME on any stream that is not reset, sent once the peer's ROOT is
+  heard and never before our own ROOT: also when the roots are equal and no
+  cell follows, and even after a peer FIN has confirmed the exchange; local
+  readiness to finish waits for it. The peer sends no cell before it arrives.
+  That wait is a remote frame owed like any other, under the walk's frame
+  deadline even when replayed cells have already proved the difference, and
+  a peer FIN while it still holds our cells back fails the exchange.
 - RIBLT_RESUME says "I hold your first `held` cells for your root R", R being
   the root the peer just announced. The claimant takes the entry for (profile,
   R) out of the cache and claims its length only when R differs from its own
@@ -855,14 +862,25 @@ connections.
   the cache only when it was cut off: it ended without an outcome of its own
   (reset, deadline, connection loss, replacement), short of decoding, with a
   peer root different from ours. A confirmed exchange drops its entry, and
-  one that failed for a reason of its own (proof, protocol, limits) drops it
-  too, so cells that failed a proof are never offered again.
-- The cache holds at most 64 MiB of mapped chunk file per host (about 1.1
-  million cells), evicting the oldest entries first; an entry larger than the
-  whole budget, or a recording that outgrows it, is not kept. A stale root
+  one that failed for a reason of its own (proof, protocol, limits, or a
+  malformed or truncated frame from the peer) drops it too, so cells that
+  failed a proof are never offered again.
+- The kept entries hold at most 64 MiB of mapped chunk file per host (about
+  1.1 million cells), evicting the oldest first; an entry larger than the
+  whole budget is not kept. The budget counts kept entries only: each running
+  cached exchange may additionally hold the entry it took and its own
+  recording, and a recording stops at the budget, so the total is at most the
+  budget times one plus the number of running cached exchanges. A stale root
   (a peer whose set changed) cannot be attributed to its old entry without a
   peer identity, so such an entry ages out under the budget. A miss of any
   kind means the stream starts from 0, never a failure.
+- Accepted limit: kept cells are not verified against the root until
+  decoding completes. Entries are keyed by root and shared across peers, so a
+  dishonest peer can plant a structurally valid but wrong prefix under an
+  honest peer's root and cut the stream; an honest reconnect with that root
+  then fails or redoes work. The final exact root proof still prevents any
+  false confirmation, and the failed exchange discards the entry it took, so
+  integrity holds and poisoning again needs another planted prefix.
 
 Cached mode uses clean write-half FIN for completion, not DONE/LANDED. Local
 eligibility requires exact decoding/proof, the complete-written matching cell

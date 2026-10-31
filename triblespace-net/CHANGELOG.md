@@ -30,8 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   owned-buffer, cancel-safe partial write: the default copies through
   `poll_write`, and the iroh adapter hands the buffer to noq's
   `write_many_chunks`. Per-cell re-encoding and copies on our side are gone;
-  QUIC still copies into its send buffer and encrypts in user space, so this is
-  not kernel zero-copy. The wire is byte-for-byte unchanged and the ALPN stays
+  noq may copy and coalesce small chunks and can retain larger owned chunks
+  (holding the mapped chunk until it releases them); QUIC encrypts in user
+  space, so this is not kernel zero-copy. The wire is byte-for-byte unchanged and the ALPN stays
   `/triblespace/pile-sync/35`.
 
 - One-way typed Prefix offers (COMMIT/DERIVE and grant walks, offer profiles

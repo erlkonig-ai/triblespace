@@ -64,9 +64,9 @@ pub trait SendStream: AsyncWrite + Unpin + Send + 'static {
     ///
     /// The default copies through `poll_write`. The QUIC adapter hands the
     /// buffer itself to the stream, so a cached cell run reaches the
-    /// transport without our own copy; QUIC still copies it into its send
-    /// buffer and encrypts each packet in user space, so this is not kernel
-    /// zero-copy.
+    /// transport without our own copy. noq may copy and coalesce small
+    /// chunks and can retain larger owned chunks; either way QUIC encrypts
+    /// each packet in user space, so this is not kernel zero-copy.
     fn write_owned<'a>(&'a mut self, bytes: &'a mut bytes::Bytes) -> WriteOwned<'a> {
         Box::pin(async move {
             if bytes.is_empty() {
