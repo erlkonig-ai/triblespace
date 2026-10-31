@@ -4,54 +4,47 @@
 //! a configured budget.
 //!
 //! Record `i` lives in chunk `i / CHUNK` at slot `i % CHUNK`. Growth maps one
-//! more chunk and never moves a written record. Each chunk is its own
-//! anonymous temporary file: already unlinked, so a killed process leaves no
-//! file behind, and closed once mapped, so no descriptor stays open. A chunk
-//! is written in full before it is mapped, so a full disk fails the
-//! reservation with an error instead of a SIGBUS on a later store into a
-//! sparse hole. The pages are shared file pages: under memory pressure the
-//! kernel writes them out and reclaims them, instead of keeping them as
-//! anonymous heap.
+//! more chunk and never moves a written record. Each chunk is an anybytes
+//! [`Section::anonymous_allocated`]: its own temporary file without a name,
+//! so a killed process leaves no file behind, closed once mapped, so no
+//! descriptor stays open, and written in full before it is mapped, so a full
+//! disk fails the reservation with an error instead of a SIGBUS on a later
+//! store into a sparse hole. The pages are shared file pages: under memory
+//! pressure the kernel writes them out and reclaims them, instead of keeping
+//! them as anonymous heap.
 //!
 //! Records are encoded byte by byte, never by layout punning. Every slot at
 //! or beyond `len` holds zero bytes.
 //!
-//! [`Records::view`] hands out published records as an immutable
-//! `anybytes::Bytes` over the mapped chunk, without copying. A view never
-//! changes: a FULL chunk is frozen in place first ([`MmapMut::make_read_only`],
-//! so the pages are read-only and the frozen map is the view's owner), and a
-//! view of the still-growing PARTIAL chunk shares the writable map, which
-//! every later write sees as shared through [`Arc::get_mut`] and copies into a
-//! fresh chunk file before writing (copy on write). Records that nobody views
-//! (the receiver's residual rows) never pay either cost.
-//!
-//! anybytes' `ByteArea`/`Section` would be the natural owner and does not fit
-//! yet: its sections grow the file with a sparse `set_len`, which would bring
-//! back the SIGBUS-on-full-disk this module exists to avoid, a `Section`
-//! borrows its area mutably for a grow-only cache that lives as long as a
-//! collection snapshot, and its file is a named temporary file.
+//! [`Records::view`] hands out published records as an immutable [`Bytes`]
+//! over the mapped chunk, without copying. A view never changes: the chunk is
+//! frozen in place first ([`Section::freeze`], so its pages are read-only and
+//! the frozen map is the view's owner), and a later write into a frozen chunk
+//! first copies it into a fresh chunk ([`Records::unshare`], copy on write),
+//! leaving the views the old map. Records that nobody views (the receiver's
+//! residual rows) never pay either cost.
 
-use std::io::{self, Write};
+use std::io;
 use std::marker::PhantomData;
-use std::sync::Arc;
 
-use memmap2::{Mmap, MmapMut};
+use anybytes::area::Section;
+use anybytes::Bytes;
 
 /// Records per chunk: 912 KiB of 57-byte cell frames.
 pub(crate) const CHUNK: usize = 1 << 14;
 
-/// One chunk file's map. `Open` is written in place while nothing shares it;
-/// `Frozen` is read-only and never written again.
+/// One chunk's map. `Open` is written in place and nothing else sees it;
+/// `Frozen` is read-only, may be viewed, and is never written again.
 enum Chunk {
-    Open(Arc<MmapMut>),
-    Frozen(Arc<Mmap>),
+    Open(Section<'static, u8>),
+    Frozen(Bytes),
 }
 
 impl Chunk {
     fn bytes(&self) -> &[u8] {
         match self {
-            Self::Open(map) => map,
-            Self::Frozen(map) => map,
+            Self::Open(section) => section,
+            Self::Frozen(bytes) => bytes,
         }
     }
 }
@@ -99,34 +92,26 @@ impl<T: Record> Records<T> {
         &self.chunks[index / CHUNK].bytes()[at..at + T::BYTES]
     }
 
-    /// The only path to a writable chunk. A shared or frozen chunk must have
-    /// been made private by [`Records::unshare`] first; writing one is a bug,
-    /// and panics rather than change a published view.
+    /// The only path to a writable chunk. A frozen chunk must have been made
+    /// private by [`Records::unshare`] first; writing one is a bug, and
+    /// panics rather than change a published view.
     fn slot_mut(&mut self, index: usize) -> &mut [u8] {
         let at = (index % CHUNK) * T::BYTES;
         match &mut self.chunks[index / CHUNK] {
-            Chunk::Open(map) => {
-                &mut Arc::get_mut(map).expect("a viewed chunk is unshared before writes")
-                    [at..at + T::BYTES]
-            }
+            Chunk::Open(section) => &mut section[at..at + T::BYTES],
             Chunk::Frozen(_) => panic!("a frozen chunk is unshared before writes"),
         }
     }
 
     /// Make every chunk holding records from `first` on privately writable:
-    /// a chunk a view shares, or a frozen one, is copied into a fresh chunk
-    /// file, which replaces it here while the views keep the old map. Callers
-    /// unshare before writing, so a failed copy is a storage error rather than
-    /// a panic half way through a write.
+    /// a frozen chunk is copied into a fresh chunk, which replaces it here
+    /// while the views keep the frozen map. Callers unshare before writing,
+    /// so a failed copy is a storage error rather than a panic half way
+    /// through a write.
     pub(crate) fn unshare(&mut self, first: usize) -> io::Result<()> {
         for slot in self.chunks.iter_mut().skip(first / CHUNK) {
-            let private = match slot {
-                Chunk::Open(map) => Arc::get_mut(map).is_some(),
-                Chunk::Frozen(_) => false,
-            };
-            if !private {
-                let copy = chunk(Some(slot.bytes()), slot.bytes().len())?;
-                *slot = Chunk::Open(Arc::new(copy));
+            if let Chunk::Frozen(bytes) = slot {
+                *slot = Chunk::Open(copy(bytes)?);
             }
         }
         Ok(())
@@ -134,25 +119,20 @@ impl<T: Record> Records<T> {
 
     /// Records `[start, start + count)` as one immutable view over their
     /// mapped chunk, without copying. The range must be published and lie in
-    /// one chunk. A full chunk is frozen read-only first; a partial one is
-    /// shared and copied by the next [`Records::unshare`] that reaches it.
-    pub(crate) fn view(&mut self, start: usize, count: usize) -> io::Result<anybytes::Bytes> {
+    /// one chunk. The chunk is frozen read-only in place first, and copied
+    /// by the next [`Records::unshare`] that reaches it.
+    pub(crate) fn view(&mut self, start: usize, count: usize) -> io::Result<Bytes> {
         assert!(count > 0 && start + count <= self.len, "a view of unpublished records");
         let index = start / CHUNK;
         assert_eq!(index, (start + count - 1) / CHUNK, "a view across chunks");
-        let full = self.len >= (index + 1) * CHUNK;
-        if full && matches!(self.chunks[index], Chunk::Open(_)) {
-            let Chunk::Open(map) = self.chunks.remove(index) else {
+        if let Chunk::Open(_) = self.chunks[index] {
+            let Chunk::Open(section) =
+                std::mem::replace(&mut self.chunks[index], Chunk::Frozen(Bytes::empty()))
+            else {
                 unreachable!("checked open")
             };
-            // A view taken while the chunk was partial may still share the
-            // writable map; then a copy is frozen and that view keeps the old.
-            let frozen = match Arc::try_unwrap(map) {
-                Ok(map) => map.make_read_only(),
-                Err(shared) => chunk(Some(&shared), shared.len()).and_then(MmapMut::make_read_only),
-            };
-            match frozen {
-                Ok(map) => self.chunks.insert(index, Chunk::Frozen(Arc::new(map))),
+            match section.freeze() {
+                Ok(bytes) => self.chunks[index] = Chunk::Frozen(bytes),
                 Err(error) => {
                     // The map is gone with the failed call. Unpublish from
                     // this chunk on, so the records stay a consistent prefix;
@@ -163,11 +143,10 @@ impl<T: Record> Records<T> {
                 }
             }
         }
-        let at = (start % CHUNK) * T::BYTES;
-        let bytes = match &self.chunks[index] {
-            Chunk::Open(map) => anybytes::Bytes::from_owning_source_arc(map.clone()),
-            Chunk::Frozen(map) => anybytes::Bytes::from_owning_source_arc(map.clone()),
+        let Chunk::Frozen(bytes) = &self.chunks[index] else {
+            unreachable!("frozen above")
         };
+        let at = (start % CHUNK) * T::BYTES;
         Ok(bytes.slice(at..at + count * T::BYTES))
     }
 
@@ -193,8 +172,8 @@ impl<T: Record> Records<T> {
     pub(crate) fn resize(&mut self, len: usize) -> io::Result<()> {
         let mapped = self.chunks.len();
         while self.chunks.len() * CHUNK < len {
-            match chunk(None, CHUNK * T::BYTES) {
-                Ok(chunk) => self.chunks.push(Chunk::Open(Arc::new(chunk))),
+            match chunk(CHUNK * T::BYTES) {
+                Ok(chunk) => self.chunks.push(Chunk::Open(chunk)),
                 Err(error) => {
                     self.chunks.truncate(mapped);
                     return Err(error);
@@ -219,10 +198,7 @@ impl<T: Record> Records<T> {
         let len = len.min(self.len);
         let chunks = self.chunks[..len.div_ceil(CHUNK)]
             .iter()
-            .map(|source| {
-                let bytes = source.bytes();
-                Ok(Chunk::Open(Arc::new(chunk(Some(bytes), bytes.len())?)))
-            })
+            .map(|source| Ok(Chunk::Open(copy(source.bytes())?)))
             .collect::<io::Result<_>>()?;
         let mut copy = Self {
             chunks,
@@ -254,9 +230,8 @@ pub(crate) fn fail_chunks_after(left: Option<usize>) {
     CHUNKS_LEFT.with(|cell| cell.set(left));
 }
 
-/// One chunk file of `bytes`, holding `contents` or zeros, mapped writable.
-fn chunk(contents: Option<&[u8]>, bytes: usize) -> io::Result<MmapMut> {
-    static ZEROS: [u8; 64 * 1024] = [0; 64 * 1024];
+/// One zeroed chunk of `bytes`, its storage claimed before it is mapped.
+fn chunk(bytes: usize) -> io::Result<Section<'static, u8>> {
     #[cfg(test)]
     if let Some(left) = CHUNKS_LEFT.with(|cell| cell.get()) {
         if left == 0 {
@@ -264,19 +239,12 @@ fn chunk(contents: Option<&[u8]>, bytes: usize) -> io::Result<MmapMut> {
         }
         CHUNKS_LEFT.with(|cell| cell.set(Some(left - 1)));
     }
-    let mut file = tempfile::tempfile()?;
-    match contents {
-        Some(contents) => file.write_all(contents)?,
-        None => {
-            let mut left = bytes;
-            while left > 0 {
-                let step = left.min(ZEROS.len());
-                file.write_all(&ZEROS[..step])?;
-                left -= step;
-            }
-        }
-    }
-    // SAFETY: the file is anonymous, already unlinked, and its descriptor is
-    // dropped on return, so nothing else can write or truncate the mapping.
-    unsafe { MmapMut::map_mut(&file) }
+    Section::anonymous_allocated(bytes)
+}
+
+/// A fresh chunk holding a copy of `contents`.
+fn copy(contents: &[u8]) -> io::Result<Section<'static, u8>> {
+    let mut section = chunk(contents.len())?;
+    section.copy_from_slice(contents);
+    Ok(section)
 }
