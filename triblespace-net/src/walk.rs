@@ -3486,8 +3486,10 @@ pub(crate) mod tests {
             assert!((150..=200).contains(&bodies), "{bodies} bodies");
             assert!(read(&mut recv).await.is_none(), "the stream finished");
             assert_eq!(*landed.lock().unwrap(), None);
+            // The task finishes the stream before it records the end, so
+            // wait for health; its events are sent before that record.
+            let health = receiving.ended(sender.id(), collection, None).await;
             assert_eq!(receiving.records(collection), records);
-            let health = receiving.health(collection, sender.id()).unwrap();
             assert!(health.receives.last_ok && health.receives.ok == 1);
             assert_eq!(health.pushes.ok + health.pushes.failed, 0, "receive only");
             let root = summary(
