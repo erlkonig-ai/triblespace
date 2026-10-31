@@ -620,12 +620,14 @@ never send or accept HAVE.
 
 What is protected is contents, not membership. A receiver able to build an
 offered subtree already holds its data, so acknowledging it discloses nothing
-the writer did not send. Exact equality does disclose that the receiver holds
-no private sibling under that prefix, and positive leaf feedback discloses
-possession of already-offered identities; neither is hidden, and no claim of
-timing or traffic-analysis secrecy is made. Where the receiver holds unrelated
-private siblings, the subtree hashes differ and receipts fall back to finer
-prefixes and leaves.
+the writer did not send. A coarse HAVE says that one retained custody view (G
+or the original pin) equals the offered subtree; it does not say the receiver
+holds nothing else under that prefix now, since a shared G can match while
+private extras exist beside it. Positive leaf feedback discloses possession of
+already-offered identities. Neither is hidden, and no claim of timing or
+traffic-analysis secrecy is made. Where the original pin holds unrelated
+private siblings and no G matches, the subtree hashes differ and receipts fall
+back to finer prefixes and leaves.
 
 At most 64 offered leaves await possession receipts. Their bodies are sent
 speculatively without VALUE_REQUEST, before waiting for those receipts; an
