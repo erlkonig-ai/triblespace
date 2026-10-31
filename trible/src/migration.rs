@@ -289,7 +289,7 @@ pub fn prepare_with_progress(
         inspection
             .legacy_branches
             .iter()
-            .filter(|branch| !selected.contains_key(branch))
+            .filter(|branch| !selected.contains_key(*branch))
             .map(|branch| Requirement::Branch { branch: *branch }),
     );
     if !requirements.is_empty() {
