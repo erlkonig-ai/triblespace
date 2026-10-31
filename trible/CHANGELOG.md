@@ -11,7 +11,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Native applications can inspect and prepare a fresh pile through
   `trible::migration`, sharing the CLI's converters without argv or stdout
   parsing. Sources remain retained; branch and authorship choices are explicit,
-  and prepared storage is never activated by the library.
+  and prepared storage is never activated by the library. Unknown bounded kinds
+  in current framing remain readable; unsupported rewriting does not block an
+  ordinary current-storage open.
 - Native `/32` preparation shares the canonical converter, original-author
   signatures, frozen-input checks and output audit. Missing exact foreign
   refreshes are typed outcomes; unconverted caches remain in retained sources.

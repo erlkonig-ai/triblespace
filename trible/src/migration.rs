@@ -61,7 +61,8 @@ pub(crate) fn checkpoint(
     Ok(())
 }
 
-/// A physical frame kind this converter cannot interpret, with its exact width.
+/// A bounded record kind this converter cannot rewrite, with its exact width.
+/// Unknown kinds in current valid framing remain readable by native replay.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnsupportedKind {
     pub kind: OpaqueKind,
@@ -298,25 +299,25 @@ pub fn prepare_with_progress(
     let inspection = inspect_with_progress(source, progress)?;
     unchanged(source, &source_metadata)?;
     checkpoint(progress, Stage::Inspect, 0, 0)?;
+    let canonical = inspection
+        .requirements
+        .iter()
+        .any(|r| matches!(r, Requirement::Canonical { .. }));
+    if inspection.current_framing && !canonical && decisions.is_empty() {
+        checkpoint(progress, Stage::Ready, 0, 0)?;
+        unchanged(source, &source_metadata)?;
+        return Ok(Outcome::Current {
+            legacy_branches: inspection.legacy_branches,
+        });
+    }
     if !inspection.unsupported.is_empty() {
         return Ok(Outcome::Unsupported {
             kinds: inspection.unsupported,
         });
     }
-    if inspection
-        .requirements
-        .iter()
-        .any(|r| matches!(r, Requirement::Canonical { .. }))
-    {
+    if canonical {
         return Ok(Outcome::ChoiceRequired {
             requirements: inspection.requirements,
-        });
-    }
-    if inspection.current_framing && decisions.is_empty() {
-        checkpoint(progress, Stage::Ready, 0, 0)?;
-        unchanged(source, &source_metadata)?;
-        return Ok(Outcome::Current {
-            legacy_branches: inspection.legacy_branches,
         });
     }
     let mut selected = BTreeMap::new();

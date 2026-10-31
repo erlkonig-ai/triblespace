@@ -105,6 +105,8 @@ converted, choice-required or unsupported outcomes; it never activates storage.
 `Current` describes physical framing, not adoption of retained legacy branches
 or understanding of every application schema. The returned legacy pins remain
 explicit. The CLI's existing decisions-file and resume behavior is unchanged.
+Unknown bounded kinds in current valid framing remain ordinary readable storage;
+they block only a required rewrite, not the `Current` outcome.
 
 `prepare_canonical` (or `prepare_canonical_with_progress`) reuses the offline
 `/32` assertion converter with the owner's existing in-memory signer. It computes

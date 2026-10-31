@@ -156,18 +156,45 @@ fn envelope(kind: &[u8; 32]) -> Vec<u8> {
 }
 
 #[test]
-fn unsupported_frames_and_deployed_32_are_structured_nonwriting_outcomes() {
+fn unknown_current_kinds_are_readable_but_refuse_a_required_rewrite() {
     let dir = tempdir().unwrap();
     let source = dir.path().join("source.pile");
     let destination = dir.path().join("candidate.pile");
     let unknown = envelope(&[0xa5; 32]);
     std::fs::write(&source, &unknown).unwrap();
+    let inspection = inspect(&source).unwrap();
+    assert!(inspection.current_framing);
+    assert_eq!(inspection.unsupported.len(), 1);
+    let mut reader = Pile::with_host(PileFile::open_read_only(&source).unwrap(), None);
+    reader.refresh().unwrap();
+    reader.snapshot().unwrap();
+    reader.close().unwrap();
+    assert_eq!(
+        prepare(&source, &destination, &[]).unwrap(),
+        Outcome::Current {
+            legacy_branches: vec![]
+        }
+    );
+    assert!(!destination.exists());
+    assert_eq!(std::fs::read(&source).unwrap(), unknown);
+
+    let mut mixed = unknown;
+    mixed.extend_from_slice(include_bytes!("fixtures/legacy_v0464_branch.pile"));
+    std::fs::write(&source, &mixed).unwrap();
+    assert!(!inspect(&source).unwrap().current_framing);
     assert!(matches!(
         prepare(&source, &destination, &[]).unwrap(),
         Outcome::Unsupported { .. }
     ));
     assert!(!destination.exists());
-    assert_eq!(std::fs::read(&source).unwrap(), unknown);
+    assert_eq!(std::fs::read(&source).unwrap(), mixed);
+}
+
+#[test]
+fn deployed_32_requires_canonical_and_unknown_kinds_still_block_that_rewrite() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source.pile");
+    let destination = dir.path().join("candidate.pile");
     // Existing deployed /32 COMMIT kind; no signature claim is made by inspection.
     let kind: [u8; 32] =
         hex::decode("A1322BB3F5214287C314D42AFCC1A97CB264FACD9A22B4938838BE78DB31AA59")
@@ -184,6 +211,15 @@ fn unsupported_frames_and_deployed_32_are_structured_nonwriting_outcomes() {
     );
     assert!(!destination.exists());
     assert_eq!(std::fs::read(&source).unwrap(), deployed);
+    let mut mixed = deployed;
+    mixed.extend_from_slice(&envelope(&[0xa5; 32]));
+    std::fs::write(&source, &mixed).unwrap();
+    assert!(matches!(
+        prepare(&source, &destination, &[]).unwrap(),
+        Outcome::Unsupported { .. }
+    ));
+    assert!(!destination.exists());
+    assert_eq!(std::fs::read(&source).unwrap(), mixed);
 }
 
 #[test]
