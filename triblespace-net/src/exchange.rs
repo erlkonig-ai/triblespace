@@ -71,9 +71,11 @@ use crate::host::{CollectionSnapshot, StoreSnapshot};
 use crate::patch_repair::PatchSummary;
 use crate::protocol::RawHash;
 use crate::riblt_cache::{
-    CELL_FRAME_BYTES, CacheError, Cell, CellFrame, Generation, KeySymbol, cell_bound,
+    CELL_FRAME_BYTES, CacheError, Cell, CellFrame, Generation, KeySymbol, MAX_INDEX, cell_bound,
 };
 use crate::riblt_decode::{DecodeError, ResidualDecoder};
+use crate::riblt_resume::ResumeCache;
+use crate::riblt_store::Records;
 use crate::walk::{
     Admit, KEY_BYTES, MAX_WALK_REQUESTS, MAX_WALK_UNLANDED, Value, WalkKind, admit_fetched,
     admit_missing, admit_value, decode_proof, node_summary, value,
@@ -93,6 +95,9 @@ mod prefix_offer_tests;
 #[cfg(test)]
 #[path = "riblt_completion_tests.rs"]
 mod riblt_completion_tests;
+#[cfg(test)]
+#[path = "riblt_resume_tests.rs"]
+mod riblt_resume_tests;
 
 /// Missing leaves awaiting a value beyond which the exchange fails.
 pub(crate) const FLOOD_WANTED: usize = 32 * 1024;
@@ -599,6 +604,51 @@ struct Riblt {
     bound: usize,
     /// Most cells per outgoing run: [`CELL_RUN`]; tests step one at a time.
     run: usize,
+    /// The generation's profile key, kept after the generation is released.
+    profile: riblt::HashKey,
+    /// The first cell of our outgoing stream: the peer's RESUME said it holds
+    /// the ones below. Receipts below it are stale ROOT-time receipts.
+    start: usize,
+    /// The peer's ROOT promised a RESUME that has not arrived: no cell may be
+    /// sent before it.
+    awaiting_resume: bool,
+    /// The RESUME our ROOT promised, decided once the peer's ROOT arrived and
+    /// sent by [`Exchange::next_delta`], so it can never precede our ROOT.
+    owed_resume: Option<Frame>,
+    /// The host's cache of peer cell prefixes, and what this exchange
+    /// received, verbatim, from cell 0 on.
+    resume: Option<Resuming>,
+}
+
+impl Riblt {
+    /// Append the peer's next cell, verbatim, to what a cut-off exchange
+    /// keeps. Past the cache's budget, or on a storage error, stop recording:
+    /// a later exchange then starts from 0.
+    fn record(&mut self, index: u32, cell: &Cell) {
+        let Some(resume) = &mut self.resume else { return };
+        let Some(cells) = &mut resume.cells else { return };
+        let frame = CellFrame {
+            index,
+            cell: cell.clone(),
+        };
+        debug_assert_eq!(cells.len(), index as usize, "recorded cells are contiguous from 0");
+        if (cells.len() + 1) * CELL_FRAME_BYTES > resume.cache.budget()
+            || cells.push(&frame).is_err()
+        {
+            resume.cells = None;
+        }
+    }
+}
+
+/// One exchange's part in the host's [`ResumeCache`].
+struct Resuming {
+    cache: Arc<ResumeCache>,
+    /// Our ROOT promised a RESUME: the cache held an entry for this profile.
+    announced: bool,
+    /// The peer's cells `[0, received)` as their RIBLT_CELL frame bytes, or
+    /// `None` once recording stopped (storage or budget): then nothing is
+    /// kept, which only means a later exchange starts from 0.
+    cells: Option<Records<CellFrame>>,
 }
 
 impl<R: BlobStoreGet + Clone> Exchange<R> {
@@ -679,6 +729,7 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
     ) -> Self {
         assert_ne!(kind, WalkKind::Authorization, "grant walks are Prefix only");
         let cache = pinned.cache(kind);
+        let profile = cache.key();
         let mut exchange = Self::start(collection, kind, pinned, None, true, true);
         // Full component, never the per-neighbour agreement difference G.
         exchange.peer = exchange.delta.clone();
@@ -697,8 +748,27 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
             eager: 0,
             bound: 0,
             run: CELL_RUN,
+            profile,
+            start: 0,
+            awaiting_resume: false,
+            owed_resume: None,
+            resume: None,
         });
         exchange
+    }
+
+    /// Resume through the host's cache of peer cell prefixes (ALPN 36):
+    /// record what the peer sends, claim what the cache holds for the peer's
+    /// root, and keep the cells if the exchange is cut off.
+    pub(crate) fn resuming(mut self, cache: Arc<ResumeCache>) -> Self {
+        if let Some(r) = &mut self.riblt {
+            r.resume = Some(Resuming {
+                announced: cache.holds(&r.profile),
+                cache,
+                cells: Some(Records::default()),
+            });
+        }
+        self
     }
 
     /// Hand out cells `run` at a time, for tests that step cell by cell.
@@ -766,6 +836,9 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
     /// Writer receipts only follow complete frame writes, never queue admission.
     pub(crate) fn on_written(&mut self, prefix: usize) -> Vec<Out> {
         if let Some(riblt) = &mut self.riblt {
+            // A receipt written before a RESUME moved the start (the ROOT's
+            // zero-cell receipt) says nothing about the peer's prefix.
+            let prefix = prefix.max(riblt.start);
             if prefix < riblt.written || prefix > riblt.generated {
                 self.fail(Failure::Protocol);
             } else {
@@ -846,15 +919,22 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
                     return None;
                 }
                 self.root_sent = true;
+                let resume = self.riblt.as_ref().unwrap().resume.as_ref();
                 return Some(Frame::RibltRoot {
                     summary: self.delta.summary(),
+                    resume: resume.is_some_and(|resume| resume.announced),
                 });
+            }
+            // Owed even when the roots are equal and no cell follows.
+            if let Some(resume) = self.riblt.as_mut().unwrap().owed_resume.take() {
+                return Some(resume);
             }
             if self.discovery_stopped() {
                 return None;
             }
-            // A root is required before spending CPU or disclosing cell data.
-            if self.peer_root.is_none() {
+            // A root is required before spending CPU or disclosing cell data,
+            // and a promised RESUME before choosing where the cells start.
+            if self.peer_root.is_none() || self.riblt.as_ref().unwrap().awaiting_resume {
                 return None;
             }
             let r = self.riblt.as_mut().unwrap();
@@ -1010,7 +1090,8 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
             })
     }
 
-    pub(crate) fn end(self) -> Ended {
+    pub(crate) fn end(mut self) -> Ended {
+        self.keep_received();
         let confirmed = self.outcome == Some(Outcome::Confirmed);
         let next = confirmed.then(|| {
             self.union_tree()
@@ -1047,6 +1128,20 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
         }
     }
 
+    /// Keep the peer cells of an exchange that was cut off: it ended without
+    /// an outcome of its own, short of decoding. A confirmed exchange needs
+    /// them no more, and one that failed for itself may have failed on them.
+    fn keep_received(&mut self) {
+        let Some(r) = &mut self.riblt else { return };
+        let Some(resume) = r.resume.take() else { return };
+        let (Some(peer), Some(cells)) = (self.peer_root, resume.cells) else {
+            return;
+        };
+        if self.outcome.is_none() && r.decoded_at.is_none() && peer != self.delta.summary() {
+            resume.cache.keep((r.profile, peer), cells);
+        }
+    }
+
     fn union_tree(&self) -> Tree {
         let mut union = self
             .agreed
@@ -1061,7 +1156,7 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
     fn frame(&mut self, frame: Frame, outs: &mut Vec<Out>) -> Result<(), Failure> {
         match frame {
             Frame::Open { .. } => Err(Failure::Protocol),
-            Frame::RibltRoot { summary } => {
+            Frame::RibltRoot { summary, resume } => {
                 let r = self.riblt.as_mut().ok_or(Failure::Protocol)?;
                 if self.peer_root.is_some() {
                     return Err(Failure::Protocol);
@@ -1071,9 +1166,27 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
                 }
                 self.peer_root = Some(summary);
                 r.bound = cell_bound(self.delta.summary().leaf_count(), summary.leaf_count());
+                r.awaiting_resume = resume;
                 if summary == self.delta.summary() {
                     r.decoded_at = Some(0);
                     r.proven = true;
+                }
+                self.claim(summary)
+            }
+            Frame::RibltResume { held, root } => {
+                let own = self.delta.summary();
+                let r = self.riblt.as_mut().ok_or(Failure::Protocol)?;
+                if self.peer_root.is_none() || !r.awaiting_resume {
+                    return Err(Failure::Protocol);
+                }
+                r.awaiting_resume = false;
+                // The same rule the claimant applied: our own root, and a
+                // prefix short of the bound. Anything else starts at 0.
+                let held = held as usize;
+                if held > 0 && root == own && held < r.bound {
+                    r.start = held;
+                    r.generated = held;
+                    r.written = held;
                 }
                 Ok(())
             }
@@ -1097,60 +1210,12 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
                 hash,
                 count,
             } => {
-                self.arriving()?;
-                let r = self.riblt.as_mut().ok_or(Failure::Protocol)?;
-                if index as usize != r.received
-                    || count < 0
-                    || count as u64 > self.peer_root.unwrap().leaf_count()
-                {
-                    return Err(Failure::Protocol);
-                }
-                if r.received >= r.bound {
-                    return Err(Failure::ResourceLimit);
-                }
-                r.received += 1;
-                // Once fully peeled, extra in-flight cells are harmless but are
-                // still ordered. Bodies never enter decoder windows.
-                if r.decoded_at.is_some() {
-                    return Ok(());
-                }
-                let local = r
-                    .cache
-                    .as_ref()
-                    .ok_or(Failure::Protocol)?
-                    .cell(index as usize)
-                    .map_err(Failure::from)?;
-                let count = count.checked_sub(local.count).ok_or(Failure::Protocol)?;
-                r.decoder
-                    .add(Cell {
-                        symbol: KeySymbol(symbol).xor(&local.symbol),
-                        hash: hash ^ local.hash,
-                        count,
-                    })
-                    .map_err(Failure::from)?;
-                let local: Vec<_> = r
-                    .decoder
-                    .local()
-                    .iter_from(r.local)
-                    .map(|s| s.symbol.0)
-                    .collect();
-                r.local = r.decoder.local().len();
-                if r.decoder.decoded() {
-                    r.decoded_at = Some(r.received);
-                    r.decoder.finish();
-                }
-                if r.decoded_at.is_some() {
-                    let summary = decoded_summary(
-                        &self.delta,
-                        r.decoder.local().iter().map(|item| item.symbol.0),
-                        r.decoder.remote().iter().map(|item| item.symbol.0),
-                    )?;
-                    if Some(summary) != self.peer_root {
-                        return Err(Failure::CountMismatch);
-                    }
-                    r.proven = true;
-                }
-                drop_local(&mut self.peer, &self.delta, &local)
+                let cell = Cell {
+                    symbol: KeySymbol(symbol),
+                    hash,
+                    count,
+                };
+                self.peer_cell(index, cell, true)
             }
             Frame::Subtree {
                 prefix,
@@ -1470,6 +1535,103 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
         }
     }
 
+    /// After the peer's ROOT. If our ROOT promised a RESUME, send it: claim
+    /// the peer cells the cache holds for exactly this root when the peer
+    /// will honor the claim (its root differs from ours and the prefix is
+    /// short of the bound), and rebuild the residual from them against our
+    /// CURRENT cells, never from a stored residual. An entry we cannot use is
+    /// dropped, and RESUME claims nothing.
+    fn claim(&mut self, peer: PatchSummary) -> Result<(), Failure> {
+        let own = self.delta.summary();
+        let r = self.riblt.as_mut().ok_or(Failure::Protocol)?;
+        let Some(resume) = r.resume.as_mut().filter(|resume| resume.announced) else {
+            return Ok(());
+        };
+        let cells = resume
+            .cache
+            .take(&(r.profile, peer))
+            .filter(|cells| peer != own && cells.len() < r.bound && cells.len() <= MAX_INDEX);
+        let held = cells.as_ref().map_or(0, Records::len);
+        r.owed_resume = Some(Frame::RibltResume {
+            held: held as u32,
+            root: peer,
+        });
+        let Some(cells) = cells else {
+            return Ok(());
+        };
+        for index in 0..held {
+            let frame = cells.get(index).expect("held cells are published");
+            self.peer_cell(frame.index, frame.cell, false)?;
+        }
+        if let Some(resume) = &mut self.riblt.as_mut().unwrap().resume {
+            resume.cells = Some(cells);
+        }
+        Ok(())
+    }
+
+    /// The peer's cell at `index`, which must be the next one owed: checked,
+    /// recorded for resumption (`record`; a replayed cell already is), and
+    /// peeled against our own cell at the same index.
+    fn peer_cell(&mut self, index: u32, cell: Cell, record: bool) -> Result<(), Failure> {
+        let peer_root = self.arriving()?;
+        let r = self.riblt.as_mut().ok_or(Failure::Protocol)?;
+        if index as usize != r.received
+            || cell.count < 0
+            || cell.count as u64 > peer_root.leaf_count()
+        {
+            return Err(Failure::Protocol);
+        }
+        if r.received >= r.bound {
+            return Err(Failure::ResourceLimit);
+        }
+        r.received += 1;
+        // Once fully peeled, extra in-flight cells are harmless but are
+        // still ordered. Bodies never enter decoder windows.
+        if r.decoded_at.is_some() {
+            return Ok(());
+        }
+        if record {
+            r.record(index, &cell);
+        }
+        let local = r
+            .cache
+            .as_ref()
+            .ok_or(Failure::Protocol)?
+            .cell(index as usize)
+            .map_err(Failure::from)?;
+        let count = cell.count.checked_sub(local.count).ok_or(Failure::Protocol)?;
+        r.decoder
+            .add(Cell {
+                symbol: cell.symbol.xor(&local.symbol),
+                hash: cell.hash ^ local.hash,
+                count,
+            })
+            .map_err(Failure::from)?;
+        let local: Vec<_> = r
+            .decoder
+            .local()
+            .iter_from(r.local)
+            .map(|s| s.symbol.0)
+            .collect();
+        r.local = r.decoder.local().len();
+        if r.decoder.decoded() {
+            r.decoded_at = Some(r.received);
+            r.decoder.finish();
+        }
+        if r.decoded_at.is_some() {
+            let summary = decoded_summary(
+                &self.delta,
+                r.decoder.local().iter().map(|item| item.symbol.0),
+                r.decoder.remote().iter().map(|item| item.symbol.0),
+            )?;
+            if Some(summary) != self.peer_root {
+                return Err(Failure::CountMismatch);
+            }
+            r.proven = true;
+        }
+        drop_local(&mut self.peer, &self.delta, &local)
+    }
+
     fn arriving(&self) -> Result<PatchSummary, Failure> {
         match self.peer_root {
             Some(root) if !self.peer_done => Ok(root),
@@ -1736,6 +1898,7 @@ pub(crate) mod tests {
                 if mode == 2 {
                     exchange.on_frame(Frame::RibltRoot {
                         summary: declared,
+                        resume: false,
                     }, Some(local.snapshot()));
                 } else {
                     exchange.on_frame(root(declared), Some(local.snapshot()));
@@ -3556,7 +3719,7 @@ pub(crate) mod tests {
 
         // Receiving: a stream that never decodes is refused at the bound.
         let mut receiver = Exchange::start_riblt(collection, kind, local.pinned(collection));
-        receiver.on_frame(Frame::RibltRoot { summary }, Some(local.snapshot()));
+        receiver.on_frame(Frame::RibltRoot { summary, resume: false }, Some(local.snapshot()));
         let undecodable = |index: usize| Frame::RibltCell {
             index: index as u32,
             symbol: [0xA5; 32],
@@ -3576,7 +3739,7 @@ pub(crate) mod tests {
         // Sending: no cell at or beyond the bound is prepared or sent.
         let mut sender = Exchange::start_riblt(collection, kind, local.pinned(collection));
         assert!(matches!(sender.next_delta(), Some(Frame::RibltRoot { .. })));
-        sender.on_frame(Frame::RibltRoot { summary }, Some(local.snapshot()));
+        sender.on_frame(Frame::RibltRoot { summary, resume: false }, Some(local.snapshot()));
         let mut sent = 0;
         while let Some(frame) = sender.next_delta() {
             for cell in frame.cells() {

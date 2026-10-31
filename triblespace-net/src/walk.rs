@@ -248,6 +248,9 @@ pub(crate) struct Walks<R> {
     /// Connection-scoped sound common-held keys: prior acknowledged base
     /// plus both completed deltas, possibly ahead of lagging physical pins.
     agreed: PATCH<65, IdentitySchema, Arc<Tree>>,
+    /// Peer cell prefixes kept for resuming cut-off cached RIBLT exchanges,
+    /// keyed by profile and peer root, never by peer.
+    resume: Arc<crate::riblt_resume::ResumeCache>,
 }
 
 /// Log an incoming OPEN that asks for a two-way Prefix walk of a data tree,
@@ -269,6 +272,7 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
             snapshot: None,
             selected: PATCH::new(),
             agreed: PATCH::new(),
+            resume: crate::riblt_resume::ResumeCache::new(crate::riblt_resume::RESUME_BUDGET_BYTES),
         }
     }
 
@@ -312,7 +316,9 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
             return None;
         }
         if sends && receives {
-            return Some(Exchange::start_riblt(collection, kind, pinned));
+            return Some(
+                Exchange::start_riblt(collection, kind, pinned).resuming(self.resume.clone()),
+            );
         }
         let agreed = self
             .agreed
@@ -378,7 +384,7 @@ impl<R: BlobStoreGet + Clone> Walks<R> {
             .cloned();
         match (algorithm, offer) {
             (Algorithm::CachedRiblt, None) if sends && receives => {
-                Some(Exchange::start_riblt(collection, kind, pinned))
+                Some(Exchange::start_riblt(collection, kind, pinned).resuming(self.resume.clone()))
             }
             // References carry no offer role: profile 0 is their one-way walk.
             (Algorithm::Prefix, None) if sends != receives => Some(Exchange::start(

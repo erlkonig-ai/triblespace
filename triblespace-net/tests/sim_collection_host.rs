@@ -1249,7 +1249,7 @@ fn a_previous_generation_peer_is_refused() {
         let server_id = server_key.verifying_key().to_bytes();
         assert_eq!(
             triblespace_net::protocol::PILE_SYNC_ALPN,
-            b"/triblespace/pile-sync/35"
+            b"/triblespace/pile-sync/36"
         );
         let current = client
             .transport
@@ -1264,9 +1264,9 @@ fn a_previous_generation_peer_is_refused() {
         .expect("the current generation answers");
         assert!(answer.is_ok(), "{answer:?}");
         for previous in [
+            b"/triblespace/pile-sync/35",
             b"/triblespace/pile-sync/34",
             b"/triblespace/pile-sync/33",
-            b"/triblespace/pile-sync/32",
         ] {
             let previous = client.transport.dial(server_id, previous).await.unwrap();
             let refused = tokio::time::timeout(

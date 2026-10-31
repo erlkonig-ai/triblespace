@@ -62,7 +62,13 @@ use crate::transport::PeerId;
 /// the narrowed acceptance needs a handshake boundary. Generation 34 is a
 /// different, deployed and rejected profile (a carried agreed tree and
 /// asymmetric RIBLT roles), so this skips it rather than reusing its number.
-pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/35";
+/// Generation 36 lets a cut-off cached RIBLT exchange resume: RIBLT_ROOT
+/// gains a resume flag (41 payload bytes) and RIBLT_RESUME (`0x0c`) says
+/// which prefix of the peer's cell stream the receiver already holds for
+/// the peer's announced root, so the cells resume there. Both are new wire
+/// bytes a generation-35 peer would reject as malformed, so they need a
+/// handshake boundary.
+pub const PILE_SYNC_ALPN: &[u8] = b"/triblespace/pile-sync/36";
 
 // Stream type tags — first byte on each stream, read before any admission
 // permit is taken. An unknown tag resets only its own stream.

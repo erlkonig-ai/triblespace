@@ -8,9 +8,10 @@
 //! | 0x06 | VALUE         | key32, nonempty bytes           |
 //! | 0x07 | DONE          | empty                           |
 //! | 0x08 | LANDED        | empty                           |
-//! | 0x09 | RIBLT_ROOT    | hash32, u64                     |
+//! | 0x09 | RIBLT_ROOT    | hash32, u64, resume:u8          |
 //! | 0x0a | RIBLT_CELL    | index:u32, symbol32, hash:u64, count:i64 |
 //! | 0x0b | HAVE          | offered depth:u8, prefix32, hash32, u64 |
+//! | 0x0c | RIBLT_RESUME  | held:u32, hash32, u64           |
 //!
 //! SUBTREE has exactly73 payload bytes, or78 bytes with the ordinary five-byte
 //! frame header. Integers are big-endian. Prefix bytes outside depth are zero;
@@ -30,7 +31,14 @@
 //! Prefix walk of data and is refused (`walk::Walks::start_incoming`).
 //! This is not an old-wire compatibility negotiation.
 //! Cached RIBLT derives its checksum key from OPEN locally; ROOT is exactly
-//! 40 payload bytes. DONE/LANDED belong only to Prefix. Cached completion uses
+//! 41 payload bytes: the exact summary, then `resume` 0 or 1. `resume` 1
+//! promises exactly one RESUME, sent once the peer's ROOT is heard, and the
+//! peer sends no cell before it. RESUME says "I hold your first `held` cells
+//! for your root (hash, count)"; the cell stream then starts at `held` when
+//! that root is the sender's own and `held` is below the cell bound of the
+//! two ROOT counts, and at 0 otherwise. Both sides apply the same rule, so the
+//! receiver knows the first index it must see (ALPN 36).
+//! DONE/LANDED belong only to Prefix. Cached completion uses
 //! clean write-half FIN after proof, actual landing and all owed frame writes.
 
 use triblespace_core::collection::CollectionHandle;
@@ -50,6 +58,7 @@ pub const SUBTREE_BYTES: usize = 1 + 32 + 32 + 8;
 pub const FRAME_RIBLT_ROOT: u8 = 0x09;
 pub const FRAME_RIBLT_CELL: u8 = 0x0a;
 pub const FRAME_HAVE: u8 = 0x0b;
+pub const FRAME_RIBLT_RESUME: u8 = 0x0c;
 
 /// The discovery profile an OPEN names. It is derived, never configured: a
 /// data tree walked both ways is CachedRiblt, one walked one way and every
@@ -118,8 +127,16 @@ pub(crate) enum Frame {
     },
     Done,
     Landed,
+    /// `resume`: a RIBLT_RESUME follows once the peer's ROOT is heard, and
+    /// the peer must send no cell before it.
     RibltRoot {
         summary: PatchSummary,
+        resume: bool,
+    },
+    /// "I hold your first `held` cells for your root `root`."
+    RibltResume {
+        held: u32,
+        root: PatchSummary,
     },
     RibltCell {
         index: u32,
@@ -176,9 +193,15 @@ impl Frame {
             }
             Self::Done => FRAME_DONE,
             Self::Landed => FRAME_LANDED,
-            Self::RibltRoot { summary } => {
+            Self::RibltRoot { summary, resume } => {
                 push_summary(&mut payload, *summary);
+                payload.push(u8::from(*resume));
                 FRAME_RIBLT_ROOT
+            }
+            Self::RibltResume { held, root } => {
+                payload.extend_from_slice(&held.to_be_bytes());
+                push_summary(&mut payload, *root);
+                FRAME_RIBLT_RESUME
             }
             Self::RibltCell {
                 index,
@@ -287,6 +310,15 @@ impl Frame {
             FRAME_LANDED => Self::Landed,
             FRAME_RIBLT_ROOT => Self::RibltRoot {
                 summary: rest.summary()?,
+                resume: match rest.byte()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(Malformed("RIBLT_ROOT resume flag is not 0 or 1")),
+                },
+            },
+            FRAME_RIBLT_RESUME => Self::RibltResume {
+                held: u32::from_be_bytes(rest.take(4)?.try_into().unwrap()),
+                root: rest.summary()?,
             },
             FRAME_RIBLT_CELL => Self::RibltCell {
                 index: u32::from_be_bytes(rest.take(4)?.try_into().unwrap()),
@@ -401,24 +433,47 @@ mod tests {
     }
 
     #[test]
-    fn cached_root_is_only_exact_summary_without_redundant_key() {
+    fn cached_root_is_exact_summary_and_resume_flag_without_redundant_key() {
         for summary in [
             PatchSummary::new(None, 0).unwrap(),
             PatchSummary::new(Some([9; 32]), 257).unwrap(),
         ] {
-            let payload = roundtrip(Frame::RibltRoot { summary });
-            assert_eq!(payload.len(), 40);
-            assert_eq!(payload.len() + 5, 45);
-            for length in 0..40 {
-                assert!(Frame::decode(FRAME_RIBLT_ROOT, &payload[..length]).is_err());
+            for resume in [false, true] {
+                let payload = roundtrip(Frame::RibltRoot { summary, resume });
+                assert_eq!(payload.len(), 41);
+                assert_eq!(payload.len() + 5, 46);
+                assert_eq!(payload[40], u8::from(resume));
+                for length in 0..41 {
+                    assert!(Frame::decode(FRAME_RIBLT_ROOT, &payload[..length]).is_err());
+                }
+                let mut retired = vec![7; 16];
+                retired.extend_from_slice(&payload);
+                assert!(Frame::decode(FRAME_RIBLT_ROOT, &retired).is_err());
+                let mut trailing = payload.clone();
+                trailing.push(0);
+                assert!(Frame::decode(FRAME_RIBLT_ROOT, &trailing).is_err());
+                let mut flag = payload;
+                flag[40] = 2;
+                assert!(Frame::decode(FRAME_RIBLT_ROOT, &flag).is_err());
             }
-            let mut retired = vec![7; 16];
-            retired.extend_from_slice(&payload);
-            assert!(Frame::decode(FRAME_RIBLT_ROOT, &retired).is_err());
+        }
+    }
+
+    #[test]
+    fn resume_is_held_count_and_exact_root() {
+        let root = PatchSummary::new(Some([9; 32]), 257).unwrap();
+        for held in [0, 1, 65_536, u32::MAX] {
+            let payload = roundtrip(Frame::RibltResume { held, root });
+            assert_eq!(payload.len(), 44);
+            assert_eq!(&payload[..4], &held.to_be_bytes());
+            for length in 0..44 {
+                assert!(Frame::decode(FRAME_RIBLT_RESUME, &payload[..length]).is_err());
+            }
             let mut trailing = payload;
             trailing.push(0);
-            assert!(Frame::decode(FRAME_RIBLT_ROOT, &trailing).is_err());
+            assert!(Frame::decode(FRAME_RIBLT_RESUME, &trailing).is_err());
         }
+        assert_eq!(FRAME_RIBLT_RESUME, 0x0c);
     }
 
     #[test]

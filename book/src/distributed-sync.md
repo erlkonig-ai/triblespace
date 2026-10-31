@@ -528,14 +528,17 @@ resource32 || proof-id32 key. Integers are big-endian.
 | `0x06` | VALUE | key32, nonempty encoded bytes |
 | `0x07` | DONE | empty |
 | `0x08` | LANDED | empty |
-| `0x09` | RIBLT_ROOT | hash32, leaf-count:u64 |
+| `0x09` | RIBLT_ROOT | hash32, leaf-count:u64, resume:u8 |
 | `0x0a` | RIBLT_CELL | index:u32, symbol32, checksum:u64, count:i64 |
 | `0x0b` | HAVE | exact offered depth:u8, prefix32, hash32, leaf-count:u64 |
+| `0x0c` | RIBLT_RESUME | held:u32, hash32, leaf-count:u64 |
 
 DONE/LANDED are Prefix-only; cached RIBLT refuses them and uses the gated FIN
-semantics below. RIBLT_ROOT has 40 payload bytes (45 framed), with no repeated
-profile key. This is the unreleased ALPN35 boundary, not compatibility
-with earlier private33 variants, the deployed and rejected 34, or deployed32.
+semantics below. RIBLT_ROOT has 41 payload bytes (46 framed): the exact
+summary and a resume flag (0 or 1), with no repeated profile key. RIBLT_RESUME
+has 44 payload bytes. Both belong to the unreleased ALPN36 boundary (see
+*Resuming a cut-off exchange*), not compatibility with 35, the private33
+variants, the deployed and rejected 34, or deployed32.
 
 Every SUBTREE payload is 73 bytes, 78 including the frame header, regardless of
 fanout. Depth is 0..32; all prefix bytes outside depth must be zero. Depth0 is the
@@ -813,6 +816,53 @@ transport's: QUIC encrypts each packet in user space, so the stream still
 copies the bytes into its send buffer, and kernel zero-copy (sendfile) is not
 possible. The bytes on the wire are unchanged: 52 payload bytes, 57 framed
 bytes per cell. Root, OPEN, control frames and bodies are additional traffic.
+
+#### Resuming a cut-off exchange
+
+A peer's cell stream is a pure function of the profile (domain, collection,
+component) and the peer's record set, and the peer's ROOT names that set
+exactly; there is no per-peer or per-connection randomness in the mapping or
+checksum key. Cells `[0, N)` received from a peer therefore stay valid for
+exactly as long as the peer announces the same root, whoever the peer is.
+
+Each host keeps a cache of such prefixes, keyed by (profile key, the PEER's
+announced root) and never by peer identity, so two peers with the same root
+may share an entry. An entry is the raw received cells, verbatim in their
+57-byte RIBLT_CELL frame bytes, contiguous from index 0; never residual
+decoder state, which also depends on our own set and may change between
+connections.
+
+- A ROOT carries `resume = 1` when the cache holds any entry for this
+  profile; that is the only bit it discloses. It promises exactly one
+  RIBLT_RESUME, sent once the peer's ROOT is heard and never before our own
+  ROOT, and the peer sends no cell before it arrives.
+- RIBLT_RESUME says "I hold your first `held` cells for your root R", R being
+  the root the peer just announced. The claimant takes the entry for (profile,
+  R) out of the cache and claims its length only when R differs from its own
+  root and the length is below the cell bound of the two ROOT counts;
+  otherwise it claims 0 and drops the entry.
+- The cell sender starts at `held` exactly when `held > 0`, R equals its own
+  current root and `held` is below the bound, and at 0 otherwise. Both sides
+  apply this one rule, so the receiver knows the first index it must see and
+  still rejects any other. The root still precedes every cell disclosure.
+- On resuming, the receiver rebuilds its residual from the cached cells
+  against its own CURRENT cells (peeling may already finish there), then
+  continues with the cells that arrive from `held` on. The sender's written
+  prefix starts at `held`, so the stop rule (exact proof plus the complete
+  written prefix reaching the decoded prefix) is unchanged: the peer holds
+  cells below `held` already.
+- An exchange records the cells it receives while undecoded. It keeps them in
+  the cache only when it was cut off: it ended without an outcome of its own
+  (reset, deadline, connection loss, replacement), short of decoding, with a
+  peer root different from ours. A confirmed exchange drops its entry, and
+  one that failed for a reason of its own (proof, protocol, limits) drops it
+  too, so cells that failed a proof are never offered again.
+- The cache holds at most 64 MiB of mapped chunk file per host (about 1.1
+  million cells), evicting the oldest entries first; an entry larger than the
+  whole budget, or a recording that outgrows it, is not kept. A stale root
+  (a peer whose set changed) cannot be attributed to its old entry without a
+  peer identity, so such an entry ages out under the budget. A miss of any
+  kind means the stream starts from 0, never a failure.
 
 Cached mode uses clean write-half FIN for completion, not DONE/LANDED. Local
 eligibility requires exact decoding/proof, the complete-written matching cell
@@ -1592,8 +1642,11 @@ guarantee.
 
 ## Wire surface
 
-The ALPN is `/triblespace/pile-sync/35`, an unreleased generation: the
-accepted semantics of generation 33 minus the two-way Prefix walk of data,
+The ALPN is `/triblespace/pile-sync/36`, an unreleased generation: generation
+35 plus resumable cached RIBLT (a resume flag on RIBLT_ROOT and the new
+RIBLT_RESUME frame, *Resuming a cut-off exchange*), which a generation-35 peer
+would reject as malformed; 35 is refused at the handshake. Generation 35 is
+the accepted semantics of generation 33 minus the two-way Prefix walk of data,
 which it refuses (*One path per direction*). Generation 34 is a different,
 deployed and rejected profile (a carried agreed tree and asymmetric RIBLT
 roles), not an ancestor of 35; both 33 and 34 are refused at the handshake.

@@ -105,7 +105,7 @@ exact C that start at one of C's roots, which admission reads. It is never
 walked. This is a validated membership projection, not validation during Pile
 replay and not a shared global host index. The record trees and, between Full
 neighbours, the held set are pushed on `walk/1` streams under
-`/triblespace/pile-sync/35`; the old repair opcodes `0x0E` and `0x0D` are reset
+`/triblespace/pile-sync/36`; the old repair opcodes `0x0E` and `0x0D` are reset
 as unknown stream tags, and the grant digest kinds `0x02` to `0x05` of
 `recon/1` are skipped as unknown. Generation 27
 changed the blob locator, directory token and exact-GET proofs to one-block

@@ -111,6 +111,7 @@ fn root(node: &Node, collection: CollectionHandle) -> Frame {
     let generation = node.pinned(collection).cache(WalkKind::Commit);
     Frame::RibltRoot {
         summary: generation.summary(),
+        resume: false,
     }
 }
 
@@ -229,7 +230,7 @@ fn riblt_runtime_large_source_summaries_do_not_impose_a_small_absolute_n_limit()
             assert!(
                 exchange
                     .on_frame(
-                        Frame::RibltRoot { summary },
+                        Frame::RibltRoot { summary, resume: false },
                         Some(local.snapshot())
                     )
                     .is_empty()
@@ -265,6 +266,7 @@ fn riblt_runtime_large_source_summaries_do_not_impose_a_small_absolute_n_limit()
         exchange.on_frame(
             Frame::RibltRoot {
                 summary: PatchSummary::new(Some([0x44; 32]), i64::MAX as u64 + 1).unwrap(),
+                resume: false,
             },
             Some(local.snapshot()),
         );
@@ -291,6 +293,7 @@ fn riblt_runtime_residual_counts_are_bounded_by_the_peer_root_not_a_budget() {
         exchange.on_frame(
             Frame::RibltRoot {
                 summary: PatchSummary::new(Some([0x44; 32]), advertised).unwrap(),
+                resume: false,
             },
             Some(local.snapshot()),
         );
@@ -491,6 +494,7 @@ async fn riblt_runtime_writer_receipts_exclude_partial_frames_and_cancelled_tail
     ));
     let frame = Frame::RibltRoot {
         summary: PatchSummary::new(None, 0).unwrap(),
+        resume: false,
     };
     let wire_len = 5 + frame.encode().1.len();
     frames.send(frame).await.unwrap();
@@ -994,7 +998,7 @@ fn riblt_runtime_peer_fin_leaves_more_than_one_reference_fetch_window_alive() {
         Exchange::start_riblt(collection, kind, local.pinned(collection)).cell_run(1);
     assert!(matches!(exchange.next_delta(), Some(Frame::RibltRoot { .. })));
     assert!(exchange.on_root_written().is_empty());
-    assert!(exchange.on_frame(Frame::RibltRoot { summary: cache.summary() },
+    assert!(exchange.on_frame(Frame::RibltRoot { summary: cache.summary(), resume: false },
         Some(local.snapshot())).is_empty());
     let mut pending = VecDeque::new();
     for index in 0..8192 {

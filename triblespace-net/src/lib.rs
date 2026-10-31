@@ -51,6 +51,7 @@ pub(crate) mod riblt_decode;
 #[cfg(test)]
 mod riblt_decode_tests;
 pub(crate) mod riblt_proof;
+pub(crate) mod riblt_resume;
 pub(crate) mod riblt_store;
 pub(crate) mod routing;
 pub(crate) mod schedule;

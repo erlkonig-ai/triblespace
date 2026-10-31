@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `/triblespace/pile-sync/36`: a cut-off cached RIBLT exchange resumes where
+  it stopped. Each host keeps the raw peer cells it received, verbatim as
+  RIBLT_CELL frames, keyed by profile and the peer's announced root (never by
+  peer identity), within a 64 MiB budget, oldest evicted first. RIBLT_ROOT
+  gains a resume flag (41 payload bytes); a flagged ROOT promises one
+  RIBLT_RESUME (`0x0c`: held:u32, root hash32, count:u64) once the peer's ROOT
+  is heard, and the peer sends no cell before it. The sender starts its cells
+  at `held` exactly when the root is its own and `held` is below the cell
+  bound, otherwise at 0; the receiver applies the same rule and rebuilds its
+  residual from the cached cells against its own current cells. Cells are kept
+  only from an exchange that was cut off before decoding, and dropped after
+  success or a failure of the exchange's own. Generation 35 is refused at the
+  handshake.
+
 - Cached RIBLT sender cells are stored as their canonical RIBLT_CELL wire
   frames (57 bytes, framing included, instead of 48 native bytes; an inherited
   65,536-cell prefix grows from 3 MiB to about 3.56 MiB) and leave the cache in

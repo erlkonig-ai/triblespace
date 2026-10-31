@@ -331,7 +331,7 @@ fn cached_riblt_two_hosts_land_records_auth_and_held_blobs_then_reconnect() {
         assert!(grant_walk_crossed(&taps, 0, b_id), "grants cross as Prefix");
         assert!(taps.since(0, b_id, TAG_WALK).iter()
             .filter(|frame| frame.kind == FRAME_RIBLT_ROOT)
-            .all(|frame| frame.wire_bytes == 45));
+            .all(|frame| frame.wire_bytes == 46));
 
         let initial_dials = net.dial_count(a_id, b_id) + net.dial_count(b_id, a_id);
         net.partition(a_id, b_id);
