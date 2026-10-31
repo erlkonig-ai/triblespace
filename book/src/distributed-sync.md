@@ -601,18 +601,31 @@ The receiver acknowledges an explicit offered leaf if its immutable typed value
 is already held, or after its validated VALUE has actually landed. A grant the
 gate skips or holds pending is acknowledged at once: it returns credit without
 landing, and it never enters the walk's agreement, so a later walk offers it
-again. Retained sound G may
-certify an exact offered subtree, including a leaf whose physical publication
-lags. An already queued descendant after such a coarse HAVE creates no new body
-debt. Private-prefix equality grafts and unlanded VALUEs remain proof-only: they
-never establish HAVE eligibility. Adding unrelated private siblings with the
-same offered-key possession and G leaves logical receipt decisions unchanged.
+again.
 
-An opaque cold root hash does not prove offered-set containment in a larger
-private set. Thus this first implementation gives leaf possession feedback and
-G-certified coarse pruning, not general early cold-subtree pruning. Positive
-leaf feedback deliberately reveals possession of already-offered identities;
-it does not claim timing or traffic-analysis secrecy.
+A whole offered subtree is acknowledged by one coarse HAVE, repeating its exact
+prefix/hash/count, when the receiver's custody evidence holds exactly that
+subtree: retained sound G, or the exchange's original typed pin. That pin holds
+COMMIT/DERIVE record bodies, and for AUTH the proofs the grant index judged and
+indexed; proof bytes merely stored, skipped or pending certify nothing. The
+writer prunes on the exact commitment alone, with or without an agreement, so a
+cold one-way offer to a receiver that already holds it all ends after the root.
+An already queued descendant after a coarse HAVE creates no new body debt and
+no second receipt. The peer delta proof is never custody evidence: its
+private-prefix grafts, unlanded VALUEs and grant stand-ins are proof-only. The
+latest serving snapshot decides single leaves only; the older pin decides
+subtrees, and neither speaks for the other. A coarse HAVE acknowledges typed
+bodies, never the blobs they reference: References carry no offer role and
+never send or accept HAVE.
+
+What is protected is contents, not membership. A receiver able to build an
+offered subtree already holds its data, so acknowledging it discloses nothing
+the writer did not send. Exact equality does disclose that the receiver holds
+no private sibling under that prefix, and positive leaf feedback discloses
+possession of already-offered identities; neither is hidden, and no claim of
+timing or traffic-analysis secrecy is made. Where the receiver holds unrelated
+private siblings, the subtree hashes differ and receipts fall back to finer
+prefixes and leaves.
 
 At most 64 offered leaves await possession receipts. Their bodies are sent
 speculatively without VALUE_REQUEST, before waiting for those receipts; an

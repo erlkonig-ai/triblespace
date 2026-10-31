@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- One-way typed Prefix offers (COMMIT/DERIVE and grant walks, offer profiles
+  2/3) now get coarse HAVE receipts in a cold exchange: the receiver
+  acknowledges a whole offered subtree with one HAVE when its original typed
+  pin (record bodies; for grants, the proofs its grant index judged and
+  indexed) or retained G holds exactly that subtree, and the writer prunes the
+  whole branch instead of collecting one HAVE per leaf and resending the
+  bodies. The peer delta proof (grafts, unlanded values, grant stand-ins) is
+  never custody evidence, the latest snapshot still decides single leaves
+  only, and References still never send or accept HAVE. A HAVE beneath an
+  already acknowledged prefix is not repeated. The privacy contract changes
+  from noninterference to protecting contents: equality may reveal that the
+  receiver holds exactly the offered set under a prefix, never data the writer
+  did not send. No ALPN change: a writer already accepted HAVE at any exactly
+  offered prefix and pruned on the commitment alone, with or without an
+  agreement.
+
 - `/triblespace/pile-sync/35`: one walk per direction for data, with nothing
   to configure. A data tree (COMMIT, DERIVE, References) walked both ways is
   cached RIBLT, one walked one way is Prefix (the offer profiles 2/3, or

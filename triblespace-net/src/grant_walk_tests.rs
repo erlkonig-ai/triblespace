@@ -21,7 +21,7 @@ use triblespace_core::repo::{
 use triblespace_core::trible::TribleSet;
 
 use crate::exchange::tests::{Side, carry};
-use crate::exchange::{Failure, Outcome};
+use crate::exchange::{Exchange, Failure, Outcome, Pinned};
 use crate::grants_index_tests::{deliver, grant, handle_of, id, key, resource};
 use crate::health::PeeringHealth;
 use crate::patch_repair::PatchSummary;
@@ -520,6 +520,90 @@ fn a_write_only_peering_is_sent_no_grants() {
             assert_eq!(opened.offer_role(), Some(OfferRole::Receive));
             assert_eq!(opened.next_delta(), Some(root(empty())), "no reader is disclosed");
             assert!(joined.is_none(), "nobody would send");
+        }
+    }
+}
+
+/// A one-way grant offer's coarse HAVE certifies only grants the receiver's
+/// ORIGINAL pin holds: proofs its grant index judged and indexed. The same
+/// indexed grants on both sides are acknowledged by one root HAVE and nothing
+/// is resent. A private extra grant, or the same proof BYTES stored but not
+/// indexed (no descriptor here), yields no coarse HAVE, and the walk still
+/// confirms leaf by leaf.
+#[test]
+fn a_one_way_grant_offer_coarse_have_certifies_only_indexed_grants() {
+    let [alice, bob, carol, dave, erin] = [0xC0, 0xC1, 0xC2, 0xC3, 0xC4].map(key);
+    for case in ["indexed", "private extra", "stored unindexed"] {
+        let mut a = Node::new(0xC0);
+        let mut b = Node::new(0xC5);
+        let (r, handle) = if case == "stored unindexed" {
+            rooted(&alice, "coarse grants", &mut [&mut a])
+        } else {
+            rooted(&alice, "coarse grants", &mut [&mut a, &mut b])
+        };
+        let grants: Vec<_> = [&bob, &carol, &dave]
+            .into_iter()
+            .map(|subject| grant(r, &alice, handle, subject))
+            .collect();
+        let refs: Vec<_> = grants.iter().collect();
+        insert(&mut a, &refs);
+        insert(&mut b, &refs);
+        if case == "private extra" {
+            insert(&mut b, &[&grant(r, &alice, handle, &erin)]);
+        }
+        let pin = |node: &Node| {
+            Pinned::Grants(r, node.serving().grants().grants(r).unwrap_or_default())
+        };
+        let indexed = b.serving().grants().summary(r);
+        let offered = a.serving().grants().summary(r);
+        match case {
+            "indexed" => assert_eq!(indexed, offered),
+            "private extra" => assert_eq!(indexed.leaf_count(), 4),
+            _ => {
+                assert_eq!(indexed, empty(), "held bytes, but nothing indexed");
+                assert!(grants.iter().all(|proof| stored(&mut b, proof).is_some()));
+            }
+        }
+        let sender = Exchange::start_one_way(r, AUTH, pin(&a), None, true, false);
+        let receiver = Exchange::start_one_way(r, AUTH, pin(&b), None, false, true);
+        let mut a = Side::with(a, sender);
+        let mut b = Side::with(b, receiver);
+        // The root receipt, if any, reaches the writer before its descendants.
+        let root = a.next().unwrap();
+        b.hear(root);
+        while let Some(frame) = b.next() {
+            a.hear(frame);
+        }
+        carry(&mut a, &mut b);
+        assert_eq!(a.outcome(), Some(Outcome::Confirmed), "{case}");
+        assert_eq!(b.outcome(), Some(Outcome::Confirmed), "{case}");
+        let coarse: Vec<_> = b
+            .sent
+            .iter()
+            .filter_map(|frame| match frame {
+                Frame::Have { prefix, summary } if prefix.len() < KEY_BYTES => {
+                    Some((prefix.clone(), *summary))
+                }
+                _ => None,
+            })
+            .collect();
+        let values = a.count(|frame| matches!(frame, Frame::Value { .. }));
+        if case == "indexed" {
+            assert_eq!(coarse, vec![(Vec::new(), offered)], "one exact root HAVE");
+            assert_eq!(a.count(|frame| matches!(frame, Frame::Subtree { .. })), 1);
+            assert_eq!(values, 0, "no held grant is resent");
+            assert_eq!(b.count(|frame| matches!(frame, Frame::Have { .. })), 1);
+        } else {
+            assert!(
+                coarse.iter().all(|(prefix, _)| !prefix.is_empty()),
+                "{case}: no root HAVE"
+            );
+            if case == "stored unindexed" {
+                assert!(coarse.is_empty(), "unindexed bytes certify nothing");
+                assert_eq!(values, 3, "every body is offered");
+            }
+            let haves = b.count(|frame| matches!(frame, Frame::Have { .. }));
+            assert!(haves >= 1, "{case}: leaf receipts continue");
         }
     }
 }

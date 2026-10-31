@@ -168,28 +168,169 @@ fn prefix_offer_all_missing_three_windows_no_requests_exact_landings() {
     );
 }
 
+fn haves(side: &Side) -> Vec<(Vec<u8>, PatchSummary)> {
+    side.sent
+        .iter()
+        .filter_map(|f| match f {
+            Frame::Have { prefix, summary } => Some((prefix.clone(), *summary)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn count(side: &Side, same: impl Fn(&Frame) -> bool) -> usize {
+    side.sent.iter().filter(|f| same(f)).count()
+}
+
+/// Cold, with no shared G: a receiver whose ORIGINAL pin holds exactly the
+/// offered subtree acknowledges it with one coarse HAVE, and the writer prunes
+/// the whole subtree. The reply discloses membership, never contents.
 #[test]
-fn prefix_offer_private_extras_do_not_change_cold_receipts() {
-    fn receipts(private: bool) -> Vec<Frame> {
-        let (mut a, mut b, _, _) = fixture(20, 20, private);
-        // The exact private-root graft in the no-extras arm must remain proof-only.
-        while let Some(frame) = a.exchange.next_delta() {
-            b.hear(frame);
-        }
-        let receipts: Vec<_> = b
-            .replies
-            .into_iter()
-            .filter(|f| matches!(f, Frame::Have { .. }))
-            .collect();
-        assert_eq!(receipts.len(), 20);
-        assert!(
-            receipts
-                .iter()
-                .all(|f| matches!(f, Frame::Have { prefix, .. } if prefix.len()==KEY_BYTES))
-        );
-        receipts
+fn prefix_offer_cold_exact_pin_sends_one_coarse_have_and_writer_prunes() {
+    let (mut a, mut b, collection, _) = fixture(20, 20, false);
+    assert!(b.exchange.agreed.is_none() && a.exchange.agreed.is_none());
+    let root = a.next().unwrap();
+    b.hear(root);
+    // Deliver the root receipt before the writer emits any descendant.
+    while let Some(frame) = b.next() {
+        a.hear(frame);
     }
-    assert_eq!(receipts(false), receipts(true));
+    assert_eq!(
+        haves(&b),
+        vec![(Vec::new(), a.exchange.delta.summary())],
+        "one coarse HAVE repeating the exact offered root commitment"
+    );
+    assert!(a.exchange.queue.is_empty(), "the writer pruned every descendant");
+    drain(&mut a, &mut b);
+    assert_eq!(a.exchange.outcome(), Some(Outcome::Confirmed));
+    assert_eq!(b.exchange.outcome(), Some(Outcome::Confirmed));
+    assert_eq!(count(&a, |f| matches!(f, Frame::Subtree { .. })), 1);
+    assert_eq!(count(&a, |f| matches!(f, Frame::Value { .. })), 0, "no held body resent");
+    assert_eq!(count(&b, |f| matches!(f, Frame::Have { .. })), 1);
+    assert_eq!(b.landed, 0);
+    assert_eq!(b.node.records(collection).len(), 20);
+}
+
+/// A receiver whose pin differs at a prefix -- a private extra, or keys it
+/// lacks -- sends no coarse HAVE there. Every coarse HAVE it does send names
+/// a prefix where its pin equals the exact offer; leaves keep their per-leaf
+/// receipts, on possession or after landing.
+#[test]
+fn prefix_offer_unequal_or_private_extra_subtree_sends_no_coarse_have_there() {
+    for (shared, private) in [(20, true), (10, false)] {
+        let (mut a, mut b, collection, records) = fixture(20, shared, private);
+        let extra = private.then(|| {
+            b.node
+                .records(collection)
+                .into_iter()
+                .map(|record| record.fingerprint().raw())
+                .find(|key| records.iter().all(|r| r.fingerprint().raw() != *key))
+                .unwrap()
+        });
+        let pin = b.exchange.pinned.clone();
+        drain(&mut a, &mut b);
+        assert_eq!(a.exchange.outcome(), Some(Outcome::Confirmed));
+        assert_eq!(b.exchange.outcome(), Some(Outcome::Confirmed));
+        let haves = haves(&b);
+        assert!(!haves.is_empty());
+        for (prefix, summary) in &haves {
+            assert_eq!(a.exchange.delta.at(prefix), Some(*summary), "an exact offer");
+            if prefix.len() < KEY_BYTES {
+                assert_eq!(pin.at(prefix), Some(*summary), "held exactly by the original pin");
+            }
+            if let Some(extra) = extra {
+                assert!(!extra.starts_with(prefix), "no HAVE over the private extra");
+            }
+        }
+        assert!(!haves.iter().any(|(prefix, _)| prefix.is_empty()), "the roots differ");
+        // Every offered leaf is acknowledged once, coarsely or by itself.
+        for record in &records {
+            let key = record.fingerprint().raw();
+            assert_eq!(
+                haves.iter().filter(|(prefix, _)| key.starts_with(prefix)).count(),
+                1,
+                "shared={shared} private={private}"
+            );
+        }
+        assert_eq!(b.landed, 20 - shared, "only missing bodies land");
+        assert_eq!(
+            b.node.records(collection).len(),
+            20 + usize::from(private)
+        );
+    }
+}
+
+/// The peer proof is never custody evidence: here it already holds a full
+/// graft equal to the offer while the receiver's pin and G hold nothing. No
+/// coarse HAVE follows; the bodies are taken and land as for any cold receiver.
+#[test]
+fn prefix_offer_coarse_have_never_comes_from_the_peer_proof() {
+    let (mut a, mut b, collection, _) = fixture(20, 0, false);
+    b.exchange.peer = Tree::pinned(WalkKind::Commit, a.node.pinned(collection).repair());
+    assert_eq!(b.exchange.peer.summary(), a.exchange.delta.summary());
+    drain(&mut a, &mut b);
+    assert_eq!(a.exchange.outcome(), Some(Outcome::Confirmed));
+    assert_eq!(b.exchange.outcome(), Some(Outcome::Confirmed));
+    assert!(
+        haves(&b).iter().all(|(prefix, _)| prefix.len() == KEY_BYTES),
+        "no coarse HAVE from a proof graft"
+    );
+    assert_eq!(count(&b, |f| matches!(f, Frame::Have { .. })), 20);
+    assert_eq!(b.landed, 20);
+    assert_eq!(b.node.records(collection).len(), 20);
+}
+
+/// References are handle-only and never enter HAVE mode: no offer role, no
+/// HAVE even when the receiver holds exactly the offered handles, and a
+/// HAVE sent to a References writer is a protocol error.
+#[test]
+fn prefix_offer_references_never_send_or_accept_have() {
+    let held = |numbers: std::ops::Range<u64>| {
+        let mut patch = PATCH::<32, IdentitySchema, (), Blake3Merkle>::new();
+        for number in numbers {
+            let mut key = [0; 32];
+            key[..8].copy_from_slice(&number.to_be_bytes());
+            patch.insert(&Entry::new(&key));
+        }
+        patch
+    };
+    let (a, b, collection, _) = fixture(1, 0, false);
+    let kind = WalkKind::References;
+    let start = |node: &Node, sends: bool| {
+        Exchange::<MemoryRepoSnapshot>::start_one_way(
+            collection,
+            kind,
+            node.pinned(collection).with_inventory(held(0..40)),
+            None,
+            sends,
+            !sends,
+        )
+    };
+    let mut writer = start(&a.node, true);
+    let mut reader = start(&b.node, false);
+    assert!(writer.offers.is_none() && reader.offers.is_none());
+    assert_eq!((writer.offer_role(), reader.offer_role()), (None, None));
+    let root = writer.next_delta().unwrap();
+    let Frame::Subtree { summary, .. } = root.clone() else {
+        unreachable!()
+    };
+    assert_eq!(reader.pinned.at(&[]), Some(summary), "an exactly equal held set");
+    let outs = reader.on_frame(root, Some(b.node.snapshot()));
+    assert!(
+        !outs
+            .iter()
+            .any(|out| matches!(out, Out::Send(Frame::Have { .. }))),
+        "References never acknowledge by HAVE"
+    );
+    assert_eq!(reader.outcome(), None);
+    writer.on_frame(
+        Frame::Have {
+            prefix: Vec::new(),
+            summary,
+        },
+        Some(a.node.snapshot()),
+    );
+    assert_eq!(writer.outcome(), Some(Outcome::Failed(Failure::Protocol)));
 }
 
 #[test]

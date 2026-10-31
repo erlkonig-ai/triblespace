@@ -22,6 +22,9 @@
 //! Pull Prefix has no full child arrays, level barriers or reply waits. The
 //! explicitly selected one-way typed offer mode adds HAVE credit and a bounded
 //! eager body window without changing final delta proof or landing completion.
+//! A receiver acknowledges a whole offered subtree once it holds exactly that
+//! subtree, by shared G or its original typed pin: the reply may reveal
+//! membership, never contents the writer did not itself send.
 //!
 //! A matching announcement is compared with our own Δ. We still announce
 //! that subtree once, but prune queued descendants and do not descend into
@@ -1182,12 +1185,14 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
                     }
                     return self.leaf(leaf);
                 }
-                // Only already shared immutable G certifies a coarse HAVE.
-                // The private-prefix graft below is proof-only and must never
-                // make a receipt depend on unrelated private siblings.
-                if self.offers.is_some()
-                    && self.agreed.as_ref().and_then(|tree| tree.at(&prefix)) == Some(declared)
-                {
+                // A coarse HAVE repeats this exact offered commitment when
+                // the subtree is already in our custody: shared immutable G,
+                // or our ORIGINAL typed pin (record bodies; indexed, admitted
+                // grants). Equality reveals membership, never contents: to
+                // build the subtree we already hold its bodies. Never the peer
+                // proof (grafts, unlanded values, grant stand-ins) and never
+                // the latest snapshot, which only decides single leaves.
+                if self.offers.is_some() && self.in_custody(&prefix, declared) {
                     self.have(&prefix, declared, outs);
                 }
                 // An exact held subtree can close this portion without any
@@ -1396,13 +1401,31 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
         Ok((Value::Proof(proof), admit))
     }
 
+    /// Whether our custody evidence holds exactly the offered subtree
+    /// `declared` at `prefix`, which certifies a coarse HAVE: shared immutable
+    /// G, or the ORIGINAL typed pin (Commit/Derive record bodies; grants the
+    /// index judged and admitted). Never `self.peer`, which may hold proof
+    /// grafts, unlanded values and grant stand-ins, and never the latest
+    /// snapshot: a newer publication decides single leaves only
+    /// ([`Self::held_value`]), and the two eligibilities are not mixed.
+    /// References never reach this: they carry no offer, and a HAVE
+    /// acknowledges typed bodies, never the blobs they reference.
+    fn in_custody(&self, prefix: &[u8], declared: PatchSummary) -> bool {
+        debug_assert_ne!(self.kind, WalkKind::References);
+        self.agreed.as_ref().and_then(|tree| tree.at(prefix)) == Some(declared)
+            || self.pinned.at(prefix) == Some(declared)
+    }
+
     fn have(&mut self, prefix: &[u8], summary: PatchSummary, outs: &mut Vec<Out>) {
         let Some(offers) = &mut self.offers else {
             return;
         };
-        let locator = locator_key(prefix);
-        if offers.sent.get(&locator).is_none() {
-            offers.sent.insert(&Entry::new(&locator));
+        // A HAVE already sent for this prefix or an ancestor released every
+        // offer beneath it; a frame racing that receipt needs no second one.
+        let covered = (0..=prefix.len())
+            .any(|depth| offers.sent.get(&locator_key(&prefix[..depth])).is_some());
+        if !covered {
+            offers.sent.insert(&Entry::new(&locator_key(prefix)));
             outs.push(Out::Send(Frame::Have {
                 prefix: prefix.to_vec(),
                 summary,

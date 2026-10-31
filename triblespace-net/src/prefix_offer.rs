@@ -1,8 +1,10 @@
 //! Per-stream one-way Prefix offer receipts. No private inventory lives here.
 //!
 //! HAVE repeats an exact offered commitment. Its eligibility is decided by the
-//! exchange from explicit leaf possession or already shared G, never equality
-//! with a complete private prefix. Final LANDED remains independent.
+//! exchange: a leaf from explicit possession, a whole subtree from exact
+//! equality with already shared G or the receiver's original typed pin. The
+//! writer prunes on the commitment alone, agreement or none. Final LANDED
+//! remains independent.
 
 use std::collections::VecDeque;
 use triblespace_core::patch::{Entry, IdentitySchema, PATCH};

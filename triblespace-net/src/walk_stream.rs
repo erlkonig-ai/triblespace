@@ -103,7 +103,8 @@ pub(crate) enum Frame {
         prefix: Vec<u8>,
         summary: PatchSummary,
     },
-    /// Possession of exactly one previously offered subtree, not a private root.
+    /// Custody of exactly one previously offered subtree: its typed bodies,
+    /// never the blobs they reference.
     Have {
         prefix: Vec<u8>,
         summary: PatchSummary,
