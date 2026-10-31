@@ -6,8 +6,8 @@ use triblespace_core::collection::CollectionRead;
 use triblespace_core::repo::pile::Pile;
 use triblespace_core::repo::{BlobStoreGet, SnapshotSource};
 
-mod branch_to_collection;
-mod canonical;
+pub(crate) mod branch_to_collection;
+pub(crate) mod canonical;
 mod clean;
 mod lattice_v3;
 mod shortstring_to_utf8;
@@ -480,33 +480,52 @@ fn migrate_record_kind_descriptions(pile_path: &PathBuf, dry_run: bool) -> Resul
 /// about two layers, and the cheap way to be sure is to check rather than to
 /// reason.
 fn reframe(pile_path: &PathBuf, destination: &PathBuf) -> Result<()> {
+    let (stats, checked) = reframe_silent(pile_path, destination)?;
+    println!(
+        "Reframed into {}:\n  blobs: {}\n  pin updates: {}\n  wants: {}\n  \
+         retired WANT records projected: {}\n  capability proofs: {}\n  collection records: {}\n  \
+         retired v8/v9 equations carried: {}\n  dropped inert records: {}",
+        destination.display(),
+        stats.blobs,
+        stats.pin_updates,
+        stats.wants,
+        stats.retired_want_records,
+        stats.capability_proofs,
+        stats.collection_records,
+        stats.retired_equations,
+        stats.dropped_inert,
+    );
+    println!("  commits verified: {checked} (signature-invalid 0)");
+    Ok(())
+}
+
+pub(crate) fn reframe_silent(
+    pile_path: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<(triblespace_core::repo::pile::PileReframeStats, usize)> {
+    reframe_with_progress(pile_path, destination, |_, _| true)
+}
+
+pub(crate) fn reframe_with_progress(
+    pile_path: &std::path::Path,
+    destination: &std::path::Path,
+    mut progress: impl FnMut(usize, usize) -> bool,
+) -> Result<(triblespace_core::repo::pile::PileReframeStats, usize)> {
     if destination.exists() {
         anyhow::bail!(
             "destination {} already exists; reframe writes a fresh pile",
             destination.display()
         );
     }
-    std::fs::File::create(destination)
+    std::fs::OpenOptions::new().write(true).create_new(true).open(destination)
         .with_context(|| format!("create {}", destination.display()))?;
 
     let mut out = Pile::open(destination).map_err(|e| anyhow!("open destination: {e:?}"))?;
-    let res = (|| -> Result<(), anyhow::Error> {
-        let stats = triblespace_core::repo::pile::reframe_into(pile_path, &mut out)
+    let res = (|| -> Result<_, anyhow::Error> {
+        let stats = triblespace_core::repo::pile::reframe_into_with_progress(
+            pile_path, &mut out, &mut progress,
+        )
             .map_err(|e| anyhow!("reframe: {e}"))?;
-        println!(
-            "Reframed into {}:\n  blobs: {}\n  pin updates: {}\n  wants: {}\n  \
-             retired WANT records projected: {}\n  capability proofs: {}\n  collection records: {}\n  \
-             retired v8/v9 equations carried: {}\n  dropped inert records: {}",
-            destination.display(),
-            stats.blobs,
-            stats.pin_updates,
-            stats.wants,
-            stats.retired_want_records,
-            stats.capability_proofs,
-            stats.collection_records,
-            stats.retired_equations,
-            stats.dropped_inert,
-        );
 
         let (mut checked, mut invalid) = (0usize, 0usize);
         let snapshot = out.snapshot().context("snapshot reframed pile")?;
@@ -514,6 +533,7 @@ fn reframe(pile_path: &PathBuf, destination: &PathBuf) -> Result<()> {
             .records()
             .map_err(|e| anyhow!("read records: {e:?}"))?
         {
+            anyhow::ensure!(progress(0, 0), "migration cancelled");
             let record = record.map_err(|e| anyhow!("read record: {e:?}"))?;
             if let triblespace_core::collection::CollectionRecord::Commit(commit) = record {
                 checked += 1;
@@ -522,17 +542,17 @@ fn reframe(pile_path: &PathBuf, destination: &PathBuf) -> Result<()> {
                 }
             }
         }
-        println!("  commits verified: {checked} (signature-invalid {invalid})");
         if invalid > 0 {
             anyhow::bail!(
                 "{invalid} commit(s) failed strict verification after reframing; \
                  keep the source pile and report this"
             );
         }
-        Ok(())
+        Ok((stats, checked))
     })();
 
     let close_res = out.close().map_err(|e| anyhow::anyhow!("{e:?}"));
-    res.and(close_res)?;
-    Ok(())
+    let report = res?;
+    close_res?;
+    Ok(report)
 }

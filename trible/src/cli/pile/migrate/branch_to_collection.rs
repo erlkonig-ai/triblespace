@@ -142,6 +142,20 @@ fn migrate(
     Ok((report, mappings, collection))
 }
 
+/// The native application uses the same validated branch conversion as the
+/// CLI, with an already loaded signer and an explicit trust root. No output,
+/// key discovery, or process exit belongs at this boundary.
+pub(crate) fn apply(
+    pile: &mut Pile,
+    branch: Id,
+    name: &str,
+    authority: VerifyingKey,
+    signer: &SigningKey,
+) -> Result<Collection<SimpleArchive>> {
+    let (_, _, collection) = migrate(pile, &format!("{branch:X}"), name, authority, signer)?;
+    Ok(collection)
+}
+
 fn resolve_branch(
     snapshot: &PileSnapshot,
     pins: &repo::PinSnapshot,
@@ -195,11 +209,14 @@ fn resolve_branch(
 /// Names of the active legacy branches, keyed by upper-hex branch id, for an
 /// operator choosing what each becomes. A branch whose name cannot be read
 /// (absent, ambiguous or undecodable metadata) is simply left out.
-pub(super) fn active_branch_names(
+pub(crate) fn active_branch_names(
     pile_path: &std::path::Path,
 ) -> Result<std::collections::BTreeMap<String, String>> {
-    let mut pile = super::super::open_refreshed(pile_path)?;
+    let file = triblespace_core::repo::pile::PileFile::open_read_only(pile_path)
+        .map_err(|error| super::super::pile_read_error(pile_path, error))?;
+    let mut pile = Pile::with_host(file, None);
     let result = (|| -> Result<std::collections::BTreeMap<String, String>> {
+        pile.refresh().context("refresh read-only branch names")?;
         let pins = pile
             .snapshot_pin_heads()
             .context("snapshot active legacy branch pins")?;
