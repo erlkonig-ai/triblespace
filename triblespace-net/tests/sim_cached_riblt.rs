@@ -29,8 +29,8 @@ use triblespace_net::reconcile::ReplicationMode;
 use triblespace_net::transport::sim::{Crossed, SimConfig, SimNet, Taps};
 use triblespace_net::transport::{Harness, Transport};
 use triblespace_net::walk_stream::{
-    Algorithm, FRAME_DONE, FRAME_LANDED, FRAME_RIBLT_CELL, FRAME_RIBLT_ROOT, FRAME_SUBTREE,
-    FRAME_VALUE, FRAME_VALUE_REQUEST,
+    Algorithm, FRAME_DONE, FRAME_LANDED, FRAME_RIBLT_CELL, FRAME_RIBLT_ROOT, FRAME_RIBLT_STOP,
+    FRAME_SUBTREE, FRAME_VALUE, FRAME_VALUE_REQUEST,
 };
 
 fn key(byte: u8) -> SigningKey {
@@ -405,5 +405,102 @@ fn cached_riblt_and_prefix_preferences_interoperate_on_explicit_incoming_selecti
                 && frames.iter().any(|frame| frame.kind == FRAME_SUBTREE)
         })
         .await;
+    });
+}
+
+/// Two ordinary hosts whose Commit components differ in size: the larger
+/// streams no Commit cells, STOPs the smaller, pushes what it lacks and
+/// requests the smaller side's own records; both land the union.
+#[test]
+fn cached_riblt_unequal_hosts_converge_with_a_silent_larger_side() {
+    run(async |clock| {
+        let net = SimNet::new(0xCACE_0034, SimConfig::default());
+        let (a_key, b_key) = (key(191), key(192));
+        let (a_id, b_id) = (
+            a_key.verifying_key().to_bytes(),
+            b_key.verifying_key().to_bytes(),
+        );
+        let mut a_store = MemoryRepo::default();
+        let mut b_store = MemoryRepo::default();
+        let collection = selected(&mut a_store, &a_key, &[&a_key, &b_key]);
+        assert_eq!(
+            selected(&mut b_store, &b_key, &[&a_key, &b_key]),
+            collection
+        );
+        // A: 1000 commits. B: 100 of them, and 10 of its own.
+        for number in 0..1000u64 {
+            commit(&mut a_store, &a_key, collection, number);
+        }
+        let shared: Vec<CollectionRecord> = a_store
+            .snapshot()
+            .unwrap()
+            .records()
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|record| record.collection() == collection)
+            .take(100)
+            .collect();
+        for record in shared {
+            b_store.insert(record).unwrap();
+        }
+        for number in 0..10u64 {
+            commit(&mut b_store, &b_key, collection, 5000 + number);
+        }
+        let (a_harness, taps) = net.tap(&a_key);
+        let mut a = host(a_harness, &a_key, a_store, Algorithm::CachedRiblt);
+        let mut b = host(net.join(&b_key), &b_key, b_store, Algorithm::CachedRiblt);
+        a.activate_collection(collection);
+        b.activate_collection(collection);
+        a.set_replication(ReplicationMode::Full, [collection]);
+        b.set_replication(ReplicationMode::Full, [collection]);
+        until(&clock, 600, || {
+            records(&mut a, collection) == 1010
+                && records(&mut b, collection) == 1010
+                && confirmed(&a, b_id, collection, 1010, 0)
+                && confirmed(&b, a_id, collection, 1010, 0)
+        })
+        .await;
+        // Commit streams (walk kind 0) seen from A.
+        let frames = component_frames(&taps, 0, b_id);
+        let commit_streams: Vec<u64> = frames
+            .iter()
+            .filter(|frame| frame.walk_kind == Some(0))
+            .map(|frame| frame.stream)
+            .collect();
+        let commit: Vec<&Crossed> = frames
+            .iter()
+            .filter(|frame| commit_streams.contains(&frame.stream))
+            .collect();
+        let count = |sent: bool, kind: u8| {
+            commit
+                .iter()
+                .filter(|frame| frame.sent == sent && frame.kind == kind)
+                .count()
+        };
+        let bytes = |sent: bool| {
+            commit
+                .iter()
+                .filter(|frame| frame.sent == sent)
+                .map(|frame| frame.wire_bytes)
+                .sum::<usize>()
+        };
+        eprintln!(
+            "RIBLT_ASYM_SIM commit a_cells={} b_cells={} a_stop={} a_values={} b_values={} a_requests={} a_bytes={} b_bytes={}",
+            count(true, FRAME_RIBLT_CELL),
+            count(false, FRAME_RIBLT_CELL),
+            count(true, FRAME_RIBLT_STOP),
+            count(true, FRAME_VALUE),
+            count(false, FRAME_VALUE),
+            count(true, FRAME_VALUE_REQUEST),
+            bytes(true),
+            bytes(false),
+        );
+        assert!(count(true, FRAME_RIBLT_STOP) >= 1, "the larger side STOPs");
+        assert_eq!(count(true, FRAME_RIBLT_CELL), 0, "the larger side streams no Commit cells");
+        assert_eq!(count(false, FRAME_RIBLT_STOP), 0);
+        assert!(count(false, FRAME_RIBLT_CELL) > 0);
+        assert!(count(true, FRAME_VALUE) >= 900);
+        assert_eq!(count(true, FRAME_VALUE_REQUEST), 10);
+        assert_eq!(count(false, FRAME_VALUE), 10);
     });
 }

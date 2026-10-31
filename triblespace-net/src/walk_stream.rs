@@ -46,6 +46,10 @@ pub const SUBTREE_BYTES: usize = 1 + 32 + 32 + 8;
 pub const FRAME_RIBLT_ROOT: u8 = 0x09;
 pub const FRAME_RIBLT_CELL: u8 = 0x0a;
 pub const FRAME_HAVE: u8 = 0x0b;
+// 0x0c is AGREED (prefix agreement persistence), shipped with pile-sync/34.
+/// Cached asymmetric discovery: the larger side has proven the smaller side's
+/// set from its cells and asks it to stop streaming. Empty payload.
+pub const FRAME_RIBLT_STOP: u8 = 0x0d;
 
 /// Explicit ALPN33 discovery profile. CachedRiblt is the default for mutually
 /// authorized peers. Prefix remains selectable and is required
@@ -123,6 +127,8 @@ pub(crate) enum Frame {
         hash: u64,
         count: i64,
     },
+    /// The larger side's proof of the smaller side's whole set: stop cells.
+    RibltStop,
 }
 
 impl Frame {
@@ -180,6 +186,7 @@ impl Frame {
                 payload.extend_from_slice(&count.to_be_bytes());
                 FRAME_RIBLT_CELL
             }
+            Self::RibltStop => FRAME_RIBLT_STOP,
         };
         (kind, payload)
     }
@@ -259,6 +266,7 @@ impl Frame {
                 hash: u64::from_be_bytes(rest.take(8)?.try_into().unwrap()),
                 count: i64::from_be_bytes(rest.take(8)?.try_into().unwrap()),
             },
+            FRAME_RIBLT_STOP => Self::RibltStop,
             _ => return Ok(None),
         };
         if !rest.0.is_empty() {

@@ -11,10 +11,10 @@
 //! A raw decode is trusted only whole: every row must be zero, no symbol may
 //! recover with a negative count, and the exact native summary of the
 //! recovered keys must equal the peer's ROOT. Anything else abandons the
-//! shortcut and leaves the symmetric decoder, which saw the same cells, to
-//! finish as before. Never a partial set.
+//! shortcut and leaves the residual decoder, which saw the same cells, to
+//! decide as before. Never a partial set.
 //!
-//! Standalone: nothing on the wire uses this yet.
+//! The cached exchange's decoder role ([`crate::exchange`]) feeds both.
 
 use riblt::HashKey;
 use triblespace_core::patch::{Blake3Merkle, IdentitySchema, PATCH};
@@ -23,12 +23,27 @@ use crate::exchange::Tree;
 use crate::patch_repair::PatchSummary;
 use crate::riblt_cache::Cell;
 use crate::riblt_decode::ResidualDecoder;
+use crate::riblt_store::Record;
 use crate::walk::KEY_BYTES;
 
 type Key = [u8; KEY_BYTES];
 
+/// A bare key in a file-backed [`crate::riblt_store::Records`] window.
+impl Record for [u8; KEY_BYTES] {
+    const BYTES: usize = KEY_BYTES;
+
+    fn load(bytes: &[u8]) -> Self {
+        bytes.try_into().unwrap()
+    }
+
+    fn store(&self, bytes: &mut [u8]) {
+        bytes.copy_from_slice(self);
+    }
+}
+
 /// Whether this side should race the raw decode of the peer's set. Only the
 /// strictly larger side does, so at most one side ever sends STOP.
+#[cfg(test)]
 pub(crate) fn eligible(local: u64, peer: u64) -> bool {
     local > peer
 }
@@ -40,6 +55,7 @@ pub(crate) struct Split {
     /// This side's keys the peer lacks: push them.
     pub(crate) local_only: Tree,
     /// Raw peer cells it took.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) cells: usize,
 }
 
@@ -67,8 +83,18 @@ impl Shortcut {
     }
 
     /// The raw decode failed or did not prove: the symmetric path decides.
+    #[cfg(test)]
     pub(crate) fn abandoned(&self) -> bool {
         matches!(self.state, State::Abandoned)
+    }
+
+    /// A peer ROOT with no members needs no cell: the empty set either is
+    /// that ROOT or the shortcut is abandoned.
+    pub(crate) fn empty_peer(&mut self, source: &Tree) -> Option<Split> {
+        if self.peer_root.leaf_count() != 0 || !matches!(self.state, State::Peeling) {
+            return None;
+        }
+        self.prove(Vec::new(), source)
     }
 
     /// Admit the peer's next raw cell, as received, before any local
@@ -89,6 +115,10 @@ impl Shortcut {
         }
         self.decoder.finish();
         let keys: Vec<Key> = self.decoder.remote().iter().map(|s| s.symbol.0).collect();
+        self.prove(keys, source)
+    }
+
+    fn prove(&mut self, keys: Vec<Key>, source: &Tree) -> Option<Split> {
         // The decoder already refused a repeated recovery, so these are
         // distinct; the exact native summary binds them to the peer's ROOT.
         let decoded =
@@ -107,4 +137,3 @@ impl Shortcut {
         })
     }
 }
-

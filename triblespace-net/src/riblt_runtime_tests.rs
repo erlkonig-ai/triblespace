@@ -12,7 +12,7 @@ use crate::exchange::Failure;
 use crate::riblt_cache::CacheError;
 use crate::transport::sim::{SimConfig, SimNet};
 use crate::walk::tests::walking::{Node, open};
-use crate::walk_stream::Algorithm;
+use crate::walk_stream::{Algorithm, FRAME_RIBLT_CELL, FRAME_VALUE, FRAME_VALUE_REQUEST};
 
 #[derive(Clone)]
 struct NoRequests;
@@ -128,7 +128,14 @@ fn cell(node: &Node, collection: CollectionHandle, index: usize) -> Frame {
     }
 }
 
+/// Today's symmetric exchange: these scripted peers stream cells whatever
+/// the counts. The asymmetric roles have their own tests below.
 fn receiver(node: &Node, collection: CollectionHandle) -> Exchange<MemoryRepoSnapshot> {
+    cached(node, collection).symmetric()
+}
+
+/// The production cached exchange, roles included.
+fn cached(node: &Node, collection: CollectionHandle) -> Exchange<MemoryRepoSnapshot> {
     Exchange::start_riblt(collection, WalkKind::Commit, node.pinned(collection))
 }
 
@@ -500,7 +507,7 @@ async fn riblt_runtime_writer_receipts_exclude_partial_frames_and_cancelled_tail
     let mut tail = [0; 2];
     recv.read_exact(&mut tail).await.unwrap();
     receipts.changed().await.unwrap();
-    assert_eq!(*receipts.borrow_and_update(), Written { root: true, cells: 0 });
+    assert_eq!(*receipts.borrow_and_update(), Written { root: true, cells: 0, stop: false });
     let frame = Frame::RibltCell {
         index: 0,
         symbol: [1; 32],
@@ -513,11 +520,11 @@ async fn riblt_runtime_writer_receipts_exclude_partial_frames_and_cancelled_tail
     let mut partial = vec![0; wire_len - 2];
     recv.read_exact(&mut partial).await.unwrap();
     tokio::task::yield_now().await;
-    assert_eq!(*receipts.borrow(), Written { root: true, cells: 0 });
+    assert_eq!(*receipts.borrow(), Written { root: true, cells: 0, stop: false });
     let mut tail = [0; 2];
     recv.read_exact(&mut tail).await.unwrap();
     receipts.changed().await.unwrap();
-    assert_eq!(*receipts.borrow_and_update(), Written { root: true, cells: 1 });
+    assert_eq!(*receipts.borrow_and_update(), Written { root: true, cells: 1, stop: false });
     frames
         .send(Frame::RibltCell {
             index: 1,
@@ -530,7 +537,7 @@ async fn riblt_runtime_writer_receipts_exclude_partial_frames_and_cancelled_tail
     tokio::task::yield_now().await;
     reset.send(RESET_WALK_FAILED).unwrap();
     assert_eq!(writer.await.unwrap(), (false, false));
-    assert_eq!(*receipts.borrow(), Written { root: true, cells: 1 });
+    assert_eq!(*receipts.borrow(), Written { root: true, cells: 1, stop: false });
     assert_eq!(*reset_note.lock().unwrap(), Some(RESET_WALK_FAILED));
 }
 
@@ -565,6 +572,17 @@ fn driven_with_writer(
     capacity: usize,
     wrap: impl FnOnce(Tx) -> Box<dyn SendStream>,
 ) -> Driven {
+    driven_exchange(local, peer, collection, capacity, wrap, receiver(local, collection))
+}
+
+fn driven_exchange(
+    local: &Node,
+    peer: &Node,
+    collection: CollectionHandle,
+    capacity: usize,
+    wrap: impl FnOnce(Tx) -> Box<dyn SendStream>,
+    exchange: Exchange<MemoryRepoSnapshot>,
+) -> Driven {
     let net = SimNet::new(0xC011, SimConfig::default());
     let harness = net.join(&local.key);
     let (snapshots, observed) = watch::channel(Some(local.snapshot()));
@@ -586,7 +604,6 @@ fn driven_with_writer(
     let reset = Arc::new(Mutex::new(None));
     let tx = wrap(Tx(send, reset.clone()));
     let rx = Rx(recv, reset.clone());
-    let exchange = receiver(local, collection);
     let (acked, acks) = mpsc::unbounded_channel();
     let (replace, replaced) = oneshot::channel();
     let done = tokio::spawn(async move {
@@ -1629,4 +1646,659 @@ fn riblt_runtime_reference_difference_beyond_retired_budgets_converges() {
         peak.0,
         peak.1,
     );
+}
+
+// ---- Asymmetric cached exchange: two production drivers through the codec ----
+//
+// Each direction is a real `drive` writer -> framed duplex -> a pump that
+// decodes every frame with the production codec, tallies it, and forwards it
+// through a modelled link (per-frame serialization time, one-way latency) ->
+// the peer's real reader. Landing is acknowledged at once by inserting into
+// the receiving node. Nothing in the exchange is scripted.
+
+const FRAME_STOP_KIND: u8 = 0x0d;
+
+#[derive(Default)]
+struct Tally {
+    frames: [usize; 16],
+    bytes: usize,
+    transcript: Vec<u8>,
+}
+
+impl Tally {
+    fn of(&self, kind: u8) -> usize {
+        self.frames[kind as usize]
+    }
+    fn digest(&self) -> String {
+        blake3::hash(&self.transcript).to_hex()[..16].to_string()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LinkModel {
+    latency: Duration,
+    per_frame: Duration,
+}
+
+/// 1 ms a frame is tokio's timer floor; a 64 KiB send buffer per direction
+/// (the duplex capacity) holds about 1,150 cells beyond what the link carries.
+const LINK: LinkModel = LinkModel {
+    latency: Duration::from_millis(5),
+    per_frame: Duration::from_millis(1),
+};
+
+async fn pump(
+    mut from: ReadHalf<DuplexStream>,
+    mut to: WriteHalf<DuplexStream>,
+    tally: Arc<Mutex<Tally>>,
+    link: LinkModel,
+) {
+    let (queue, mut queued) =
+        mpsc::unbounded_channel::<Option<(tokio::time::Instant, u8, Vec<u8>)>>();
+    let forward = tokio::spawn(async move {
+        while let Some(Some((due, kind, payload))) = queued.recv().await {
+            tokio::time::sleep_until(due).await;
+            if write_frame(&mut to, kind, &payload).await.is_err() {
+                return;
+            }
+        }
+        let _ = to.shutdown().await;
+    });
+    loop {
+        match read_frame(&mut from).await {
+            Ok(Some((kind, payload))) => {
+                // Every frame must decode as the production codec reads it.
+                assert!(
+                    Frame::decode(kind, &payload).is_ok(),
+                    "malformed frame {kind:#x}"
+                );
+                {
+                    let mut tally = tally.lock().unwrap();
+                    tally.frames[kind as usize & 15] += 1;
+                    tally.bytes += 5 + payload.len();
+                    tally.transcript.push(kind);
+                    tally
+                        .transcript
+                        .extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                    tally.transcript.extend_from_slice(&payload);
+                }
+                if !link.per_frame.is_zero() {
+                    tokio::time::sleep(link.per_frame).await;
+                }
+                let due = tokio::time::Instant::now() + link.latency;
+                let _ = queue.send(Some((due, kind, payload)));
+            }
+            Ok(None) => {
+                let _ = queue.send(None);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = forward.await;
+}
+
+struct Pair {
+    a: Node,
+    b: Node,
+    collection: CollectionHandle,
+}
+
+/// A holds `a_n` records; B holds the first `shared` of them and `foreign`
+/// records of its own.
+fn asym_pair(a_n: u64, shared: u64, foreign: u64) -> Pair {
+    let mut a = Node::new(241);
+    let mut b = Node::new(242);
+    let collection = a.hold("riblt-asymmetric-exchange", open());
+    assert_eq!(b.hold("riblt-asymmetric-exchange", open()), collection);
+    let mut records = Vec::new();
+    for i in 0..a_n {
+        let record = a.commit(collection, i);
+        if i < shared {
+            records.push(NetEvent::CollectionRecord(record));
+        }
+    }
+    assert_eq!(b.insert(records).1, 0);
+    for i in 0..foreign {
+        b.commit(collection, 1_000_000 + i);
+    }
+    a.observe();
+    b.observe();
+    Pair { a, b, collection }
+}
+
+struct Exchanged {
+    a: Ended,
+    b: Ended,
+    a_sent: Tally,
+    b_sent: Tally,
+    elapsed: Duration,
+}
+
+fn side_driver(
+    local: &Node,
+    peer: &Node,
+    collection: CollectionHandle,
+    net: &SimNet,
+) -> (
+    Driver<crate::transport::sim::SimTransport, NoRequests, MemoryRepoSnapshot>,
+    watch::Sender<Option<StoreSnapshot<MemoryRepoSnapshot>>>,
+    mpsc::UnboundedReceiver<(u64, Vec<NetEvent>)>,
+) {
+    let harness = net.join(&local.key);
+    let (snapshots, observed) = watch::channel(Some(local.snapshot()));
+    let (landing, landings) = mpsc::unbounded_channel();
+    let (commands, _commanded) = mpsc::unbounded_channel();
+    let driver = Driver {
+        connections: ConnectionTable::new(harness.transport, NoRequests),
+        snapshots: observed,
+        landing,
+        grants: mpsc::unbounded_channel().0,
+        commands,
+        id: 1,
+        peer: peer.id(),
+        collection,
+        kind: WalkKind::Commit,
+    };
+    (driver, snapshots, landings)
+}
+
+/// Both production drivers, each with `prepare` applied to its exchange.
+async fn exchange_through_codec(
+    pair: &mut Pair,
+    link: LinkModel,
+    prepare: fn(Exchange<MemoryRepoSnapshot>) -> Exchange<MemoryRepoSnapshot>,
+) -> Exchanged {
+    let net = SimNet::new(0xA5E7, SimConfig::default());
+    let collection = pair.collection;
+    let (a_driver, _a_snapshots, mut a_landings) = side_driver(&pair.a, &pair.b, collection, &net);
+    let (b_driver, _b_snapshots, mut b_landings) = side_driver(&pair.b, &pair.a, collection, &net);
+    let a_exchange = prepare(cached(&pair.a, collection));
+    let b_exchange = prepare(cached(&pair.b, collection));
+    const CAP: usize = 64 * 1024;
+    // A -> pump -> B
+    let (a_out, a_pump_in) = tokio::io::duplex(CAP);
+    let (a_pump_out, b_in) = tokio::io::duplex(CAP);
+    // B -> pump -> A
+    let (b_out, b_pump_in) = tokio::io::duplex(CAP);
+    let (b_pump_out, a_in) = tokio::io::duplex(CAP);
+    let (a_in_r, _a_in_w) = tokio::io::split(a_in);
+    let (_a_out_r, a_out_w) = tokio::io::split(a_out);
+    let (b_in_r, _b_in_w) = tokio::io::split(b_in);
+    let (_b_out_r, b_out_w) = tokio::io::split(b_out);
+    let (ap_r, _ap_w) = tokio::io::split(a_pump_in);
+    let (_apo_r, apo_w) = tokio::io::split(a_pump_out);
+    let (bp_r, _bp_w) = tokio::io::split(b_pump_in);
+    let (_bpo_r, bpo_w) = tokio::io::split(b_pump_out);
+    let a_tally = Arc::new(Mutex::new(Tally::default()));
+    let b_tally = Arc::new(Mutex::new(Tally::default()));
+    let a_pump = tokio::spawn(pump(ap_r, apo_w, a_tally.clone(), link));
+    let b_pump = tokio::spawn(pump(bp_r, bpo_w, b_tally.clone(), link));
+    let a_reset = Arc::new(Mutex::new(None));
+    let b_reset = Arc::new(Mutex::new(None));
+    let (a_acked, a_acks) = mpsc::unbounded_channel();
+    let (b_acked, b_acks) = mpsc::unbounded_channel();
+    let (_a_replace, a_replaced) = oneshot::channel();
+    let (_b_replace, b_replaced) = oneshot::channel();
+    let started = tokio::time::Instant::now();
+    let (a_tx, a_rx) = (Tx(a_out_w, a_reset.clone()), Rx(a_in_r, a_reset.clone()));
+    let (b_tx, b_rx) = (Tx(b_out_w, b_reset.clone()), Rx(b_in_r, b_reset.clone()));
+    let mut a_done = tokio::spawn(async move {
+        let ended = drive(
+            &a_driver,
+            a_exchange,
+            Box::new(a_tx),
+            Box::new(a_rx),
+            a_acks,
+            a_replaced,
+        )
+        .await;
+        (ended, tokio::time::Instant::now())
+    });
+    let mut b_done = tokio::spawn(async move {
+        let ended = drive(
+            &b_driver,
+            b_exchange,
+            Box::new(b_tx),
+            Box::new(b_rx),
+            b_acks,
+            b_replaced,
+        )
+        .await;
+        (ended, tokio::time::Instant::now())
+    });
+    let (mut a_end, mut b_end) = (None, None);
+    while a_end.is_none() || b_end.is_none() {
+        tokio::select! {
+            Some((_, events)) = a_landings.recv() => {
+                let _ = a_acked.send(pair.a.insert(events));
+            }
+            Some((_, events)) = b_landings.recv() => {
+                let _ = b_acked.send(pair.b.insert(events));
+            }
+            done = &mut a_done, if a_end.is_none() => a_end = Some(done.unwrap()),
+            done = &mut b_done, if b_end.is_none() => b_end = Some(done.unwrap()),
+        }
+    }
+    // A side that failed stops reading; its pump would block forever.
+    a_pump.abort();
+    b_pump.abort();
+    let ((a, _), a_at) = a_end.unwrap();
+    let ((b, _), b_at) = b_end.unwrap();
+    let a_sent = std::mem::take(&mut *a_tally.lock().unwrap());
+    let b_sent = std::mem::take(&mut *b_tally.lock().unwrap());
+    Exchanged {
+        a,
+        b,
+        a_sent,
+        b_sent,
+        elapsed: a_at.max(b_at) - started,
+    }
+}
+
+fn report(case: &str, run: &Exchanged, link: LinkModel) {
+    let (a, b) = (&run.a_sent, &run.b_sent);
+    let rtt = 2 * link.latency;
+    eprintln!(
+        "RIBLT_ASYM case={case} a_cells={} b_cells={} total_cells={} a_bytes={} b_bytes={} total_bytes={} a_stop={} b_stop={} a_values={} b_values={} a_requests={} b_requests={} virtual_ms={} rounds={:.1} a_digest={} b_digest={}",
+        a.of(FRAME_RIBLT_CELL),
+        b.of(FRAME_RIBLT_CELL),
+        a.of(FRAME_RIBLT_CELL) + b.of(FRAME_RIBLT_CELL),
+        a.bytes,
+        b.bytes,
+        a.bytes + b.bytes,
+        a.of(FRAME_STOP_KIND),
+        b.of(FRAME_STOP_KIND),
+        a.of(FRAME_VALUE),
+        b.of(FRAME_VALUE),
+        a.of(FRAME_VALUE_REQUEST),
+        b.of(FRAME_VALUE_REQUEST),
+        run.elapsed.as_millis(),
+        run.elapsed.as_secs_f64() / rtt.as_secs_f64(),
+        a.digest(),
+        b.digest(),
+    );
+}
+
+/// Both sides end with the union, FIN in both directions, landed, agreed.
+fn assert_union(pair: &mut Pair, run: &Exchanged, union: u64) {
+    assert_eq!(
+        (run.a.failure, run.b.failure),
+        (None, None),
+        "failures (larger, smaller)"
+    );
+    for ended in [&run.a, &run.b] {
+        assert_eq!(ended.failure, None);
+        assert!(ended.landed && ended.confirmed, "landed and peer FIN");
+        assert_eq!(ended.agreed.as_ref().unwrap().summary().leaf_count(), union);
+    }
+    assert_eq!(
+        run.a.agreed.as_ref().unwrap().summary(),
+        run.b.agreed.as_ref().unwrap().summary()
+    );
+    let a = pair.a.records(pair.collection);
+    let b = pair.b.records(pair.collection);
+    assert_eq!(a.len() as u64, union);
+    assert_eq!(a, b);
+}
+
+fn unchanged(exchange: Exchange<MemoryRepoSnapshot>) -> Exchange<MemoryRepoSnapshot> {
+    exchange
+}
+
+#[tokio::test(start_paused = true)]
+async fn riblt_asym_subset_exchanges_complete_with_a_silent_larger_side() {
+    for small in [0, 100, 1000] {
+        let mut pair = asym_pair(10_000, small, 0);
+        let run = exchange_through_codec(&mut pair, LINK, unchanged).await;
+        report(&format!("subset_b{small}"), &run, LINK);
+        assert_union(&mut pair, &run, 10_000);
+        assert_eq!(
+            run.a_sent.of(FRAME_RIBLT_CELL),
+            0,
+            "the larger side streams no cells"
+        );
+        assert_eq!(run.a_sent.of(FRAME_STOP_KIND), 1);
+        assert_eq!(run.b_sent.of(FRAME_STOP_KIND), 0);
+        assert_eq!(run.a_sent.of(FRAME_VALUE) as u64, 10_000 - small);
+        assert_eq!(run.a_sent.of(FRAME_VALUE_REQUEST), 0);
+        assert_eq!(run.b_sent.of(FRAME_VALUE), 0);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn riblt_asym_foreign_tenth_is_requested_by_the_larger_side() {
+    for small in [100u64, 1000] {
+        let foreign = small / 10;
+        let mut pair = asym_pair(10_000, small - foreign, foreign);
+        let run = exchange_through_codec(&mut pair, LINK, unchanged).await;
+        report(&format!("foreign_b{small}"), &run, LINK);
+        assert_union(&mut pair, &run, 10_000 + foreign);
+        assert_eq!(
+            run.a_sent.of(FRAME_RIBLT_CELL),
+            0,
+            "the larger side streams no cells"
+        );
+        assert_eq!(run.a_sent.of(FRAME_STOP_KIND), 1);
+        assert_eq!(run.a_sent.of(FRAME_VALUE_REQUEST) as u64, foreign);
+        assert_eq!(run.b_sent.of(FRAME_VALUE) as u64, foreign);
+        assert_eq!(
+            run.a_sent.of(FRAME_VALUE) as u64,
+            10_000 - (small - foreign)
+        );
+    }
+}
+
+/// Equal counts keep the symmetric exchange through the real drivers. Their
+/// unbiased `select!` makes transcripts vary run to run, so the byte-exact
+/// comparison against the pre-role protocol is the deterministic lockstep in
+/// `riblt_lockstep_tests`; this checks the driven exchange stays symmetric.
+#[tokio::test(start_paused = true)]
+async fn riblt_asym_balanced_exchange_stays_symmetric_through_the_drivers() {
+    let mut pair = asym_pair(1000, 900, 100);
+    let run = exchange_through_codec(&mut pair, LINK, unchanged).await;
+    report("balanced_1000", &run, LINK);
+    assert_union(&mut pair, &run, 1100);
+    assert_eq!(
+        run.a_sent.of(FRAME_STOP_KIND) + run.b_sent.of(FRAME_STOP_KIND),
+        0
+    );
+    assert_eq!(
+        run.a_sent.of(FRAME_VALUE_REQUEST) + run.b_sent.of(FRAME_VALUE_REQUEST),
+        0
+    );
+    assert!(run.a_sent.of(FRAME_RIBLT_CELL) > 0 && run.b_sent.of(FRAME_RIBLT_CELL) > 0);
+    assert_eq!(
+        (run.a_sent.of(FRAME_VALUE), run.b_sent.of(FRAME_VALUE)),
+        (100, 100)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn riblt_asym_stop_races_cells_already_in_flight() {
+    let slow = LinkModel {
+        latency: Duration::from_millis(100),
+        per_frame: Duration::from_millis(1),
+    };
+    let mut pair = asym_pair(2000, 100, 10);
+    let run = exchange_through_codec(&mut pair, slow, unchanged).await;
+    report("race_b100_lag100ms", &run, slow);
+    assert_union(&mut pair, &run, 2010);
+    assert_eq!(run.a_sent.of(FRAME_RIBLT_CELL), 0);
+    assert_eq!(run.a_sent.of(FRAME_STOP_KIND), 1);
+    // The raw decode of |B| = 110 needs about 150 cells. A 200 ms round
+    // trip at 1 ms a frame, plus the send buffer, puts over a thousand more
+    // on the wire before STOP lands: each reaches the decoder after STOP.
+    assert!(
+        run.b_sent.of(FRAME_RIBLT_CELL) > 1000,
+        "only {} cells raced STOP",
+        run.b_sent.of(FRAME_RIBLT_CELL)
+    );
+}
+
+fn asym_scripted(local: &Node, peer: &Node, collection: CollectionHandle) -> Driven {
+    driven_exchange(
+        local,
+        peer,
+        collection,
+        1 << 20,
+        |tx| Box::new(tx),
+        cached(local, collection),
+    )
+}
+
+async fn drain_frames(recv: &mut ReadHalf<DuplexStream>) -> Vec<Frame> {
+    let mut frames = Vec::new();
+    while let Ok(Some((kind, bytes))) = read_frame(recv).await {
+        if let Ok(Some(frame)) = Frame::decode(kind, &bytes) {
+            frames.push(frame);
+        } else {
+            frames.push(Frame::Done); // Stands for a frame this codec does not know.
+        }
+    }
+    frames
+}
+
+#[tokio::test(start_paused = true)]
+async fn riblt_asym_stream_ending_before_stop_never_confirms() {
+    // The larger side: the smaller peer finishes before any proof.
+    let pair = asym_pair(10, 1, 0);
+    let mut run = asym_scripted(&pair.a, &pair.b, pair.collection);
+    assert_eq!(
+        receive_frame(&mut run.recv).await,
+        root(&pair.a, pair.collection)
+    );
+    send_frame(&mut run.send, root(&pair.b, pair.collection)).await;
+    run.send.shutdown().await.unwrap();
+    let (ended, _) = run.done.await.unwrap();
+    assert!(!ended.confirmed && !ended.landed && ended.agreed.is_none());
+    let sent = drain_frames(&mut run.recv).await;
+    assert!(
+        sent.iter()
+            .all(|frame| !matches!(frame, Frame::RibltCell { .. })),
+        "the larger side never streams"
+    );
+
+    // The smaller side: the larger peer finishes without STOP.
+    let mut run = asym_scripted(&pair.b, &pair.a, pair.collection);
+    assert_eq!(
+        receive_frame(&mut run.recv).await,
+        root(&pair.b, pair.collection)
+    );
+    send_frame(&mut run.send, root(&pair.a, pair.collection)).await;
+    assert!(matches!(
+        receive_frame(&mut run.recv).await,
+        Frame::RibltCell { index: 0, .. }
+    ));
+    run.send.shutdown().await.unwrap();
+    let (ended, _) = run.done.await.unwrap();
+    assert!(!ended.confirmed && !ended.landed && ended.agreed.is_none());
+
+    // The smaller side: STOP, then FIN without the bodies it lacks.
+    let mut run = asym_scripted(&pair.b, &pair.a, pair.collection);
+    assert_eq!(
+        receive_frame(&mut run.recv).await,
+        root(&pair.b, pair.collection)
+    );
+    send_frame(&mut run.send, root(&pair.a, pair.collection)).await;
+    assert!(matches!(
+        receive_frame(&mut run.recv).await,
+        Frame::RibltCell { index: 0, .. }
+    ));
+    write_frame(&mut run.send, FRAME_STOP_KIND, &[])
+        .await
+        .unwrap();
+    run.send.shutdown().await.unwrap();
+    let (ended, _) = run.done.await.unwrap();
+    assert!(!ended.confirmed && !ended.landed && ended.agreed.is_none());
+
+    // The smaller side refuses any incoming cell.
+    let mut run = asym_scripted(&pair.b, &pair.a, pair.collection);
+    assert_eq!(
+        receive_frame(&mut run.recv).await,
+        root(&pair.b, pair.collection)
+    );
+    send_frame(&mut run.send, root(&pair.a, pair.collection)).await;
+    send_frame(&mut run.send, cell(&pair.a, pair.collection, 0)).await;
+    let (ended, _) = run.done.await.unwrap();
+    assert_eq!(ended.failure, Some(Failure::Protocol));
+    assert!(!ended.confirmed && ended.agreed.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn riblt_asym_a_raw_decode_that_misses_the_root_never_stops_or_confirms() {
+    // The smaller peer's cells are honest but its ROOT names another set of
+    // the same count: the raw decode completes and misses it, the residual
+    // decode decides, and it fails as before.
+    let pair = asym_pair(10, 1, 0);
+    let honest = pair
+        .b
+        .pinned(pair.collection)
+        .cache(WalkKind::Commit)
+        .summary();
+    let lying = PatchSummary::new(Some([0x5A; 32]), honest.leaf_count()).unwrap();
+    let mut run = asym_scripted(&pair.a, &pair.b, pair.collection);
+    assert_eq!(
+        receive_frame(&mut run.recv).await,
+        root(&pair.a, pair.collection)
+    );
+    send_frame(&mut run.send, Frame::RibltRoot { summary: lying }).await;
+    for index in 0..64 {
+        let (kind, bytes) = cell(&pair.b, pair.collection, index).encode();
+        if write_frame(&mut run.send, kind, &bytes).await.is_err() {
+            break;
+        }
+    }
+    let (ended, _) = run.done.await.unwrap();
+    assert_eq!(ended.failure, Some(Failure::CountMismatch));
+    assert!(!ended.confirmed && !ended.landed && ended.agreed.is_none());
+    let sent = drain_frames(&mut run.recv).await;
+    assert!(
+        sent.iter()
+            .all(|frame| !matches!(frame, Frame::RibltCell { .. })),
+        "the larger side never streams: {sent:?}"
+    );
+    assert!(run.landings.try_recv().is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn riblt_asym_a_corrupted_raw_decode_falls_back_to_the_residual_decode() {
+    fn faulted(exchange: Exchange<MemoryRepoSnapshot>) -> Exchange<MemoryRepoSnapshot> {
+        exchange.fault_raw_cell(0)
+    }
+    let mut pair = asym_pair(2000, 90, 10);
+    let run = exchange_through_codec(&mut pair, LINK, faulted).await;
+    report("raw_fault_b100", &run, LINK);
+    assert_union(&mut pair, &run, 2010);
+    assert_eq!(run.a_sent.of(FRAME_RIBLT_CELL), 0);
+    assert_eq!(run.a_sent.of(FRAME_STOP_KIND), 1);
+    assert_eq!(run.a_sent.of(FRAME_VALUE_REQUEST), 10);
+    // The residual decode of d = 1920 keys took the cells, not |B| = 100.
+    assert!(
+        run.b_sent.of(FRAME_RIBLT_CELL) > 2000,
+        "{}",
+        run.b_sent.of(FRAME_RIBLT_CELL)
+    );
+}
+
+/// The same fixtures with roles switched off: today's exchange, measured
+/// through the same codec, drivers and link, for the before/after table.
+#[tokio::test(start_paused = true)]
+async fn riblt_asym_symmetric_baseline_through_the_drivers() {
+    fn symmetric(exchange: Exchange<MemoryRepoSnapshot>) -> Exchange<MemoryRepoSnapshot> {
+        exchange.symmetric()
+    }
+    let cases: [(&str, u64, u64, u64); 5] = [
+        ("subset_b0", 0, 0, 10_000),
+        ("subset_b100", 100, 0, 10_000),
+        ("subset_b1000", 1000, 0, 10_000),
+        ("foreign_b100", 90, 10, 10_010),
+        ("foreign_b1000", 900, 100, 10_100),
+    ];
+    for (case, shared, foreign, union) in cases {
+        let mut pair = asym_pair(10_000, shared, foreign);
+        let run = exchange_through_codec(&mut pair, LINK, symmetric).await;
+        report(&format!("before_{case}"), &run, LINK);
+        assert_union(&mut pair, &run, union);
+        assert_eq!(
+            run.a_sent.of(FRAME_STOP_KIND) + run.b_sent.of(FRAME_STOP_KIND),
+            0
+        );
+        assert!(run.a_sent.of(FRAME_RIBLT_CELL) > 10_000);
+    }
+}
+
+#[test]
+fn riblt_asym_roles_refuse_out_of_place_frames() {
+    let mut pair = asym_pair(10, 1, 1);
+    let collection = pair.collection;
+    let a_records = pair.a.records(collection);
+    let b_records = pair.b.records(collection);
+    // A record only A holds, and one only B holds.
+    let record = *a_records.difference(&b_records).next().unwrap();
+    let held = *b_records.difference(&a_records).next().unwrap();
+    let (a, b) = (&pair.a, &pair.b);
+    let started = |node: &Node, peer: &Node| {
+        let mut exchange = cached(node, collection);
+        assert!(matches!(
+            exchange.next_delta(),
+            Some(Frame::RibltRoot { .. })
+        ));
+        exchange.on_root_written();
+        exchange.on_frame(root(peer, collection), Some(node.snapshot()));
+        exchange
+    };
+    // Roles from counts: 10 against 2.
+    assert_eq!(started(a, b).role(), Some(crate::exchange::Role::Decoder));
+    assert_eq!(started(b, a).role(), Some(crate::exchange::Role::Streamer));
+    assert_eq!(
+        started(a, b).next_delta(),
+        None,
+        "the decoder streams nothing"
+    );
+
+    // The decoder refuses STOP and an unrequested value.
+    let mut decoder = started(a, b);
+    decoder.on_frame(Frame::RibltStop, Some(a.snapshot()));
+    assert_eq!(decoder.outcome(), Some(Outcome::Failed(Failure::Protocol)));
+    let mut decoder = started(a, b);
+    decoder.on_frame(
+        Frame::Value {
+            key: record.fingerprint().raw(),
+            bytes: encode_record(collection, record).unwrap(),
+        },
+        Some(a.snapshot()),
+    );
+    assert_eq!(decoder.outcome(), Some(Outcome::Failed(Failure::Protocol)));
+    // A STOP written that was never queued is a local protocol fault.
+    let mut decoder = started(a, b);
+    decoder.on_stop_written();
+    assert_eq!(decoder.outcome(), Some(Outcome::Failed(Failure::Protocol)));
+
+    // The streamer refuses a request or a push before STOP, a second STOP,
+    // a request for a key outside its source, and a repeated request.
+    let request = Frame::ValueRequest {
+        key: held.fingerprint().raw(),
+    };
+    let mut streamer = started(b, a);
+    streamer.on_frame(request.clone(), Some(b.snapshot()));
+    assert_eq!(streamer.outcome(), Some(Outcome::Failed(Failure::Protocol)));
+    let mut streamer = started(b, a);
+    streamer.on_frame(
+        Frame::Value {
+            key: record.fingerprint().raw(),
+            bytes: encode_record(collection, record).unwrap(),
+        },
+        Some(b.snapshot()),
+    );
+    assert_eq!(streamer.outcome(), Some(Outcome::Failed(Failure::Protocol)));
+    let mut streamer = started(b, a);
+    streamer.on_frame(Frame::RibltStop, Some(b.snapshot()));
+    assert_eq!(streamer.outcome(), None);
+    assert!(streamer.discovery_stopped() && streamer.next_delta().is_none());
+    streamer.on_frame(Frame::RibltStop, Some(b.snapshot()));
+    assert_eq!(streamer.outcome(), Some(Outcome::Failed(Failure::Protocol)));
+    let mut streamer = started(b, a);
+    streamer.on_frame(Frame::RibltStop, Some(b.snapshot()));
+    streamer.on_frame(Frame::ValueRequest { key: [0x77; 32] }, Some(b.snapshot()));
+    assert_eq!(streamer.outcome(), Some(Outcome::Failed(Failure::Protocol)));
+    let mut streamer = started(b, a);
+    streamer.on_frame(Frame::RibltStop, Some(b.snapshot()));
+    let outs = streamer.on_frame(request.clone(), Some(b.snapshot()));
+    assert!(
+        matches!(&outs[..], [Out::Send(Frame::Value { key, .. })] if *key == held.fingerprint().raw())
+    );
+    streamer.on_frame(request, Some(b.snapshot()));
+    assert_eq!(streamer.outcome(), Some(Outcome::Failed(Failure::Protocol)));
+    // A push of a key the streamer already holds is a false split.
+    let mut streamer = started(b, a);
+    streamer.on_frame(Frame::RibltStop, Some(b.snapshot()));
+    streamer.on_frame(
+        Frame::Value {
+            key: held.fingerprint().raw(),
+            bytes: encode_record(collection, held).unwrap(),
+        },
+        Some(b.snapshot()),
+    );
+    assert_eq!(streamer.outcome(), Some(Outcome::Failed(Failure::BadNode)));
 }

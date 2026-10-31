@@ -151,6 +151,7 @@ where
                     let written = *progressed.borrow_and_update();
                     let mut outs = exchange.on_written(written.cells);
                     if written.root { outs.extend(exchange.on_root_written()); }
+                    if written.stop { outs.extend(exchange.on_stop_written()); }
                     outs
                 }
             },

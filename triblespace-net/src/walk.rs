@@ -1821,6 +1821,8 @@ async fn read_stream(
 struct Written {
     root: bool,
     cells: usize,
+    /// A cached decoder's STOP is on the wire.
+    stop: bool,
 }
 
 type Reset = futures::future::Fuse<oneshot::Receiver<u32>>;
@@ -1901,7 +1903,11 @@ async fn write_stream_inner(
                         }
                         if !broken {
                             receipt.root |= matches!(frame, Frame::RibltRoot { .. });
-                            let notify = matches!(frame, Frame::RibltCell { .. } | Frame::RibltRoot { .. });
+                            receipt.stop |= matches!(frame, Frame::RibltStop);
+                            let notify = matches!(
+                                frame,
+                                Frame::RibltCell { .. } | Frame::RibltRoot { .. } | Frame::RibltStop
+                            );
                             if let Frame::RibltCell { index, .. } = frame {
                                 receipt.cells = index as usize + 1;
                             }
