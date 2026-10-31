@@ -1639,14 +1639,14 @@ where
             pending = None;
         }
         if exchange.discovery_stopped() {
-            if matches!(pending, Some(Frame::RibltCell { .. })) {
+            if matches!(pending, Some(Frame::RibltCells { .. })) {
                 pending = None;
             }
             deferred_delta = None;
         }
         // An eager body supersedes a not-yet-queued cell; prepared capacity is
         // irrelevant to this one-frame lookahead. Never split an in-flight write.
-        if matches!(pending, Some(Frame::RibltCell { .. })) {
+        if matches!(pending, Some(Frame::RibltCells { .. })) {
             if let Some(body) = outbox.pop_front().or_else(|| exchange.next_body()) {
                 deferred_delta = pending.replace(body);
             }
@@ -1896,6 +1896,29 @@ async fn write_stream_inner(
                 if broken {
                     continue;
                 }
+                if let Frame::RibltCells { first, frames } = frame {
+                    // One owned buffer for the whole run, receipts per whole
+                    // frame. Each write is cancel safe, so a reset between or
+                    // during them abandons the rest and nothing more.
+                    let written = tokio::select! {
+                        biased;
+                        Ok(code) = &mut *reset => {
+                            send.reset(code);
+                            return (landed_written, false);
+                        }
+                        written = write_cells(&mut **send, first, frames, |cells| {
+                            receipt.cells = cells;
+                            if let Some(progress) = &progress {
+                                let _ = progress.send(receipt);
+                            }
+                        }) => written,
+                    };
+                    broken = written.is_err();
+                    if broken && let Some(failed) = write_failed.take() {
+                        let _ = failed.send(());
+                    }
+                    continue;
+                }
                 let (kind, payload) = frame.encode();
                 tokio::select! {
                     biased;
@@ -1932,8 +1955,174 @@ async fn write_stream_inner(
     }
 }
 
+/// Write a run of canonical RIBLT_CELL frames, cells `first..`, as one owned
+/// buffer through [`SendStream::write_owned`], with the walk's byte-progress
+/// deadline on every write. `done` hears the cells completely written so far
+/// (an absolute count) after each write that completes another frame.
+async fn write_cells(
+    send: &mut dyn SendStream,
+    first: u32,
+    frames: anybytes::Bytes,
+    mut done: impl FnMut(usize),
+) -> io::Result<()> {
+    use crate::riblt_cache::CELL_FRAME_BYTES;
+    let total = frames.len();
+    let mut buffer = bytes::Bytes::from(frames);
+    let mut reported = 0;
+    while !buffer.is_empty() {
+        let written = tokio::time::timeout(WALK_DEADLINE, send.write_owned(&mut buffer))
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "no write progress within the walk deadline")
+            })??;
+        if written == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        let complete = (total - buffer.len()) / CELL_FRAME_BYTES;
+        if complete > reported {
+            reported = complete;
+            done(first as usize + complete);
+        }
+    }
+    Ok(())
+}
+
 #[path = "walk_cached.rs"]
 mod cached;
+
+#[cfg(test)]
+mod cell_write_tests {
+    use super::*;
+    use crate::riblt_cache::{CELL_FRAME_BYTES, Generation};
+    use crate::riblt_cache_tests::encoded_cell_frame;
+
+    /// A stream that takes at most `step` bytes per write and is not ready on
+    /// every other poll, recording what it was given.
+    struct Trickle {
+        wire: Vec<u8>,
+        step: usize,
+        ready: bool,
+        calls: usize,
+    }
+
+    impl AsyncWrite for Trickle {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.ready = !self.ready;
+            if !self.ready {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            let n = bytes.len().min(self.step);
+            self.wire.extend_from_slice(&bytes[..n]);
+            self.calls += 1;
+            Poll::Ready(Ok(n))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl SendStream for Trickle {
+        fn reset(&mut self, _: u32) {}
+    }
+
+    fn generation() -> Arc<Generation> {
+        let mut patch = PATCH::<32, IdentitySchema, (), Blake3Merkle>::new();
+        for number in 0u64..90 {
+            let mut key = [0; 32];
+            key[..8].copy_from_slice(&number.to_be_bytes());
+            patch.insert(&Entry::new(&key));
+        }
+        Generation::advance(
+            CollectionHandle::new([30; 32]),
+            WalkKind::References,
+            Tree::References(patch),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Partial writes of every size end in exactly the per-cell encoding,
+    /// and each receipt counts only frames written whole.
+    #[tokio::test]
+    async fn a_cell_run_written_in_partial_writes_is_the_per_cell_encoding() {
+        let generation = generation();
+        for step in [1, 13, CELL_FRAME_BYTES - 1, CELL_FRAME_BYTES, CELL_FRAME_BYTES + 1, 4096] {
+            let first = 100;
+            let frames = generation.frames(first, 40).unwrap();
+            let cells = frames.len() / CELL_FRAME_BYTES;
+            assert_eq!(cells, 40);
+            let mut stream = Trickle { wire: Vec::new(), step, ready: false, calls: 0 };
+            let mut receipts = Vec::new();
+            write_cells(&mut stream, first as u32, frames, |done| {
+                receipts.push(done);
+            })
+            .await
+            .unwrap();
+            let expected: Vec<u8> = (first..first + cells)
+                .flat_map(|index| encoded_cell_frame(index, &generation.cell(index).unwrap()))
+                .collect();
+            assert_eq!(stream.wire, expected, "step {step}");
+            assert_eq!(stream.calls, expected.len().div_ceil(step));
+            // One receipt per write that completed another frame, counting
+            // only whole frames: never ahead of the bytes written.
+            let mut expected_receipts = Vec::new();
+            for call in 1..=stream.calls {
+                let complete = (call * step).min(expected.len()) / CELL_FRAME_BYTES;
+                if complete > 0 && expected_receipts.last() != Some(&(first + complete)) {
+                    expected_receipts.push(first + complete);
+                }
+            }
+            assert_eq!(receipts, expected_receipts, "step {step}");
+            assert_eq!(receipts.last(), Some(&(first + cells)));
+        }
+    }
+
+    /// A stream error ends the run; no receipt claims the unwritten frame.
+    #[tokio::test]
+    async fn a_failed_owned_write_reports_no_more_cells() {
+        struct Broken(usize);
+        impl AsyncWrite for Broken {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                if self.0 == 0 {
+                    return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()));
+                }
+                let n = bytes.len().min(self.0);
+                self.0 -= n;
+                Poll::Ready(Ok(n))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        impl SendStream for Broken {
+            fn reset(&mut self, _: u32) {}
+        }
+        let generation = generation();
+        let frames = generation.frames(0, 10).unwrap();
+        let mut stream = Broken(3 * CELL_FRAME_BYTES + 5);
+        let mut receipts = Vec::new();
+        let error = write_cells(&mut stream, 0, frames, |done| receipts.push(done))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        assert_eq!(receipts, vec![3]);
+    }
+}
 
 #[cfg(test)]
 impl<R: BlobStoreGet + Clone> Walks<R> {

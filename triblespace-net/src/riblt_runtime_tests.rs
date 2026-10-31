@@ -422,7 +422,8 @@ fn riblt_runtime_stop_requires_written_matching_prefix_but_not_bodies() {
     exchange.on_frame(root(&peer, collection), Some(local.snapshot()));
     assert!(matches!(
         exchange.next_delta(),
-        Some(Frame::RibltCell { index: 0, .. })
+        Some(Frame::RibltCells { first: 0, ref frames })
+            if frames.len() == crate::riblt_cache::CELL_FRAME_BYTES
     ));
     let outs = exchange.on_frame(cell(&peer, collection, 0), Some(local.snapshot()));
     assert!(
@@ -989,14 +990,15 @@ fn riblt_runtime_peer_fin_leaves_more_than_one_reference_fetch_window_alive() {
     peer.observe();
     let kind = WalkKind::References;
     let cache = peer.pinned(collection).cache(kind);
-    let mut exchange = Exchange::start_riblt(collection, kind, local.pinned(collection));
+    let mut exchange =
+        Exchange::start_riblt(collection, kind, local.pinned(collection)).cell_run(1);
     assert!(matches!(exchange.next_delta(), Some(Frame::RibltRoot { .. })));
     assert!(exchange.on_root_written().is_empty());
     assert!(exchange.on_frame(Frame::RibltRoot { summary: cache.summary() },
         Some(local.snapshot())).is_empty());
     let mut pending = VecDeque::new();
     for index in 0..8192 {
-        assert!(matches!(exchange.next_delta(), Some(Frame::RibltCell { .. })));
+        assert!(matches!(exchange.next_delta(), Some(Frame::RibltCells { .. })));
         assert!(exchange.on_written(index + 1).is_empty());
         let item = cache.cell(index).unwrap();
         for out in exchange.on_frame(Frame::RibltCell {
@@ -1125,8 +1127,8 @@ fn riblt_runtime_more_than_one_body_window_cannot_finish_at_an_empty_current_win
     }
     a.observe();
     b.observe();
-    let mut left = receiver(&a, collection);
-    let mut right = receiver(&b, collection);
+    let mut left = receiver(&a, collection).cell_run(1);
+    let mut right = receiver(&b, collection).cell_run(1);
     let a_root = left.next_delta().unwrap();
     let b_root = right.next_delta().unwrap();
     assert!(left.on_root_written().is_empty());
@@ -1136,8 +1138,8 @@ fn riblt_runtime_more_than_one_body_window_cannot_finish_at_an_empty_current_win
     for prefix in 1..8192 {
         let a_cell = left.next_delta().expect("a cell before proof");
         let b_cell = right.next_delta().expect("a cell before proof");
-        assert!(matches!(a_cell, Frame::RibltCell { .. }));
-        assert!(matches!(b_cell, Frame::RibltCell { .. }));
+        assert!(matches!(a_cell, Frame::RibltCells { .. }));
+        assert!(matches!(b_cell, Frame::RibltCells { .. }));
         assert!(left.on_written(prefix).is_empty());
         assert!(right.on_written(prefix).is_empty());
         assert!(left.on_frame(b_cell, Some(a.snapshot())).is_empty());
@@ -1515,8 +1517,8 @@ fn riblt_runtime_reference_difference_beyond_retired_budgets_converges() {
     };
     let (a_snapshot, b_snapshot) = (local.snapshot(), peer.snapshot());
     let kind = WalkKind::References;
-    let mut a = Exchange::start_riblt(collection, kind, a_pin.clone());
-    let mut b = Exchange::start_riblt(collection, kind, b_pin.clone());
+    let mut a = Exchange::start_riblt(collection, kind, a_pin.clone()).cell_run(1);
+    let mut b = Exchange::start_riblt(collection, kind, b_pin.clone()).cell_run(1);
     let fixture = started.elapsed();
     let baseline = rss_kib();
     let started = std::time::Instant::now();
@@ -1535,7 +1537,7 @@ fn riblt_runtime_reference_difference_beyond_retired_budgets_converges() {
     loop {
         let mut moved = false;
         if let Some(frame) = a.next_delta() {
-            if matches!(frame, Frame::RibltCell { .. }) {
+            if matches!(frame, Frame::RibltCells { .. }) {
                 a_sent += 1;
                 assert!(a.on_written(a_sent).is_empty());
             } else {
@@ -1545,7 +1547,7 @@ fn riblt_runtime_reference_difference_beyond_retired_budgets_converges() {
             moved = true;
         }
         if let Some(frame) = b.next_delta() {
-            if matches!(frame, Frame::RibltCell { .. }) {
+            if matches!(frame, Frame::RibltCells { .. }) {
                 b_sent += 1;
                 assert!(b.on_written(b_sent).is_empty());
             } else {

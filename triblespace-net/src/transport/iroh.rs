@@ -69,6 +69,23 @@ impl super::SendStream for iroh::endpoint::SendStream {
         // An already finished or reset stream has nothing left to abandon.
         let _ = iroh::endpoint::SendStream::reset(self, code.into());
     }
+
+    /// The owned buffer goes to the stream as it is. `write_many_chunks`
+    /// takes a fully written chunk out of the slice (leaving `bytes` empty)
+    /// and splits a partly written one in place (leaving the unwritten
+    /// suffix), and is cancel safe; noq still copies the bytes into its own
+    /// send buffer.
+    fn write_owned<'a>(&'a mut self, bytes: &'a mut bytes::Bytes) -> super::WriteOwned<'a> {
+        Box::pin(async move {
+            if bytes.is_empty() {
+                return Ok(0);
+            }
+            let mut chunks: &mut [bytes::Bytes] = std::slice::from_mut(bytes);
+            self.write_many_chunks(&mut chunks)
+                .await
+                .map_err(std::io::Error::from)
+        })
+    }
 }
 
 impl super::RecvStream for iroh::endpoint::RecvStream {
@@ -421,6 +438,65 @@ mod tests {
             .expect("the learned address answers")
             .unwrap();
         assert_eq!(conn.remote_id(), id);
+        dialler.transport.shutdown().await;
+        listener.transport.shutdown().await;
+    }
+
+    /// The QUIC override of `write_owned`: a buffer larger than the stream
+    /// accepts at once is written in order across several calls, a fully
+    /// written buffer is left empty (or the caller would write it again), and
+    /// FIN after the owned writes ends the stream where the bytes end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_writes_reach_the_peer_in_order_and_empty_the_buffer() {
+        use tokio::io::AsyncWriteExt as _;
+
+        use crate::transport::SendStream as _;
+
+        let mut listener = bind_with_endpoint(loopback(3).await).await;
+        let dialler = bind_with_endpoint(loopback(4).await).await;
+        let id = listener.transport.local_id();
+        dialler.transport.learn(EndpointAddr::from_parts(
+            EndpointId::from_bytes(&id).unwrap(),
+            listener
+                .transport
+                .endpoint()
+                .bound_sockets()
+                .into_iter()
+                .map(TransportAddr::Ip),
+        ));
+        let deadline = Duration::from_secs(10);
+        let conn = tokio::time::timeout(deadline, dialler.transport.dial(id, PILE_SYNC_ALPN))
+            .await
+            .unwrap()
+            .unwrap();
+        let payload: Vec<u8> = (0..8 << 20).map(|i: u32| (i % 251) as u8).collect();
+        let expected = payload.clone();
+        let reader = tokio::spawn(async move {
+            let incoming = listener.incoming.recv().await.unwrap();
+            let (_send, mut recv) = incoming.conn.accept_bi().await.unwrap();
+            let mut got = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut recv, &mut got).await.unwrap();
+            (got, listener)
+        });
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        let mut owned = bytes::Bytes::from(payload);
+        let mut calls = 0;
+        while !owned.is_empty() {
+            let before = owned.len();
+            let written = tokio::time::timeout(deadline, send.write_owned(&mut owned))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(written > 0);
+            assert_eq!(owned.len(), before - written, "advanced by exactly what was written");
+            calls += 1;
+        }
+        assert_eq!(send.write_owned(&mut owned).await.unwrap(), 0);
+        send.shutdown().await.unwrap();
+        let (got, listener) = tokio::time::timeout(deadline, reader).await.unwrap().unwrap();
+        assert_eq!(got.len(), expected.len());
+        assert!(got == expected, "bytes arrive in order, once");
+        assert!(calls > 1, "8 MiB exceeds one write's stream credit");
         dialler.transport.shutdown().await;
         listener.transport.shutdown().await;
     }

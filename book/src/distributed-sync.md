@@ -719,10 +719,20 @@ then updated privately. Growth scatters the entire frozen source only into a
 private new tail; existing cells never change. This avoids adding symbols
 to an already-advanced upstream encoder. Old leases can grow their own generation
 without becoming the latest owner. There is no retained reverse-membership index;
-the public mapping reconstructs each changed symbol's memberships. Cell storage
-is 48 logical bytes (and measured Rust layout on the tested target), at most
-48 MiB per prepared generation, plus Vec capacity, native PATCH sharing and
-decoder state. Exhaustion, poisoning or count overflow fails the exchange or
+the public mapping reconstructs each changed symbol's memberships. A prepared
+cell is stored as nothing but its canonical RIBLT_CELL frame: the exact 57
+bytes the wire carries for it, framing and index included (it was 48 bytes of
+native-endian cell before; an inherited 65,536-cell prefix grew from 3 MiB to
+about 3.56 MiB). Chunks are file-backed and fully written before they are
+mapped, so a full disk is an error, never a later SIGBUS. A contiguous run of
+cells leaves the cache as one immutable `anybytes::Bytes` view of its mapped
+chunk and is written with one owned-buffer write, so the sender neither
+re-encodes nor copies a cell. Views never change: a full chunk is frozen
+read-only in place before it is viewed, and the still-growing partial chunk,
+once viewed, is copied before the next write to it (copy on write); a new
+generation scatters its difference into its own copy. The receiver's residual
+rows keep their 48-byte native records. Plus native PATCH sharing and decoder
+state. Exhaustion, poisoning or count overflow fails the exchange or
 publication; none is a success or silent prefix fallback. Each decoded local-only
 or remote-only set and the eager-body deduplication set have a 1,048,576-key
 ceiling. Unlike Prefix's materialized delta proof, the cached COW proof does not
@@ -792,9 +802,17 @@ Equal root/count with the same locally derived profile/domain can stop at zero
 cells; the upstream decoder's initially true `decoded()` alone cannot. A full
 ROOT write receipt is still required. Eager bodies take priority over unqueued cells; one active write,
 one queued frame and a single deferred cell bound coded lookahead independently
-of prepared megabytes. Each cell is locked/copied/encoded individually: 52 payload
-bytes, 57 framed bytes, not zero-copy wire. Root, OPEN, control frames and bodies
-are additional traffic.
+of prepared megabytes. Cells go out in runs: one cell first, then runs as long
+as the cells already generated, up to 64 cells (3.6 KiB) per view, never across
+a chunk. Each run is one owned buffer handed to the transport seam's
+`SendStream::write_owned`, which the QUIC adapter passes to the stream's
+`write_many_chunks` as it is; write receipts count whole frames only, a
+reset abandons the rest of a run, and FIN follows the last owned write as it
+follows any other. This removes our own per-cell encoding and copies, not the
+transport's: QUIC encrypts each packet in user space, so the stream still
+copies the bytes into its send buffer, and kernel zero-copy (sendfile) is not
+possible. The bytes on the wire are unchanged: 52 payload bytes, 57 framed
+bytes per cell. Root, OPEN, control frames and bodies are additional traffic.
 
 Cached mode uses clean write-half FIN for completion, not DONE/LANDED. Local
 eligibility requires exact decoding/proof, the complete-written matching cell

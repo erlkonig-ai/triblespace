@@ -70,7 +70,9 @@ use crate::grants::{Gate, Gated, ResourceGrants};
 use crate::host::{CollectionSnapshot, StoreSnapshot};
 use crate::patch_repair::PatchSummary;
 use crate::protocol::RawHash;
-use crate::riblt_cache::{CacheError, Cell, Generation, KeySymbol, cell_bound};
+use crate::riblt_cache::{
+    CELL_FRAME_BYTES, CacheError, Cell, CellFrame, Generation, KeySymbol, cell_bound,
+};
 use crate::riblt_decode::{DecodeError, ResidualDecoder};
 use crate::walk::{
     Admit, KEY_BYTES, MAX_WALK_REQUESTS, MAX_WALK_UNLANDED, Value, WalkKind, admit_fetched,
@@ -96,6 +98,12 @@ mod riblt_completion_tests;
 pub(crate) const FLOOD_WANTED: usize = 32 * 1024;
 /// Grow-on-demand frontier and delta-proof budget, independent of value waits.
 const FLOOD_LOCATORS: usize = 1024 * 1024;
+/// Most cells a sender hands its writer at once, as one view of its cell
+/// cache (3.6 KiB of frames). Runs start at one cell and double with the
+/// cells already generated, so a small difference still goes out cell by
+/// cell, and the cells generated past the decoding point stay within the
+/// cells sent before it (plus at most one run).
+pub(crate) const CELL_RUN: usize = 64;
 
 fn locator_key(locator: &[u8]) -> [u8; KEY_BYTES + 1] {
     let mut key = [0; KEY_BYTES + 1];
@@ -589,6 +597,8 @@ struct Riblt {
     /// [`cell_bound`] of the two ROOT counts, set when the peer ROOT arrives:
     /// neither side sends or accepts a cell at or beyond it.
     bound: usize,
+    /// Most cells per outgoing run: [`CELL_RUN`]; tests step one at a time.
+    run: usize,
 }
 
 impl<R: BlobStoreGet + Clone> Exchange<R> {
@@ -686,8 +696,19 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
             values: PATCH::new(),
             eager: 0,
             bound: 0,
+            run: CELL_RUN,
         });
         exchange
+    }
+
+    /// Hand out cells `run` at a time, for tests that step cell by cell.
+    #[cfg(test)]
+    pub(crate) fn cell_run(mut self, run: usize) -> Self {
+        assert!(run > 0);
+        if let Some(r) = &mut self.riblt {
+            r.run = run;
+        }
+        self
     }
 
     /// A grant walk on a link peered for R keeps what it receives over R.
@@ -843,16 +864,12 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
             }
             let cache = r.cache.as_ref().expect("released only after discovery");
             // The cache refuses indices beyond the u32 domain; never wrap.
-            let index = u32::try_from(r.generated).map_err(|_| CacheError::Exhausted);
-            match index.and_then(|index| Ok((index, cache.cell(r.generated)?))) {
-                Ok((index, cell)) => {
-                    r.generated += 1;
-                    return Some(Frame::RibltCell {
-                        index,
-                        symbol: cell.symbol.0,
-                        hash: cell.hash,
-                        count: cell.count,
-                    });
+            let first = u32::try_from(r.generated).map_err(|_| CacheError::Exhausted);
+            let run = r.run.min(r.generated.max(1)).min(r.bound - r.generated);
+            match first.and_then(|first| Ok((first, cache.frames(r.generated, run)?))) {
+                Ok((first, frames)) => {
+                    r.generated += frames.len() / CELL_FRAME_BYTES;
+                    return Some(Frame::RibltCells { first, frames });
                 }
                 Err(error) => {
                     self.fail(error.into());
@@ -1057,6 +1074,20 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
                 if summary == self.delta.summary() {
                     r.decoded_at = Some(0);
                     r.proven = true;
+                }
+                Ok(())
+            }
+            // Only our own tests hand a run to a receiver; it means its cells.
+            Frame::RibltCells { frames, .. } => {
+                for bytes in frames.chunks(CELL_FRAME_BYTES) {
+                    let CellFrame { index, cell } = CellFrame::parse(bytes).ok_or(Failure::Protocol)?;
+                    let frame = Frame::RibltCell {
+                        index,
+                        symbol: cell.symbol.0,
+                        hash: cell.hash,
+                        count: cell.count,
+                    };
+                    self.frame(frame, outs)?;
                 }
                 Ok(())
             }
@@ -1832,7 +1863,13 @@ pub(crate) mod tests {
                 .outbox
                 .pop_front()
                 .or_else(|| self.exchange.next_body())
-                .or_else(|| self.exchange.next_delta())?;
+                .or_else(|| {
+                    // A run is its cells: queue the rest as the writer would.
+                    let mut cells = self.exchange.next_delta()?.cells().into_iter();
+                    let first = cells.next();
+                    self.outbox.extend(cells);
+                    first
+                })?;
             self.sent.push(frame.clone());
             Some(frame)
         }
@@ -3542,8 +3579,10 @@ pub(crate) mod tests {
         sender.on_frame(Frame::RibltRoot { summary }, Some(local.snapshot()));
         let mut sent = 0;
         while let Some(frame) = sender.next_delta() {
-            assert!(matches!(frame, Frame::RibltCell { index, .. } if index as usize == sent));
-            sent += 1;
+            for cell in frame.cells() {
+                assert!(matches!(cell, Frame::RibltCell { index, .. } if index as usize == sent));
+                sent += 1;
+            }
         }
         assert_eq!(sent, bound);
         assert_eq!(
@@ -3576,14 +3615,14 @@ pub(crate) mod tests {
         let b_pin = peer.pinned(collection).with_inventory(held(20..60));
         let a_cache = Arc::downgrade(&a_pin.cache(kind));
         let b_cache = Arc::downgrade(&b_pin.cache(kind));
-        let mut a = Exchange::start_riblt(collection, kind, a_pin);
-        let mut b = Exchange::start_riblt(collection, kind, b_pin);
+        let mut a = Exchange::start_riblt(collection, kind, a_pin).cell_run(1);
+        let mut b = Exchange::start_riblt(collection, kind, b_pin).cell_run(1);
         let (a_snapshot, b_snapshot) = (local.snapshot(), peer.snapshot());
         let (mut a_sent, mut b_sent) = (0, 0);
         while !(a.discovery_stopped() && b.discovery_stopped()) {
             assert!(a_cache.upgrade().is_some() && b_cache.upgrade().is_some());
             let frame = a.next_delta().expect("a frame before discovery stops");
-            if matches!(frame, Frame::RibltCell { .. }) {
+            if matches!(frame, Frame::RibltCells { .. }) {
                 a_sent += 1;
                 a.on_written(a_sent);
             } else {
@@ -3591,7 +3630,7 @@ pub(crate) mod tests {
             }
             b.on_frame(frame, Some(b_snapshot.clone()));
             let frame = b.next_delta().expect("a frame before discovery stops");
-            if matches!(frame, Frame::RibltCell { .. }) {
+            if matches!(frame, Frame::RibltCells { .. }) {
                 b_sent += 1;
                 b.on_written(b_sent);
             } else {

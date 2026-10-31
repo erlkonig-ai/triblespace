@@ -17,6 +17,14 @@
 //! RandomMapping defines the index sequence, using IEEE754 binary64 sqrt/ceil.
 //! Wire checksum/count/index scalars are big endian. The map is public and is
 //! not an authentication claim; the exact native peer root/count proves closure.
+//!
+//! A prepared cell is stored as nothing but its canonical RIBLT_CELL wire
+//! frame, framing included ([`CELL_FRAME_BYTES`]), so a contiguous run of
+//! cells is sent as one immutable view of the mapped chunk
+//! ([`Generation::frames`]) instead of being re-encoded cell by cell. That
+//! removes only our own encoding and copies: QUIC encrypts every packet in
+//! user space, so the transport still copies and coalesces these bytes into
+//! its send buffer, and no kernel zero-copy (sendfile) is possible below it.
 
 use std::hash::Hasher;
 use std::sync::{Arc, Mutex};
@@ -36,8 +44,10 @@ pub(crate) const INITIAL_CELLS: usize = 1024;
 /// The last cell index a RIBLT_CELL frame can carry (its index is a u32).
 /// A structural limit of the wire format, not a tuning constant.
 pub(crate) const MAX_INDEX: usize = u32::MAX as usize;
-/// Prepared cells a new generation inherits from its predecessor: 3 MiB of
-/// file per component, enough for differences of about 48,000 keys. Cells
+/// Prepared cells a new generation inherits from its predecessor: about 3.56
+/// MiB of file per component (57-byte frames; 3 MiB as 48-byte native
+/// records before the frames were cached), enough for differences of about
+/// 48,000 keys. Cells
 /// beyond it are prepared again by the session that needs them, in its own
 /// generation, and die with it; this bounds the copy every publication
 /// pays, never what a session may grow.
@@ -92,7 +102,7 @@ impl Symbol for KeySymbol {
 
 pub(crate) type Cell = CodedSymbol<KeySymbol>;
 
-/// Symbol, checksum and count, native endian: a stored cell never leaves the
+/// Symbol, checksum and count, native endian: a residual row never leaves the
 /// process, and zero bytes are the empty cell.
 impl Record for Cell {
     const BYTES: usize = 48;
@@ -112,6 +122,58 @@ impl Record for Cell {
     }
 }
 
+/// RIBLT_CELL's payload: index:u32, symbol32, hash:u64, count:i64.
+pub(crate) const CELL_PAYLOAD_BYTES: usize = 4 + 32 + 8 + 8;
+/// One whole RIBLT_CELL frame on the wire: kind:u8, length:u32, payload.
+pub(crate) const CELL_FRAME_BYTES: usize = 1 + 4 + CELL_PAYLOAD_BYTES;
+
+/// One cell at its index, stored as exactly the bytes its RIBLT_CELL frame
+/// puts on the wire (big endian, framing included). All zero bytes load as
+/// the empty cell at index 0; a published slot always carries its header.
+#[derive(Clone, Debug)]
+pub(crate) struct CellFrame {
+    pub(crate) index: u32,
+    pub(crate) cell: Cell,
+}
+
+impl CellFrame {
+    /// Parse one canonical frame. `None` unless the header is exactly a
+    /// RIBLT_CELL frame of [`CELL_PAYLOAD_BYTES`].
+    pub(crate) fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != CELL_FRAME_BYTES
+            || bytes[0] != crate::walk_stream::FRAME_RIBLT_CELL
+            || bytes[1..5] != (CELL_PAYLOAD_BYTES as u32).to_be_bytes()
+        {
+            return None;
+        }
+        Some(Self::load(bytes))
+    }
+}
+
+impl Record for CellFrame {
+    const BYTES: usize = CELL_FRAME_BYTES;
+
+    fn load(bytes: &[u8]) -> Self {
+        Self {
+            index: u32::from_be_bytes(bytes[5..9].try_into().unwrap()),
+            cell: Cell {
+                symbol: KeySymbol(bytes[9..41].try_into().unwrap()),
+                hash: u64::from_be_bytes(bytes[41..49].try_into().unwrap()),
+                count: i64::from_be_bytes(bytes[49..57].try_into().unwrap()),
+            },
+        }
+    }
+
+    fn store(&self, bytes: &mut [u8]) {
+        bytes[0] = crate::walk_stream::FRAME_RIBLT_CELL;
+        bytes[1..5].copy_from_slice(&(CELL_PAYLOAD_BYTES as u32).to_be_bytes());
+        bytes[5..9].copy_from_slice(&self.index.to_be_bytes());
+        bytes[9..41].copy_from_slice(&self.cell.symbol.0);
+        bytes[41..49].copy_from_slice(&self.cell.hash.to_be_bytes());
+        bytes[49..57].copy_from_slice(&self.cell.count.to_be_bytes());
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CacheError {
     /// Beyond [`MAX_INDEX`].
@@ -128,7 +190,7 @@ pub(crate) struct Generation {
     kind: WalkKind,
     source: Tree,
     key: HashKey,
-    cells: Mutex<Records<Cell>>,
+    cells: Mutex<Records<CellFrame>>,
 }
 
 impl Generation {
@@ -201,24 +263,50 @@ impl Generation {
     /// writes its new chunk files under the lock. Contending readers share
     /// growth, not full encoders or a permanent per-peer cache copy.
     pub(crate) fn cell(&self, index: usize) -> Result<Cell, CacheError> {
+        let mut cells = self.cells.lock().map_err(|_| CacheError::Poisoned)?;
+        self.prepare(&mut cells, index)?;
+        Ok(cells.get(index).expect("prepared through index").cell)
+    }
+
+    /// The canonical wire frames of cells `[start, start + n)` as one
+    /// immutable view of the mapped cache, for some `1 <= n <= max`: `n`
+    /// stops at the prepared end and at a chunk boundary. The bytes are
+    /// exactly what encoding each cell as a RIBLT_CELL frame writes, and they
+    /// never change, whatever the cache or a newer generation does later.
+    pub(crate) fn frames(&self, start: usize, max: usize) -> Result<anybytes::Bytes, CacheError> {
+        assert!(max > 0, "a run of at least one cell");
+        let mut cells = self.cells.lock().map_err(|_| CacheError::Poisoned)?;
+        self.prepare(&mut cells, start)?;
+        let chunk_end = (start / crate::riblt_store::CHUNK + 1) * crate::riblt_store::CHUNK;
+        let count = max.min(cells.len() - start).min(chunk_end - start);
+        cells.view(start, count).map_err(|_| CacheError::Storage)
+    }
+
+    /// Prepare the cells through `index`, in doubling steps.
+    fn prepare(&self, cells: &mut Records<CellFrame>, index: usize) -> Result<(), CacheError> {
         if index > MAX_INDEX {
             return Err(CacheError::Exhausted);
         }
-        let mut cells = self.cells.lock().map_err(|_| CacheError::Poisoned)?;
-        if index >= cells.len() {
-            let length = (index + 1)
-                .next_power_of_two()
-                .max(INITIAL_CELLS)
-                .min(MAX_INDEX.saturating_add(1));
-            let start = cells.len();
-            cells.resize(length).map_err(|_| CacheError::Storage)?;
-            // Failed growth must not publish a partial tail.
-            if let Err(error) = scatter(&self.source, &self.key, &mut cells, start, 1) {
-                cells.truncate(start);
-                return Err(error);
-            }
+        if index < cells.len() {
+            return Ok(());
         }
-        Ok(cells.get(index).expect("prepared through index"))
+        let length = (index + 1)
+            .next_power_of_two()
+            .max(INITIAL_CELLS)
+            .min(MAX_INDEX.saturating_add(1));
+        let start = cells.len();
+        // A view may share the partial chunk this growth writes into.
+        cells.unshare(start).map_err(|_| CacheError::Storage)?;
+        cells.resize(length).map_err(|_| CacheError::Storage)?;
+        for index in start..length {
+            cells.set(index, &CellFrame { index: index as u32, cell: Cell::default() });
+        }
+        // Failed growth must not publish a partial tail.
+        if let Err(error) = scatter(&self.source, &self.key, cells, start, 1) {
+            cells.truncate(start);
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
@@ -227,7 +315,7 @@ impl Generation {
 fn scatter(
     source: &Tree,
     key: &HashKey,
-    cells: &mut Records<Cell>,
+    cells: &mut Records<CellFrame>,
     offset: usize,
     direction: i64,
 ) -> Result<(), CacheError> {
@@ -242,12 +330,13 @@ fn scatter(
         while mapping.last_index() < end {
             let index = mapping.last_index();
             if index >= offset {
-                let mut cell = cells.get(index).expect("index below len");
+                let mut frame = cells.get(index).expect("index below len");
+                let cell = &mut frame.cell;
                 if let Some(count) = cell.count.checked_add(direction) {
                     cell.symbol = cell.symbol.xor(&symbol.symbol);
                     cell.hash ^= symbol.hash;
                     cell.count = count;
-                    cells.set(index, &cell);
+                    cells.set(index, &frame);
                 } else {
                     failed = true;
                 }

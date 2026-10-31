@@ -21,7 +21,8 @@ netwatch = "=0.19.1"
 iroh-mdns-address-lookup = "0.4"
 url = "2"
 anyhow = "1"
-anybytes = { version = "0.20.3", features = ["zerocopy"], path = "../../anybytes" }
+anybytes = { version = "0.20.3", features = ["zerocopy", "mmap", "bytes"], path = "../../anybytes" }
+bytes = "1"
 memmap2 = "0.9"
 tempfile = "3.15.0"
 blake3 = "1.8"

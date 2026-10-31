@@ -13,7 +13,8 @@ use triblespace_core::repo::{SnapshotSource, StoreChanges, StoreSnapshot as _};
 use crate::exchange::Tree;
 use crate::host::StoreSnapshot;
 use crate::riblt_cache::{
-    CacheError, Cell, Generation, INHERITED_CELLS, INITIAL_CELLS, KeySymbol, MAX_INDEX,
+    CELL_FRAME_BYTES, CacheError, Cell, Generation, INHERITED_CELLS, INITIAL_CELLS, KeySymbol,
+    MAX_INDEX,
 };
 use crate::riblt_store::CHUNK;
 use crate::walk::WalkKind;
@@ -229,7 +230,7 @@ fn riblt_cache_grows_past_the_retired_cell_budget_in_file_backed_chunks() {
     assert_eq!(generation.prepared().unwrap(), retired * 2);
     assert_eq!(
         generation.retained_bytes().unwrap(),
-        retired * 2 / CHUNK * CHUNK * std::mem::size_of::<Cell>()
+        retired * 2 / CHUNK * CHUNK * CELL_FRAME_BYTES
     );
     for (index, cell) in early.iter().enumerate() {
         same_cell(&generation.cell(index).unwrap(), cell, index);
@@ -251,7 +252,7 @@ fn riblt_cache_grows_past_the_retired_cell_budget_in_file_backed_chunks() {
     assert_eq!(next.prepared().unwrap(), INHERITED_CELLS);
     assert_eq!(
         next.retained_bytes().unwrap(),
-        INHERITED_CELLS * std::mem::size_of::<Cell>()
+        INHERITED_CELLS * CELL_FRAME_BYTES
     );
     assert_eq!(generation.prepared().unwrap(), retired * 2);
     exact_prefix(&next, retired + 1);
@@ -289,7 +290,7 @@ fn riblt_cache_failed_growth_reserves_no_unpublished_chunks() {
     generation.cell(0).unwrap();
     let prepared = generation.prepared().unwrap();
     let bytes = generation.retained_bytes().unwrap();
-    assert_eq!(bytes, CHUNK * std::mem::size_of::<Cell>());
+    assert_eq!(bytes, CHUNK * CELL_FRAME_BYTES);
     // Doubling to 4 * CHUNK needs three more chunks; the second one fails.
     crate::riblt_store::fail_chunks_after(Some(1));
     let failed = generation.cell(3 * CHUNK);
@@ -551,11 +552,11 @@ fn riblt_cache_bounded_cold_edit_growth_cost_receipt() {
     let growth = started.elapsed();
     assert_eq!(old.prepared().unwrap(), 65_536);
     assert_eq!(latest.prepared().unwrap(), 131_072);
-    assert!(old_bytes >= 65_536 * std::mem::size_of::<Cell>());
-    assert!(latest.retained_bytes().unwrap() >= 131_072 * std::mem::size_of::<Cell>());
+    assert!(old_bytes >= 65_536 * CELL_FRAME_BYTES);
+    assert!(latest.retained_bytes().unwrap() >= 131_072 * CELL_FRAME_BYTES);
     eprintln!(
         "RIBLT_CACHE_COST sample=1 fixture_construction=excluded update_source=native_cow_32remove_32add source=raw_be_u64_zero24 old_keys=0..65536 latest_keys=32..65568 cell_bytes={} old_prepared={} latest_prepared={} leased_old_alloc={} latest_alloc_after_edit={} latest_alloc_after_growth={} cold_us={} edit_including_diff_clone_scatter_us={} growth_us={} old_root={:?} latest_root={:?}",
-        std::mem::size_of::<Cell>(),
+        CELL_FRAME_BYTES,
         old.prepared().unwrap(),
         latest.prepared().unwrap(),
         old_bytes,
@@ -644,4 +645,99 @@ fn riblt_cache_opposite_matching_prefixes_decode_at_the_same_frontier() {
         }
         assert!(finished, "bounded honest fixture must decode");
     }
+}
+
+/// The bytes `connection::write_frame` puts on the wire for this cell's
+/// RIBLT_CELL frame: the old per-cell send path, kept as the oracle.
+pub(crate) fn encoded_cell_frame(index: usize, cell: &Cell) -> Vec<u8> {
+    let (kind, payload) = crate::walk_stream::Frame::RibltCell {
+        index: index as u32,
+        symbol: cell.symbol.0,
+        hash: cell.hash,
+        count: cell.count,
+    }
+    .encode();
+    let mut wire = Vec::new();
+    futures::executor::block_on(crate::connection::write_frame(&mut wire, kind, &payload)).unwrap();
+    wire
+}
+
+#[test]
+fn riblt_cache_frames_are_exactly_the_encoded_cell_frames() {
+    let generation = Generation::advance(
+        CollectionHandle::new([28; 32]),
+        WalkKind::References,
+        references(0..300),
+        None,
+    )
+    .unwrap();
+    let mut encoder = upstream(&generation);
+    let end = CHUNK + 300;
+    let expected: Vec<u8> = (0..end)
+        .flat_map(|index| encoded_cell_frame(index, &encoder.produce_next_coded_symbol()))
+        .collect();
+    assert_eq!(CELL_FRAME_BYTES, 57);
+    assert_eq!(expected.len(), end * CELL_FRAME_BYTES);
+    // Runs of several lengths from several starts, across the first growth
+    // and across the chunk boundary, which a run never crosses.
+    for max in [1, 7, 64, CHUNK] {
+        let mut wire = Vec::new();
+        let mut start = 0;
+        while start < end {
+            let frames = generation.frames(start, max).unwrap();
+            let cells = frames.len() / CELL_FRAME_BYTES;
+            assert!(cells >= 1 && cells <= max && frames.len() % CELL_FRAME_BYTES == 0);
+            assert_eq!((start / CHUNK), (start + cells - 1) / CHUNK, "a run crossed a chunk");
+            wire.extend_from_slice(&frames);
+            start += cells;
+        }
+        wire.truncate(expected.len());
+        assert_eq!(wire, expected, "runs of at most {max}");
+    }
+    for start in [0, 1, INITIAL_CELLS - 1, INITIAL_CELLS, CHUNK - 1, CHUNK, CHUNK + 299] {
+        let frames = generation.frames(start, 1).unwrap();
+        assert_eq!(
+            &frames[..],
+            &expected[start * CELL_FRAME_BYTES..(start + 1) * CELL_FRAME_BYTES],
+            "cell {start}"
+        );
+    }
+}
+
+#[test]
+fn riblt_cache_views_never_change_as_the_cache_grows_or_advances() {
+    let collection = CollectionHandle::new([29; 32]);
+    let old = Generation::advance(collection, WalkKind::References, references(0..200), None)
+        .unwrap();
+    // A view of the partial first chunk (INITIAL_CELLS of CHUNK prepared).
+    let partial = old.frames(INITIAL_CELLS - 16, 16).unwrap();
+    let partial_bytes = partial.to_vec();
+    assert_eq!(old.prepared().unwrap(), INITIAL_CELLS);
+    // Growth writes the rest of that chunk and past it: copy on write.
+    old.cell(2 * CHUNK).unwrap();
+    assert_eq!(&partial[..], &partial_bytes[..]);
+    let again = old.frames(INITIAL_CELLS - 16, 16).unwrap();
+    assert_eq!(&again[..], &partial_bytes[..], "the cells themselves are unchanged");
+    assert_ne!(again.as_ptr(), partial.as_ptr(), "the grown chunk is a copy");
+    let full = old.frames(0, CHUNK).unwrap();
+    assert_eq!(full.len(), CHUNK * CELL_FRAME_BYTES, "the first chunk is full now");
+    let full_bytes = full.to_vec();
+    // A newer generation scatters its difference into an inherited copy.
+    let next = Generation::advance(collection, WalkKind::References, references(100..300), Some(&old))
+        .unwrap();
+    next.cell(3 * CHUNK).unwrap();
+    assert_eq!(&full[..], &full_bytes[..]);
+    assert_eq!(&partial[..], &partial_bytes[..]);
+    assert_ne!(&next.frames(0, CHUNK).unwrap()[..], &full_bytes[..]);
+    // Further growth of the old generation leaves its frozen chunk alone.
+    old.cell(4 * CHUNK).unwrap();
+    assert_eq!(&full[..], &full_bytes[..]);
+    assert_eq!(&old.frames(0, CHUNK).unwrap()[..], &full_bytes[..]);
+    exact_prefix(&old, 2 * CHUNK + 1);
+    exact_prefix(&next, 2 * CHUNK + 1);
+    // Views outlive their generation.
+    drop(old);
+    drop(next);
+    assert_eq!(&full[..], &full_bytes[..]);
+    assert_eq!(&partial[..], &partial_bytes[..]);
 }

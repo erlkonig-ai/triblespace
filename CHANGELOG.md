@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Cached RIBLT sender cells are stored as their canonical RIBLT_CELL wire
+  frames (57 bytes, framing included, instead of 48 native bytes; an inherited
+  65,536-cell prefix grows from 3 MiB to about 3.56 MiB) and leave the cache in
+  runs of up to 64 cells as one immutable `anybytes::Bytes` view of the mapped
+  chunk. A full chunk is frozen read-only before it is viewed; a viewed partial
+  chunk is copied before its next write. `SendStream` gains `write_owned`, an
+  owned-buffer, cancel-safe partial write: the default copies through
+  `poll_write`, and the iroh adapter hands the buffer to noq's
+  `write_many_chunks`. Per-cell re-encoding and copies on our side are gone;
+  QUIC still copies into its send buffer and encrypts in user space, so this is
+  not kernel zero-copy. The wire is byte-for-byte unchanged and the ALPN stays
+  `/triblespace/pile-sync/35`.
+
 - One-way typed Prefix offers (COMMIT/DERIVE and grant walks, offer profiles
   2/3) now get coarse HAVE receipts in a cold exchange: the receiver
   acknowledges a whole offered subtree with one HAVE when its original typed

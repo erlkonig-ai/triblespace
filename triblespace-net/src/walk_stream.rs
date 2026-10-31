@@ -127,6 +127,14 @@ pub(crate) enum Frame {
         hash: u64,
         count: i64,
     },
+    /// Outgoing only, never decoded: the consecutive RIBLT_CELL frames from
+    /// index `first` on, as their exact canonical wire bytes (framing
+    /// included) in one immutable view of the sender's cell cache. Written
+    /// as one owned buffer; it means exactly its cells, in order.
+    RibltCells {
+        first: u32,
+        frames: anybytes::Bytes,
+    },
 }
 
 impl Frame {
@@ -184,8 +192,31 @@ impl Frame {
                 payload.extend_from_slice(&count.to_be_bytes());
                 FRAME_RIBLT_CELL
             }
+            Self::RibltCells { .. } => {
+                unreachable!("a cell run is written as its canonical bytes, never re-encoded")
+            }
         };
         (kind, payload)
+    }
+
+    /// The cells of a [`Frame::RibltCells`] run, each as the RIBLT_CELL frame
+    /// it is; any other frame as itself.
+    pub(crate) fn cells(self) -> Vec<Frame> {
+        let Self::RibltCells { frames, .. } = self else {
+            return vec![self];
+        };
+        frames
+            .chunks(crate::riblt_cache::CELL_FRAME_BYTES)
+            .map(|bytes| {
+                let frame = crate::riblt_cache::CellFrame::parse(bytes).expect("canonical cell frame");
+                Self::RibltCell {
+                    index: frame.index,
+                    symbol: frame.cell.symbol.0,
+                    hash: frame.cell.hash,
+                    count: frame.cell.count,
+                }
+            })
+            .collect()
     }
 
     pub(crate) fn decode(kind: u8, payload: &[u8]) -> Result<Option<Self>, Malformed> {

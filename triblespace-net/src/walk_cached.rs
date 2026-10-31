@@ -73,13 +73,13 @@ where
             break false;
         }
         if exchange.discovery_stopped() {
-            if matches!(pending, Some(Frame::RibltCell { .. })) {
+            if matches!(pending, Some(Frame::RibltCells { .. })) {
                 pending = None;
             }
             deferred_delta = None;
         }
         if outgoing.is_some() {
-            if matches!(pending, Some(Frame::RibltCell { .. })) {
+            if matches!(pending, Some(Frame::RibltCells { .. })) {
                 if let Some(body) = outbox.pop_front().or_else(|| exchange.next_body()) {
                     deferred_delta = pending.replace(body);
                 }

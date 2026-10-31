@@ -27,6 +27,9 @@
 //! `AsyncWriteExt::shutdown()`. Abandoning a stream is not a finish, so the
 //! halves also carry [`SendStream::reset`] and [`RecvStream::stop`].
 
+use std::future::Future;
+use std::pin::Pin;
+
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
@@ -40,12 +43,41 @@ pub type PeerId = [u8; 32];
 /// borrowed static slice suffices and keeps dispatch alloc-free.
 pub type Alpn = &'static [u8];
 
+/// One [`SendStream::write_owned`] in flight.
+pub type WriteOwned<'a> = Pin<Box<dyn Future<Output = std::io::Result<usize>> + Send + 'a>>;
+
 /// The sending half of a bidirectional stream.
 pub trait SendStream: AsyncWrite + Unpin + Send + 'static {
     /// Abandon the stream: buffered bytes are dropped and the peer's reads
     /// fail with `code`. Shutting down instead finishes the stream, which the
     /// peer reads as a complete response.
     fn reset(&mut self, code: u32);
+
+    /// Write a prefix of an OWNED buffer: wait until the stream accepts at
+    /// least one byte, take as many as it accepts without waiting again,
+    /// advance `bytes` past them and return their count. The same stream and
+    /// order as `poll_write`: [`SendStream::reset`] and shutdown (FIN) mean
+    /// what they mean after any other write, and an error is the stream's
+    /// error. Cancel safe: dropping the future before it resolves writes
+    /// nothing and leaves `bytes` as it was. A deadline is the caller's,
+    /// around each call.
+    ///
+    /// The default copies through `poll_write`. The QUIC adapter hands the
+    /// buffer itself to the stream, so a cached cell run reaches the
+    /// transport without our own copy; QUIC still copies it into its send
+    /// buffer and encrypts each packet in user space, so this is not kernel
+    /// zero-copy.
+    fn write_owned<'a>(&'a mut self, bytes: &'a mut bytes::Bytes) -> WriteOwned<'a> {
+        Box::pin(async move {
+            if bytes.is_empty() {
+                return Ok(0);
+            }
+            let written =
+                std::future::poll_fn(|cx| Pin::new(&mut *self).poll_write(cx, &bytes[..])).await?;
+            bytes::Buf::advance(bytes, written);
+            Ok(written)
+        })
+    }
 }
 
 /// The receiving half of a bidirectional stream.
