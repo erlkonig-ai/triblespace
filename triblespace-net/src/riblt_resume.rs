@@ -52,8 +52,10 @@ use crate::riblt_store::Records;
 /// cut off once. Chunks are 912 KiB, so a small entry costs a whole chunk.
 /// Entries taken into running exchanges and their recordings are not
 /// counted: each running cached exchange may hold one taken entry and its
-/// own recording, which stops at this budget, so a host's total is at most
-/// this budget times one plus its running cached exchanges.
+/// own recording. A recording stops once its logical size reaches this
+/// budget, but chunks are reserved whole, so it may reserve up to one more
+/// 912 KiB chunk: a host's total is at most this budget times one plus its
+/// running cached exchanges, plus one chunk per running exchange.
 pub(crate) const RESUME_BUDGET_BYTES: usize = 64 << 20;
 
 /// The profile key of the generation the cells were checked against, and

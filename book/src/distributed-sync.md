@@ -869,8 +869,10 @@ connections.
   1.1 million cells), evicting the oldest first; an entry larger than the
   whole budget is not kept. The budget counts kept entries only: each running
   cached exchange may additionally hold the entry it took and its own
-  recording, and a recording stops at the budget, so the total is at most the
-  budget times one plus the number of running cached exchanges. A stale root
+  recording. A recording stops once its logical size reaches the budget, but
+  chunks are reserved whole, so it may reserve up to one more 912 KiB chunk:
+  the total is at most the budget times one plus the number of running cached
+  exchanges, plus one chunk per running exchange. A stale root
   (a peer whose set changed) cannot be attributed to its old entry without a
   peer identity, so such an entry ages out under the budget. A miss of any
   kind means the stream starts from 0, never a failure.
