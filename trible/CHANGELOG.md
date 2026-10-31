@@ -12,6 +12,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   `trible::migration`, sharing the CLI's converters without argv or stdout
   parsing. Sources remain retained; branch and authorship choices are explicit,
   and prepared storage is never activated by the library.
+- Native `/32` preparation shares the canonical converter, original-author
+  signatures, frozen-input checks and output audit. Missing exact foreign
+  refreshes are typed outcomes; unconverted caches remain in retained sources.
+  Cancellation checkpoints precede destination publication. CLI behavior and
+  report format remain unchanged.
 - `trible-migrate clean` and `trible-migrate lattice-v3` refuse a source that
   holds frames of the deployed /32 collection kinds (COMMIT, MERGE, DERIVE,
   MAP), before writing anything and whatever `--drop-unknown` or `--dry-run`

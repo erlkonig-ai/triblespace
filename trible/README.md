@@ -106,6 +106,19 @@ converted, choice-required or unsupported outcomes; it never activates storage.
 or understanding of every application schema. The returned legacy pins remain
 explicit. The CLI's existing decisions-file and resume behavior is unchanged.
 
+`prepare_canonical` (or `prepare_canonical_with_progress`) reuses the offline
+`/32` assertion converter with the owner's existing in-memory signer. It computes
+and checks the frozen source's complete digest, audits the candidate, and returns
+either `Converted` or `ForeignRefreshRequired` with the original author keys.
+Exact refresh piles can be supplied; the library never substitutes an identity.
+Rebuildable foreign/non-eight caches remain in the retained original, with their
+count returned. The original is always required; conversion is not permission to
+delete it. Copied raw frames are unchanged, so inspect the candidate for further
+physical framing or branch-adoption work, and validate actual application paths
+before activating it. Progress/cancellation includes a checkpoint before atomic
+publication; failure may retain an unpublished `.partial`, never a resumable
+completion marker. `/34` changes the network protocol, not this disk format.
+
 - `trible-migrate <PILE> list` — list known migrations and whether they are needed for this pile.
 - `trible-migrate <PILE> run <MIGRATION>` — run one explicitly named migration.
   Pass `--dry-run` to preview changes. In particular, `monotone-wants` is a

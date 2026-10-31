@@ -1,4 +1,6 @@
 //! CLI-private tests. Manual cases require the independently built /32 writer.
+#[path = "native_tests.rs"]
+mod native_tests;
 #[path = "retired_tests.rs"]
 mod retired_tests;
 

@@ -32,6 +32,8 @@ pub enum Stage {
     Reframe,
     Describe,
     Branch,
+    Canonical,
+    Audit,
     Ready,
 }
 
@@ -42,7 +44,7 @@ pub struct Progress {
     pub total_bytes: u64,
 }
 
-fn checkpoint(
+pub(crate) fn checkpoint(
     progress: &mut impl FnMut(Progress) -> bool,
     stage: Stage,
     completed_bytes: u64,
@@ -123,6 +125,50 @@ pub enum Outcome {
     Unsupported {
         kinds: Vec<UnsupportedKind>,
     },
+}
+
+/// Native /32 assertion conversion under the caller's frozen-input custody.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CanonicalOutcome {
+    /// Assertions passed the existing canonical converter's signature and
+    /// indexed-identity audit. Allowed raw frames were copied exactly: inspect
+    /// this candidate for any further framing/branch work before activation.
+    Converted {
+        destination: PathBuf,
+        source_hash: [u8; 32],
+        emitted_assertions: u64,
+        /// Rebuildable caches retained only in the original, never fabricated.
+        retained_original_caches: u64,
+    },
+    /// No destination was published. Only exact canonical refresh assertions
+    /// from these original authors can discharge the missing foundations.
+    ForeignRefreshRequired { authors: Vec<[u8; 32]> },
+}
+
+/// Convert supported /32 assertions with the existing signer, retaining the
+/// complete original. Existing destinations/partials are refused. This does
+/// not select a signer, adopt branches, or activate application configuration.
+pub fn prepare_canonical(
+    source: &Path,
+    destination: &Path,
+    signer: &SigningKey,
+    refreshes: &[PathBuf],
+) -> Result<CanonicalOutcome> {
+    prepare_canonical_with_progress(source, destination, signer, refreshes, &mut |_| true)
+}
+
+/// Cancellation checkpoints cover input boundaries, each source/audit record
+/// and acceptance before publication. Failed attempts may leave an unpublished
+/// `.partial`; neither that file nor the retained source is deleted or resumed.
+/// The caller must freeze the source and refresh inputs for the entire call.
+pub fn prepare_canonical_with_progress(
+    source: &Path,
+    destination: &Path,
+    signer: &SigningKey,
+    refreshes: &[PathBuf],
+    progress: &mut impl FnMut(Progress) -> bool,
+) -> Result<CanonicalOutcome> {
+    canonical::prepare_native(source, destination, signer, refreshes, progress)
 }
 
 /// Classify decoded record framing without opening the source for writing,
