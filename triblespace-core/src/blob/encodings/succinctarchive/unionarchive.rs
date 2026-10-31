@@ -13,7 +13,9 @@ use crate::query::{
 };
 use crate::trible::Trible;
 
-use super::{SuccinctArchive, SuccinctArchiveConstraint, Universe};
+use super::{
+    SuccinctArchive, SuccinctArchiveConstraint, SuccinctArchiveDomainRangeConstraint, Universe,
+};
 
 /// A [`TriblePattern`] view that unions several Succinct archive shards.
 ///
@@ -83,6 +85,23 @@ impl<U> UnionArchive<U>
 where
     U: Universe,
 {
+    /// [`SuccinctArchive::domain_in_range`] over every shard: the domain
+    /// values in the inclusive range `[min, max]`, whichever positions they
+    /// occur in. A value several shards hold is proposed once.
+    pub fn domain_in_range<V: InlineEncoding>(
+        &self,
+        variable: crate::query::Variable<V>,
+        min: crate::inline::Inline<V>,
+        max: crate::inline::Inline<V>,
+    ) -> UnionConstraint<SuccinctArchiveDomainRangeConstraint<'_, U>> {
+        UnionConstraint::new(
+            self.segments
+                .iter()
+                .map(|segment| segment.domain_in_range(variable, min, max))
+                .collect(),
+        )
+    }
+
     /// Iterate the logical set union in canonical EAV order.
     ///
     /// The k-way merge retains one position per physical shard and removes

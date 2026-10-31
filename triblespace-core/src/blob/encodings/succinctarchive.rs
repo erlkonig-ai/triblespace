@@ -39,6 +39,9 @@ pub use succinctarchiveconstraint::SuccinctArchiveConstraint;
 /// Inclusive value-range constraint returned by [`SuccinctArchive::value_in_range`].
 pub use succinctarchiverangeconstraint::SuccinctArchiveRangeConstraint;
 
+/// Inclusive domain-range constraint returned by [`SuccinctArchive::domain_in_range`].
+pub use succinctarchiverangeconstraint::SuccinctArchiveDomainRangeConstraint;
+
 /// Storage-neutral logical union over attached Succinct archive shards.
 pub use unionarchive::{UnionArchive, UnionArchiveConstraint};
 
@@ -1392,6 +1395,39 @@ where
         max: Inline<V>,
     ) -> SuccinctArchiveRangeConstraint<'_, U> {
         SuccinctArchiveRangeConstraint::new(variable, min, max, self)
+    }
+
+    /// A constraint over the archive's domain and the inclusive
+    /// byte-lexicographic range `[min, max]`, on no particular axis.
+    ///
+    /// Entities, attributes and values share one ordered domain, so this
+    /// proposes every domain value in the range, whichever positions it
+    /// occurs in, and leaves the position to the patterns it is joined
+    /// with. An id prefix is such a range over `GenId` values, and a
+    /// `pattern!` with the variable in entity position keeps the entities:
+    ///
+    /// ```rust,ignore
+    /// find!(id: Id,
+    ///     and!(
+    ///         pattern!(&archive, [{ ?id @ attr: value }]),
+    ///         archive.domain_in_range(id, min, max),
+    ///     )
+    /// )
+    /// ```
+    ///
+    /// The cost is one [`Universe::search_range`] (O(log n) for an
+    /// [`OrderedUniverse`]) and one domain access per value in range, and
+    /// the estimate is that count exactly. [`Self::value_in_range`] is the
+    /// V-axis-only form: it walks the V prefix to skip domain values that
+    /// never occur as values, which matters when the encoding's range
+    /// overlaps the id-shaped part of the domain.
+    pub fn domain_in_range<V: InlineEncoding>(
+        &self,
+        variable: crate::query::Variable<V>,
+        min: Inline<V>,
+        max: Inline<V>,
+    ) -> SuccinctArchiveDomainRangeConstraint<'_, U> {
+        SuccinctArchiveDomainRangeConstraint::new(variable, min, max, self)
     }
 
     /// Iterates over all tribles by walking the EAV wavelet matrix and
