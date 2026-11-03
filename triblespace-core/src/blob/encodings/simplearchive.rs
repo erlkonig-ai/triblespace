@@ -284,6 +284,23 @@ fn parallel_run_len(rows: usize) -> usize {
     rows.div_ceil(rayon::current_num_threads().max(1)).max(1)
 }
 
+/// A copy of `bytes` whose base is not 16-byte aligned, for tests that a
+/// reader refuses such input with [`UnarchiveError::BadArchive`] instead of
+/// decoding it.
+#[cfg(test)]
+pub(crate) fn misaligned_copy(bytes: &[u8]) -> Bytes {
+    let mut backing = vec![0u8; bytes.len() + 16];
+    let base = backing.as_ptr() as usize;
+    let offset = (1..16)
+        .find(|offset| (base + offset) % 16 != 0)
+        .expect("an unaligned offset below 16");
+    backing[offset..offset + bytes.len()].copy_from_slice(bytes);
+    let misaligned = Bytes::from(backing).slice(offset..offset + bytes.len());
+    assert_ne!(misaligned.as_ptr() as usize % 16, 0);
+    assert_eq!(&misaligned[..], bytes);
+    misaligned
+}
+
 /// Below this many tribles, serial unarchive wins (rayon overhead
 /// dominates).
 #[cfg(feature = "parallel")]

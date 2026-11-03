@@ -23,10 +23,10 @@ use std::fmt;
 use std::io;
 
 use anybytes::area::{ByteArea, Section};
-use anybytes::{Bytes, View};
+use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
 
-use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
+use crate::blob::encodings::simplearchive::{CanonicalTribles, SimpleArchive, UnarchiveError};
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
 use crate::id::Id;
@@ -394,7 +394,7 @@ pub fn join(
 ) -> Result<Blob<SimpleArchive>, SimpleArchiveJoinError> {
     let left_rows = canonical_rows(left)?;
     let right_rows = canonical_rows(right)?;
-    join_canonical_rows(left, right, &left_rows, &right_rows)
+    join_canonical_rows(left, right, left_rows.as_tribles(), right_rows.as_tribles())
 }
 
 /// Compute the exact canonical union of one or more `SimpleArchive` elements:
@@ -407,10 +407,11 @@ pub fn join(
 pub fn join_all(
     members: &[Blob<SimpleArchive>],
 ) -> Result<Blob<SimpleArchive>, SimpleArchiveJoinError> {
-    let rows = members
+    let canonical = members
         .iter()
         .map(canonical_rows)
         .collect::<Result<Vec<_>, _>>()?;
+    let rows: Vec<&[Trible]> = canonical.iter().map(CanonicalTribles::as_tribles).collect();
     let nonempty: Vec<usize> = (0..members.len())
         .filter(|&index| !rows[index].is_empty())
         .collect();
@@ -428,10 +429,10 @@ pub fn join_all(
     let total = union_row_capacity(rows.iter().map(|rows| rows.len()))?;
     let mut area = ByteArea::new()?;
     let mut sections = area.sections();
-    let mut out = sections.reserve::<[u8; TRIBLE_LEN]>(total)?;
+    let mut out = sections.reserve::<Trible>(total)?;
     let mut used = 0;
     loop {
-        let mut least: Option<&[u8; TRIBLE_LEN]> = None;
+        let mut least: Option<&Trible> = None;
         for (index, rows) in rows.iter().enumerate() {
             if let Some(row) = rows.get(cursors[index]) {
                 if least.is_none_or(|least| row < least) {
@@ -447,7 +448,7 @@ pub fn join_all(
                 cursors[index] += 1;
             }
         }
-        out[used] = least;
+        out.write(used, &least);
         used += 1;
     }
     freeze_union_rows(out, used)
@@ -510,14 +511,17 @@ pub fn validate_merge(
     validate_handle(ElementRole::MergeResult, claim.result(), result)?;
 
     let input_rows = inputs.map(canonical_rows);
-    let mut streams: [&[[u8; TRIBLE_LEN]]; 8] = [&[]; 8];
+    let mut streams: [&[Trible]; 8] = [&[]; 8];
     for (index, rows) in input_rows.iter().enumerate() {
-        streams[index] = rows.as_deref().map_err(|&source| {
-            SimpleArchiveUnionValidationError::InvalidElement {
-                role: ElementRole::MergeInput(index),
-                source,
-            }
-        })?;
+        streams[index] = rows
+            .as_ref()
+            .map(CanonicalTribles::as_tribles)
+            .map_err(
+                |&source| SimpleArchiveUnionValidationError::InvalidElement {
+                    role: ElementRole::MergeInput(index),
+                    source,
+                },
+            )?;
     }
     let result_rows = canonical_rows(result).map_err(|source| {
         SimpleArchiveUnionValidationError::InvalidElement {
@@ -539,7 +543,7 @@ pub fn validate_merge(
         }
         Some(least)
     });
-    if !expected.eq(result_rows.iter().copied()) {
+    if !expected.eq(result_rows.as_tribles().iter().copied()) {
         return Err(SimpleArchiveUnionValidationError::WrongMergeResult);
     }
     Ok(())
@@ -596,8 +600,8 @@ fn validate_handle(
 fn join_canonical_rows(
     left: &Blob<SimpleArchive>,
     right: &Blob<SimpleArchive>,
-    left_rows: &[[u8; TRIBLE_LEN]],
-    right_rows: &[[u8; TRIBLE_LEN]],
+    left_rows: &[Trible],
+    right_rows: &[Trible],
 ) -> Result<Blob<SimpleArchive>, SimpleArchiveJoinError> {
     if left.bytes == right.bytes || right_rows.is_empty() {
         return Ok(Blob::new(left.bytes.clone()));
@@ -609,10 +613,10 @@ fn join_canonical_rows(
     let capacity = union_row_capacity([left_rows.len(), right_rows.len()].into_iter())?;
     let mut area = ByteArea::new()?;
     let mut sections = area.sections();
-    let mut out = sections.reserve::<[u8; TRIBLE_LEN]>(capacity)?;
+    let mut out = sections.reserve::<Trible>(capacity)?;
     let mut used = 0;
     for row in UnionRows::new(left_rows, right_rows) {
-        out[used] = *row;
+        out.write(used, row);
         used += 1;
     }
     freeze_union_rows(out, used)
@@ -630,15 +634,15 @@ fn union_row_capacity(mut lengths: impl Iterator<Item = usize>) -> io::Result<us
 
 fn union_row_bytes(rows: usize) -> io::Result<usize> {
     // ByteArea's reserve arithmetic is unchecked. This single section starts
-    // at zero with byte alignment, so bounding its byte length also bounds
-    // every mmap and slice length it constructs.
+    // at zero, where its 16-byte alignment needs no padding, so bounding its
+    // byte length also bounds every mmap and slice length it constructs.
     rows.checked_mul(TRIBLE_LEN)
         .filter(|&bytes| bytes <= isize::MAX as usize)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "union byte capacity overflow"))
 }
 
 fn freeze_union_rows(
-    rows: Section<'_, [u8; TRIBLE_LEN]>,
+    rows: Section<'_, Trible>,
     used: usize,
 ) -> Result<Blob<SimpleArchive>, SimpleArchiveJoinError> {
     let len = union_row_bytes(used)?;
@@ -648,39 +652,19 @@ fn freeze_union_rows(
     Ok(Blob::new(rows.freeze()?.slice(..len)))
 }
 
-fn canonical_rows(blob: &Blob<SimpleArchive>) -> Result<View<[[u8; TRIBLE_LEN]]>, UnarchiveError> {
-    let rows: View<[[u8; TRIBLE_LEN]]> = blob
-        .bytes
-        .clone()
-        .view()
-        .map_err(|_| UnarchiveError::BadArchive)?;
-    let mut previous: Option<&[u8; TRIBLE_LEN]> = None;
-    for row in rows.iter() {
-        if Trible::as_transmute_force_raw(row).is_none() {
-            return Err(UnarchiveError::BadTrible);
-        }
-        if let Some(previous) = previous {
-            if previous == row {
-                return Err(UnarchiveError::BadCanonicalizationRedundancy);
-            }
-            if previous > row {
-                return Err(UnarchiveError::BadCanonicalizationOrdering);
-            }
-        }
-        previous = Some(row);
-    }
-    Ok(rows)
+fn canonical_rows(blob: &Blob<SimpleArchive>) -> Result<CanonicalTribles, UnarchiveError> {
+    CanonicalTribles::validate(blob.bytes.clone())
 }
 
 struct UnionRows<'a> {
-    left: &'a [[u8; TRIBLE_LEN]],
-    right: &'a [[u8; TRIBLE_LEN]],
+    left: &'a [Trible],
+    right: &'a [Trible],
     left_index: usize,
     right_index: usize,
 }
 
 impl<'a> UnionRows<'a> {
-    fn new(left: &'a [[u8; TRIBLE_LEN]], right: &'a [[u8; TRIBLE_LEN]]) -> Self {
+    fn new(left: &'a [Trible], right: &'a [Trible]) -> Self {
         Self {
             left,
             right,
@@ -691,7 +675,7 @@ impl<'a> UnionRows<'a> {
 }
 
 impl<'a> Iterator for UnionRows<'a> {
-    type Item = &'a [u8; TRIBLE_LEN];
+    type Item = &'a Trible;
 
     fn next(&mut self) -> Option<Self::Item> {
         match (
@@ -758,6 +742,7 @@ mod tests {
     use crate::repo::pile::Pile;
     use crate::repo::{BlobStoreGet, SnapshotSource};
     use crate::trible::TribleSet;
+    use anybytes::View;
 
     /// The one team every collection in these tests belongs to.
     fn test_team() -> ed25519_dalek::VerifyingKey {
@@ -1368,10 +1353,10 @@ mod tests {
         let (joined, mapped_ptr) = {
             let mut area = ByteArea::new().unwrap();
             let mut sections = area.sections();
-            let mut rows = sections.reserve::<[u8; TRIBLE_LEN]>(3).unwrap();
-            rows[0] = row(1, 1, 1);
-            rows[1] = row(2, 1, 2);
-            let mapped_ptr = rows.as_ptr().cast::<u8>();
+            let mut rows = sections.reserve::<Trible>(3).unwrap();
+            rows.write(0, &Trible::force_raw(row(1, 1, 1)).unwrap());
+            rows.write(1, &Trible::force_raw(row(2, 1, 2)).unwrap());
+            let mapped_ptr = rows.as_mut_bytes().as_ptr();
             (freeze_union_rows(rows, 2).unwrap(), mapped_ptr)
         };
         assert_eq!(joined.bytes.as_ptr(), mapped_ptr, "freezing must not copy");
@@ -1379,7 +1364,30 @@ mod tests {
         assert_eq!(joined.get_handle(), expected.get_handle());
         let retained_rows = canonical_rows(&joined).unwrap();
         drop(joined);
-        assert_eq!(&*retained_rows, &[row(1, 1, 1), row(2, 1, 2)]);
+        assert_eq!(retained_rows.as_rows(), &[row(1, 1, 1), row(2, 1, 2)]);
+    }
+
+    #[test]
+    fn misaligned_elements_are_bad_archives_not_unions() {
+        let valid = raw_archive(vec![row(1, 1, 1), row(2, 1, 2)]);
+        let misaligned = Blob::<SimpleArchive>::new(
+            crate::blob::encodings::simplearchive::misaligned_copy(&valid.bytes),
+        );
+        assert_eq!(misaligned.get_handle(), valid.get_handle());
+        assert_eq!(
+            validate_element(&misaligned),
+            Err(UnarchiveError::BadArchive)
+        );
+        for error in [
+            join(&misaligned, &valid).unwrap_err(),
+            join(&valid, &misaligned).unwrap_err(),
+            join_all(&[valid.clone(), misaligned.clone()]).unwrap_err(),
+        ] {
+            assert!(matches!(
+                error,
+                SimpleArchiveJoinError::InvalidElement(UnarchiveError::BadArchive)
+            ));
+        }
     }
 
     #[test]
