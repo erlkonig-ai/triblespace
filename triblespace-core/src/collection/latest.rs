@@ -34,7 +34,7 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
-use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
+use crate::blob::encodings::simplearchive::{CanonicalTribles, SimpleArchive, UnarchiveError};
 use crate::blob::{Blob, BlobEncoding};
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
@@ -48,7 +48,7 @@ use crate::query::{
     VariableId, VariableSet,
 };
 use crate::repo::BlobStoreGet;
-use crate::trible::{Fragment, Trible, A_START, E_START, TRIBLE_LEN};
+use crate::trible::Fragment;
 use zerocopy::byteorder::big_endian;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
@@ -233,42 +233,20 @@ pub fn derive_element(
     source: &Blob<SimpleArchive>,
     observes: Id,
 ) -> Result<Blob<LatestBlob>, LatestError> {
-    let bytes = source.bytes.as_ref();
-    if bytes.len() % TRIBLE_LEN != 0 {
-        return Err(LatestError::InvalidSource(UnarchiveError::BadArchive));
-    }
     let mut subjects: Vec<[u8; ID_LEN]> = Vec::new();
     let mut retired: Vec<[u8; ID_LEN]> = Vec::new();
-    let mut previous = None;
-    for row in bytes.chunks_exact(TRIBLE_LEN) {
-        let row: &[u8; TRIBLE_LEN] = row.try_into().expect("64-byte archive row");
-        let trible = Trible::as_transmute_force_raw(row)
-            .ok_or(LatestError::InvalidSource(UnarchiveError::BadTrible))?;
-        if let Some(previous) = previous {
-            if previous == row {
-                return Err(LatestError::InvalidSource(
-                    UnarchiveError::BadCanonicalizationRedundancy,
-                ));
-            }
-            if previous > row {
-                return Err(LatestError::InvalidSource(
-                    UnarchiveError::BadCanonicalizationOrdering,
-                ));
-            }
-        }
-        previous = Some(row);
-        let subject = row[E_START..E_START + ID_LEN]
-            .try_into()
-            .expect("16-byte subject");
+    CanonicalTribles::validate_with(source.bytes.clone(), |_, trible| {
+        let subject: [u8; ID_LEN] = **trible.e();
         if subjects.last() != Some(&subject) {
             subjects.push(subject);
         }
-        if row[A_START..A_START + ID_LEN] == observes[..] {
+        if *trible.a() == observes {
             if let Ok(id) = trible.v::<GenId>().try_from_inline::<Id>() {
-                retired.push(id[..].try_into().expect("16-byte id"));
+                retired.push(*id);
             }
         }
-    }
+    })
+    .map_err(LatestError::InvalidSource)?;
     retired.sort_unstable();
     retired.dedup();
     let retired = retired.concat();
@@ -647,7 +625,7 @@ mod tests {
     use super::*;
     use crate::prelude::*;
     use crate::query::register::{resolve, ObservationOrder};
-    use crate::trible::V_START;
+    use crate::trible::{TRIBLE_LEN, V_START};
     use futures::executor::block_on;
     use std::collections::BTreeSet;
 
@@ -1142,6 +1120,21 @@ mod tests {
             assert_eq!(heads(&derived), BTreeSet::from([*b]));
             assert!(sections(&derived).unwrap().1.is_empty());
         }
+    }
+
+    #[test]
+    fn misaligned_sources_are_bad_archives() {
+        let a = ufoid();
+        let b = ufoid();
+        let archive: Blob<SimpleArchive> = edge(&b, &a).to_blob();
+        let misaligned: Blob<SimpleArchive> = Blob::new(
+            crate::blob::encodings::simplearchive::misaligned_copy(&archive.bytes),
+        );
+        assert!(derive_element(&archive, metadata::supersedes.id()).is_ok());
+        assert_eq!(
+            derive_element(&misaligned, metadata::supersedes.id()),
+            Err(LatestError::InvalidSource(UnarchiveError::BadArchive))
+        );
     }
 
     #[test]
