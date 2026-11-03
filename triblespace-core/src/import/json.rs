@@ -825,4 +825,169 @@ mod tests {
             Err(JsonImportError::Syntax(_))
         ));
     }
+
+    fn nested_objects(depth: usize) -> String {
+        format!("{}1{}", r#"{"a":"#.repeat(depth), "}".repeat(depth))
+    }
+
+    /// `{"a": [[...1...]]}` with `depth` arrays inside the root object.
+    fn arrays_in_object(depth: usize) -> String {
+        format!(r#"{{"a":{}1{}}}"#, "[".repeat(depth), "]".repeat(depth))
+    }
+
+    /// Decoded text of every blob in the store, sorted.
+    fn stored_texts(blobs: &mut MemoryBlobStore) -> Vec<String> {
+        let mut out: Vec<String> = blobs
+            .snapshot()
+            .unwrap()
+            .into_iter()
+            .map(|(_, blob)| {
+                let text: View<str> = blob
+                    .clone()
+                    .transmute::<UTF8String>()
+                    .try_from_blob()
+                    .expect("utf-8 blob");
+                text.as_ref().to_owned()
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn object_importer_refuses_nesting_past_128() {
+        let mut blobs = MemoryBlobStore::new();
+        let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
+        importer
+            .import_str(&nested_objects(128))
+            .expect("128 nested objects are accepted");
+        // Arrays are containers too; the root object is the first one.
+        importer
+            .import_str(&arrays_in_object(127))
+            .expect("an object holding 127 nested arrays is accepted");
+        for doc in [
+            nested_objects(129),
+            arrays_in_object(128),
+            // A root array counts as the first container.
+            format!("[{}]", nested_objects(128)),
+        ] {
+            match importer.import_str(&doc) {
+                Err(JsonImportError::DepthExceeded { max_depth: 128 }) => {}
+                other => panic!("expected DepthExceeded, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn object_importer_hundred_thousand_deep_does_not_overflow_the_stack() {
+        let depth = 100_000;
+        let mut blobs = MemoryBlobStore::new();
+        let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
+        for doc in [nested_objects(depth), arrays_in_object(depth)] {
+            assert!(matches!(
+                importer.import_str(&doc),
+                Err(JsonImportError::DepthExceeded { max_depth: 128 })
+            ));
+        }
+    }
+
+    /// A refused document must leave the caller's store and the importer's
+    /// attribute cache as they were: nothing of its parsed prefix survives.
+    #[test]
+    fn object_importer_refused_document_puts_and_caches_nothing() {
+        let fresh = JsonObjectImporter::<_>::new(&mut MemoryBlobStore::new(), None).metadata();
+        let mut blobs = MemoryBlobStore::new();
+        let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
+        let bad = [
+            r#"{"f": "v", "n": 01}"#.to_owned(),
+            r#"{"f": "v", "s": "\ud800"}"#.to_owned(),
+            r#"{"f": "v", "g": {"h": [true, "w", 1e999]}}"#.to_owned(),
+            r#"{"f": "v", "t": ["w"]"#.to_owned(),
+            format!(r#"{{"f": "v", "d": {}}}"#, arrays_in_object(200)),
+        ];
+        for doc in &bad {
+            assert!(importer.import_str(doc).is_err(), "{doc} must be refused");
+            let meta = importer.metadata();
+            assert_eq!(meta.facts(), fresh.facts(), "{doc} left attributes cached");
+            assert_eq!(
+                meta.metafacts(),
+                fresh.metafacts(),
+                "{doc} left attributes cached"
+            );
+        }
+        // The field name refused above must still be stored when a later
+        // document uses it.
+        importer.import_str(r#"{"f": "w"}"#).unwrap();
+        drop(importer);
+        assert_eq!(stored_texts(&mut blobs), vec!["f", "w"]);
+    }
+
+    /// A string that is not syntactically complete is a syntax error, even
+    /// when it begins with a high surrogate; `LoneSurrogate` is only for a
+    /// well-formed document whose escapes leave a surrogate unpaired.
+    #[test]
+    fn object_importer_malformed_escape_after_high_surrogate_is_syntax() {
+        let mut blobs = MemoryBlobStore::new();
+        let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
+        for doc in [
+            r#"{"a": "\ud800\x"}"#,
+            r#"{"a": "\ud800\"#,
+            r#"{"a": "\ud800"#,
+            r#"{"a": "\ud800\u0041"#,
+            r#"{"a": "\ud800\u12"}"#,
+            r#"{"\ud800": 1"#,
+            r#"{"a": "\ud800" "b": 1}"#,
+            r#"{"a": "\ud800"} x"#,
+        ] {
+            match importer.import_str(doc) {
+                Err(JsonImportError::Syntax(_)) => {}
+                other => panic!("{doc}: expected a syntax error, got {other:?}"),
+            }
+        }
+        for (doc, unit) in [
+            (r#"{"a": "\ud800\u0041"}"#, 0xD800),
+            (r#"{"a": "\ud800\n"}"#, 0xD800),
+            (r#"{"a": ["x", "\udc00"]}"#, 0xDC00),
+        ] {
+            match importer.import_str(doc) {
+                Err(JsonImportError::LoneSurrogate { code_unit }) => assert_eq!(code_unit, unit),
+                other => panic!("{doc}: expected LoneSurrogate, got {other:?}"),
+            }
+        }
+    }
+
+    /// Malformed input is a syntax error, not a primitive root.
+    #[test]
+    fn object_importer_names_syntax_errors_as_syntax() {
+        let mut blobs = MemoryBlobStore::new();
+        let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
+        for doc in [
+            "",
+            "x",
+            "tru",
+            r#"[{"a": 1} {"b": 2}]"#,
+            r#"[{"a": 1},]"#,
+            r#"[{"a": 1}"#,
+            r#"{"a": 1} x"#,
+            r#"{"a": 1}{"b": 2}"#,
+            r#"[] []"#,
+        ] {
+            match importer.import_str(doc) {
+                Err(JsonImportError::Syntax(_)) => {}
+                other => panic!("{doc:?}: expected a syntax error, got {other:?}"),
+            }
+        }
+        for doc in [
+            "1",
+            r#""s""#,
+            "null",
+            r#"[{"a": 1}, 2]"#,
+            r#"[{"a": 1}, [{}]]"#,
+        ] {
+            match importer.import_str(doc) {
+                Err(JsonImportError::PrimitiveRoot) => {}
+                other => panic!("{doc:?}: expected PrimitiveRoot, got {other:?}"),
+            }
+        }
+    }
 }

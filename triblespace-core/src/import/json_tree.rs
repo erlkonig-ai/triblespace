@@ -776,14 +776,46 @@ mod tests {
         }
     }
 
+    /// A string that is not syntactically complete is a syntax error, even
+    /// when it begins with a high surrogate; `LoneSurrogate` is only for a
+    /// well-formed document whose escapes leave a surrogate unpaired.
+    #[test]
+    fn malformed_escape_after_high_surrogate_is_syntax() {
+        for doc in [
+            r#""\ud800\x""#,
+            r#""\ud800\"#,
+            r#""\ud800"#,
+            r#""\ud800\u0041"#,
+            r#""\ud800\u12""#,
+            r#""\ud800\uzzzz""#,
+            r#""\ude00\x""#,
+            r#"["\ud800" 1]"#,
+            r#"{"\ud800" 1}"#,
+            r#""\ud800" x"#,
+        ] {
+            match import(doc) {
+                Err(JsonImportError::Syntax(_)) => {}
+                other => panic!("{doc}: expected a syntax error, got {other:?}"),
+            }
+        }
+    }
+
     /// RFC 8259 whitespace is space, tab, newline and carriage return only:
     /// a form feed is refused wherever it appears, and so is an unescaped
     /// control character inside a string, while its escaped form decodes.
     #[test]
     fn only_json_whitespace_and_escaped_controls_are_accepted() {
         for bad in [
-            "\x0c[]", "[\x0c1]", "[1\x0c]", "[\"a\"\x0c]", "{\x0c}", "[true\x0c]",
-            "\"a\x01b\"", "\"a\tb\"", "\"a\x1fb\"", "{\"k\x00\": 1}",
+            "\x0c[]",
+            "[\x0c1]",
+            "[1\x0c]",
+            "[\"a\"\x0c]",
+            "{\x0c}",
+            "[true\x0c]",
+            "\"a\x01b\"",
+            "\"a\tb\"",
+            "\"a\x1fb\"",
+            "{\"k\x00\": 1}",
         ] {
             assert!(
                 matches!(import(bad), Err(JsonImportError::Syntax(_))),
@@ -908,6 +940,32 @@ mod tests {
             let b: View<str> = local.get(handle).expect("readable from the fragment");
             assert_eq!(a.as_ref(), b.as_ref());
         }
+    }
+
+    /// A refused document puts nothing into the caller's store, however
+    /// much of it parsed before the refusal.
+    #[test]
+    fn refused_document_puts_nothing_into_the_store() {
+        let mut store = CountingStore::default();
+        let mut importer = JsonTreeImporter::<_>::new(&mut store, None);
+        let bad = [
+            r#"["kept", {"name": 1}, 01]"#.to_owned(),
+            r#"["kept", {"name": "\ud800"}]"#.to_owned(),
+            r#"["kept", 1e5, "x" "y"]"#.to_owned(),
+            r#"["kept"] trailing"#.to_owned(),
+            format!(r#"["kept", {}{}]"#, "[".repeat(200), "]".repeat(200)),
+        ];
+        for doc in &bad {
+            assert!(importer.import_str(doc).is_err(), "{doc} must be refused");
+        }
+        importer.import_str(r#"["ok"]"#).unwrap();
+        drop(importer);
+        let ok: Inline<Handle<UTF8String>> = "ok".to_blob().get_handle();
+        assert_eq!(
+            store.puts,
+            vec![ok.raw],
+            "only the accepted document's blob"
+        );
     }
 
     fn nested_arrays(depth: usize) -> String {
