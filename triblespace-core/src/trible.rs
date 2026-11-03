@@ -6,7 +6,14 @@ mod fragment;
 mod spread;
 mod tribleset;
 
-use std::convert::TryInto;
+use std::fmt;
+use std::hash::Hash;
+use std::hash::Hasher;
+
+use zerocopy::Immutable;
+use zerocopy::IntoBytes;
+use zerocopy::KnownLayout;
+use zerocopy::TryFromBytes;
 
 use crate::id::ExclusiveId;
 use crate::id::Id;
@@ -107,11 +114,48 @@ const _: () = {
 /// See the [Trible Structure](../book/src/deep-dive/trible-structure.md)
 /// chapter of the Tribles Book for a detailed discussion of the layout and its
 /// design rationale.
-#[derive(Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Debug)]
-#[repr(transparent)]
+///
+/// The fields are laid out exactly as the 64 bytes on disk and on the wire:
+/// entity, attribute, value, with no padding. The type is 16-byte aligned, so
+/// a `&[Trible]` view over archive bytes refuses a misaligned base. Its
+/// validity, checked by zerocopy's [`TryFromBytes`], is the row rule: neither
+/// the entity nor the attribute is nil (all zero).
+///
+/// The derived [`Ord`] compares the fields in layout order, and each field
+/// compares its raw bytes, so it is the byte-lexicographic order of
+/// [`Trible::as_raw`].
+#[derive(
+    Copy, Clone, PartialEq, Eq, PartialOrd, Ord, TryFromBytes, KnownLayout, Immutable, IntoBytes,
+)]
+#[repr(C, align(16))]
 pub struct Trible {
-    /// The raw 64-byte EAV content of this trible.
-    pub data: RawTrible,
+    e: Id,
+    a: Id,
+    v: RawInline,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<Trible>() == TRIBLE_LEN);
+    assert!(std::mem::align_of::<Trible>() == crate::id::ID_LEN);
+    assert!(std::mem::offset_of!(Trible, e) == E_START);
+    assert!(std::mem::offset_of!(Trible, a) == A_START);
+    assert!(std::mem::offset_of!(Trible, v) == V_START);
+};
+
+// Hash and Debug go through the raw bytes so both stay exactly what they were
+// when the trible was a bare `[u8; 64]`.
+impl Hash for Trible {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_raw().hash(state);
+    }
+}
+
+impl fmt::Debug for Trible {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Trible")
+            .field("data", self.as_raw())
+            .finish()
+    }
 }
 
 impl Trible {
@@ -139,12 +183,7 @@ impl Trible {
     /// let trible = Trible::new(&e, &a, &v);
     /// ```
     pub fn new<V: InlineEncoding>(e: &ExclusiveId, a: &Id, v: &Inline<V>) -> Trible {
-        let mut data = [0; TRIBLE_LEN];
-        data[E_START..=E_END].copy_from_slice(&e[..]);
-        data[A_START..=A_END].copy_from_slice(&a[..]);
-        data[V_START..=V_END].copy_from_slice(&v.raw[..]);
-
-        Self { data }
+        Trible::force(e, a, v)
     }
 
     /// Creates a new trible from an entity, an attribute, and a value.
@@ -179,7 +218,11 @@ impl Trible {
     /// assert_eq!(trible.e(), &*e);
     /// ```
     pub fn force<V: InlineEncoding>(e: &Id, a: &Id, v: &Inline<V>) -> Trible {
-        Trible::new(ExclusiveId::force_ref(e), a, v)
+        Self {
+            e: *e,
+            a: *a,
+            v: v.raw,
+        }
     }
 
     /// Creates a new trible from a raw trible (a 64-byte array).
@@ -213,15 +256,12 @@ impl Trible {
     /// assert!(trible.is_some());
     /// ```
     pub fn force_raw(data: RawTrible) -> Option<Trible> {
-        if data[E_START..=E_END].iter().all(|&x| x == 0)
-            || data[A_START..=A_END].iter().all(|&x| x == 0)
-        {
-            return None;
-        }
-        Some(Self { data })
+        // A by-value read copies into an aligned `Trible`, so the source
+        // array's alignment does not matter; only validity can fail.
+        Trible::try_read_from_bytes(&data).ok()
     }
 
-    /// Transmutes a raw trible reference into a trible reference.
+    /// Views a raw trible reference as a trible reference.
     /// Circumvents the ownership system, and is useful for loading existing trible data,
     /// just like [Trible::force] and [Trible::force_raw].
     ///
@@ -231,15 +271,20 @@ impl Trible {
     ///
     /// # Returns
     ///
-    /// A new trible reference if the entity and attribute are not nil
-    /// (i.e. they are not all zeroes), otherwise `None`.
+    /// A trible reference if `data` is 16-byte aligned and the entity and
+    /// attribute are not nil (i.e. they are not all zeroes), otherwise `None`.
     ///
     /// # Example
     ///
     /// ```
     /// use triblespace_core::prelude::*;
     ///
-    /// let data = [
+    /// // A `[u8; 64]` has alignment 1; this wrapper gives it the 16-byte
+    /// // alignment a `&Trible` requires.
+    /// #[repr(align(16))]
+    /// struct Aligned([u8; 64]);
+    ///
+    /// let data = Aligned([
     ///   // Entity
     ///   0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
     ///   // Attribute
@@ -247,24 +292,12 @@ impl Trible {
     ///   // Inline
     ///   32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
     ///   48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
-    /// ];
-    /// let trible = Trible::as_transmute_force_raw(&data);
+    /// ]);
+    /// let trible = Trible::as_transmute_force_raw(&data.0);
     /// assert!(trible.is_some());
     /// ```
     pub fn as_transmute_force_raw(data: &RawTrible) -> Option<&Self> {
-        if data[E_START..=E_END].iter().all(|&x| x == 0)
-            || data[A_START..=A_END].iter().all(|&x| x == 0)
-        {
-            return None;
-        }
-        Some(unsafe { std::mem::transmute::<&RawTrible, &Self>(data) })
-    }
-
-    /// Transmutes a raw trible reference into a trible reference.
-    /// Circumvents the ownership system, and does not check if the entity and attribute are nil.
-    /// Should only be used if it it certain that the `RawTrible` is actually valid.
-    pub fn as_transmute_raw_unchecked(data: &RawTrible) -> &Self {
-        unsafe { std::mem::transmute::<&RawTrible, &Self>(data) }
+        Trible::try_ref_from_bytes(data).ok()
     }
 
     /// Returns the entity of the trible.
@@ -292,7 +325,7 @@ impl Trible {
     /// assert_eq!(entity, &Id::new([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]).unwrap());
     /// ```
     pub fn e(&self) -> &Id {
-        Id::as_transmute_raw(self.data[E_START..=E_END].try_into().unwrap()).unwrap()
+        &self.e
     }
 
     /// Returns the attribute of the trible.
@@ -320,7 +353,7 @@ impl Trible {
     /// assert_eq!(attribute, &Id::new([16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]).unwrap());
     /// ```
     pub fn a(&self) -> &Id {
-        Id::as_transmute_raw(self.data[A_START..=A_END].try_into().unwrap()).unwrap()
+        &self.a
     }
 
     /// Returns the value of the trible.
@@ -350,7 +383,7 @@ impl Trible {
     /// 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63]));
     /// ```
     pub fn v<V: InlineEncoding>(&self) -> &Inline<V> {
-        Inline::as_transmute_raw(self.data[V_START..=V_END].try_into().unwrap())
+        Inline::as_transmute_raw(&self.v)
     }
 
     /// Returns the raw 64-byte EAV content of this trible.
@@ -358,7 +391,7 @@ impl Trible {
     /// This is the byte form used on disk and on the wire, and the order
     /// that [`Ord`] compares.
     pub fn as_raw(&self) -> &RawTrible {
-        &self.data
+        zerocopy::transmute_ref!(self)
     }
 }
 

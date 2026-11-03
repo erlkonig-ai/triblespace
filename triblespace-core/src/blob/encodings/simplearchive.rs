@@ -43,16 +43,25 @@ impl MetaDescribe for SimpleArchive {
     }
 }
 
+/// Collects the canonical EAV rows into a `Vec<Trible>`.
+///
+/// The vector is 16-byte aligned by its element type, so the archive bytes
+/// built from it always satisfy the alignment that `ArchiveEntry` and a
+/// `[Trible]` view require. An empty set encodes as empty bytes.
+fn encode_rows(source: &TribleSet) -> Blob<SimpleArchive> {
+    let mut tribles: Vec<Trible> = Vec::with_capacity(source.len());
+    tribles.extend(source.iter_ordered().copied());
+    let bytes: Bytes = tribles.into();
+    Blob::new(bytes)
+}
+
 impl Encodes<TribleSet> for SimpleArchive
 where
     crate::inline::encodings::hash::Handle<SimpleArchive>: crate::inline::InlineEncoding,
 {
     type Output = Blob<SimpleArchive>;
     fn encode(source: TribleSet) -> Blob<SimpleArchive> {
-        let mut tribles: Vec<[u8; 64]> = Vec::with_capacity(source.len());
-        tribles.extend(source.eav.iter_ordered());
-        let bytes: Bytes = tribles.into();
-        Blob::new(bytes)
+        encode_rows(&source)
     }
 }
 
@@ -62,10 +71,7 @@ where
 {
     type Output = Blob<SimpleArchive>;
     fn encode(source: &TribleSet) -> Blob<SimpleArchive> {
-        let mut tribles: Vec<[u8; 64]> = Vec::with_capacity(source.len());
-        tribles.extend(source.eav.iter_ordered());
-        let bytes: Bytes = tribles.into();
-        Blob::new(bytes)
+        encode_rows(source)
     }
 }
 

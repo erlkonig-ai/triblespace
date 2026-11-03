@@ -34,6 +34,14 @@ use std::ops::Add;
 use std::ops::AddAssign;
 use std::sync::Arc;
 use zerocopy::IntoBytes;
+use zerocopy::TryFromBytes;
+
+/// Why a trible-set key always views as a [`Trible`]: every key was inserted
+/// from a valid `Trible` (non-nil entity and attribute), and a PATCH key lives
+/// in a 16-byte-aligned heap `Leaf` or in archive bytes whose rows an
+/// `ArchiveEntry` requires to be 16-byte aligned.
+const PATCH_KEY_IS_TRIBLE: &str =
+    "trible-set keys are 16-byte-aligned rows inserted from valid tribles";
 
 /// Canonicalizes and stores the facts of one content-derived entity.
 ///
@@ -120,7 +128,9 @@ fn build_intrinsic_entity_inner(
 
     let mut set = TribleSet::new();
     for row in &rows {
-        set.insert(Trible::as_transmute_raw_unchecked(row.raw()));
+        let trible = Trible::force_raw(*row.raw())
+            .expect("intrinsic rows carry a BLAKE3-derived non-nil entity and a non-nil attribute");
+        set.insert(&trible);
     }
 
     (id, set)
@@ -656,7 +666,7 @@ impl TribleSet {
             inner: self
                 .eav
                 .iter()
-                .map(|data| Trible::as_transmute_raw_unchecked(data)),
+                .map(|data| Trible::try_ref_from_bytes(data).expect(PATCH_KEY_IS_TRIBLE)),
         }
     }
 
@@ -664,7 +674,7 @@ impl TribleSet {
     pub fn iter_ordered(&self) -> impl Iterator<Item = &Trible> {
         self.eav
             .iter_ordered()
-            .map(|data| Trible::as_transmute_raw_unchecked(data))
+            .map(|data| Trible::try_ref_from_bytes(data).expect(PATCH_KEY_IS_TRIBLE))
     }
 }
 
