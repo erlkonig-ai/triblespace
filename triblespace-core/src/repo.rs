@@ -1476,7 +1476,7 @@ where
 pub fn potential_handles<'a>(
     set: &'a TribleSet,
 ) -> impl Iterator<Item = Inline<Handle<UnknownBlob>>> + 'a {
-    set.vae.iter().map(|raw| {
+    set.vae().iter().map(|raw| {
         let mut value = [0u8; INLINE_LEN];
         value.copy_from_slice(&raw[V_START..=V_END]);
         Inline::<Handle<UnknownBlob>>::new(value)

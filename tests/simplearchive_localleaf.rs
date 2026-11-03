@@ -107,7 +107,7 @@ fn union_two_overlapping_archives() {
 
     // Walk every key via the eav iterator — if any LocalLeaf points
     // into freed archive bytes, this will read garbage or fault.
-    let count: usize = unioned.eav.iter_ordered().count();
+    let count: usize = unioned.eav().iter_ordered().count();
     assert_eq!(count, expected_len);
 }
 

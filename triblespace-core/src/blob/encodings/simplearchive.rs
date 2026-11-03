@@ -10,7 +10,6 @@ use crate::metadata;
 use crate::metadata::MetaDescribe;
 #[cfg(any(test, feature = "parallel"))]
 use crate::patch::hash_key;
-use crate::patch::ArchiveEntry;
 use crate::patch::ArchiveOwner;
 use crate::trible::Fragment;
 use crate::trible::RawTrible;
@@ -22,7 +21,6 @@ use crate::trible::TRIBLE_LEN;
 use anybytes::view::ViewError;
 use anybytes::Bytes;
 use anybytes::View;
-use std::ptr::NonNull;
 use std::sync::Arc;
 #[cfg(feature = "parallel")]
 use zerocopy::{IntoBytes, TryFromBytes};
@@ -545,10 +543,8 @@ fn insert_row(set: &mut TribleSet, trible: &Trible, owner: Option<&Arc<dyn Archi
     match owner {
         Some(owner) => {
             // SAFETY: `trible` lies in the immutable archive bytes that
-            // `owner` keeps alive, and a `&Trible` is 16-byte aligned by its
-            // type.
-            let entry = unsafe { ArchiveEntry::new(NonNull::from(trible.as_raw()), owner) };
-            set.insert_archive(&entry);
+            // `owner` keeps alive.
+            unsafe { set.insert_archive(trible, owner) };
         }
         None => set.insert(trible),
     }
@@ -892,12 +888,12 @@ mod tests {
     }
 
     fn assert_all_six_parity(candidate: &TribleSet, baseline: &TribleSet, len: usize) {
-        assert_index_parity::<EAVOrder>(&candidate.eav, &baseline.eav, len);
-        assert_index_parity::<EVAOrder>(&candidate.eva, &baseline.eva, len);
-        assert_index_parity::<AEVOrder>(&candidate.aev, &baseline.aev, len);
-        assert_index_parity::<AVEOrder>(&candidate.ave, &baseline.ave, len);
-        assert_index_parity::<VEAOrder>(&candidate.vea, &baseline.vea, len);
-        assert_index_parity::<VAEOrder>(&candidate.vae, &baseline.vae, len);
+        assert_index_parity::<EAVOrder>(candidate.eav(), baseline.eav(), len);
+        assert_index_parity::<EVAOrder>(candidate.eva(), baseline.eva(), len);
+        assert_index_parity::<AEVOrder>(candidate.aev(), baseline.aev(), len);
+        assert_index_parity::<AVEOrder>(candidate.ave(), baseline.ave(), len);
+        assert_index_parity::<VEAOrder>(candidate.vea(), baseline.vea(), len);
+        assert_index_parity::<VAEOrder>(candidate.vae(), baseline.vae(), len);
     }
 
     /// An archive skewed the way a real collection is: a handful of
@@ -973,12 +969,12 @@ mod tests {
 
             if len > 1 {
                 for stats in [
-                    candidate.eav.node_stats(),
-                    candidate.eva.node_stats(),
-                    candidate.aev.node_stats(),
-                    candidate.ave.node_stats(),
-                    candidate.vea.node_stats(),
-                    candidate.vae.node_stats(),
+                    candidate.eav().node_stats(),
+                    candidate.eva().node_stats(),
+                    candidate.aev().node_stats(),
+                    candidate.ave().node_stats(),
+                    candidate.vea().node_stats(),
+                    candidate.vae().node_stats(),
                 ] {
                     assert_eq!(stats.2, 0, "bottom-up build materialized heap leaves");
                     assert_eq!(stats.3, len as u64, "bottom-up build lost LocalLeaves");
@@ -990,12 +986,12 @@ mod tests {
             drop(baseline);
             drop(blob);
             black_box(vec![0xa5u8; len.saturating_mul(64).min(1 << 20)]);
-            assert_eq!(survivor.eav.iter_ordered().count(), len);
-            assert_eq!(survivor.eva.iter_ordered().count(), len);
-            assert_eq!(survivor.aev.iter_ordered().count(), len);
-            assert_eq!(survivor.ave.iter_ordered().count(), len);
-            assert_eq!(survivor.vea.iter_ordered().count(), len);
-            assert_eq!(survivor.vae.iter_ordered().count(), len);
+            assert_eq!(survivor.eav().iter_ordered().count(), len);
+            assert_eq!(survivor.eva().iter_ordered().count(), len);
+            assert_eq!(survivor.aev().iter_ordered().count(), len);
+            assert_eq!(survivor.ave().iter_ordered().count(), len);
+            assert_eq!(survivor.vea().iter_ordered().count(), len);
+            assert_eq!(survivor.vae().iter_ordered().count(), len);
         }
     }
 
@@ -1003,24 +999,24 @@ mod tests {
     fn bottom_up_root_owner_guards_cover_every_local_leaf() {
         let set = bottom_up_for_test(fixture_blob(8_192)).unwrap();
         let guards = [
-            set.eav.owner_guard(),
-            set.eva.owner_guard(),
-            set.aev.owner_guard(),
-            set.ave.owner_guard(),
-            set.vea.owner_guard(),
-            set.vae.owner_guard(),
+            set.eav().owner_guard(),
+            set.eva().owner_guard(),
+            set.aev().owner_guard(),
+            set.ave().owner_guard(),
+            set.vea().owner_guard(),
+            set.vae().owner_guard(),
         ];
         assert!(
             guards[1..].iter().all(|guard| guard.ptr_eq(&guards[0])),
             "the six archive indexes duplicated their owner cover",
         );
         for stats in [
-            set.eav.archive_owner_guard_stats(),
-            set.eva.archive_owner_guard_stats(),
-            set.aev.archive_owner_guard_stats(),
-            set.ave.archive_owner_guard_stats(),
-            set.vea.archive_owner_guard_stats(),
-            set.vae.archive_owner_guard_stats(),
+            set.eav().archive_owner_guard_stats(),
+            set.eva().archive_owner_guard_stats(),
+            set.aev().archive_owner_guard_stats(),
+            set.ave().archive_owner_guard_stats(),
+            set.vea().archive_owner_guard_stats(),
+            set.vae().archive_owner_guard_stats(),
         ] {
             assert!(stats.0, "archive PATCH has no root owner guard");
             assert_eq!(stats.1, 8_192, "not every archive row remained local");
@@ -1045,7 +1041,7 @@ mod tests {
         let baseline = serial_for_test(blob.clone()).unwrap();
         let candidate = bottom_up_for_test(blob).unwrap();
         assert_all_six_parity(&candidate, &baseline, 256);
-        assert_eq!(candidate.eav.branch_fanout_histogram()[256], 1);
+        assert_eq!(candidate.eav().branch_fanout_histogram()[256], 1);
     }
 
     #[cfg(feature = "proptest")]
@@ -1127,12 +1123,12 @@ mod tests {
                     drop(baseline);
                     drop(blob);
                     black_box(vec![0x5au8; len.saturating_mul(64).min(1 << 20)]);
-                    assert_eq!(survivor.eav.iter_ordered().count(), len);
-                    assert_eq!(survivor.eva.iter_ordered().count(), len);
-                    assert_eq!(survivor.aev.iter_ordered().count(), len);
-                    assert_eq!(survivor.ave.iter_ordered().count(), len);
-                    assert_eq!(survivor.vea.iter_ordered().count(), len);
-                    assert_eq!(survivor.vae.iter_ordered().count(), len);
+                    assert_eq!(survivor.eav().iter_ordered().count(), len);
+                    assert_eq!(survivor.eva().iter_ordered().count(), len);
+                    assert_eq!(survivor.aev().iter_ordered().count(), len);
+                    assert_eq!(survivor.ave().iter_ordered().count(), len);
+                    assert_eq!(survivor.vea().iter_ordered().count(), len);
+                    assert_eq!(survivor.vae().iter_ordered().count(), len);
                 }
             });
     }
@@ -1231,12 +1227,12 @@ mod tests {
         assert_all_six_parity(&heap_only, &archive_backed, len);
 
         for stats in [
-            heap_only.eav.node_stats(),
-            heap_only.eva.node_stats(),
-            heap_only.aev.node_stats(),
-            heap_only.ave.node_stats(),
-            heap_only.vea.node_stats(),
-            heap_only.vae.node_stats(),
+            heap_only.eav().node_stats(),
+            heap_only.eva().node_stats(),
+            heap_only.aev().node_stats(),
+            heap_only.ave().node_stats(),
+            heap_only.vea().node_stats(),
+            heap_only.vae().node_stats(),
         ] {
             assert_eq!(stats.2, len as u64, "heap fallback lost heap Leaves");
             assert_eq!(stats.3, 0, "heap fallback created LocalLeaves");

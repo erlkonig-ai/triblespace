@@ -210,17 +210,17 @@ mod tests {
             [row(1), row(2), row(3)],
         );
         assert!(facts
-            .eav
+            .eav()
             .iter()
             .all(|row| input_addresses.contains(&(row.as_ptr() as usize))));
         assert_eq!(
             [
-                facts.eav.archive_owner_guard_stats(),
-                facts.eva.archive_owner_guard_stats(),
-                facts.aev.archive_owner_guard_stats(),
-                facts.ave.archive_owner_guard_stats(),
-                facts.vea.archive_owner_guard_stats(),
-                facts.vae.archive_owner_guard_stats(),
+                facts.eav().archive_owner_guard_stats(),
+                facts.eva().archive_owner_guard_stats(),
+                facts.aev().archive_owner_guard_stats(),
+                facts.ave().archive_owner_guard_stats(),
+                facts.vea().archive_owner_guard_stats(),
+                facts.vae().archive_owner_guard_stats(),
             ],
             [(true, 3); 6],
         );

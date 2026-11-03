@@ -3183,17 +3183,17 @@ where
     <U as Serializable>::Meta: Clone,
     F: MergedWaveletFactory,
 {
-    let triple_count = set.eav.len() as usize;
+    let triple_count = set.eav().len() as usize;
 
     let e_iter = set
-        .eav
+        .eav()
         .iter_prefix_count::<16>()
         .map(|(e, _)| id_into_value(&e));
     let a_iter = set
-        .ave
+        .ave()
         .iter_prefix_count::<16>()
         .map(|(a, _)| id_into_value(&a));
-    let v_iter = set.vea.iter_prefix_count::<32>().map(|(v, _)| v);
+    let v_iter = set.vea().iter_prefix_count::<32>().map(|(v, _)| v);
 
     let mut area = ByteArea::new().unwrap();
     let mut sections = area.sections();
@@ -3207,7 +3207,7 @@ where
     let e_a = build_prefix_bv(
         domain.len(),
         triple_count,
-        set.eav.iter_prefix_count::<16>().map(|(e, c)| {
+        set.eav().iter_prefix_count::<16>().map(|(e, c)| {
             (
                 domain.search(&id_into_value(&e)).expect("e in domain"),
                 c as usize,
@@ -3219,7 +3219,7 @@ where
     let a_a = build_prefix_bv(
         domain.len(),
         triple_count,
-        set.ave.iter_prefix_count::<16>().map(|(a, c)| {
+        set.ave().iter_prefix_count::<16>().map(|(a, c)| {
             (
                 domain.search(&id_into_value(&a)).expect("a in domain"),
                 c as usize,
@@ -3231,7 +3231,7 @@ where
     let v_a = build_prefix_bv(
         domain.len(),
         triple_count,
-        set.vea
+        set.vea()
             .iter_prefix_count::<32>()
             .map(|(v, c)| (domain.search(&v).expect("v in domain"), c as usize)),
         &mut sections,
@@ -3241,7 +3241,7 @@ where
     fill_tribleset_wavelet(
         &mut wavelets,
         SuccinctRotation::Eav,
-        set.eav
+        set.eav()
             .iter_prefix_count::<64>()
             .map(|(t, _)| t[32..64].try_into().unwrap())
             .map(|v| domain.search(&v).expect("v in domain")),
@@ -3249,7 +3249,7 @@ where
     fill_tribleset_wavelet(
         &mut wavelets,
         SuccinctRotation::Vea,
-        set.vea
+        set.vea()
             .iter_prefix_count::<64>()
             .map(|(t, _)| id_into_value(t[48..64].try_into().unwrap()))
             .map(|a| domain.search(&a).expect("a in domain")),
@@ -3257,7 +3257,7 @@ where
     fill_tribleset_wavelet(
         &mut wavelets,
         SuccinctRotation::Ave,
-        set.ave
+        set.ave()
             .iter_prefix_count::<64>()
             .map(|(t, _)| id_into_value(t[48..64].try_into().unwrap()))
             .map(|e| domain.search(&e).expect("e in domain")),
@@ -3265,7 +3265,7 @@ where
     fill_tribleset_wavelet(
         &mut wavelets,
         SuccinctRotation::Vae,
-        set.vae
+        set.vae()
             .iter_prefix_count::<64>()
             .map(|(t, _)| id_into_value(t[48..64].try_into().unwrap()))
             .map(|e| domain.search(&e).expect("e in domain")),
@@ -3273,7 +3273,7 @@ where
     fill_tribleset_wavelet(
         &mut wavelets,
         SuccinctRotation::Eva,
-        set.eva
+        set.eva()
             .iter_prefix_count::<64>()
             .map(|(t, _)| id_into_value(t[48..64].try_into().unwrap()))
             .map(|a| domain.search(&a).expect("a in domain")),
@@ -3281,7 +3281,7 @@ where
     fill_tribleset_wavelet(
         &mut wavelets,
         SuccinctRotation::Aev,
-        set.aev
+        set.aev()
             .iter_prefix_count::<64>()
             .map(|(t, _)| t[32..64].try_into().unwrap())
             .map(|v| domain.search(&v).expect("v in domain")),
@@ -3289,7 +3289,7 @@ where
     let changed_e_a = {
         let mut b = BitVectorBuilder::with_capacity(triple_count, &mut sections).unwrap();
         let mut bits = set
-            .eav
+            .eav()
             .iter_prefix_count::<32>()
             .flat_map(|(_, c)| iter::once(true).chain(std::iter::repeat_n(false, c as usize - 1)));
         b.set_bits_from_iter(0, &mut bits).unwrap();
@@ -3299,7 +3299,7 @@ where
     let changed_e_v = {
         let mut b = BitVectorBuilder::with_capacity(triple_count, &mut sections).unwrap();
         let mut bits = set
-            .eva
+            .eva()
             .iter_prefix_count::<48>()
             .flat_map(|(_, c)| iter::once(true).chain(std::iter::repeat_n(false, c as usize - 1)));
         b.set_bits_from_iter(0, &mut bits).unwrap();
@@ -3309,7 +3309,7 @@ where
     let changed_a_e = {
         let mut b = BitVectorBuilder::with_capacity(triple_count, &mut sections).unwrap();
         let mut bits = set
-            .aev
+            .aev()
             .iter_prefix_count::<32>()
             .flat_map(|(_, c)| iter::once(true).chain(std::iter::repeat_n(false, c as usize - 1)));
         b.set_bits_from_iter(0, &mut bits).unwrap();
@@ -3319,7 +3319,7 @@ where
     let changed_a_v = {
         let mut b = BitVectorBuilder::with_capacity(triple_count, &mut sections).unwrap();
         let mut bits = set
-            .ave
+            .ave()
             .iter_prefix_count::<48>()
             .flat_map(|(_, c)| iter::once(true).chain(std::iter::repeat_n(false, c as usize - 1)));
         b.set_bits_from_iter(0, &mut bits).unwrap();
@@ -3329,7 +3329,7 @@ where
     let changed_v_e = {
         let mut b = BitVectorBuilder::with_capacity(triple_count, &mut sections).unwrap();
         let mut bits = set
-            .vea
+            .vea()
             .iter_prefix_count::<48>()
             .flat_map(|(_, c)| iter::once(true).chain(std::iter::repeat_n(false, c as usize - 1)));
         b.set_bits_from_iter(0, &mut bits).unwrap();
@@ -3339,7 +3339,7 @@ where
     let changed_v_a = {
         let mut b = BitVectorBuilder::with_capacity(triple_count, &mut sections).unwrap();
         let mut bits = set
-            .vae
+            .vae()
             .iter_prefix_count::<48>()
             .flat_map(|(_, c)| iter::once(true).chain(std::iter::repeat_n(false, c as usize - 1)));
         b.set_bits_from_iter(0, &mut bits).unwrap();
@@ -4307,15 +4307,15 @@ mod tests {
         assert_eq!(TribleSet::from(&archive), set);
         assert_eq!(
             archive.entity_count(),
-            set.eav.segmented_len(&[0; 0]) as usize
+            set.eav().segmented_len(&[0; 0]) as usize
         );
         assert_eq!(
             archive.attribute_count(),
-            set.ave.segmented_len(&[0; 0]) as usize
+            set.ave().segmented_len(&[0; 0]) as usize
         );
         assert_eq!(
             archive.value_count(),
-            set.vea.segmented_len(&[0; 0]) as usize
+            set.vea().segmented_len(&[0; 0]) as usize
         );
         // Querying did not defer a hidden whole-index construction.
         assert!(archive.rank9_index_bytes.is_none());
@@ -4362,7 +4362,7 @@ mod tests {
             &clone.distinct_counts
         ));
 
-        let entities = set.eav.segmented_len(&[0; 0]) as usize;
+        let entities = set.eav().segmented_len(&[0; 0]) as usize;
         assert_eq!(archive.entity_count(), entities);
         assert_eq!(
             PREFIX_DISTINCT_COUNT_CALLS.with(std::cell::Cell::get),
@@ -4380,8 +4380,8 @@ mod tests {
             before + 1
         );
 
-        let attributes = set.ave.segmented_len(&[0; 0]) as usize;
-        let values = set.vea.segmented_len(&[0; 0]) as usize;
+        let attributes = set.ave().segmented_len(&[0; 0]) as usize;
+        let values = set.vea().segmented_len(&[0; 0]) as usize;
         for _ in 0..4 {
             assert_eq!(clone.attribute_count(), attributes);
             assert_eq!(archive.attribute_count(), attributes);

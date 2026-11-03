@@ -174,12 +174,12 @@ fn raw_facts(set: &TribleSet) -> BTreeSet<[u8; 64]> {
 
 fn assert_all_indexes(set: &TribleSet, expected: &BTreeSet<[u8; 64]>) {
     for actual in [
-        set.eav.iter_ordered().copied().collect::<BTreeSet<_>>(),
-        set.eva.iter_ordered().copied().collect::<BTreeSet<_>>(),
-        set.aev.iter_ordered().copied().collect::<BTreeSet<_>>(),
-        set.ave.iter_ordered().copied().collect::<BTreeSet<_>>(),
-        set.vea.iter_ordered().copied().collect::<BTreeSet<_>>(),
-        set.vae.iter_ordered().copied().collect::<BTreeSet<_>>(),
+        set.eav().iter_ordered().copied().collect::<BTreeSet<_>>(),
+        set.eva().iter_ordered().copied().collect::<BTreeSet<_>>(),
+        set.aev().iter_ordered().copied().collect::<BTreeSet<_>>(),
+        set.ave().iter_ordered().copied().collect::<BTreeSet<_>>(),
+        set.vea().iter_ordered().copied().collect::<BTreeSet<_>>(),
+        set.vae().iter_ordered().copied().collect::<BTreeSet<_>>(),
     ] {
         assert_eq!(&actual, expected);
     }

@@ -43,6 +43,44 @@ use zerocopy::TryFromBytes;
 const PATCH_KEY_IS_TRIBLE: &str =
     "trible-set keys are 16-byte-aligned rows inserted from valid tribles";
 
+/// Views a key of one of a [`TribleSet`]'s indexes as the [`Trible`] it was
+/// inserted from, without zerocopy's per-row validity check.
+///
+/// # Safety
+///
+/// `key` must be a key yielded by one of a `TribleSet`'s six indexes.
+///
+/// That is enough because the indexes are private to this module and every
+/// path that adds a key to them starts from a valid `Trible`, so each key's
+/// bytes satisfy the row rule (non-nil entity and attribute) and its address
+/// is 16-byte aligned:
+///
+/// - [`TribleSet::insert`] copies `trible.as_raw()` into a heap `Leaf`,
+///   which is `repr(C, align(16))` with the key at offset 0.
+/// - [`TribleSet::insert_archive`] takes a `&Trible` and points a `LocalLeaf`
+///   at that trible's own (aligned, valid) bytes.
+/// - [`TribleSet::from_archive_partition`] takes `&[Trible]` and points
+///   `LocalLeaf`s at those rows, or calls `insert` for a single row.
+/// - [`TribleSet::union`], [`TribleSet::intersect`] and
+///   [`TribleSet::difference`] only rearrange leaves of sets that already
+///   satisfy this, and never copy or rewrite key bytes.
+///
+/// PATCH iterators yield the stored key itself (`Leaf::key` or the
+/// `LocalLeaf` pointer), never a reordered copy. The child modules (the
+/// constraints) only read the indexes; the one direct index write outside
+/// the methods above is a test helper that inserts non-nil, 16-aligned rows.
+#[inline(always)]
+unsafe fn index_key_as_trible(key: &[u8; TRIBLE_LEN]) -> &Trible {
+    debug_assert!(
+        Trible::try_ref_from_bytes(key).is_ok(),
+        "{PATCH_KEY_IS_TRIBLE}"
+    );
+    // SAFETY: by the caller's contract `key` is valid as a `Trible` and
+    // 16-byte aligned (see above); `Trible` is `repr(C, align(16))` with
+    // size `TRIBLE_LEN`, and the borrow keeps `key`'s lifetime.
+    unsafe { &*(key as *const [u8; TRIBLE_LEN]).cast::<Trible>() }
+}
+
 /// Canonicalizes and stores the facts of one content-derived entity.
 ///
 /// Each input row has the shape `NIL || attribute || value`. Rows are sorted
@@ -150,20 +188,25 @@ fn build_intrinsic_entity_inner(
 /// as this would conflict with the CRDT semantics of the [`TribleSet`] and CALM principles as a whole.
 /// It does allow for set subtraction, but that operation is meant to compute the difference between two sets
 /// and not to remove elements from the set. A subtle but important distinction.
+///
+/// The six indexes are private and are read through [`Self::eav`] and its
+/// siblings, which return shared references only. Every key they hold was
+/// inserted from a valid [`Trible`] by this module, which is what lets
+/// [`Self::iter`] view keys as tribles without re-checking them.
 #[derive(Debug, Clone)]
 pub struct TribleSet {
     /// Entity → Attribute → Inline index.
-    pub eav: PATCH<TRIBLE_LEN, EAVOrder, ()>,
+    eav: PATCH<TRIBLE_LEN, EAVOrder, ()>,
     /// Inline → Entity → Attribute index.
-    pub vea: PATCH<TRIBLE_LEN, VEAOrder, ()>,
+    vea: PATCH<TRIBLE_LEN, VEAOrder, ()>,
     /// Attribute → Inline → Entity index.
-    pub ave: PATCH<TRIBLE_LEN, AVEOrder, ()>,
+    ave: PATCH<TRIBLE_LEN, AVEOrder, ()>,
     /// Inline → Attribute → Entity index.
-    pub vae: PATCH<TRIBLE_LEN, VAEOrder, ()>,
+    vae: PATCH<TRIBLE_LEN, VAEOrder, ()>,
     /// Entity → Inline → Attribute index.
-    pub eva: PATCH<TRIBLE_LEN, EVAOrder, ()>,
+    eva: PATCH<TRIBLE_LEN, EVAOrder, ()>,
     /// Attribute → Entity → Inline index.
-    pub aev: PATCH<TRIBLE_LEN, AEVOrder, ()>,
+    aev: PATCH<TRIBLE_LEN, AEVOrder, ()>,
 }
 
 /// O(1) opaque cache token for a [`TribleSet`].
@@ -569,10 +612,26 @@ impl TribleSet {
 
     /// Inserts an archive-backed trible into all six covering indexes
     /// using [`PATCH::insert_archive`], so each index may land the new
-    /// entry as a `LocalLeaf` instead of a freshly allocated heap
-    /// `Leaf`. Each PATCH's root owner set keeps the underlying archive
-    /// bytes alive independently of trie shape.
-    pub fn insert_archive(&mut self, entry: &ArchiveEntry<'_, TRIBLE_LEN>) {
+    /// entry as a `LocalLeaf` pointing at `trible` itself instead of a
+    /// freshly allocated heap `Leaf`. Each PATCH's root owner set keeps the
+    /// underlying archive bytes alive independently of trie shape.
+    ///
+    /// It takes a `&Trible` rather than an [`ArchiveEntry`] so that every key
+    /// in the set is a valid, aligned trible by type, which [`Self::iter`]
+    /// relies on.
+    ///
+    /// # Safety
+    ///
+    /// `trible` must lie in bytes that `owner` keeps alive, and those bytes
+    /// must not be mutated while any clone of `owner` retained by this set
+    /// exists (the conditions of [`ArchiveEntry::new`]; alignment holds by
+    /// type).
+    pub unsafe fn insert_archive(&mut self, trible: &Trible, owner: &Arc<dyn ArchiveOwner>) {
+        // SAFETY: the caller upholds the lifetime and immutability conditions,
+        // and a `&Trible` is 16-byte aligned.
+        let entry: ArchiveEntry<'_, TRIBLE_LEN> =
+            unsafe { ArchiveEntry::new(std::ptr::NonNull::from(trible.as_raw()), owner) };
+        let entry = &entry;
         if !self.shared_owner_guard_latest_is(entry.owner()) {
             let mut owners = self.combined_owner_guard();
             owners.retain_archive_owner(entry.owner());
@@ -662,18 +721,50 @@ impl TribleSet {
     /// the sequence.
     pub fn iter(&self) -> TribleSetIterator<'_> {
         TribleSetIterator {
+            // SAFETY: the keys come from this set's EAV index.
             inner: self
                 .eav
                 .iter()
-                .map(|data| Trible::try_ref_from_bytes(data).expect(PATCH_KEY_IS_TRIBLE)),
+                .map(|key| unsafe { index_key_as_trible(key) }),
         }
     }
 
     /// Iterates over all tribles in canonical byte-lexicographic EAV order.
     pub fn iter_ordered(&self) -> impl Iterator<Item = &Trible> {
+        // SAFETY: the keys come from this set's EAV index.
         self.eav
             .iter_ordered()
-            .map(|data| Trible::try_ref_from_bytes(data).expect(PATCH_KEY_IS_TRIBLE))
+            .map(|key| unsafe { index_key_as_trible(key) })
+    }
+
+    /// The entity → attribute → value index.
+    pub fn eav(&self) -> &PATCH<TRIBLE_LEN, EAVOrder, ()> {
+        &self.eav
+    }
+
+    /// The entity → value → attribute index.
+    pub fn eva(&self) -> &PATCH<TRIBLE_LEN, EVAOrder, ()> {
+        &self.eva
+    }
+
+    /// The attribute → entity → value index.
+    pub fn aev(&self) -> &PATCH<TRIBLE_LEN, AEVOrder, ()> {
+        &self.aev
+    }
+
+    /// The attribute → value → entity index.
+    pub fn ave(&self) -> &PATCH<TRIBLE_LEN, AVEOrder, ()> {
+        &self.ave
+    }
+
+    /// The value → entity → attribute index.
+    pub fn vea(&self) -> &PATCH<TRIBLE_LEN, VEAOrder, ()> {
+        &self.vea
+    }
+
+    /// The value → attribute → entity index.
+    pub fn vae(&self) -> &PATCH<TRIBLE_LEN, VAEOrder, ()> {
+        &self.vae
     }
 }
 
