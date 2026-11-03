@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `ObjectStoreSnapshot::get` copies a fetched body whose base is not 16-byte
+  aligned into aligned storage before building the `Blob`, so typed views
+  such as a `SimpleArchive` decode no longer fail with `BadArchive` because
+  of where the transport buffer put the bytes. Aligned bodies are kept
+  without a copy.
+
 - The archive readers validate through `CanonicalTribles` and read typed
   rows: `simplearchive_union` (`validate_element`, `join`, `join_all`,
   `validate_merge`), `lww_register::derive_element`,

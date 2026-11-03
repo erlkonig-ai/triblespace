@@ -321,6 +321,30 @@ impl crate::repo::StorageClose for ObjectStoreRemote {
     }
 }
 
+/// Sixteen bytes at the alignment of a [`Trible`](crate::trible::Trible), the
+/// strictest a blob view asks of its base.
+#[derive(Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+#[repr(C, align(16))]
+struct AlignedWord([u8; 16]);
+
+/// The fetched object as blob bytes whose base is 16-byte aligned.
+///
+/// An object store hands back a body at whatever address its transport
+/// buffer put it, and typed blob views (a `SimpleArchive` decodes as
+/// `[Trible]`) refuse a misaligned base with `BadArchive`. A blob is a value,
+/// so where its bytes live is not part of it: a misaligned body is copied
+/// once into aligned storage, and an aligned one is kept without a copy.
+fn aligned_blob_bytes(fetched: bytes::Bytes) -> Bytes {
+    let align = std::mem::align_of::<AlignedWord>();
+    if fetched.is_empty() || fetched.as_ptr() as usize % align == 0 {
+        return fetched.into();
+    }
+    let len = fetched.len();
+    let mut words = vec![AlignedWord([0; 16]); len.div_ceil(16)];
+    zerocopy::IntoBytes::as_mut_bytes(&mut words[..])[..len].copy_from_slice(&fetched);
+    Bytes::from(words).slice(..len)
+}
+
 impl ObjectStoreSnapshot {
     fn blob_path(&self, handle_hex: String) -> Path {
         self.prefix.child(BLOB_INFIX).child(handle_hex)
@@ -343,8 +367,7 @@ impl AsyncBlobStoreGet for ObjectStoreSnapshot {
         async move {
             let path = self.blob_path(hex::encode(raw));
             let object = self.store.get(&path).await?;
-            let bytes = object.bytes().await?;
-            let bytes: Bytes = bytes.into();
+            let bytes = aligned_blob_bytes(object.bytes().await?);
             let blob: Blob<S> = Blob::new(bytes);
             let expected = Inline::<Hash<Blake3>>::new(raw);
             let actual = blob.get_handle().into();
@@ -1060,5 +1083,79 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(actual, vec![record]);
+    }
+
+    #[test]
+    fn misaligned_blob_bodies_are_realigned_before_decoding() {
+        use crate::blob::encodings::simplearchive::SimpleArchive;
+        use crate::trible::{Trible, TribleSet};
+
+        block_on(async {
+            let mut store = remote();
+            let mut set = TribleSet::new();
+            for index in 1..=3u8 {
+                let mut row = [0u8; 64];
+                row[15] = index;
+                row[31] = 1;
+                row[63] = index;
+                set.insert(&Trible::force_raw(row).unwrap());
+            }
+            let archive: Blob<SimpleArchive> = (&set).to_blob();
+            let handle = archive.get_handle();
+
+            // The same bytes one past an aligned base, stored as the body.
+            let mut backing = vec![0u8; archive.bytes.len() + 16];
+            let offset = (1..16)
+                .find(|offset| (backing.as_ptr() as usize + offset) % 16 != 0)
+                .unwrap();
+            backing[offset..offset + archive.bytes.len()].copy_from_slice(&archive.bytes);
+            let body = bytes::Bytes::from(backing).slice(offset..offset + archive.bytes.len());
+            assert_ne!(body.as_ptr() as usize % 16, 0);
+            let path = store
+                .prefix
+                .child(BLOB_INFIX)
+                .child(hex::encode(handle.raw));
+            store.store.put(&path, body.into()).await.unwrap();
+
+            // The fetched body really is misaligned, so the test exercises
+            // the copy and not a store that happens to realign.
+            let fetched = store.store.get(&path).await.unwrap().bytes().await.unwrap();
+            assert_ne!(fetched.as_ptr() as usize % 16, 0);
+            let realigned = aligned_blob_bytes(fetched.clone());
+            assert_eq!(realigned.as_ptr() as usize % 16, 0);
+            assert_eq!(&realigned[..], &fetched[..]);
+
+            let snapshot = AsyncSnapshotSource::snapshot(&mut store).await.unwrap();
+            let decoded: TribleSet =
+                AsyncBlobStoreGet::get::<TribleSet, SimpleArchive>(&snapshot, handle)
+                    .await
+                    .unwrap();
+            assert_eq!(decoded, set);
+        });
+    }
+
+    #[test]
+    fn aligned_blob_bodies_are_kept_without_a_copy() {
+        let words = vec![AlignedWord([7; 16]); 4];
+        let body = bytes::Bytes::from(zerocopy::IntoBytes::as_bytes(&words[..]).to_vec());
+        let aligned = if body.as_ptr() as usize % 16 == 0 {
+            body
+        } else {
+            // A Vec<u8> base is not promised to be 16-byte aligned; find
+            // an aligned window in a larger buffer instead.
+            let backing = bytes::Bytes::from(vec![7u8; 64 + 16]);
+            let offset = (0..16)
+                .find(|offset| (backing.as_ptr() as usize + offset) % 16 == 0)
+                .unwrap();
+            backing.slice(offset..offset + 64)
+        };
+        let pointer = aligned.as_ptr();
+        let kept = aligned_blob_bytes(aligned);
+        assert_eq!(kept.as_ptr(), pointer);
+        assert_eq!(&kept[..], &[7u8; 64][..]);
+
+        let odd = aligned_blob_bytes(bytes::Bytes::from_static(b"odd"));
+        assert_eq!(&odd[..], b"odd");
+        assert!(aligned_blob_bytes(bytes::Bytes::new()).is_empty());
     }
 }
