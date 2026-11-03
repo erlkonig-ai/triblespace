@@ -31,3 +31,43 @@ pub struct ZTriblePacked {
     pub a: PackedId,
     pub v: [u8; 32],
 }
+
+/// The canonical check in blocks of `block` rows: each block is validated as
+/// `[ZTrible]` and then checked strictly increasing, within itself and
+/// against the previous block's last row, while its rows are still in cache.
+/// A block zerocopy rejects is re-run through the per-row base check, so the
+/// first error in row order is reported whichever kind it is, with its index.
+#[inline(never)]
+pub fn check_ztrible_blocked(
+    rows: &[[u8; 64]],
+    block: usize,
+) -> Result<(), (usize, triblespace_core::blob::encodings::simplearchive::UnarchiveError)> {
+    use triblespace_core::blob::encodings::simplearchive::{phase_probe, UnarchiveError};
+    assert!(block > 0);
+    let mut previous: Option<&[u8; 64]> = None;
+    for (number, chunk) in rows.chunks(block).enumerate() {
+        let start = number * block;
+        if <[ZTrible]>::try_ref_from_bytes(chunk.as_bytes()).is_err() {
+            // Rows before `start` passed, so the base check over the block,
+            // preceded by the previous block's last row, finds the first error.
+            let from = start.saturating_sub(1);
+            let to = start + chunk.len();
+            return match phase_probe::check_rows_at(&rows[from..to]) {
+                Err((index, error)) => Err((from + index, error)),
+                Ok(()) => unreachable!("zerocopy rejected a block the base check accepts"),
+            };
+        }
+        for (offset, row) in chunk.iter().enumerate() {
+            if let Some(previous) = previous {
+                if previous == row {
+                    return Err((start + offset, UnarchiveError::BadCanonicalizationRedundancy));
+                }
+                if previous > row {
+                    return Err((start + offset, UnarchiveError::BadCanonicalizationOrdering));
+                }
+            }
+            previous = Some(row);
+        }
+    }
+    Ok(())
+}

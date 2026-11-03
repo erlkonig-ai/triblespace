@@ -4,7 +4,8 @@
 #[path = "support/ztrible.rs"]
 mod ztrible;
 
-use ztrible::{PackedId, ZTrible, ZTriblePacked};
+use triblespace_core::blob::encodings::simplearchive::{phase_probe, UnarchiveError};
+use ztrible::{check_ztrible_blocked, PackedId, ZTrible, ZTriblePacked};
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes, Unaligned};
 
 fn splitmix(state: &mut u64) -> u64 {
@@ -182,4 +183,65 @@ fn ztrible_packed_id_fields_match_ztrible() {
         .filter(|r| ZTrible::try_ref_from_bytes(r).is_ok())
         .collect();
     assert!(<[ZTriblePacked]>::try_ref_from_bytes(good.as_bytes()).is_ok());
+}
+
+fn sorted_rows(len: usize, seed: u64) -> Vec<[u8; 64]> {
+    let mut state = seed;
+    let mut rows: Vec<[u8; 64]> = (0..len).map(|_| valid_row(&mut state)).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    rows
+}
+
+/// The blocked check must agree with the base check on kind and index, and
+/// on kind with the decoders' own check, for every block size.
+fn assert_blocked_matches_base(rows: &[[u8; 64]], expected: Result<(), (usize, UnarchiveError)>) {
+    assert_eq!(phase_probe::check_rows_at(rows), expected);
+    assert_eq!(phase_probe::check_rows(rows), expected.map_err(|(_, e)| e));
+    for block in [1, 2, 3, 7, 64, 256, 4096] {
+        assert_eq!(check_ztrible_blocked(rows, block), expected, "block {block}");
+    }
+}
+
+#[test]
+fn ztrible_blocked_error_order_matches_base() {
+    let base = sorted_rows(1000, 6);
+    let n = base.len();
+    assert_blocked_matches_base(&base, Ok(()));
+    let firsts = [0, 1, 2, 6, 7, 63, 64, 254, 255, 256, 500, 900];
+    let gaps = [2, 3, 8, 64, 300];
+    let mut cases = 0;
+    for &i in &firsts {
+        for &gap in &gaps {
+            let j = i + gap;
+            if j + 1 >= n {
+                continue;
+            }
+            for zero in [0..16, 16..32] {
+                // An ordering error at i + 1, then a zero id at j.
+                let mut rows = base.clone();
+                rows.swap(i, i + 1);
+                rows[j][zero.clone()].fill(0);
+                assert_blocked_matches_base(
+                    &rows,
+                    Err((i + 1, UnarchiveError::BadCanonicalizationOrdering)),
+                );
+                // A zero id at i, then an ordering error at j + 1.
+                let mut rows = base.clone();
+                rows[i][zero.clone()].fill(0);
+                rows.swap(j, j + 1);
+                assert_blocked_matches_base(&rows, Err((i, UnarchiveError::BadTrible)));
+                // A duplicate at i + 1, then a zero id at j.
+                let mut rows = base.clone();
+                rows[i + 1] = rows[i];
+                rows[j][zero.clone()].fill(0);
+                assert_blocked_matches_base(
+                    &rows,
+                    Err((i + 1, UnarchiveError::BadCanonicalizationRedundancy)),
+                );
+                cases += 3;
+            }
+        }
+    }
+    assert!(cases > 100, "{cases}");
 }

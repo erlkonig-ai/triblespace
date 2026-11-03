@@ -4,12 +4,13 @@
 //!
 //! usage: unarchive_phase_probe <rows> <mode> [inner]
 //! modes: par-hash | single-hash | serial | e2e | check-base | check-ztrible
-//!        | view-ztrible
+//!        | check-ztrible-blocked:<B> | view-ztrible
 //!        | file:<path>:<mode>
 //! check-base is the decoders' hand-written canonical check with no per-row
 //! work; check-ztrible is an anybytes view as `[ZTrible]` (zerocopy validates
-//! the row invariant) followed by one strictly-increasing pass; view-ztrible
-//! is that view alone, to split the cost.
+//! the row invariant) followed by one strictly-increasing pass;
+//! check-ztrible-blocked:<B> validates and orders each block of B rows before
+//! the next; view-ztrible is the whole view alone, to split the cost.
 //! Prints one line: mode, rows, threads, median ns/row and min ns/row over
 //! `inner` timed iterations after one warm-up.
 
@@ -23,7 +24,7 @@ use zerocopy::IntoBytes;
 #[path = "../tests/support/ztrible.rs"]
 #[allow(dead_code)]
 mod ztrible;
-use ztrible::ZTrible;
+use ztrible::{check_ztrible_blocked, ZTrible};
 
 /// The canonical check through the prototype row type: the view proves every
 /// row valid, then one pass proves the rows strictly increasing. The pass has
@@ -110,6 +111,10 @@ fn main() {
     let slice: &[[u8; 64]] = &view;
     let n = slice.len();
 
+    let block: Option<usize> = sub
+        .strip_prefix("check-ztrible-blocked:")
+        .map(|b| b.parse().expect("block rows"));
+
     let mut times = Vec::with_capacity(inner);
     for iter in 0..=inner {
         let start = Instant::now();
@@ -137,6 +142,12 @@ fn main() {
                 let e = start.elapsed();
                 assert_eq!(v.len(), n);
                 drop(v);
+                e
+            }
+            _ if block.is_some() => {
+                let r = check_ztrible_blocked(std::hint::black_box(slice), block.unwrap());
+                let e = start.elapsed();
+                r.unwrap();
                 e
             }
             "view-ztrible" => {
