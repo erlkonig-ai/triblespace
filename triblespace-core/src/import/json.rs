@@ -154,11 +154,22 @@ impl std::error::Error for EncodeError {
 
 type ParsedString = View<str>;
 
+/// Default nesting limit of [`JsonObjectImporter`] and
+/// [`JsonTreeImporter`](crate::import::json_tree::JsonTreeImporter): a value
+/// may sit inside at most this many arrays/objects.
+pub const DEFAULT_MAX_DEPTH: usize = 128;
+
 /// Deterministic JSON importer that derives entity ids from canonical fact rows.
 ///
 /// This importer expects either:
 /// - a top-level JSON object, or
 /// - a top-level array of JSON objects.
+///
+/// Parsing is iterative, so deeply nested input cannot overflow the call
+/// stack; nesting beyond [`with_max_depth`](Self::with_max_depth) (default
+/// [`DEFAULT_MAX_DEPTH`]) is refused with [`JsonImportError::DepthExceeded`].
+/// A refused document puts nothing into the store and leaves the attribute
+/// cache as it was.
 ///
 /// Use [`crate::import::json_tree::JsonTreeImporter`] when you need a lossless
 /// representation of arbitrary JSON values (including primitive roots).
@@ -173,72 +184,85 @@ where
     genid_attrs: HashMap<View<str>, Attribute<GenId>>,
     id_salt: Option<[u8; 32]>,
     array_fields: HashSet<View<str>>,
+    max_depth: usize,
+}
+
+/// An attribute-cache insertion made while importing one document, undone
+/// if the document is refused.
+enum CacheEntry {
+    Bool(ParsedString),
+    Num(ParsedString),
+    Str(ParsedString),
+    GenId(ParsedString),
+    ArrayField(ParsedString),
+}
+
+/// What one [`JsonObjectImporter::import_blob`] call accumulates before the
+/// document is accepted.
+#[derive(Default)]
+struct ObjectImport {
+    facts: TribleSet,
+    /// Blobs to put once the document is accepted, each with the JSON field
+    /// it belongs to (for the error if the put fails).
+    blobs: Vec<(Blob<UTF8String>, ParsedString)>,
+    staged: HashSet<RawInline>,
+    undo: Vec<CacheEntry>,
+    /// The first surrogate a complete string left unpaired.
+    unpaired: Option<u16>,
+}
+
+impl ObjectImport {
+    fn stage(
+        &mut self,
+        blob: Blob<UTF8String>,
+        field: &ParsedString,
+    ) -> Inline<Handle<UTF8String>> {
+        let handle = blob.get_handle();
+        if self.staged.insert(handle.raw) {
+            self.blobs.push((blob, field.clone()));
+        }
+        handle
+    }
+}
+
+/// An object whose closing brace has not been read yet. `field` names the
+/// member whose value is being parsed; array elements belong to it too.
+struct OpenObject {
+    pairs: Vec<(Id, RawInline)>,
+    field: ParsedString,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Container {
+    Object,
+    Array,
+}
+
+/// Looks `field` up in `cache`, deriving (and staging the name blob of) its
+/// attribute on first use.
+fn cached_attr<S: InlineEncoding + MetaDescribe>(
+    cache: &mut HashMap<View<str>, Attribute<S>>,
+    field: &ParsedString,
+    import: &mut ObjectImport,
+    entry: fn(ParsedString) -> CacheEntry,
+) -> Attribute<S> {
+    if let Some(attr) = cache.get(field) {
+        return attr.clone();
+    }
+    let handle = import.stage(field.clone().to_blob(), field);
+    let attr = Attribute::<S>::from_fragment_unchecked(entity! {
+        metadata::name:         handle,
+        metadata::value_encoding: <S as MetaDescribe>::id(),
+    });
+    cache.insert(field.clone(), attr.clone());
+    import.undo.push(entry(field.clone()));
+    attr
 }
 
 impl<'a, Store> JsonObjectImporter<'a, Store>
 where
     Store: BlobStore,
 {
-    fn attr_from_field<S: InlineEncoding + MetaDescribe>(
-        &mut self,
-        field: &ParsedString,
-    ) -> Result<Attribute<S>, JsonImportError> {
-        let handle =
-            self.store
-                .put(field.clone())
-                .map_err(|err| JsonImportError::EncodeString {
-                    field: field.as_ref().to_owned(),
-                    source: EncodeError::from_error(err),
-                })?;
-        Ok(Attribute::<S>::from_fragment_unchecked(entity! {
-            metadata::name:         handle,
-            metadata::value_encoding: <S as MetaDescribe>::id(),
-        }))
-    }
-
-    fn bool_attr(&mut self, field: &ParsedString) -> Result<Attribute<Boolean>, JsonImportError> {
-        let key = field.clone();
-        if let Some(attr) = self.bool_attrs.get(&key) {
-            return Ok(attr.clone());
-        }
-        let attr = self.attr_from_field::<Boolean>(field)?;
-        self.bool_attrs.insert(key, attr.clone());
-        Ok(attr)
-    }
-
-    fn num_attr(&mut self, field: &ParsedString) -> Result<Attribute<F64>, JsonImportError> {
-        let key = field.clone();
-        if let Some(attr) = self.num_attrs.get(&key) {
-            return Ok(attr.clone());
-        }
-        let attr = self.attr_from_field::<F64>(field)?;
-        self.num_attrs.insert(key, attr.clone());
-        Ok(attr)
-    }
-
-    fn str_attr(
-        &mut self,
-        field: &ParsedString,
-    ) -> Result<Attribute<Handle<UTF8String>>, JsonImportError> {
-        let key = field.clone();
-        if let Some(attr) = self.str_attrs.get(&key) {
-            return Ok(attr.clone());
-        }
-        let attr = self.attr_from_field::<Handle<UTF8String>>(field)?;
-        self.str_attrs.insert(key, attr.clone());
-        Ok(attr)
-    }
-
-    fn genid_attr(&mut self, field: &ParsedString) -> Result<Attribute<GenId>, JsonImportError> {
-        let key = field.clone();
-        if let Some(attr) = self.genid_attrs.get(&key) {
-            return Ok(attr.clone());
-        }
-        let attr = self.attr_from_field::<GenId>(field)?;
-        self.genid_attrs.insert(key, attr.clone());
-        Ok(attr)
-    }
-
     /// Creates a new importer backed by `store`. Pass an optional 32-byte
     /// salt to namespace the deterministic entity ids.
     pub fn new(store: &'a mut Store, id_salt: Option<[u8; 32]>) -> Self {
@@ -250,7 +274,17 @@ where
             genid_attrs: HashMap::new(),
             id_salt,
             array_fields: HashSet::new(),
+            max_depth: DEFAULT_MAX_DEPTH,
         }
+    }
+
+    /// Sets how many arrays/objects a value may be nested inside, counting
+    /// the root object and a root array. Deeper input is refused with
+    /// [`JsonImportError::DepthExceeded`]; the limit bounds work per value,
+    /// not stack use, which never grows with depth.
+    pub fn with_max_depth(mut self, max_depth: usize) -> Self {
+        self.max_depth = max_depth;
+        self
     }
 
     /// Imports a JSON string. Convenience wrapper around [`import_blob`](Self::import_blob).
@@ -260,84 +294,247 @@ where
 
     /// Imports a JSON document from a [`UTF8String`] blob, returning a
     /// [`Fragment`] with the root entity ids as exports.
+    ///
+    /// The document's blobs are put into the store only after the whole
+    /// document has been accepted, so a refused document leaves the store
+    /// untouched. (A store that fails partway through those puts can still
+    /// keep the blobs put before the failure; nothing references them.)
     pub fn import_blob(&mut self, blob: Blob<UTF8String>) -> Result<Fragment, JsonImportError> {
-        let mut bytes = blob.bytes.clone();
+        let mut import = ObjectImport::default();
+        let result = self
+            .parse_document(&blob.bytes, &mut import)
+            .and_then(|roots| self.commit(&mut import).map(|()| roots));
+        match result {
+            Ok(roots) => Ok(Fragment::new(roots, import.facts)),
+            Err(err) => {
+                self.rollback(import.undo);
+                Err(err)
+            }
+        }
+    }
+
+    fn parse_document(
+        &mut self,
+        bytes: &Bytes,
+        import: &mut ObjectImport,
+    ) -> Result<Vec<Id>, JsonImportError> {
+        let mut bytes = bytes.clone();
         self.skip_ws(&mut bytes);
 
         let mut roots = Vec::new();
-        let mut staged = TribleSet::new();
         match bytes.peek_token() {
-            Some(b'{') => {
-                let (root, obj_staged) = self.parse_object(&mut bytes)?;
-                staged += obj_staged;
-                roots.push(root);
-            }
+            Some(b'{') => roots.push(self.parse_object(&mut bytes, 0, import)?),
             Some(b'[') => {
-                self.consume_byte(&mut bytes, b'[')?;
+                if self.max_depth == 0 {
+                    return Err(JsonImportError::DepthExceeded { max_depth: 0 });
+                }
+                bytes.pop_front();
                 self.skip_ws(&mut bytes);
                 if bytes.peek_token() == Some(b']') {
-                    self.consume_byte(&mut bytes, b']')?;
+                    bytes.pop_front();
                 } else {
                     loop {
-                        self.skip_ws(&mut bytes);
-                        if bytes.peek_token() != Some(b'{') {
-                            return Err(JsonImportError::PrimitiveRoot);
-                        }
-                        let (root, obj_staged) = self.parse_object(&mut bytes)?;
-                        staged += obj_staged;
-                        roots.push(root);
-                        self.skip_ws(&mut bytes);
                         match bytes.peek_token() {
-                            Some(b',') => {
-                                self.consume_byte(&mut bytes, b',')?;
-                                continue;
+                            Some(b'{') => roots.push(self.parse_object(&mut bytes, 1, import)?),
+                            Some(b']') | None => {
+                                return Err(JsonImportError::Syntax("expected a value".into()))
                             }
-                            Some(b']') => {
-                                self.consume_byte(&mut bytes, b']')?;
-                                break;
+                            Some(_) => return Err(JsonImportError::PrimitiveRoot),
+                        }
+                        self.skip_ws(&mut bytes);
+                        match bytes.pop_front() {
+                            Some(b',') => self.skip_ws(&mut bytes),
+                            Some(b']') => break,
+                            _ => {
+                                return Err(JsonImportError::Syntax(
+                                    "expected ',' or ']' in array".into(),
+                                ))
                             }
-                            _ => return Err(JsonImportError::PrimitiveRoot),
                         }
                     }
                 }
             }
-            _ => return Err(JsonImportError::PrimitiveRoot),
+            None => return Err(JsonImportError::Syntax("expected a value".into())),
+            Some(first) => {
+                // Name the primitive root only if it is one: anything else
+                // is a syntax error.
+                if first == b'"' {
+                    // An unpaired surrogate does not make it any less primitive.
+                    let _ = scanner::parse_string_checked(&mut bytes).map_err(from_scan)?;
+                } else {
+                    scanner::skip_value(&mut bytes).map_err(from_scan)?;
+                }
+                self.skip_ws(&mut bytes);
+                if bytes.peek_token().is_some() {
+                    return Err(JsonImportError::Syntax("trailing tokens".into()));
+                }
+                return Err(JsonImportError::PrimitiveRoot);
+            }
         }
 
         self.skip_ws(&mut bytes);
-        Ok(Fragment::new(roots, staged))
+        if bytes.peek_token().is_some() {
+            return Err(JsonImportError::Syntax("trailing tokens".into()));
+        }
+        if let Some(code_unit) = import.unpaired {
+            return Err(JsonImportError::LoneSurrogate { code_unit });
+        }
+        Ok(roots)
     }
 
-    fn parse_object(&mut self, bytes: &mut Bytes) -> Result<(Id, TribleSet), JsonImportError> {
-        self.consume_byte(bytes, b'{')?;
-        self.skip_ws(bytes);
-        let mut pairs: Vec<(Id, RawInline)> = Vec::new();
-        let mut staged = TribleSet::new();
+    /// Puts the accepted document's blobs into the store.
+    fn commit(&mut self, import: &mut ObjectImport) -> Result<(), JsonImportError> {
+        for (blob, field) in import.blobs.drain(..) {
+            self.store
+                .put::<UTF8String, _>(blob)
+                .map_err(|err| JsonImportError::EncodeString {
+                    field: field.as_ref().to_owned(),
+                    source: EncodeError::from_error(err),
+                })?;
+        }
+        Ok(())
+    }
 
-        if bytes.peek_token() == Some(b'}') {
-            self.consume_byte(bytes, b'}')?;
-        } else {
-            loop {
-                let field = self.parse_string(bytes)?;
-                self.skip_ws(bytes);
-                self.consume_byte(bytes, b':')?;
-                self.skip_ws(bytes);
-                self.parse_value(bytes, &field, &mut pairs, &mut staged)?;
-                self.skip_ws(bytes);
-                match bytes.peek_token() {
-                    Some(b',') => {
-                        self.consume_byte(bytes, b',')?;
-                        self.skip_ws(bytes);
+    /// Forgets the attributes a refused document added to the cache.
+    fn rollback(&mut self, undo: Vec<CacheEntry>) {
+        for entry in undo {
+            match entry {
+                CacheEntry::Bool(field) => {
+                    self.bool_attrs.remove(&field);
+                }
+                CacheEntry::Num(field) => {
+                    self.num_attrs.remove(&field);
+                }
+                CacheEntry::Str(field) => {
+                    self.str_attrs.remove(&field);
+                }
+                CacheEntry::GenId(field) => {
+                    self.genid_attrs.remove(&field);
+                }
+                CacheEntry::ArrayField(field) => {
+                    self.array_fields.remove(&field);
+                }
+            }
+        }
+    }
+
+    /// Parses one object (the cursor at its `{`) without recursion: open
+    /// objects and arrays live on heap stacks, so input depth costs heap,
+    /// never call stack. `depth` counts the containers already open around
+    /// it, and the limit is checked before each container is entered.
+    fn parse_object(
+        &mut self,
+        bytes: &mut Bytes,
+        depth: usize,
+        import: &mut ObjectImport,
+    ) -> Result<Id, JsonImportError> {
+        let mut objects: Vec<OpenObject> = Vec::new();
+        let mut open: Vec<Container> = Vec::new();
+        loop {
+            // Parse the value at the cursor. A scalar is added to the
+            // innermost object at once; a non-empty container is pushed and
+            // its first value is parsed on the next iteration.
+            let mut finished = match bytes.peek_token() {
+                Some(bracket @ (b'{' | b'[')) => {
+                    if depth + open.len() >= self.max_depth {
+                        return Err(JsonImportError::DepthExceeded {
+                            max_depth: self.max_depth,
+                        });
                     }
-                    Some(b'}') => {
-                        self.consume_byte(bytes, b'}')?;
+                    bytes.pop_front();
+                    self.skip_ws(bytes);
+                    if bracket == b'{' {
+                        if bytes.peek_token() == Some(b'}') {
+                            bytes.pop_front();
+                            Some(self.finish_object(Vec::new(), import))
+                        } else {
+                            let field = self.parse_member_name(bytes, import)?;
+                            objects.push(OpenObject {
+                                pairs: Vec::new(),
+                                field,
+                            });
+                            open.push(Container::Object);
+                            continue;
+                        }
+                    } else {
+                        let field = &objects.last().expect("arrays sit in objects").field;
+                        if self.array_fields.insert(field.clone()) {
+                            import.undo.push(CacheEntry::ArrayField(field.clone()));
+                        }
+                        if bytes.peek_token() == Some(b']') {
+                            bytes.pop_front();
+                            None
+                        } else {
+                            open.push(Container::Array);
+                            continue;
+                        }
+                    }
+                }
+                _ => {
+                    let object = objects.last_mut().expect("scalars sit in objects");
+                    self.parse_scalar(bytes, object, import)?;
+                    None
+                }
+            };
+
+            // Hand a finished object to its parent and close every container
+            // that ends right after the value.
+            loop {
+                if let Some(child) = finished.take() {
+                    let Some(parent) = objects.last_mut() else {
+                        return Ok(child);
+                    };
+                    let attr = cached_attr(
+                        &mut self.genid_attrs,
+                        &parent.field,
+                        import,
+                        CacheEntry::GenId,
+                    );
+                    parent
+                        .pairs
+                        .push((attr.id(), GenId::inline_from(&child).raw));
+                }
+                let container = *open.last().expect("the root object is still open");
+                self.skip_ws(bytes);
+                match (container, bytes.pop_front()) {
+                    (Container::Array, Some(b',')) => {
+                        self.skip_ws(bytes);
                         break;
+                    }
+                    (Container::Object, Some(b',')) => {
+                        self.skip_ws(bytes);
+                        let field = self.parse_member_name(bytes, import)?;
+                        objects.last_mut().expect("open object").field = field;
+                        break;
+                    }
+                    (Container::Array, Some(b']')) => {
+                        open.pop();
+                    }
+                    (Container::Object, Some(b'}')) => {
+                        open.pop();
+                        let object = objects.pop().expect("open object");
+                        finished = Some(self.finish_object(object.pairs, import));
                     }
                     _ => return Err(JsonImportError::Syntax("unexpected token".into())),
                 }
             }
         }
+    }
 
+    /// Parses `"name"`, the `:` and surrounding whitespace.
+    fn parse_member_name(
+        &mut self,
+        bytes: &mut Bytes,
+        import: &mut ObjectImport,
+    ) -> Result<ParsedString, JsonImportError> {
+        let field = parse_json_string(bytes, &mut import.unpaired)?;
+        self.skip_ws(bytes);
+        self.consume_byte(bytes, b':')?;
+        self.skip_ws(bytes);
+        Ok(field)
+    }
+
+    fn finish_object(&self, pairs: Vec<(Id, RawInline)>, import: &mut ObjectImport) -> Id {
         let rows = pairs
             .into_iter()
             .map(|(attribute, value)| IntrinsicEntityRow::new(attribute, value))
@@ -346,93 +543,36 @@ where
             Some(namespace) => build_namespaced_intrinsic_entity(rows, namespace),
             None => build_intrinsic_entity(rows),
         };
-        staged += entity_facts;
-
-        Ok((entity, staged))
+        import.facts += entity_facts;
+        entity
     }
 
-    fn parse_array(
+    /// Parses one scalar value of `object`'s current field.
+    fn parse_scalar(
         &mut self,
         bytes: &mut Bytes,
-        field: &ParsedString,
-        pairs: &mut Vec<(Id, RawInline)>,
-        staged: &mut TribleSet,
+        object: &mut OpenObject,
+        import: &mut ObjectImport,
     ) -> Result<(), JsonImportError> {
-        self.consume_byte(bytes, b'[')?;
-        self.array_fields.insert(field.clone());
-        self.skip_ws(bytes);
-        if bytes.peek_token() == Some(b']') {
-            self.consume_byte(bytes, b']')?;
-            return Ok(());
-        }
-
-        loop {
-            self.parse_value(bytes, field, pairs, staged)?;
-            self.skip_ws(bytes);
-            match bytes.peek_token() {
-                Some(b',') => {
-                    self.consume_byte(bytes, b',')?;
-                    self.skip_ws(bytes);
-                }
-                Some(b']') => {
-                    self.consume_byte(bytes, b']')?;
-                    break;
-                }
-                _ => return Err(JsonImportError::Syntax("unexpected token".into())),
-            }
-        }
-        Ok(())
-    }
-
-    fn parse_value(
-        &mut self,
-        bytes: &mut Bytes,
-        field: &ParsedString,
-        pairs: &mut Vec<(Id, RawInline)>,
-        staged: &mut TribleSet,
-    ) -> Result<(), JsonImportError> {
+        let field = &object.field;
         match bytes.peek_token() {
-            Some(b'n') => {
-                self.consume_literal(bytes, b"null")?;
-                Ok(())
-            }
-            Some(b't') => {
-                self.consume_literal(bytes, b"true")?;
-                let attr = self.bool_attr(field)?;
-                pairs.push((attr.id(), attr.inline_from(true).raw));
-                Ok(())
-            }
-            Some(b'f') => {
-                self.consume_literal(bytes, b"false")?;
-                let attr = self.bool_attr(field)?;
-                pairs.push((attr.id(), attr.inline_from(false).raw));
+            Some(b'n') => self.consume_literal(bytes, b"null"),
+            Some(b't' | b'f') => {
+                let value = bytes.peek_token() == Some(b't');
+                self.consume_literal(bytes, if value { b"true" } else { b"false" })?;
+                let attr = cached_attr(&mut self.bool_attrs, field, import, CacheEntry::Bool);
+                object.pairs.push((attr.id(), attr.inline_from(value).raw));
                 Ok(())
             }
             Some(b'"') => {
-                let text = self.parse_string(bytes)?;
-                let field_name = field.as_ref().to_owned();
-                let attr = self.str_attr(field)?;
-                let handle: Inline<Handle<UTF8String>> =
-                    self.store
-                        .put(text)
-                        .map_err(|err| JsonImportError::EncodeString {
-                            field: field_name,
-                            source: EncodeError::from_error(err),
-                        })?;
-                pairs.push((attr.id(), handle.raw));
+                let text = parse_json_string(bytes, &mut import.unpaired)?;
+                let attr = cached_attr(&mut self.str_attrs, field, import, CacheEntry::Str);
+                let handle = import.stage(text.to_blob(), field);
+                object.pairs.push((attr.id(), handle.raw));
                 Ok(())
             }
-            Some(b'{') => {
-                let (child, child_staged) = self.parse_object(bytes)?;
-                *staged += child_staged;
-                let attr = self.genid_attr(field)?;
-                let value = GenId::inline_from(&child);
-                pairs.push((attr.id(), value.raw));
-                Ok(())
-            }
-            Some(b'[') => self.parse_array(bytes, field, pairs, staged),
             _ => {
-                let num = self.parse_number(bytes)?;
+                let num = parse_number_common(bytes)?;
                 let num_str = num
                     .view::<str>()
                     .map_err(|_| JsonImportError::Syntax("invalid number".into()))?;
@@ -448,9 +588,9 @@ where
                         source: EncodeError::message("non-finite number"),
                     });
                 }
-                let attr = self.num_attr(field)?;
+                let attr = cached_attr(&mut self.num_attrs, field, import, CacheEntry::Num);
                 let encoded: Inline<F64> = number.to_inline();
-                pairs.push((attr.id(), encoded.raw));
+                object.pairs.push((attr.id(), encoded.raw));
                 Ok(())
             }
         }
@@ -473,16 +613,6 @@ where
             self.consume_byte(bytes, *expected)?;
         }
         Ok(())
-    }
-
-    fn parse_string(&self, bytes: &mut Bytes) -> Result<ParsedString, JsonImportError> {
-        let raw = parse_string_common(bytes, &mut parse_unicode_escape)?;
-        raw.view::<str>()
-            .map_err(|_| JsonImportError::Syntax("invalid utf-8".into()))
-    }
-
-    fn parse_number(&self, bytes: &mut Bytes) -> Result<Bytes, JsonImportError> {
-        parse_number_common(bytes)
     }
 
     /// Returns a [`Fragment`] describing every attribute and schema
@@ -545,112 +675,27 @@ fn from_scan(err: scanner::ScanError) -> JsonImportError {
     }
 }
 
-/// Decodes a JSON `\uXXXX` escape (cursor just after the `u`) into UTF-8.
+/// Parses one JSON string at the cursor.
 ///
-/// A high surrogate consumes the `\uXXXX` low surrogate that must follow it,
-/// and the pair decodes to one scalar value. A surrogate that is not half of
-/// such a pair is valid JSON but has no UTF-8 form, so it is refused with
-/// [`JsonImportError::LoneSurrogate`] rather than replaced.
-pub(crate) fn parse_unicode_escape(bytes: &mut Bytes) -> Result<Vec<u8>, JsonImportError> {
-    let first = scanner::parse_utf16_code_unit(bytes).map_err(from_scan)?;
-    let scalar = match first {
-        0xD800..=0xDBFF => {
-            let mut ahead = bytes.clone();
-            if ahead.pop_front() != Some(b'\\') || ahead.pop_front() != Some(b'u') {
-                return Err(JsonImportError::LoneSurrogate { code_unit: first });
-            }
-            let low = scanner::parse_utf16_code_unit(&mut ahead).map_err(from_scan)?;
-            if !(0xDC00..=0xDFFF).contains(&low) {
-                return Err(JsonImportError::LoneSurrogate { code_unit: first });
-            }
-            *bytes = ahead;
-            0x1_0000 + (((first as u32) - 0xD800) << 10) + ((low as u32) - 0xDC00)
-        }
-        0xDC00..=0xDFFF => return Err(JsonImportError::LoneSurrogate { code_unit: first }),
-        unit => unit as u32,
-    };
-    let ch = char::from_u32(scalar).expect("a non-surrogate code point below 0x110000");
-    let mut buf = [0u8; 4];
-    Ok(ch.encode_utf8(&mut buf).as_bytes().to_vec())
-}
-
-pub(crate) fn parse_string_common(
+/// A string that is syntactically complete but whose escapes leave a UTF-16
+/// surrogate unpaired is not refused here: the first such code unit is
+/// recorded in `unpaired`, an empty placeholder is returned, and the caller
+/// keeps parsing, so that a syntax error anywhere in the document is still
+/// reported as [`JsonImportError::Syntax`]. The caller refuses the document
+/// with [`JsonImportError::LoneSurrogate`] once its syntax is complete.
+pub(crate) fn parse_json_string(
     bytes: &mut Bytes,
-    unicode_escape: &mut impl FnMut(&mut Bytes) -> Result<Vec<u8>, JsonImportError>,
-) -> Result<Bytes, JsonImportError> {
-    let consume_byte = |bytes: &mut Bytes, expected: u8| -> Result<(), JsonImportError> {
-        match bytes.pop_front() {
-            Some(b) if b == expected => Ok(()),
-            _ => Err(JsonImportError::Syntax("unexpected token".into())),
+    unpaired: &mut Option<u16>,
+) -> Result<ParsedString, JsonImportError> {
+    let raw = match scanner::parse_string_checked(bytes).map_err(from_scan)? {
+        Ok(raw) => raw,
+        Err(code_unit) => {
+            unpaired.get_or_insert(code_unit);
+            Bytes::empty()
         }
     };
-
-    consume_byte(bytes, b'"')?;
-    {
-        use winnow::error::InputError;
-        use winnow::token::take_while;
-        use winnow::Parser;
-
-        let mut tentative = bytes.clone();
-        let mut segment = take_while::<_, _, InputError<Bytes>>(0.., |b: u8| {
-            b >= 0x20 && b != b'"' && b != b'\\'
-        });
-
-        if let Ok(prefix) = segment.parse_next(&mut tentative) {
-            if tentative.peek_token() == Some(b'"') {
-                tentative.pop_front();
-                *bytes = tentative;
-                return Ok(prefix);
-            }
-        }
-    }
-
-    let mut out = Vec::new();
-    loop {
-        use winnow::error::InputError;
-        use winnow::token::take_while;
-        use winnow::Parser;
-
-        let mut segment = take_while::<_, _, InputError<Bytes>>(0.., |b: u8| {
-            b >= 0x20 && b != b'\\' && b != b'"'
-        });
-        let chunk = segment
-            .parse_next(bytes)
-            .map_err(|_| JsonImportError::Syntax("unterminated string".into()))?;
-        out.extend_from_slice(chunk.as_ref());
-
-        match bytes.peek_token() {
-            Some(b'"') => {
-                bytes.pop_front();
-                return Ok(Bytes::from(out));
-            }
-            Some(b'\\') => {
-                bytes.pop_front();
-                let esc = bytes
-                    .pop_front()
-                    .ok_or_else(|| JsonImportError::Syntax("unterminated escape".into()))?;
-                match esc {
-                    b'"' => out.push(b'"'),
-                    b'\\' => out.push(b'\\'),
-                    b'/' => out.push(b'/'),
-                    b'b' => out.push(0x08),
-                    b'f' => out.push(0x0c),
-                    b'n' => out.push(b'\n'),
-                    b'r' => out.push(b'\r'),
-                    b't' => out.push(b'\t'),
-                    b'u' => out.extend_from_slice(&unicode_escape(bytes)?),
-                    _ => return Err(JsonImportError::Syntax("invalid escape sequence".into())),
-                }
-            }
-            None => return Err(JsonImportError::Syntax("unterminated string".into())),
-            // RFC 8259: a control character (U+0000 to U+001F) must be escaped.
-            Some(_) => {
-                return Err(JsonImportError::Syntax(
-                    "unescaped control character in string".into(),
-                ))
-            }
-        }
-    }
+    raw.view::<str>()
+        .map_err(|_| JsonImportError::Syntax("invalid utf-8".into()))
 }
 
 /// Parses one RFC 8259 number and returns its raw token unchanged:
@@ -888,6 +933,43 @@ mod tests {
                 importer.import_str(&doc),
                 Err(JsonImportError::DepthExceeded { max_depth: 128 })
             ));
+        }
+        // ... and imported without recursion when the limit allows it.
+        let mut importer =
+            JsonObjectImporter::<_>::new(&mut blobs, None).with_max_depth(usize::MAX);
+        let objects = importer
+            .import_str(&nested_objects(depth))
+            .expect("deep objects import");
+        assert_eq!(objects.facts().len(), depth, "one field per object");
+        let arrays = importer
+            .import_str(&arrays_in_object(depth))
+            .expect("deep arrays import");
+        assert_eq!(arrays.facts().len(), 1, "arrays flatten into one field");
+    }
+
+    #[test]
+    fn object_importer_depth_limit_is_configurable() {
+        assert_eq!(DEFAULT_MAX_DEPTH, 128);
+        let mut blobs = MemoryBlobStore::new();
+        let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None).with_max_depth(2);
+        importer
+            .import_str(r#"{"a": {"b": 1}}"#)
+            .expect("depth 2 accepted");
+        importer
+            .import_str(r#"[{"a": 1}]"#)
+            .expect("a root array is one of the two containers");
+        for doc in [r#"{"a": {"b": {}}}"#, r#"{"a": [[1]]}"#, r#"[{"a": {}}]"#] {
+            match importer.import_str(doc) {
+                Err(JsonImportError::DepthExceeded { max_depth: 2 }) => {}
+                other => panic!("{doc}: expected DepthExceeded, got {other:?}"),
+            }
+        }
+        let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None).with_max_depth(0);
+        for doc in ["{}", "[]"] {
+            match importer.import_str(doc) {
+                Err(JsonImportError::DepthExceeded { max_depth: 0 }) => {}
+                other => panic!("{doc}: expected DepthExceeded, got {other:?}"),
+            }
         }
     }
 

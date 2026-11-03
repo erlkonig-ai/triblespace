@@ -128,34 +128,65 @@ pub(crate) fn parse_utf16_code_unit(bytes: &mut Bytes) -> Result<u16, ScanError>
     Ok(code)
 }
 
+/// One decoded `\uXXXX` escape, or surrogate pair of escapes.
+pub(crate) enum UnicodeEscape {
+    /// A Unicode scalar value.
+    Scalar(char),
+    /// A UTF-16 surrogate code unit that is not half of a high/low pair.
+    /// The cursor is left just after its own escape, so whatever follows is
+    /// read as ordinary string content and its syntax is still checked.
+    Unpaired(u16),
+}
+
+/// Decode a JSON `\uXXXX` escape. The cursor must be positioned just after
+/// the `u`.
+///
+/// A high surrogate consumes the immediately following `\uXXXX` when that
+/// escape is its low surrogate. A malformed escape is a syntax error; a
+/// well-formed one that leaves a surrogate unpaired is
+/// [`UnicodeEscape::Unpaired`], which only the caller can judge.
+pub(crate) fn decode_unicode_escape(bytes: &mut Bytes) -> Result<UnicodeEscape, ScanError> {
+    let first = parse_utf16_code_unit(bytes)?;
+    match first {
+        0xD800..=0xDBFF => {
+            let mut ahead = bytes.clone();
+            if ahead.pop_front() != Some(b'\\') || ahead.pop_front() != Some(b'u') {
+                return Ok(UnicodeEscape::Unpaired(first));
+            }
+            let low = parse_utf16_code_unit(&mut ahead)?;
+            if !(0xDC00..=0xDFFF).contains(&low) {
+                return Ok(UnicodeEscape::Unpaired(first));
+            }
+            *bytes = ahead;
+            let scalar = 0x1_0000 + (((first as u32) - 0xD800) << 10) + ((low as u32) - 0xDC00);
+            Ok(UnicodeEscape::Scalar(
+                char::from_u32(scalar).expect("a surrogate pair decodes to a scalar value"),
+            ))
+        }
+        0xDC00..=0xDFFF => Ok(UnicodeEscape::Unpaired(first)),
+        unit => Ok(UnicodeEscape::Scalar(
+            char::from_u32(unit as u32).expect("a non-surrogate BMP code unit is a scalar value"),
+        )),
+    }
+}
+
+fn unpaired_surrogate(code_unit: u16) -> ScanError {
+    ScanError::Syntax(format!("unpaired UTF-16 surrogate \\u{code_unit:04X}"))
+}
+
 /// Decode a JSON `\uXXXX` escape into UTF-8 bytes. The cursor must be
 /// positioned just after the first `u`.
 ///
 /// JSON spells non-BMP scalar values as a UTF-16 surrogate pair. A leading
 /// surrogate therefore consumes the immediately following `\uXXXX` escape;
-/// lone low surrogates and malformed pairs are rejected.
+/// lone surrogates and malformed pairs are rejected.
 pub fn parse_unicode_escape(bytes: &mut Bytes) -> Result<Vec<u8>, ScanError> {
-    let first = parse_utf16_code_unit(bytes)?;
-    let code = match first {
-        high @ 0xD800..=0xDBFF => {
-            if bytes.pop_front() != Some(b'\\') || bytes.pop_front() != Some(b'u') {
-                return Err(syntax("high surrogate must be followed by a low surrogate"));
-            }
-            let low = parse_utf16_code_unit(bytes)?;
-            if !(0xDC00..=0xDFFF).contains(&low) {
-                return Err(syntax("high surrogate must be followed by a low surrogate"));
-            }
-            0x1_0000 + (((high as u32) - 0xD800) << 10) + ((low as u32) - 0xDC00)
+    match decode_unicode_escape(bytes)? {
+        UnicodeEscape::Scalar(ch) => {
+            let mut buf = [0u8; 4];
+            Ok(ch.encode_utf8(&mut buf).as_bytes().to_vec())
         }
-        0xDC00..=0xDFFF => return Err(syntax("lone low surrogate")),
-        scalar => scalar as u32,
-    };
-
-    if let Some(ch) = char::from_u32(code) {
-        let mut buf = [0u8; 4];
-        Ok(ch.encode_utf8(&mut buf).as_bytes().to_vec())
-    } else {
-        Err(syntax("invalid unicode escape"))
+        UnicodeEscape::Unpaired(code_unit) => Err(unpaired_surrogate(code_unit)),
     }
 }
 
@@ -164,7 +195,20 @@ pub fn parse_unicode_escape(bytes: &mut Bytes) -> Result<Vec<u8>, ScanError> {
 /// Zero-copy fast path: a string with no escapes is returned as a borrowed
 /// slice of the input, no allocation. Escaped strings allocate only the decoded
 /// result. The cursor must be positioned at the opening `"`.
+///
+/// A string whose escapes leave a UTF-16 surrogate unpaired has no UTF-8
+/// form and is refused, but only once the string is known to be
+/// syntactically complete; until then a syntax error takes precedence.
 pub fn parse_string(bytes: &mut Bytes) -> Result<Bytes, ScanError> {
+    parse_string_checked(bytes)?.map_err(unpaired_surrogate)
+}
+
+/// [`parse_string`] that reports an unpaired surrogate separately.
+///
+/// `Ok(Err(code_unit))` means the string is syntactically complete (the
+/// cursor is past its closing quote) and `code_unit` is the first surrogate
+/// its escapes leave unpaired. Any `Err` is a syntax error.
+pub(crate) fn parse_string_checked(bytes: &mut Bytes) -> Result<Result<Bytes, u16>, ScanError> {
     expect(bytes, b'"')?;
     {
         use winnow::error::InputError;
@@ -180,12 +224,13 @@ pub fn parse_string(bytes: &mut Bytes) -> Result<Bytes, ScanError> {
             if tentative.peek_token() == Some(b'"') {
                 tentative.pop_front();
                 *bytes = tentative;
-                return Ok(prefix);
+                return Ok(Ok(prefix));
             }
         }
     }
 
     let mut out = Vec::new();
+    let mut unpaired = None;
     loop {
         use winnow::error::InputError;
         use winnow::token::take_while;
@@ -202,7 +247,10 @@ pub fn parse_string(bytes: &mut Bytes) -> Result<Bytes, ScanError> {
         match bytes.peek_token() {
             Some(b'"') => {
                 bytes.pop_front();
-                return Ok(Bytes::from(out));
+                return Ok(match unpaired {
+                    None => Ok(Bytes::from(out)),
+                    Some(code_unit) => Err(code_unit),
+                });
             }
             Some(b'\\') => {
                 bytes.pop_front();
@@ -218,7 +266,15 @@ pub fn parse_string(bytes: &mut Bytes) -> Result<Bytes, ScanError> {
                     b'n' => out.push(b'\n'),
                     b'r' => out.push(b'\r'),
                     b't' => out.push(b'\t'),
-                    b'u' => out.extend_from_slice(&parse_unicode_escape(bytes)?),
+                    b'u' => match decode_unicode_escape(bytes)? {
+                        UnicodeEscape::Scalar(ch) => {
+                            let mut buf = [0u8; 4];
+                            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                        }
+                        UnicodeEscape::Unpaired(code_unit) => {
+                            unpaired.get_or_insert(code_unit);
+                        }
+                    },
                     _ => return Err(syntax("invalid escape sequence")),
                 }
             }
@@ -476,6 +532,33 @@ mod tests {
             let mut input = bytes(invalid);
             assert!(parse_string(&mut input).is_err(), "accepted {invalid:?}");
         }
+    }
+
+    #[test]
+    fn string_syntax_errors_take_precedence_over_unpaired_surrogates() {
+        for (invalid, reason) in [
+            (r#""\ud800\x""#, "invalid escape sequence"),
+            (r#""\ud800\"#, "unterminated escape"),
+            (r#""\ud800"#, "unterminated string"),
+            (r#""\ud800\u12""#, "unterminated unicode escape"),
+        ] {
+            let mut input = bytes(invalid);
+            assert_eq!(
+                parse_string(&mut input),
+                Err(ScanError::Syntax(reason.into())),
+                "{invalid}"
+            );
+        }
+        let mut input = bytes(r#""\ud800\u0041" rest"#);
+        assert_eq!(
+            parse_string(&mut input),
+            Err(ScanError::Syntax(
+                r"unpaired UTF-16 surrogate \uD800".into()
+            ))
+        );
+        let mut input = bytes(r#""\ud800\u0041" rest"#);
+        assert_eq!(parse_string_checked(&mut input), Ok(Err(0xD800)));
+        assert_eq!(input.as_ref(), b" rest", "cursor is past the string");
     }
 
     #[test]

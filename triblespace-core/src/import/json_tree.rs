@@ -27,9 +27,8 @@ use crate::trible::Fragment;
 use crate::trible::TribleSet;
 use triblespace_core_macros::attributes;
 
-use crate::import::json::{
-    parse_number_common, parse_string_common, parse_unicode_escape, EncodeError, JsonImportError,
-};
+pub use crate::import::json::DEFAULT_MAX_DEPTH;
+use crate::import::json::{parse_json_string, parse_number_common, EncodeError, JsonImportError};
 
 type ParsedString = View<str>;
 
@@ -143,12 +142,17 @@ enum Frame {
     },
 }
 
-/// What one `import_blob` call accumulates.
+/// What one `import_blob` call accumulates before the document is accepted.
 struct ImportState {
     data: TribleSet,
     local_blobs: MemoryBlobStore,
-    /// Handles already put during this import.
+    /// Handles already staged during this import.
     stored: HashSet<RawInline>,
+    /// Blobs to put into the caller's store once the document is accepted,
+    /// with the error a failed put becomes.
+    pending: Vec<(Blob<UTF8String>, fn(EncodeError) -> JsonImportError)>,
+    /// The first surrogate a complete string left unpaired.
+    unpaired: Option<u16>,
 }
 
 /// Lossless JSON importer that preserves ordering and encodes explicit entry nodes.
@@ -160,7 +164,8 @@ struct ImportState {
 /// stack; nesting beyond [`with_max_depth`](Self::with_max_depth) (default
 /// [`DEFAULT_MAX_DEPTH`]) is refused with [`JsonImportError::DepthExceeded`].
 /// A `\uXXXX` surrogate that is not half of a pair is refused with
-/// [`JsonImportError::LoneSurrogate`].
+/// [`JsonImportError::LoneSurrogate`], once the document is known to be
+/// syntactically complete. A refused document puts nothing into the store.
 pub struct JsonTreeImporter<'a, Store>
 where
     Store: BlobStore,
@@ -169,10 +174,6 @@ where
     id_salt: Option<[u8; 32]>,
     max_depth: usize,
 }
-
-/// Default nesting limit of [`JsonTreeImporter`]: a value may sit inside at
-/// most this many arrays/objects.
-pub const DEFAULT_MAX_DEPTH: usize = 128;
 
 impl<'a, Store> JsonTreeImporter<'a, Store>
 where
@@ -209,11 +210,18 @@ where
 
     /// Imports a JSON document from a [`UTF8String`] blob, returning a
     /// [`Fragment`] rooted at the document's top-level node.
+    ///
+    /// The document's blobs are put into the store only after the whole
+    /// document has been accepted, so a refused document leaves the store
+    /// untouched. (A store that fails partway through those puts can still
+    /// keep the blobs put before the failure; nothing references them.)
     pub fn import_blob(&mut self, blob: Blob<UTF8String>) -> Result<Fragment, JsonImportError> {
         let mut state = ImportState {
             data: TribleSet::new(),
             local_blobs: MemoryBlobStore::new(),
             stored: HashSet::new(),
+            pending: Vec::new(),
+            unpaired: None,
         };
         let mut bytes = blob.bytes.clone();
         self.skip_ws(&mut bytes);
@@ -221,6 +229,14 @@ where
         self.skip_ws(&mut bytes);
         if bytes.peek_token().is_some() {
             return Err(JsonImportError::Syntax("trailing tokens".into()));
+        }
+        if let Some(code_unit) = state.unpaired {
+            return Err(JsonImportError::LoneSurrogate { code_unit });
+        }
+        for (blob, on_error) in state.pending {
+            self.store
+                .put::<UTF8String, _>(blob)
+                .map_err(|err| on_error(EncodeError::from_error(err)))?;
         }
         let mut fragment = Fragment::rooted_with_blobs(root, state.data, state.local_blobs);
         // The node kinds are minted here rather than declared by an
@@ -337,7 +353,7 @@ where
         bytes: &mut Bytes,
         state: &mut ImportState,
     ) -> Result<(ParsedString, Inline<Handle<UTF8String>>), JsonImportError> {
-        let name = self.parse_string(bytes)?;
+        let name = parse_json_string(bytes, &mut state.unpaired)?;
         self.skip_ws(bytes);
         self.consume_byte(bytes, b':')?;
         self.skip_ws(bytes);
@@ -346,7 +362,7 @@ where
                 field: "field".to_string(),
                 source,
             }
-        })?;
+        });
         Ok((name, handle))
     }
 
@@ -383,14 +399,14 @@ where
                 Ok(id)
             }
             Some(b'"') => {
-                let text = self.parse_string(bytes)?;
+                let text = parse_json_string(bytes, &mut state.unpaired)?;
                 let id = self.hash_tagged(b"string", &[text.as_ref().as_bytes()]);
                 let handle = self.store_text(text.to_blob(), state, |source| {
                     JsonImportError::EncodeString {
                         field: "string".to_string(),
                         source,
                     }
-                })?;
+                });
                 state.data += entity! { ExclusiveId::force_ref(&id) @
                     kind: kind_string,
                     string: handle,
@@ -408,7 +424,7 @@ where
                         field: "number".to_string(),
                         source,
                     }
-                })?;
+                });
                 state.data += entity! { ExclusiveId::force_ref(&id) @
                     kind: kind_number,
                     number_raw: handle,
@@ -418,23 +434,21 @@ where
         }
     }
 
-    /// Puts `blob` into the external store and the fragment's own store, once
-    /// per distinct blob per import. Both stores hold the same refcounted
-    /// bytes; nothing is copied.
+    /// Puts `blob` into the fragment's own store and stages it for the
+    /// external store, once per distinct blob per import. Both stores hold
+    /// the same refcounted bytes; nothing is copied.
     fn store_text(
         &mut self,
         blob: Blob<UTF8String>,
         state: &mut ImportState,
-        on_error: impl FnOnce(EncodeError) -> JsonImportError,
-    ) -> Result<Inline<Handle<UTF8String>>, JsonImportError> {
+        on_error: fn(EncodeError) -> JsonImportError,
+    ) -> Inline<Handle<UTF8String>> {
         let handle = blob.get_handle();
         if state.stored.insert(handle.raw) {
-            self.store
-                .put::<UTF8String, _>(blob.clone())
-                .map_err(|err| on_error(EncodeError::from_error(err)))?;
+            state.pending.push((blob.clone(), on_error));
             state.local_blobs.insert(blob);
         }
-        Ok(handle)
+        handle
     }
 
     fn finish_object(&self, fields: &[FieldEntry], state: &mut ImportState) -> Id {
@@ -559,12 +573,6 @@ where
             self.consume_byte(bytes, *expected)?;
         }
         Ok(())
-    }
-
-    fn parse_string(&self, bytes: &mut Bytes) -> Result<ParsedString, JsonImportError> {
-        let raw = parse_string_common(bytes, &mut parse_unicode_escape)?;
-        raw.view::<str>()
-            .map_err(|_| JsonImportError::Syntax("invalid utf-8".into()))
     }
 
     fn parse_number(&self, bytes: &mut Bytes) -> Result<Bytes, JsonImportError> {

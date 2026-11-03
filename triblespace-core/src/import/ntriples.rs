@@ -373,7 +373,7 @@ fn topo_sort(
 // `Bytes` for literal lexical forms whose fast/slow path differ). View
 // slices Arc-share the input buffer, so storing them in `BnodeBuffer`
 // across line-equivalent boundaries costs nothing — no copy or alloc.
-// Mirrors `json::parse_string_common`'s shape.
+// Mirrors `scanner::parse_string`'s shape.
 
 /// What follows a closing `"` on an N-Triples literal:
 /// `^^<datatype>`, `@language`, or nothing.
