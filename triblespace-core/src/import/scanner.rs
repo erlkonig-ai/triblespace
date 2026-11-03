@@ -104,7 +104,7 @@ pub fn expect_literal(bytes: &mut Bytes, literal: &[u8]) -> Result<(), ScanError
 
 /// Parse the four hexadecimal digits in one JSON UTF-16 code unit. The cursor
 /// must be positioned just after the `u`.
-fn parse_utf16_code_unit(bytes: &mut Bytes) -> Result<u16, ScanError> {
+pub(crate) fn parse_utf16_code_unit(bytes: &mut Bytes) -> Result<u16, ScanError> {
     use winnow::error::InputError;
     use winnow::token::take;
     use winnow::Parser;

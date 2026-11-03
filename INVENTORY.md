@@ -378,3 +378,14 @@ prioritized for efficient zero-copy access.
   `UnionConstraint::propose` variant that is satisfied on only some rows. If a
   union-heavy profile ever shows it, the word-aligned bulk case (`base % 32 ==
   0` and a run of survivors) can be lifted to whole-word shifts.
+- `import::json` / `import::json_tree` still differ from RFC 8259 in two
+  lexical points the strict scanner already gets right: whitespace is
+  `is_ascii_whitespace` (admits form feed), and strings reject only raw
+  `\n`/`\r`, not every control byte below 0x20. Tightening either would
+  refuse documents that import today, so it wants a deliberate decision.
+- `JsonObjectImporter` still parses recursively with no depth limit; it could
+  share the explicit-stack shape and `DepthExceeded` of `JsonTreeImporter`.
+- `JsonTreeImporter` puts blobs into the caller's store while parsing, so a
+  document refused halfway (syntax, lone surrogate, depth) leaves the blobs of
+  its parsed prefix in that store. The returned fragment already carries every
+  blob; deciding whether the importer needs a store at all would remove this.

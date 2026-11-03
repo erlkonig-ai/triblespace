@@ -5,6 +5,8 @@
 //! Entity ids are content-addressed so identical subtrees deduplicate across
 //! imports.
 
+use std::collections::HashSet;
+
 use anybytes::{Bytes, View};
 use winnow::stream::Stream;
 
@@ -17,7 +19,7 @@ use crate::inline::encodings::boolean::Boolean;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::hash::{Blake3, Handle};
 use crate::inline::encodings::iu256::U256BE;
-use crate::inline::Inline;
+use crate::inline::{Inline, RawInline};
 use crate::macros::{entity, id_hex};
 use crate::metadata;
 use crate::repo::BlobStore;
@@ -131,10 +133,34 @@ struct ArrayEntry {
     value: Id,
 }
 
+/// An array or object whose closing bracket has not been read yet.
+enum Frame {
+    Array(Vec<ArrayEntry>),
+    /// `pending` is the name of the member whose value is being parsed.
+    Object {
+        fields: Vec<FieldEntry>,
+        pending: (ParsedString, Inline<Handle<UTF8String>>),
+    },
+}
+
+/// What one `import_blob` call accumulates.
+struct ImportState {
+    data: TribleSet,
+    local_blobs: MemoryBlobStore,
+    /// Handles already put during this import.
+    stored: HashSet<RawInline>,
+}
+
 /// Lossless JSON importer that preserves ordering and encodes explicit entry nodes.
 ///
 /// This importer encodes JSON values as an explicit node/entry graph (a JSON AST),
 /// using content-addressed ids so identical subtrees deduplicate across imports.
+///
+/// Parsing is iterative, so deeply nested input cannot overflow the call
+/// stack; nesting beyond [`with_max_depth`](Self::with_max_depth) (default
+/// [`DEFAULT_MAX_DEPTH`]) is refused with [`JsonImportError::DepthExceeded`].
+/// A `\uXXXX` surrogate that is not half of a pair is refused with
+/// [`JsonImportError::LoneSurrogate`].
 pub struct JsonTreeImporter<'a, Store>
 where
     Store: BlobStore,
@@ -152,8 +178,13 @@ impl<'a, Store> JsonTreeImporter<'a, Store>
 where
     Store: BlobStore,
 {
-    /// Creates a new lossless importer backed by `store`. Pass an optional
-    /// 32-byte salt to namespace the content-addressed entity ids.
+    /// Creates a new lossless importer backed by `store`.
+    ///
+    /// `id_salt` namespaces the content-addressed entity ids: any `Some`
+    /// salt gives every node and entry a different id than `None` does.
+    /// Archive imports must pass `None`, so that the same document always
+    /// lands on the same ids no matter who imports it; a salt is only for
+    /// callers that deliberately want ids disjoint from everyone else's.
     pub fn new(store: &'a mut Store, id_salt: Option<[u8; 32]>) -> Self {
         Self {
             store,
@@ -162,7 +193,10 @@ where
         }
     }
 
-    /// Sets how many arrays/objects a value may be nested inside.
+    /// Sets how many arrays/objects a value may be nested inside (`0`
+    /// admits only scalar documents). Deeper input is refused with
+    /// [`JsonImportError::DepthExceeded`]; the limit bounds work per value,
+    /// not stack use, which never grows with depth.
     pub fn with_max_depth(mut self, max_depth: usize) -> Self {
         self.max_depth = max_depth;
         self
@@ -176,16 +210,19 @@ where
     /// Imports a JSON document from a [`UTF8String`] blob, returning a
     /// [`Fragment`] rooted at the document's top-level node.
     pub fn import_blob(&mut self, blob: Blob<UTF8String>) -> Result<Fragment, JsonImportError> {
-        let mut data = TribleSet::new();
-        let mut local_blobs = MemoryBlobStore::new();
+        let mut state = ImportState {
+            data: TribleSet::new(),
+            local_blobs: MemoryBlobStore::new(),
+            stored: HashSet::new(),
+        };
         let mut bytes = blob.bytes.clone();
         self.skip_ws(&mut bytes);
-        let root = self.parse_value(&mut bytes, &mut data, &mut local_blobs)?;
+        let root = self.parse_document(&mut bytes, &mut state)?;
         self.skip_ws(&mut bytes);
         if bytes.peek_token().is_some() {
             return Err(JsonImportError::Syntax("trailing tokens".into()));
         }
-        let mut fragment = Fragment::rooted_with_blobs(root, data, local_blobs);
+        let mut fragment = Fragment::rooted_with_blobs(root, state.data, state.local_blobs);
         // The node kinds are minted here rather than declared by an
         // `attributes!` block, so the importer has to attach their schema
         // itself. Keep it in the returned fragment's metafacts so committing
@@ -200,17 +237,129 @@ where
         build_json_tree_metadata()
     }
 
-    fn parse_value(
+    /// Parses one JSON value without recursion: open arrays/objects live on
+    /// an explicit heap stack, so input depth costs heap, never call stack,
+    /// and the depth limit is checked before a container is entered.
+    fn parse_document(
         &mut self,
         bytes: &mut Bytes,
-        data: &mut TribleSet,
-        local_blobs: &mut MemoryBlobStore,
+        state: &mut ImportState,
+    ) -> Result<Id, JsonImportError> {
+        let mut stack: Vec<Frame> = Vec::new();
+        loop {
+            // Parse the value at the cursor. A scalar or an empty container
+            // completes at once; a non-empty container is pushed and its first
+            // member's value is parsed on the next iteration.
+            let mut value = match bytes.peek_token() {
+                Some(open @ (b'[' | b'{')) => {
+                    if stack.len() >= self.max_depth {
+                        return Err(JsonImportError::DepthExceeded {
+                            max_depth: self.max_depth,
+                        });
+                    }
+                    bytes.pop_front();
+                    self.skip_ws(bytes);
+                    if open == b'[' {
+                        if bytes.peek_token() == Some(b']') {
+                            bytes.pop_front();
+                            self.finish_array(&[], state)
+                        } else {
+                            stack.push(Frame::Array(Vec::new()));
+                            continue;
+                        }
+                    } else if bytes.peek_token() == Some(b'}') {
+                        bytes.pop_front();
+                        self.finish_object(&[], state)
+                    } else {
+                        let pending = self.parse_member_name(bytes, state)?;
+                        stack.push(Frame::Object {
+                            fields: Vec::new(),
+                            pending,
+                        });
+                        continue;
+                    }
+                }
+                _ => self.parse_scalar(bytes, state)?,
+            };
+
+            // Hand the finished value to its parent, closing every container
+            // that ends right after it.
+            loop {
+                let Some(frame) = stack.last_mut() else {
+                    return Ok(value);
+                };
+                self.skip_ws(bytes);
+                let closed = match frame {
+                    Frame::Array(entries) => {
+                        let index = entries.len() as u64;
+                        entries.push(ArrayEntry { index, value });
+                        match bytes.pop_front() {
+                            Some(b',') => false,
+                            Some(b']') => true,
+                            _ => return Err(JsonImportError::Syntax("unexpected token".into())),
+                        }
+                    }
+                    Frame::Object { fields, pending } => {
+                        let index = fields.len() as u64;
+                        let (name, name_handle) = pending.clone();
+                        fields.push(FieldEntry {
+                            name,
+                            name_handle,
+                            index,
+                            value,
+                        });
+                        match bytes.pop_front() {
+                            Some(b',') => {
+                                self.skip_ws(bytes);
+                                *pending = self.parse_member_name(bytes, state)?;
+                                false
+                            }
+                            Some(b'}') => true,
+                            _ => return Err(JsonImportError::Syntax("unexpected token".into())),
+                        }
+                    }
+                };
+                if !closed {
+                    self.skip_ws(bytes);
+                    break;
+                }
+                value = match stack.pop().expect("the frame just inspected") {
+                    Frame::Array(entries) => self.finish_array(&entries, state),
+                    Frame::Object { fields, .. } => self.finish_object(&fields, state),
+                };
+            }
+        }
+    }
+
+    /// Parses `"name"`, the `:` and surrounding whitespace, storing the name.
+    fn parse_member_name(
+        &mut self,
+        bytes: &mut Bytes,
+        state: &mut ImportState,
+    ) -> Result<(ParsedString, Inline<Handle<UTF8String>>), JsonImportError> {
+        let name = self.parse_string(bytes)?;
+        self.skip_ws(bytes);
+        self.consume_byte(bytes, b':')?;
+        self.skip_ws(bytes);
+        let handle = self.store_text(name.clone().to_blob(), state, |source| {
+            JsonImportError::EncodeString {
+                field: "field".to_string(),
+                source,
+            }
+        })?;
+        Ok((name, handle))
+    }
+
+    fn parse_scalar(
+        &mut self,
+        bytes: &mut Bytes,
+        state: &mut ImportState,
     ) -> Result<Id, JsonImportError> {
         match bytes.peek_token() {
             Some(b'n') => {
                 self.consume_literal(bytes, b"null")?;
                 let id = self.hash_tagged(b"null", &[]);
-                *data += entity! { ExclusiveId::force_ref(&id) @
+                state.data += entity! { ExclusiveId::force_ref(&id) @
                     kind: kind_null,
                 };
                 Ok(id)
@@ -218,7 +367,7 @@ where
             Some(b't') => {
                 self.consume_literal(bytes, b"true")?;
                 let id = self.hash_tagged(b"bool", &[b"true"]);
-                *data += entity! { ExclusiveId::force_ref(&id) @
+                state.data += entity! { ExclusiveId::force_ref(&id) @
                     kind: kind_bool,
                     boolean: true,
                 };
@@ -227,7 +376,7 @@ where
             Some(b'f') => {
                 self.consume_literal(bytes, b"false")?;
                 let id = self.hash_tagged(b"bool", &[b"false"]);
-                *data += entity! { ExclusiveId::force_ref(&id) @
+                state.data += entity! { ExclusiveId::force_ref(&id) @
                     kind: kind_bool,
                     boolean: false,
                 };
@@ -236,37 +385,31 @@ where
             Some(b'"') => {
                 let text = self.parse_string(bytes)?;
                 let id = self.hash_tagged(b"string", &[text.as_ref().as_bytes()]);
-                let text_blob: Blob<UTF8String> = text.to_blob();
-                let handle = self.store.put(text_blob.clone()).map_err(|err| {
+                let handle = self.store_text(text.to_blob(), state, |source| {
                     JsonImportError::EncodeString {
                         field: "string".to_string(),
-                        source: EncodeError::from_error(err),
+                        source,
                     }
                 })?;
-                local_blobs.insert(text_blob);
-                *data += entity! { ExclusiveId::force_ref(&id) @
+                state.data += entity! { ExclusiveId::force_ref(&id) @
                     kind: kind_string,
                     string: handle,
                 };
                 Ok(id)
             }
-            Some(b'{') => self.parse_object(bytes, data, local_blobs),
-            Some(b'[') => self.parse_array(bytes, data, local_blobs),
             _ => {
                 let number = self.parse_number(bytes)?;
                 let number_view = number
                     .view::<str>()
                     .map_err(|_| JsonImportError::Syntax("invalid number".into()))?;
                 let id = self.hash_tagged(b"number", &[number_view.as_ref().as_bytes()]);
-                let number_blob: Blob<UTF8String> = number_view.to_blob();
-                let handle = self.store.put(number_blob.clone()).map_err(|err| {
+                let handle = self.store_text(number_view.to_blob(), state, |source| {
                     JsonImportError::EncodeNumber {
                         field: "number".to_string(),
-                        source: EncodeError::from_error(err),
+                        source,
                     }
                 })?;
-                local_blobs.insert(number_blob);
-                *data += entity! { ExclusiveId::force_ref(&id) @
+                state.data += entity! { ExclusiveId::force_ref(&id) @
                     kind: kind_number,
                     number_raw: handle,
                 };
@@ -275,65 +418,34 @@ where
         }
     }
 
-    fn parse_object(
+    /// Puts `blob` into the external store and the fragment's own store, once
+    /// per distinct blob per import. Both stores hold the same refcounted
+    /// bytes; nothing is copied.
+    fn store_text(
         &mut self,
-        bytes: &mut Bytes,
-        data: &mut TribleSet,
-        local_blobs: &mut MemoryBlobStore,
-    ) -> Result<Id, JsonImportError> {
-        self.consume_byte(bytes, b'{')?;
-        self.skip_ws(bytes);
-
-        let mut fields: Vec<FieldEntry> = Vec::new();
-        if bytes.peek_token() == Some(b'}') {
-            self.consume_byte(bytes, b'}')?;
-        } else {
-            let mut index: u64 = 0;
-            loop {
-                let name = self.parse_string(bytes)?;
-                self.skip_ws(bytes);
-                self.consume_byte(bytes, b':')?;
-                self.skip_ws(bytes);
-                let value = self.parse_value(bytes, data, local_blobs)?;
-                let name_blob: Blob<UTF8String> = name.clone().to_blob();
-                let name_handle = self.store.put(name_blob.clone()).map_err(|err| {
-                    JsonImportError::EncodeString {
-                        field: "field".to_string(),
-                        source: EncodeError::from_error(err),
-                    }
-                })?;
-                local_blobs.insert(name_blob);
-                fields.push(FieldEntry {
-                    name,
-                    name_handle,
-                    index,
-                    value,
-                });
-                index = index.saturating_add(1);
-
-                self.skip_ws(bytes);
-                match bytes.peek_token() {
-                    Some(b',') => {
-                        self.consume_byte(bytes, b',')?;
-                        self.skip_ws(bytes);
-                    }
-                    Some(b'}') => {
-                        self.consume_byte(bytes, b'}')?;
-                        break;
-                    }
-                    _ => return Err(JsonImportError::Syntax("unexpected token".into())),
-                }
-            }
+        blob: Blob<UTF8String>,
+        state: &mut ImportState,
+        on_error: impl FnOnce(EncodeError) -> JsonImportError,
+    ) -> Result<Inline<Handle<UTF8String>>, JsonImportError> {
+        let handle = blob.get_handle();
+        if state.stored.insert(handle.raw) {
+            self.store
+                .put::<UTF8String, _>(blob.clone())
+                .map_err(|err| on_error(EncodeError::from_error(err)))?;
+            state.local_blobs.insert(blob);
         }
+        Ok(handle)
+    }
 
-        let object_id = self.hash_object(&fields);
-        *data += entity! { ExclusiveId::force_ref(&object_id) @
+    fn finish_object(&self, fields: &[FieldEntry], state: &mut ImportState) -> Id {
+        let object_id = self.hash_object(fields);
+        state.data += entity! { ExclusiveId::force_ref(&object_id) @
             kind: kind_object,
         };
 
         for field in fields {
-            let entry_id = self.hash_field_entry(&object_id, &field);
-            *data += entity! { ExclusiveId::force_ref(&entry_id) @
+            let entry_id = self.hash_field_entry(&object_id, field);
+            state.data += entity! { ExclusiveId::force_ref(&entry_id) @
                 kind: kind_field,
                 field_parent: object_id,
                 field_name: field.name_handle,
@@ -342,51 +454,18 @@ where
             };
         }
 
-        Ok(object_id)
+        object_id
     }
 
-    fn parse_array(
-        &mut self,
-        bytes: &mut Bytes,
-        data: &mut TribleSet,
-        local_blobs: &mut MemoryBlobStore,
-    ) -> Result<Id, JsonImportError> {
-        self.consume_byte(bytes, b'[')?;
-        self.skip_ws(bytes);
-
-        let mut entries: Vec<ArrayEntry> = Vec::new();
-        if bytes.peek_token() == Some(b']') {
-            self.consume_byte(bytes, b']')?;
-        } else {
-            let mut index: u64 = 0;
-            loop {
-                let value = self.parse_value(bytes, data, local_blobs)?;
-                entries.push(ArrayEntry { index, value });
-                index = index.saturating_add(1);
-
-                self.skip_ws(bytes);
-                match bytes.peek_token() {
-                    Some(b',') => {
-                        self.consume_byte(bytes, b',')?;
-                        self.skip_ws(bytes);
-                    }
-                    Some(b']') => {
-                        self.consume_byte(bytes, b']')?;
-                        break;
-                    }
-                    _ => return Err(JsonImportError::Syntax("unexpected token".into())),
-                }
-            }
-        }
-
-        let array_id = self.hash_array(&entries);
-        *data += entity! { ExclusiveId::force_ref(&array_id) @
+    fn finish_array(&self, entries: &[ArrayEntry], state: &mut ImportState) -> Id {
+        let array_id = self.hash_array(entries);
+        state.data += entity! { ExclusiveId::force_ref(&array_id) @
             kind: kind_array,
         };
 
         for entry in entries {
-            let entry_id = self.hash_array_entry(&array_id, &entry);
-            *data += entity! { ExclusiveId::force_ref(&entry_id) @
+            let entry_id = self.hash_array_entry(&array_id, entry);
+            state.data += entity! { ExclusiveId::force_ref(&entry_id) @
                 kind: kind_array_entry,
                 array_parent: array_id,
                 array_index: entry.index,
@@ -394,7 +473,7 @@ where
             };
         }
 
-        Ok(array_id)
+        array_id
     }
 
     fn hash_object(&self, fields: &[FieldEntry]) -> Id {

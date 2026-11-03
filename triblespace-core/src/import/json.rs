@@ -20,6 +20,7 @@ use crate::blob::encodings::utf8string::UTF8String;
 use crate::blob::Blob;
 use crate::blob::IntoBlob;
 use crate::id::{ExclusiveId, Id};
+use crate::import::scanner;
 use crate::inline::encodings::boolean::Boolean;
 use crate::inline::encodings::f64::F64;
 use crate::inline::encodings::genid::GenId;
@@ -539,34 +540,39 @@ where
     }
 }
 
+fn from_scan(err: scanner::ScanError) -> JsonImportError {
+    match err {
+        scanner::ScanError::Syntax(msg) => JsonImportError::Syntax(msg),
+    }
+}
+
+/// Decodes a JSON `\uXXXX` escape (cursor just after the `u`) into UTF-8.
+///
+/// A high surrogate consumes the `\uXXXX` low surrogate that must follow it,
+/// and the pair decodes to one scalar value. A surrogate that is not half of
+/// such a pair is valid JSON but has no UTF-8 form, so it is refused with
+/// [`JsonImportError::LoneSurrogate`] rather than replaced.
 pub(crate) fn parse_unicode_escape(bytes: &mut Bytes) -> Result<Vec<u8>, JsonImportError> {
-    use winnow::error::InputError;
-    use winnow::token::take;
-    use winnow::Parser;
-
-    let mut grab = take::<_, _, InputError<Bytes>>(4usize);
-    let hex = grab
-        .parse_next(bytes)
-        .map_err(|_| JsonImportError::Syntax("unterminated unicode escape".into()))?;
-
-    let mut code: u32 = 0;
-    for h in hex.as_ref() {
-        code = (code << 4)
-            | match h {
-                b'0'..=b'9' => (h - b'0') as u32,
-                b'a'..=b'f' => (h - b'a' + 10) as u32,
-                b'A'..=b'F' => (h - b'A' + 10) as u32,
-                _ => return Err(JsonImportError::Syntax("invalid unicode escape".into())),
-            };
-    }
-
-    if let Some(ch) = char::from_u32(code) {
-        let mut buf = [0u8; 4];
-        let encoded = ch.encode_utf8(&mut buf);
-        Ok(encoded.as_bytes().to_vec())
-    } else {
-        Err(JsonImportError::Syntax("invalid unicode escape".into()))
-    }
+    let first = scanner::parse_utf16_code_unit(bytes).map_err(from_scan)?;
+    let scalar = match first {
+        0xD800..=0xDBFF => {
+            let mut ahead = bytes.clone();
+            if ahead.pop_front() != Some(b'\\') || ahead.pop_front() != Some(b'u') {
+                return Err(JsonImportError::LoneSurrogate { code_unit: first });
+            }
+            let low = scanner::parse_utf16_code_unit(&mut ahead).map_err(from_scan)?;
+            if !(0xDC00..=0xDFFF).contains(&low) {
+                return Err(JsonImportError::LoneSurrogate { code_unit: first });
+            }
+            *bytes = ahead;
+            0x1_0000 + (((first as u32) - 0xD800) << 10) + ((low as u32) - 0xDC00)
+        }
+        0xDC00..=0xDFFF => return Err(JsonImportError::LoneSurrogate { code_unit: first }),
+        unit => unit as u32,
+    };
+    let ch = char::from_u32(scalar).expect("a non-surrogate code point below 0x110000");
+    let mut buf = [0u8; 4];
+    Ok(ch.encode_utf8(&mut buf).as_bytes().to_vec())
 }
 
 pub(crate) fn parse_string_common(
@@ -645,18 +651,11 @@ pub(crate) fn parse_string_common(
     }
 }
 
+/// Parses one RFC 8259 number and returns its raw token unchanged:
+/// `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`, followed by
+/// whitespace, `,`, `]`, `}` or the end of input.
 pub(crate) fn parse_number_common(bytes: &mut Bytes) -> Result<Bytes, JsonImportError> {
-    use winnow::error::InputError;
-    use winnow::token::take_while;
-    use winnow::Parser;
-
-    let mut number = take_while::<_, _, InputError<Bytes>>(1.., |b: u8| {
-        b.is_ascii_digit() || b == b'-' || b == b'+' || b == b'.' || b == b'e' || b == b'E'
-    });
-
-    number
-        .parse_next(bytes)
-        .map_err(|_: InputError<Bytes>| JsonImportError::Syntax("expected number".into()))
+    scanner::parse_number(bytes).map_err(from_scan)
 }
 
 #[cfg(test)]

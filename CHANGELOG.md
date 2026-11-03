@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `import::json_tree`: surrogate-pair escapes (`\ud83d\ude00`) decode to one
+  scalar value; an unpaired surrogate is refused with the new
+  `JsonImportError::LoneSurrogate { code_unit }` instead of a generic syntax
+  error. Numbers follow the RFC 8259 grammar exactly (`1-2`, `01`, `1.`, `.5`,
+  `1e`, `+1` are refused) and keep their raw token. Nesting is limited to
+  `DEFAULT_MAX_DEPTH` (128) containers, configurable with
+  `JsonTreeImporter::with_max_depth`, and refused with
+  `JsonImportError::DepthExceeded`; the parser is iterative, so depth never
+  grows the call stack. Each distinct blob is put into the caller's store once
+  per import instead of once per occurrence. Ids with `id_salt = None` are
+  unchanged and pinned by golden tests. `JsonObjectImporter` shares the escape
+  and number rules.
+
 - `TribleSet`'s six indexes are private. Read them through `eav()`,
   `eva()`, `aev()`, `ave()`, `vea()` and `vae()`, which return shared
   references only. `insert_archive` now takes the `&Trible` and its
