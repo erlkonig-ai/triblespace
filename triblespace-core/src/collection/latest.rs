@@ -49,6 +49,8 @@ use crate::query::{
 };
 use crate::repo::BlobStoreGet;
 use crate::trible::{Fragment, Trible, A_START, E_START, TRIBLE_LEN};
+use zerocopy::byteorder::big_endian;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use super::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
 use super::{
@@ -57,7 +59,17 @@ use super::{
 };
 
 const ID_LEN: usize = 16;
-const HEADER_LEN: usize = 16;
+
+/// The two id counts that open an element, big endian: live, then superseded.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct Header {
+    live: big_endian::U64,
+    retired: big_endian::U64,
+}
+
+const HEADER_LEN: usize = size_of::<Header>();
+const _: () = assert!(HEADER_LEN == 16);
 
 crate::macros::attributes! {
     /// The observation attribute read by a maintained latest-state mapping.
@@ -132,19 +144,17 @@ impl Error for LatestError {}
 
 fn sections(blob: &Blob<LatestBlob>) -> Result<(&[u8], &[u8]), LatestError> {
     let bytes = blob.bytes.as_ref();
-    if bytes.len() < HEADER_LEN {
+    let Ok((header, _)) = Header::ref_from_prefix(bytes) else {
         return Err(LatestError::BadLength(bytes.len()));
-    }
-    let count = |header: &[u8]| {
-        usize::try_from(u64::from_be_bytes(
-            header.try_into().expect("eight-byte count"),
-        ))
-        .ok()
-        .and_then(|n| n.checked_mul(ID_LEN))
-        .ok_or(LatestError::CountOverflow)
     };
-    let live_len = count(&bytes[..8])?;
-    let retired_len = count(&bytes[8..HEADER_LEN])?;
+    let count = |count: &big_endian::U64| {
+        usize::try_from(count.get())
+            .ok()
+            .and_then(|n| n.checked_mul(ID_LEN))
+            .ok_or(LatestError::CountOverflow)
+    };
+    let live_len = count(&header.live)?;
+    let retired_len = count(&header.retired)?;
     let split = HEADER_LEN
         .checked_add(live_len)
         .ok_or(LatestError::CountOverflow)?;
@@ -186,8 +196,11 @@ pub fn validate_element(blob: &Blob<LatestBlob>) -> Result<(), LatestError> {
 
 fn encode(live: &[u8], retired: &[u8]) -> Blob<LatestBlob> {
     let mut bytes = Vec::with_capacity(HEADER_LEN + live.len() + retired.len());
-    bytes.extend_from_slice(&((live.len() / ID_LEN) as u64).to_be_bytes());
-    bytes.extend_from_slice(&((retired.len() / ID_LEN) as u64).to_be_bytes());
+    let header = Header {
+        live: ((live.len() / ID_LEN) as u64).into(),
+        retired: ((retired.len() / ID_LEN) as u64).into(),
+    };
+    bytes.extend_from_slice(header.as_bytes());
     bytes.extend_from_slice(live);
     bytes.extend_from_slice(retired);
     Blob::new(Bytes::from_source(bytes))
@@ -678,6 +691,24 @@ mod tests {
             .collect::<Vec<_>>();
         let snapshot = store.snapshot().unwrap();
         LatestIndex::try_from_cover(&target.cover(handles), &Fragment::empty(), &snapshot).unwrap()
+    }
+
+    /// The element's bytes are content-addressed, so the header type must
+    /// keep exactly the documented layout. Spelled out by hand here,
+    /// independent of that type.
+    #[test]
+    fn element_layout_is_pinned_byte_for_byte() {
+        let live = [1u8; ID_LEN];
+        let retired = [[2u8; ID_LEN], [3u8; ID_LEN]].concat();
+        let blob = encode(&live, &retired);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&1u64.to_be_bytes());
+        expected.extend_from_slice(&2u64.to_be_bytes());
+        expected.extend_from_slice(&live);
+        expected.extend_from_slice(&retired);
+        assert_eq!(blob.bytes.as_ref(), &expected[..]);
+        assert_eq!(sections(&blob), Ok((&live[..], &retired[..])));
+        assert_eq!(empty().bytes.as_ref(), &[0u8; 16][..]);
     }
 
     #[test]
