@@ -17,6 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `par_validate_map` (feature `parallel`) splits that pass across the rayon
   pool. Accessors: `as_tribles`, `as_rows`, `len`, `is_empty`.
 
+- `SimpleArchive` decoding (`TribleSet::try_from_blob`,
+  `try_from_archive_bytes`, `try_from_blob_heap_only`) validates through
+  `CanonicalTribles`. Behaviour changes: bytes whose base is not 16-byte
+  aligned are refused with `BadArchive` instead of falling back to heap
+  leaves; and the row rule is checked over the whole archive before ordering,
+  so an archive with both a nil row and an inversion reports `BadTrible` from
+  the serial and the parallel decoder alike (the parallel one used to report
+  an inversion at a run seam first). Among ordering errors the parallel
+  decoder still checks run seams first.
+
 - `Trible` is now `#[repr(C, align(16))] { e: Id, a: Id, v: RawInline }`
   with private fields, deriving zerocopy `TryFromBytes`, `KnownLayout`,
   `Immutable` and `IntoBytes`; its validity is the row rule (entity and

@@ -500,12 +500,12 @@ impl TribleSet {
     ///
     /// # Safety
     ///
-    /// Every row must be 16-byte aligned, immutable, duplicate-free, and kept
-    /// alive by `owner`. `hashes[row]` must be the PATCH key hash of
-    /// `rows[row]`.
+    /// Every row must be immutable, duplicate-free, and kept alive by
+    /// `owner`. `hashes[row]` must be the PATCH key hash of `rows[row]`.
+    /// (Alignment and the row rule are guaranteed by `&[Trible]`.)
     #[cfg(any(test, feature = "parallel"))]
     pub(crate) unsafe fn from_archive_partition(
-        rows: &[[u8; TRIBLE_LEN]],
+        rows: &[Trible],
         hashes: &[u128],
         owner: &std::sync::Arc<dyn ArchiveOwner>,
     ) -> Self {
@@ -520,12 +520,11 @@ impl TribleSet {
         if rows.len() == 1 {
             // Preserve the established heap singleton path: all six indexes
             // share one Leaf allocation and need no archive-owner receipt.
-            let trible = Trible::as_transmute_force_raw(&rows[0])
-                .expect("validated archive rows are well-formed tribles");
             let mut set = Self::new();
-            set.insert(trible);
+            set.insert(&rows[0]);
             return set;
         }
+        let keys: &[[u8; TRIBLE_LEN]] = zerocopy::transmute_ref!(rows);
 
         let mut permutation = vec![0u32; rows.len()];
         let mut owner_guard = PATCHOwnerGuard::default();
@@ -541,7 +540,7 @@ impl TribleSet {
                 reset(&mut permutation);
                 unsafe {
                     PATCH::<TRIBLE_LEN, $order>::from_archive_partition_with_guard(
-                        rows,
+                        keys,
                         hashes,
                         &mut permutation,
                         owner,
@@ -780,15 +779,18 @@ mod tests {
     struct AlignedRows([[u8; TRIBLE_LEN]; 2]);
 
     fn archive_set(first: u8, second: u8) -> TribleSet {
-        let storage = Arc::new(AlignedRows([[first; TRIBLE_LEN], [second; TRIBLE_LEN]]));
+        let storage = Arc::new([
+            Trible::force_raw([first; TRIBLE_LEN]).unwrap(),
+            Trible::force_raw([second; TRIBLE_LEN]).unwrap(),
+        ]);
         let owner: Arc<dyn ArchiveOwner> = storage.clone();
         let hashes = [
-            crate::patch::hash_key(&storage.0[0]),
-            crate::patch::hash_key(&storage.0[1]),
+            crate::patch::hash_key(storage[0].as_raw()),
+            crate::patch::hash_key(storage[1].as_raw()),
         ];
-        // SAFETY: the wrapper and both 64-byte rows are 16-byte aligned, the
-        // keys are distinct, immutable, and retained by `owner` during build.
-        unsafe { TribleSet::from_archive_partition(&storage.0, &hashes, &owner) }
+        // SAFETY: the keys are distinct, immutable, and retained by `owner`
+        // during build.
+        unsafe { TribleSet::from_archive_partition(&storage[..], &hashes, &owner) }
     }
 
     #[test]

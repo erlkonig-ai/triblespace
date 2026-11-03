@@ -16,6 +16,8 @@ use crate::trible::Fragment;
 use crate::trible::RawTrible;
 use crate::trible::Trible;
 use crate::trible::TribleSet;
+#[cfg(feature = "parallel")]
+use crate::trible::TRIBLE_LEN;
 
 use anybytes::view::ViewError;
 use anybytes::Bytes;
@@ -301,6 +303,10 @@ impl TryFromBlob<SimpleArchive> for TribleSet {
 /// computed the bytes itself and only wants to query them should not pay a
 /// Blake3 pass to name a value it is about to consume; naming is what
 /// [`Blob::new`] is for, and it is a separate decision.
+///
+/// The bytes are validated as [`CanonicalTribles`], which fixes the errors:
+/// see there for the order of the checks. Bytes whose base is not 16-byte
+/// aligned are refused with [`UnarchiveError::BadArchive`].
 pub fn try_from_archive_bytes(bytes: Bytes) -> Result<TribleSet, UnarchiveError> {
     try_from_bytes_inner(bytes, /*archive_backed:*/ true)
 }
@@ -314,107 +320,47 @@ pub fn try_from_blob_heap_only(blob: Blob<SimpleArchive>) -> Result<TribleSet, U
 }
 
 fn try_from_bytes_inner(bytes: Bytes, archive_backed: bool) -> Result<TribleSet, UnarchiveError> {
-    let Ok(packed_tribles): Result<View<[[u8; 64]]>, _> = bytes.clone().view() else {
-        return Err(UnarchiveError::BadArchive);
-    };
-    let slice: &[[u8; 64]] = &packed_tribles;
-
-    // ArchiveEntry / LocalLeaf require the trible pointer to be
-    // 16-byte aligned (the low 4 bits encode `HeadTag::LocalLeaf`).
-    // Every 64-byte stride preserves alignment, so it's enough to
-    // check the slice base. Modern allocators (and mmap'd files)
-    // satisfy this; the heap-Leaf fallback handles the rare miss.
-    let owner: Option<Arc<dyn ArchiveOwner>> =
-        if archive_backed && (slice.as_ptr() as usize) & 0x0f == 0 {
-            Some(Arc::new(bytes.clone()))
-        } else {
-            None
-        };
-
     #[cfg(feature = "parallel")]
     {
-        if slice.len() >= PARALLEL_UNARCHIVE_THRESHOLD {
-            return parallel_unarchive(slice, owner);
+        if bytes.len() / TRIBLE_LEN >= PARALLEL_UNARCHIVE_THRESHOLD {
+            return parallel_unarchive(bytes, archive_backed);
         }
     }
 
-    serial_unarchive(slice, owner.as_ref())
+    serial_unarchive(bytes, archive_backed)
 }
 
-/// Serial fallback. Validates ordering + redundancy inline with
-/// insertion — every byte read once. When `owner` is `Some`, each
-/// trible is inserted as an `ArchiveEntry` (LocalLeaf-backed); when
-/// `None`, the heap-Leaf path is taken.
-fn serial_unarchive(
-    slice: &[[u8; 64]],
-    owner: Option<&Arc<dyn ArchiveOwner>>,
-) -> Result<TribleSet, UnarchiveError> {
+/// The archive allocation as the owner every `LocalLeaf` retains, when the
+/// decode is archive-backed.
+fn archive_owner(bytes: &Bytes, archive_backed: bool) -> Option<Arc<dyn ArchiveOwner>> {
+    archive_backed.then(|| Arc::new(bytes.clone()) as Arc<dyn ArchiveOwner>)
+}
+
+/// Insert one validated archive row: as an `ArchiveEntry` (LocalLeaf-backed)
+/// when `owner` is `Some`, as a heap `Leaf` otherwise.
+#[inline]
+fn insert_row(set: &mut TribleSet, trible: &Trible, owner: Option<&Arc<dyn ArchiveOwner>>) {
+    match owner {
+        Some(owner) => {
+            // SAFETY: `trible` lies in the immutable archive bytes that
+            // `owner` keeps alive, and a `&Trible` is 16-byte aligned by its
+            // type.
+            let entry = unsafe { ArchiveEntry::new(NonNull::from(trible.as_raw()), owner) };
+            set.insert_archive(&entry);
+        }
+        None => set.insert(trible),
+    }
+}
+
+/// Serial decode: the canonical check and the index inserts in one pass over
+/// the rows, after the zerocopy view has checked the row rule.
+fn serial_unarchive(bytes: Bytes, archive_backed: bool) -> Result<TribleSet, UnarchiveError> {
+    let owner = archive_owner(&bytes, archive_backed);
     let mut tribles = TribleSet::new();
-    let mut prev_trible: Option<&[u8; 64]> = None;
-    for t in slice.iter() {
-        let Some(trible) = Trible::as_transmute_force_raw(t) else {
-            return Err(UnarchiveError::BadTrible);
-        };
-        if let Some(prev) = prev_trible {
-            if prev == t {
-                return Err(UnarchiveError::BadCanonicalizationRedundancy);
-            }
-            if prev > t {
-                return Err(UnarchiveError::BadCanonicalizationOrdering);
-            }
-        }
-        prev_trible = Some(t);
-        match owner {
-            Some(owner_arc) => {
-                // SAFETY: `t` points into the archive bytes kept alive
-                // by `owner_arc`, and base-alignment + 64-byte stride
-                // guarantees this element is 16-byte aligned.
-                let ptr = NonNull::from(t);
-                let entry = unsafe { ArchiveEntry::new(ptr, owner_arc) };
-                tribles.insert_archive(&entry);
-            }
-            None => tribles.insert(trible),
-        }
-    }
+    CanonicalTribles::validate_with(bytes, |_, trible| {
+        insert_row(&mut tribles, trible, owner.as_ref())
+    })?;
     Ok(tribles)
-}
-
-#[cfg(test)]
-fn validate_and_hash_archive_slice(slice: &[[u8; 64]]) -> Result<Vec<u128>, UnarchiveError> {
-    let mut hashes = vec![0u128; slice.len()];
-    validate_and_hash_archive_into(slice, &mut hashes)?;
-    Ok(hashes)
-}
-
-/// Validate one run of archive rows and write their key hashes in place.
-///
-/// Writing into a caller-owned slice is what lets the parallel decoder hash
-/// the whole archive into one contiguous vector: each worker fills its own
-/// disjoint window, and the trie build that follows indexes rows by their
-/// absolute archive ordinal rather than by a per-chunk one.
-#[cfg(any(test, feature = "parallel"))]
-fn validate_and_hash_archive_into(
-    slice: &[[u8; 64]],
-    hashes: &mut [u128],
-) -> Result<(), UnarchiveError> {
-    debug_assert_eq!(slice.len(), hashes.len());
-    let mut previous: Option<&[u8; 64]> = None;
-    for (row, hash) in slice.iter().zip(hashes.iter_mut()) {
-        if Trible::as_transmute_force_raw(row).is_none() {
-            return Err(UnarchiveError::BadTrible);
-        }
-        if let Some(previous) = previous {
-            if previous == row {
-                return Err(UnarchiveError::BadCanonicalizationRedundancy);
-            }
-            if previous > row {
-                return Err(UnarchiveError::BadCanonicalizationOrdering);
-            }
-        }
-        previous = Some(row);
-        *hash = hash_key(&row[..]);
-    }
-    Ok(())
 }
 
 /// Whether every row of an archive this long has an ordinal the partition
@@ -435,76 +381,44 @@ fn archive_rows_fit_ordinals(rows: usize) -> bool {
 /// so every chunk boundary put the same keys in the same subtries and left the
 /// reduce to walk them again. One build per order visits each key once.
 #[cfg(feature = "parallel")]
-fn parallel_unarchive(
-    slice: &[[u8; 64]],
-    owner: Option<Arc<dyn ArchiveOwner>>,
-) -> Result<TribleSet, UnarchiveError> {
+fn parallel_unarchive(bytes: Bytes, archive_backed: bool) -> Result<TribleSet, UnarchiveError> {
     use rayon::prelude::*;
 
-    // Validation is a linear scan, so give each worker one contiguous run.
-    let n_threads = rayon::current_num_threads().max(1);
-    let scan_size = slice.len().div_ceil(n_threads).max(1);
-    // Row ordinals now index the whole archive, so the `u32` bound is on the
+    let owner = archive_owner(&bytes, archive_backed);
+    // Row ordinals index the whole archive, so the `u32` bound is on the
     // archive rather than on a chunk of it.
-    let bottom_up = owner.is_some() && archive_rows_fit_ordinals(slice.len());
-
-    // Phase 1: the seams between runs, checked before any worker looks
-    // inside one. This is a tiny O(runs) scan over already cache-hot run
-    // ends, and it keeps a straddling duplicate or inversion reported as
-    // such rather than as whatever a worker happens to meet first.
-    let runs: Vec<&[[u8; 64]]> = slice.chunks(scan_size).collect();
-    check_archive_run_boundaries(&runs)?;
+    let bottom_up = owner.is_some() && archive_rows_fit_ordinals(bytes.len() / TRIBLE_LEN);
 
     if !bottom_up {
-        // Unaligned input keeps the heap-Leaf worker; an archive too long to
-        // address with u32 ordinals keeps the established online worker. Both
-        // are per-run and still reduce through `TribleSet::union`.
-        let sets: Result<Vec<TribleSet>, UnarchiveError> = runs
-            .par_iter()
-            .map(|run| serial_unarchive(run, owner.as_ref()))
+        // The heap-Leaf decode, and an archive too long to address with u32
+        // ordinals, keep the established online worker: per run, reduced
+        // through `TribleSet::union`.
+        let (canonical, _) = CanonicalTribles::par_validate_map(bytes, |_| ())?;
+        let run_len = parallel_run_len(canonical.len());
+        let sets: Vec<TribleSet> = canonical
+            .as_tribles()
+            .par_chunks(run_len)
+            .map(|run| {
+                let mut set = TribleSet::new();
+                for trible in run {
+                    insert_row(&mut set, trible, owner.as_ref());
+                }
+                set
+            })
             .collect();
-        return Ok(sets?.into_par_iter().reduce(TribleSet::new, |a, b| a + b));
+        return Ok(sets.into_par_iter().reduce(TribleSet::new, |a, b| a + b));
     }
 
-    let owner = owner
-        .as_ref()
-        .expect("bottom-up eligibility requires an archive owner");
+    let owner = owner.expect("bottom-up eligibility requires an archive owner");
+    let (canonical, hashes) =
+        CanonicalTribles::par_validate_map(bytes, |trible| hash_key(&trible.as_raw()[..]))?;
 
-    // Phase 2: validate and hash every row, one contiguous run per worker.
-    // Each run proves its own interior ordering and phase 1 proved the seams;
-    // ordering is transitive, so the pair is exactly the whole-archive check
-    // the serial decoder performs.
-    let mut hashes = vec![0u128; slice.len()];
-    slice
-        .par_chunks(scan_size)
-        .zip(hashes.par_chunks_mut(scan_size))
-        .try_for_each(|(rows, out)| validate_and_hash_archive_into(rows, out))?;
-
-    // Phase 3: one bottom-up build per index order, over the whole archive.
-    // SAFETY: owner presence proves 16-byte base alignment (and 64-byte
-    // strides preserve it); phase 2 proves canonical, distinct tribles;
-    // `hashes` corresponds index-for-index to `slice`; and `bottom_up` proves
-    // every row ordinal fits u32.
-    Ok(unsafe { TribleSet::from_archive_partition(slice, &hashes, owner) })
-}
-
-/// Reject a duplicate or an inversion straddling two validated runs.
-///
-/// A per-run scan proves each run internally ordered; this proves the seams,
-/// and ordering is transitive, so the pair is exactly the whole-archive check.
-#[cfg(feature = "parallel")]
-fn check_archive_run_boundaries(runs: &[&[[u8; 64]]]) -> Result<(), UnarchiveError> {
-    for w in runs.windows(2) {
-        let last_a = w[0].last().expect("non-empty run");
-        let first_b = w[1].first().expect("non-empty run");
-        if last_a == first_b {
-            return Err(UnarchiveError::BadCanonicalizationRedundancy);
-        }
-        if last_a > first_b {
-            return Err(UnarchiveError::BadCanonicalizationOrdering);
-        }
-    }
-    Ok(())
+    // One bottom-up build per index order, over the whole archive.
+    // SAFETY: `canonical` proves well-formed, distinct rows (and `&[Trible]`
+    // their alignment); its rows lie in the bytes `owner` keeps alive and
+    // never mutates; `hashes` corresponds index-for-index to those rows; and
+    // `bottom_up` proves every row ordinal fits u32.
+    Ok(unsafe { TribleSet::from_archive_partition(canonical.as_tribles(), &hashes, &owner) })
 }
 
 #[cfg(test)]
@@ -564,29 +478,18 @@ mod tests {
     }
 
     fn serial_for_test(blob: Blob<SimpleArchive>) -> Result<TribleSet, UnarchiveError> {
-        let Ok(packed): Result<View<[[u8; 64]]>, _> = blob.bytes.clone().view() else {
-            return Err(UnarchiveError::BadArchive);
-        };
-        let slice: &[[u8; 64]] = &packed;
-        let owner: Option<Arc<dyn ArchiveOwner>> = ((slice.as_ptr() as usize) & 0x0f == 0)
-            .then(|| Arc::new(blob.bytes.clone()) as Arc<dyn ArchiveOwner>);
-        serial_unarchive(slice, owner.as_ref())
+        serial_unarchive(blob.bytes, /*archive_backed:*/ true)
     }
 
     fn bottom_up_for_test(blob: Blob<SimpleArchive>) -> Result<TribleSet, UnarchiveError> {
-        let Ok(packed): Result<View<[[u8; 64]]>, _> = blob.bytes.clone().view() else {
-            return Err(UnarchiveError::BadArchive);
-        };
-        let slice: &[[u8; 64]] = &packed;
-        assert!(
-            slice.is_empty() || slice.as_ptr() as usize & 0x0f == 0,
-            "bottom-up test archives must be aligned",
-        );
-        let hashes = validate_and_hash_archive_slice(slice)?;
+        let mut hashes = Vec::new();
+        let canonical = CanonicalTribles::validate_with(blob.bytes.clone(), |_, trible| {
+            hashes.push(hash_key(&trible.as_raw()[..]))
+        })?;
         let owner: Arc<dyn ArchiveOwner> = Arc::new(blob.bytes.clone());
-        // SAFETY: the test checks alignment; validation proves well-formed,
-        // canonical, distinct rows and produces the matching hash vector.
-        Ok(unsafe { TribleSet::from_archive_partition(slice, &hashes, &owner) })
+        // SAFETY: `canonical` proves well-formed, distinct, aligned rows in
+        // the bytes `owner` retains, and `hashes` was built from those rows.
+        Ok(unsafe { TribleSet::from_archive_partition(canonical.as_tribles(), &hashes, &owner) })
     }
 
     fn assert_index_parity<O: KeySchema<64>>(
@@ -903,13 +806,23 @@ mod tests {
                     .collect();
                 assert_public_error(invalid, UnarchiveError::BadTrible);
 
-                // Boundary errors are checked before worker validation.
+                // The row rule is checked over the whole archive before any
+                // ordering, so a nil row wins over an inversion at a seam.
+                // (The serial decoder already reported this input as
+                // BadTrible; the parallel one used to say Ordering.)
                 let mut invalid_and_descending = (0..len).map(fixture_row).collect::<Vec<_>>();
                 invalid_and_descending[0][..16].fill(0);
                 invalid_and_descending.swap(chunk_size - 1, chunk_size);
+                assert_public_error(invalid_and_descending, UnarchiveError::BadTrible);
+
+                // Among ordering errors, the seams are still checked first: a
+                // seam duplicate wins over an inversion inside the first run.
+                let mut inside_and_seam = (0..len).map(fixture_row).collect::<Vec<_>>();
+                inside_and_seam.swap(0, 1);
+                inside_and_seam[chunk_size] = inside_and_seam[chunk_size - 1];
                 assert_public_error(
-                    invalid_and_descending,
-                    UnarchiveError::BadCanonicalizationOrdering,
+                    inside_and_seam,
+                    UnarchiveError::BadCanonicalizationRedundancy,
                 );
 
                 let malformed = Blob::new(Bytes::from(vec![0u8; 63]));
