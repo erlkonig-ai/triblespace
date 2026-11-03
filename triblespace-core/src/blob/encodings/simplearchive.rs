@@ -54,11 +54,16 @@ impl MetaDescribe for SimpleArchive {
 /// The vector is 16-byte aligned by its element type, so the archive bytes
 /// built from it always satisfy the alignment that `ArchiveEntry` and a
 /// `[Trible]` view require. An empty set encodes as empty bytes.
-fn encode_rows(source: &TribleSet) -> Blob<SimpleArchive> {
+/// The rows of `source` in archive order, in a heap allocation that is
+/// 16-aligned by its type.
+fn ordered_rows(source: &TribleSet) -> Bytes {
     let mut tribles: Vec<Trible> = Vec::with_capacity(source.len());
     tribles.extend(source.iter_ordered().copied());
-    let bytes: Bytes = tribles.into();
-    Blob::new(bytes)
+    tribles.into()
+}
+
+fn encode_rows(source: &TribleSet) -> Blob<SimpleArchive> {
+    Blob::new(ordered_rows(source))
 }
 
 impl Encodes<TribleSet> for SimpleArchive
@@ -201,6 +206,27 @@ impl CanonicalTribles {
         check_increasing(rows, |_, _| {})?;
         // SAFETY: `check_increasing` just proved the rows strictly increasing.
         Ok(unsafe { Self::from_tribles_unchecked(rows) })
+    }
+
+    /// The rows of `set` as a canonical archive, without the ordering pass.
+    ///
+    /// A `TribleSet`'s EAV index iterates in key order, which is the rows'
+    /// byte order, and holds each row once, so its rows are strictly
+    /// increasing by construction (the trible goldens pin this). The rows
+    /// are copied once into aligned storage; zerocopy's row check still
+    /// runs, one read per row. Arbitrary bytes go through [`Self::validate`].
+    pub fn from_set(set: &TribleSet) -> View<Self> {
+        let rows = view_rows(ordered_rows(set))
+            .expect("a Vec<Trible> is aligned and holds only valid tribles");
+        debug_assert!(
+            check_increasing(&rows, |_: usize, _: &Trible| {}).is_ok(),
+            "TribleSet::iter_ordered must yield strictly increasing rows"
+        );
+        // SAFETY: the rows are `set`'s EAV index in key order, which is
+        // strictly increasing byte order with no repeats (see above).
+        let canonical = unsafe { Self::from_tribles_unchecked(&rows) };
+        rows.field_to_view(canonical)
+            .expect("the canonical rows are the bytes of the view")
     }
 
     /// Wraps `rows` without checking them. This is the only place a
@@ -734,6 +760,31 @@ mod tests {
             view.as_tribles(),
             &set.iter_ordered().copied().collect::<Vec<_>>()[..]
         );
+    }
+
+    /// `from_set` gives exactly the rows and bytes a checked decode of the
+    /// set's archive gives, for empty, single and large sets, and inserts in
+    /// any order.
+    #[test]
+    fn from_set_matches_the_checked_decode_of_its_archive() {
+        for len in [0usize, 1, 2, 257, PARALLEL_THRESHOLD_FOR_TESTS + 1] {
+            let set: TribleSet = (0..len)
+                .rev()
+                .map(|index| Trible::force_raw(fixture_row(index)).unwrap())
+                .fold(TribleSet::new(), |mut set, trible| {
+                    set.insert(&trible);
+                    set
+                });
+            let fast = CanonicalTribles::from_set(&set);
+            let blob: Blob<SimpleArchive> = (&set).to_blob();
+            let checked: View<CanonicalTribles> = blob.clone().try_from_blob().unwrap();
+            assert_eq!(fast.len(), set.len());
+            assert_eq!(fast.as_tribles(), checked.as_tribles());
+            assert_eq!(&fast.clone().bytes()[..], &blob.bytes[..]);
+            if len > 0 {
+                assert_eq!(fast.as_tribles().as_ptr() as usize % 16, 0);
+            }
+        }
     }
 
     /// The decode keeps the other errors exactly as the byte checks report
