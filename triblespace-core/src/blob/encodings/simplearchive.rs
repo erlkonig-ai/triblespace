@@ -24,6 +24,8 @@ use anybytes::Bytes;
 use anybytes::View;
 use std::ptr::NonNull;
 use std::sync::Arc;
+#[cfg(feature = "parallel")]
+use zerocopy::{IntoBytes, TryFromBytes};
 
 /// Canonical trible sequence stored as raw 64-byte entries.
 ///
@@ -180,14 +182,18 @@ impl CanonicalTribles {
         Ok(Self { rows })
     }
 
-    /// Validates `bytes` with the ordering pass split across the rayon pool,
-    /// and returns `map(trible)` for every row in archive order.
+    /// Validates `bytes` with the row rule and the ordering pass split across
+    /// the rayon pool, and returns `map(trible)` for every row in archive
+    /// order.
     ///
-    /// The rows are cut into one contiguous run per worker. The seams between
-    /// runs are checked before any run, so an ordering error that straddles
-    /// two runs is reported as such; each run then proves its own interior.
-    /// Ordering is transitive, so the two together are exactly the check
-    /// [`Self::validate`] performs, and the errors are the same kinds.
+    /// Size and alignment are checked once, up front. The rows are then cut
+    /// into one contiguous run per worker. The seams between runs are checked
+    /// before any run, so an ordering error that straddles two runs is
+    /// reported as such; each run then checks the row rule on its own rows
+    /// and proves its own interior ordering. Ordering is transitive, so
+    /// together this is exactly the check [`Self::validate`] performs, and
+    /// the errors are the same kinds in the same precedence: an ordering
+    /// error is reported only once no row anywhere breaks the row rule.
     #[cfg(feature = "parallel")]
     pub fn par_validate_map<T, F>(bytes: Bytes, map: F) -> Result<(Self, Vec<T>), UnarchiveError>
     where
@@ -196,25 +202,41 @@ impl CanonicalTribles {
     {
         use rayon::prelude::*;
 
-        let rows = view_rows(bytes)?;
+        let rows = view_aligned_rows(bytes)?;
         let run_len = parallel_run_len(rows.len());
-        for seam in rows.chunks(run_len).collect::<Vec<_>>().windows(2) {
-            let last = seam[0].last().expect("non-empty run").as_raw();
-            let first = seam[1].first().expect("non-empty run").as_raw();
-            if last == first {
-                return Err(UnarchiveError::BadCanonicalizationRedundancy);
+        let runs = check_seams(&rows, run_len).and_then(|()| {
+            let mut mapped = vec![T::default(); rows.len()];
+            rows.par_chunks(run_len)
+                .zip(mapped.par_chunks_mut(run_len))
+                .try_for_each(|(run, out)| {
+                    check_increasing(row_rule(run)?, |index, trible| out[index] = map(trible))
+                })
+                .map(|()| mapped)
+        });
+        let mapped = match runs {
+            Ok(mapped) => mapped,
+            Err(UnarchiveError::BadTrible) => return Err(UnarchiveError::BadTrible),
+            // A seam error skips the runs and a failing run stops the
+            // others, so an ordering error has not seen every row. The row
+            // rule takes precedence, so it is checked over the rest before
+            // the ordering error is reported. This is the error path only.
+            Err(ordering) => {
+                rows.par_chunks(run_len)
+                    .try_for_each(|run| row_rule(run).map(|_| ()))?;
+                return Err(ordering);
             }
-            if last > first {
-                return Err(UnarchiveError::BadCanonicalizationOrdering);
-            }
-        }
+        };
 
-        let mut mapped = vec![T::default(); rows.len()];
-        rows.par_chunks(run_len)
-            .zip(mapped.par_chunks_mut(run_len))
-            .try_for_each(|(run, out)| {
-                check_increasing(run, |index, trible| out[index] = map(trible))
-            })?;
+        // SAFETY: `AlignedRow` and `Trible` have the same size and alignment
+        // (asserted at compile time), and every row has passed `row_rule`,
+        // zerocopy's validity check for `Trible`: the runs were all checked
+        // to completion and together cover `rows`.
+        let tribles: &[Trible] =
+            unsafe { std::slice::from_raw_parts(rows.as_ptr().cast::<Trible>(), rows.len()) };
+        debug_assert!(<[Trible]>::try_ref_from_bytes(tribles.as_bytes()).is_ok());
+        let rows = rows
+            .field_to_view(tribles)
+            .expect("the tribles are the bytes of the aligned rows");
         Ok((Self { rows }, mapped))
     }
 
@@ -255,6 +277,59 @@ pub(crate) fn view_rows(bytes: Bytes) -> Result<View<[Trible]>, UnarchiveError> 
         ViewError::Alignment(_) | ViewError::Size(_) => UnarchiveError::BadArchive,
         ViewError::Validity(_) => UnarchiveError::BadTrible,
     })
+}
+
+/// A canonical archive row before the row rule is checked: the 64 bytes of a
+/// [`Trible`] at its alignment, with no validity of its own, so a view of
+/// these checks size and alignment only.
+#[cfg(feature = "parallel")]
+#[derive(zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable, zerocopy::IntoBytes)]
+#[repr(C, align(16))]
+struct AlignedRow(RawTrible);
+
+#[cfg(feature = "parallel")]
+const _: () = {
+    assert!(std::mem::size_of::<AlignedRow>() == std::mem::size_of::<Trible>());
+    assert!(std::mem::align_of::<AlignedRow>() == std::mem::align_of::<Trible>());
+};
+
+/// The first check of [`CanonicalTribles`] alone: size and alignment, with
+/// the same empty exemption as [`view_rows`].
+#[cfg(feature = "parallel")]
+fn view_aligned_rows(bytes: Bytes) -> Result<View<[AlignedRow]>, UnarchiveError> {
+    let bytes = if bytes.is_empty() {
+        Bytes::from(Vec::<Trible>::new())
+    } else {
+        bytes
+    };
+    bytes.view().map_err(|err| match err {
+        ViewError::Alignment(_) | ViewError::Size(_) => UnarchiveError::BadArchive,
+        ViewError::Validity(_) => unreachable!("AlignedRow has no invalid bit patterns"),
+    })
+}
+
+/// The row rule on one run of aligned rows, which yields them as tribles.
+#[cfg(feature = "parallel")]
+#[inline]
+fn row_rule(run: &[AlignedRow]) -> Result<&[Trible], UnarchiveError> {
+    <[Trible]>::try_ref_from_bytes(run.as_bytes()).map_err(|_| UnarchiveError::BadTrible)
+}
+
+/// The ordering check across the seams between consecutive runs of
+/// `run_len` rows.
+#[cfg(feature = "parallel")]
+fn check_seams(rows: &[AlignedRow], run_len: usize) -> Result<(), UnarchiveError> {
+    for seam in rows.chunks(run_len).collect::<Vec<_>>().windows(2) {
+        let last = &seam[0].last().expect("non-empty run").0;
+        let first = &seam[1].first().expect("non-empty run").0;
+        if last == first {
+            return Err(UnarchiveError::BadCanonicalizationRedundancy);
+        }
+        if last > first {
+            return Err(UnarchiveError::BadCanonicalizationOrdering);
+        }
+    }
+    Ok(())
 }
 
 /// One pass proving `rows` strictly increasing in byte order, calling `visit`
@@ -1052,5 +1127,92 @@ mod tests {
                     );
                 }
             });
+    }
+
+    /// The parallel path checks the row rule inside each run, so a nil row
+    /// that only a later run sees must still be reported, and must still win
+    /// over an ordering error that an earlier run or a seam meets first.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn canonical_tribles_parallel_reports_a_nil_row_in_a_later_run_as_bad_trible() {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap()
+            .install(|| {
+                let len = PARALLEL_UNARCHIVE_THRESHOLD;
+                let run_len = parallel_run_len(len);
+                assert!(2 * run_len + 1 < len, "three runs");
+                let canonical = || (0..len).map(fixture_row).collect::<Vec<_>>();
+
+                let mut nil_in_second_run = canonical();
+                nil_in_second_run[run_len + 1][..16].fill(0);
+
+                let mut nil_later_descending_first = canonical();
+                nil_later_descending_first.swap(1, 2);
+                nil_later_descending_first[run_len + 1][..16].fill(0);
+
+                let mut nil_later_duplicate_first = canonical();
+                nil_later_duplicate_first[1] = nil_later_duplicate_first[0];
+                nil_later_duplicate_first[2 * run_len + 1][16..32].fill(0);
+
+                let mut nil_later_seam_duplicate = canonical();
+                nil_later_seam_duplicate[run_len] = nil_later_seam_duplicate[run_len - 1];
+                nil_later_seam_duplicate[2 * run_len + 1][16..32].fill(0);
+
+                for rows in [
+                    nil_in_second_run,
+                    nil_later_descending_first,
+                    nil_later_duplicate_first,
+                    nil_later_seam_duplicate,
+                ] {
+                    let bytes = Bytes::from(rows);
+                    assert_eq!(
+                        CanonicalTribles::validate(bytes.clone()).unwrap_err(),
+                        UnarchiveError::BadTrible,
+                    );
+                    assert_eq!(
+                        CanonicalTribles::par_validate_map(bytes.clone(), |_| ()).unwrap_err(),
+                        UnarchiveError::BadTrible,
+                    );
+                    assert_eq!(
+                        try_from_archive_bytes(bytes.clone()).unwrap_err(),
+                        UnarchiveError::BadTrible,
+                    );
+                    assert_eq!(
+                        try_from_blob_heap_only(Blob::new(bytes)).unwrap_err(),
+                        UnarchiveError::BadTrible,
+                    );
+                }
+            });
+    }
+
+    /// Size and alignment are checked once, before the runs, on the parallel
+    /// path too: they win over a nil row, and empty input is canonical at any
+    /// address.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn canonical_tribles_parallel_keeps_archive_errors_and_the_empty_exemption() {
+        let backing = Bytes::from(vec![fixture_row(0)]);
+        for offset in 0..=3 {
+            let (canonical, mapped) =
+                CanonicalTribles::par_validate_map(backing.slice(offset..offset), |_| 1u8).unwrap();
+            assert!(canonical.is_empty());
+            assert!(mapped.is_empty());
+        }
+
+        let mut rows: Vec<[u8; 64]> = (0..5).map(fixture_row).collect();
+        rows[3][..16].fill(0);
+        let misaligned = misaligned_copy(rows.as_flattened());
+        assert_eq!(
+            CanonicalTribles::par_validate_map(misaligned, |_| ()).unwrap_err(),
+            UnarchiveError::BadArchive,
+        );
+        let mut partial = Bytes::from(rows);
+        assert!(partial.take_suffix(1).is_some());
+        assert_eq!(
+            CanonicalTribles::par_validate_map(partial, |_| ()).unwrap_err(),
+            UnarchiveError::BadArchive,
+        );
     }
 }
