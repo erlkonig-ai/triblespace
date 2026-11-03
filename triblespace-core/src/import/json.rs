@@ -56,6 +56,20 @@ pub enum JsonImportError {
     },
     /// The JSON input is syntactically invalid.
     Syntax(String),
+    /// A `\uXXXX` escape names a UTF-16 surrogate that is not half of a
+    /// high/low pair. Such a string is valid JSON but has no UTF-8
+    /// representation, so the importer refuses the document instead of
+    /// substituting U+FFFD or inventing an encoding.
+    LoneSurrogate {
+        /// The unpaired UTF-16 code unit, `0xD800..=0xDFFF`.
+        code_unit: u16,
+    },
+    /// Arrays and objects nest deeper than the importer's configured limit.
+    DepthExceeded {
+        /// The limit that was exceeded (the number of enclosing containers
+        /// a value may have).
+        max_depth: usize,
+    },
 }
 
 impl fmt::Display for JsonImportError {
@@ -69,6 +83,13 @@ impl fmt::Display for JsonImportError {
                 write!(f, "failed to encode number field {field:?}: {source}")
             }
             Self::Syntax(msg) => write!(f, "failed to parse JSON: {msg}"),
+            Self::LoneSurrogate { code_unit } => write!(
+                f,
+                "unpaired UTF-16 surrogate \\u{code_unit:04X} has no UTF-8 representation"
+            ),
+            Self::DepthExceeded { max_depth } => {
+                write!(f, "JSON nests deeper than the limit of {max_depth}")
+            }
         }
     }
 }
@@ -76,7 +97,10 @@ impl fmt::Display for JsonImportError {
 impl std::error::Error for JsonImportError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::PrimitiveRoot | Self::Syntax(_) => None,
+            Self::PrimitiveRoot
+            | Self::Syntax(_)
+            | Self::LoneSurrogate { .. }
+            | Self::DepthExceeded { .. } => None,
             Self::EncodeString { source, .. } | Self::EncodeNumber { source, .. } => {
                 Some(source.as_error())
             }
@@ -777,5 +801,27 @@ mod tests {
         drop(importer);
         let text = read_text(&mut blobs, handle);
         assert_eq!(text, "smile: \u{263A}");
+    }
+
+    #[test]
+    fn object_importer_shares_the_strict_string_and_number_rules() {
+        let input = r#"{ "text": "\ud83d\ude00" }"#;
+        let mut blobs = MemoryBlobStore::new();
+        let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
+        let fragment = importer.import_blob(input.to_blob()).unwrap();
+        let handle = extract_handle_raw(fragment.facts(), "text");
+        drop(importer);
+        assert_eq!(read_text(&mut blobs, handle), "\u{1F600}");
+
+        let mut blobs = MemoryBlobStore::new();
+        let mut importer = JsonObjectImporter::<_>::new(&mut blobs, None);
+        assert!(matches!(
+            importer.import_str(r#"{ "text": "\ude00" }"#),
+            Err(JsonImportError::LoneSurrogate { code_unit: 0xDE00 })
+        ));
+        assert!(matches!(
+            importer.import_str(r#"{ "n": 1-2 }"#),
+            Err(JsonImportError::Syntax(_))
+        ));
     }
 }

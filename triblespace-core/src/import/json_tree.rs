@@ -141,7 +141,12 @@ where
 {
     store: &'a mut Store,
     id_salt: Option<[u8; 32]>,
+    max_depth: usize,
 }
+
+/// Default nesting limit of [`JsonTreeImporter`]: a value may sit inside at
+/// most this many arrays/objects.
+pub const DEFAULT_MAX_DEPTH: usize = 128;
 
 impl<'a, Store> JsonTreeImporter<'a, Store>
 where
@@ -150,7 +155,17 @@ where
     /// Creates a new lossless importer backed by `store`. Pass an optional
     /// 32-byte salt to namespace the content-addressed entity ids.
     pub fn new(store: &'a mut Store, id_salt: Option<[u8; 32]>) -> Self {
-        Self { store, id_salt }
+        Self {
+            store,
+            id_salt,
+            max_depth: DEFAULT_MAX_DEPTH,
+        }
+    }
+
+    /// Sets how many arrays/objects a value may be nested inside.
+    pub fn with_max_depth(mut self, max_depth: usize) -> Self {
+        self.max_depth = max_depth;
+        self
     }
 
     /// Imports a JSON string. Convenience wrapper around [`import_blob`](Self::import_blob).
@@ -500,13 +515,17 @@ mod tests {
 
     use super::{kind_array_entry, JsonTreeImporter};
     use crate::blob::encodings::utf8string::UTF8String;
+    use crate::blob::BlobEncoding;
     use crate::blob::IntoBlob;
     use crate::blob::MemoryBlobStore;
+    use crate::blob::MemoryBlobStoreSnapshot;
     use crate::id::Id;
+    use crate::import::json::JsonImportError;
     use crate::inline::encodings::hash::Handle;
-    use crate::inline::Inline;
+    use crate::inline::{Inline, InlineEncoding, RawInline};
     use crate::macros::{find, pattern};
-    use crate::repo::{BlobStoreGet, SnapshotSource};
+    use crate::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
+    use crate::trible::Fragment;
 
     #[test]
     fn lossless_ids_are_content_based() {
@@ -592,5 +611,393 @@ mod tests {
             .expect("field-name bytes resolve from the returned fragment");
         assert_eq!(&*value, "value");
         assert_eq!(&*field, "field");
+    }
+    fn import(doc: &str) -> Result<Fragment, JsonImportError> {
+        let mut blobs = MemoryBlobStore::new();
+        JsonTreeImporter::<_>::new(&mut blobs, None).import_str(doc)
+    }
+
+    fn read_blob(fragment: &Fragment, handle: Inline<Handle<UTF8String>>) -> String {
+        let reader = fragment.blobs().clone().snapshot().unwrap();
+        let text: View<str> = reader.get(handle).expect("blob resolves from fragment");
+        text.as_ref().to_owned()
+    }
+
+    /// Decoded text of every string node in the fragment, sorted.
+    fn string_values(fragment: &Fragment) -> Vec<String> {
+        let mut out = find!(
+            (handle: Inline<Handle<UTF8String>>),
+            pattern!(fragment.facts(), [{ _?node @
+                super::kind: super::kind_string,
+                super::string: ?handle,
+            }])
+        )
+        .map(|(handle,)| read_blob(fragment, handle))
+        .collect::<Vec<_>>();
+        out.sort();
+        out
+    }
+
+    /// Raw token of every number node in the fragment, sorted.
+    fn number_tokens(fragment: &Fragment) -> Vec<String> {
+        let mut out = find!(
+            (handle: Inline<Handle<UTF8String>>),
+            pattern!(fragment.facts(), [{ _?node @
+                super::kind: super::kind_number,
+                super::number_raw: ?handle,
+            }])
+        )
+        .map(|(handle,)| read_blob(fragment, handle))
+        .collect::<Vec<_>>();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn surrogate_pair_escape_decodes_to_one_scalar() {
+        for (doc, expected) in [
+            (r#""\ud83d\ude00""#, "\u{1F600}"),
+            (r#""\uD83D\uDE00""#, "\u{1F600}"),
+            (r#""a\ud83d\ude00b""#, "a\u{1F600}b"),
+            (r#""\udbff\udfff""#, "\u{10FFFF}"),
+        ] {
+            let fragment = import(doc).unwrap_or_else(|e| panic!("{doc}: {e}"));
+            assert_eq!(string_values(&fragment), vec![expected.to_owned()], "{doc}");
+        }
+        // Field names go through the same decoder.
+        let fragment = import(r#"{"\ud83d\ude00": 1}"#).unwrap();
+        let name = find!(
+            (handle: Inline<Handle<UTF8String>>),
+            pattern!(fragment.facts(), [{ _?entry @ super::field_name: ?handle }])
+        )
+        .map(|(handle,)| read_blob(&fragment, handle))
+        .next()
+        .expect("field entry");
+        assert_eq!(name, "\u{1F600}");
+    }
+
+    #[test]
+    fn lone_surrogate_is_refused_with_its_code_unit() {
+        for (doc, unit) in [
+            (r#""\ud83d""#, 0xD83D),
+            (r#""\ude00""#, 0xDE00),
+            (r#""\ud83d x""#, 0xD83D),
+            (r#""\ud83d\n""#, 0xD83D),
+            (r#""\ud83d\u0041""#, 0xD83D),
+            (r#""\ud83d\ud83d""#, 0xD83D),
+            (r#""\ude00\ud83d""#, 0xDE00),
+            (r#"{"\udfff": 1}"#, 0xDFFF),
+            (r#"["ok", "\udbff"]"#, 0xDBFF),
+        ] {
+            match import(doc) {
+                Err(JsonImportError::LoneSurrogate { code_unit }) => {
+                    assert_eq!(code_unit, unit, "{doc}")
+                }
+                other => panic!("{doc}: expected LoneSurrogate, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn number_grammar_rejects_non_json_forms() {
+        for bad in [
+            "1-2", "01", "-01", "1.", ".5", "1e", "1E+", "+1", "-", "1e2e3", "1.2.3",
+        ] {
+            for doc in [
+                bad.to_owned(),
+                format!("[{bad}]"),
+                format!("{{\"n\": {bad}}}"),
+            ] {
+                match import(&doc) {
+                    Err(JsonImportError::Syntax(_)) => {}
+                    other => panic!("{doc}: expected a syntax error, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn number_grammar_accepts_json_forms_with_exact_raw_tokens() {
+        for good in [
+            "0",
+            "-0",
+            "1.5e-3",
+            "1E+2",
+            "10",
+            "-1",
+            "0.25",
+            "1e10",
+            "123456789012345678901234567890",
+        ] {
+            for doc in [
+                good.to_owned(),
+                format!("[ {good} ]"),
+                format!("{{\"n\":{good}}}"),
+            ] {
+                let fragment = import(&doc).unwrap_or_else(|e| panic!("{doc}: {e}"));
+                assert_eq!(number_tokens(&fragment), vec![good.to_owned()], "{doc}");
+            }
+        }
+    }
+
+    /// Wraps a `MemoryBlobStore` and records every `put`.
+    #[derive(Default)]
+    struct CountingStore {
+        inner: MemoryBlobStore,
+        puts: Vec<RawInline>,
+    }
+
+    impl BlobStorePut for CountingStore {
+        type PutError = std::convert::Infallible;
+
+        fn put<S, T>(&mut self, item: T) -> Result<Inline<Handle<S>>, Self::PutError>
+        where
+            S: BlobEncoding + 'static,
+            T: IntoBlob<S>,
+            Handle<S>: InlineEncoding,
+        {
+            let blob = item.to_blob();
+            let handle = blob.get_handle();
+            self.puts.push(handle.raw);
+            self.inner.insert(blob);
+            Ok(handle)
+        }
+    }
+
+    impl SnapshotSource for CountingStore {
+        type Snapshot = MemoryBlobStoreSnapshot;
+        type SnapshotError = std::convert::Infallible;
+
+        fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+            self.inner.snapshot()
+        }
+    }
+
+    #[test]
+    fn each_distinct_blob_is_put_once_and_readable_from_both_sides() {
+        // Distinct UTF-8 blobs: "k", "v", "1" (the number 1 and the string
+        // "1" have the same bytes, hence the same blob).
+        let doc = r#"[{"k":"v"},{"k":"v"},{"v":"k"}, 1, 1, "1", {"1": 1}]"#;
+        let mut store = CountingStore::default();
+        let fragment = JsonTreeImporter::<_>::new(&mut store, None)
+            .import_str(doc)
+            .unwrap();
+
+        let mut distinct = store.puts.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 3, "three distinct blobs");
+        assert_eq!(store.puts.len(), 3, "one put per distinct blob");
+
+        let facts = fragment.facts();
+        let mut handles = Vec::new();
+        handles.extend(find!(
+            (handle: Inline<Handle<UTF8String>>),
+            pattern!(facts, [{ _?n @ super::string: ?handle }])
+        ));
+        handles.extend(find!(
+            (handle: Inline<Handle<UTF8String>>),
+            pattern!(facts, [{ _?n @ super::number_raw: ?handle }])
+        ));
+        handles.extend(find!(
+            (handle: Inline<Handle<UTF8String>>),
+            pattern!(facts, [{ _?n @ super::field_name: ?handle }])
+        ));
+        assert!(!handles.is_empty());
+        let external = store.snapshot().unwrap();
+        let local = fragment.blobs().clone().snapshot().unwrap();
+        for (handle,) in handles {
+            let a: View<str> = external.get(handle).expect("readable from the store");
+            let b: View<str> = local.get(handle).expect("readable from the fragment");
+            assert_eq!(a.as_ref(), b.as_ref());
+        }
+    }
+
+    fn nested_arrays(depth: usize) -> String {
+        format!("{}{}", "[".repeat(depth), "]".repeat(depth))
+    }
+
+    fn nested_objects(depth: usize) -> String {
+        format!("{}1{}", r#"{"a":"#.repeat(depth), "}".repeat(depth))
+    }
+
+    fn expect_depth_exceeded(result: Result<Fragment, JsonImportError>, max: usize) {
+        match result {
+            Err(JsonImportError::DepthExceeded { max_depth }) => assert_eq!(max_depth, max),
+            other => panic!("expected DepthExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_depth_limit_is_128() {
+        assert_eq!(super::DEFAULT_MAX_DEPTH, 128);
+        import(&nested_arrays(128)).expect("depth 128 is accepted");
+        import(&nested_objects(128)).expect("depth 128 is accepted");
+        expect_depth_exceeded(import(&nested_arrays(129)), 128);
+        expect_depth_exceeded(import(&nested_objects(129)), 128);
+        // Mixed nesting counts both kinds of container.
+        let mixed = format!("{}{}", r#"[{"a":"#.repeat(65), "}]".repeat(65));
+        expect_depth_exceeded(import(&mixed), 128);
+    }
+
+    #[test]
+    fn depth_limit_is_configurable() {
+        let mut blobs = MemoryBlobStore::new();
+        let mut importer = JsonTreeImporter::<_>::new(&mut blobs, None).with_max_depth(2);
+        importer.import_str("[[1]]").expect("depth 2 accepted");
+        importer.import_str("1").expect("scalars have depth 0");
+        expect_depth_exceeded(importer.import_str("[[[1]]]"), 2);
+        expect_depth_exceeded(importer.import_str(r#"[{"a":[]}]"#), 2);
+
+        let mut importer = JsonTreeImporter::<_>::new(&mut blobs, None).with_max_depth(0);
+        importer
+            .import_str("\"x\"")
+            .expect("scalar root at depth 0");
+        expect_depth_exceeded(importer.import_str("[]"), 0);
+    }
+
+    #[test]
+    fn hundred_thousand_deep_array_does_not_overflow_the_stack() {
+        let depth = 100_000;
+        let doc = nested_arrays(depth);
+        // Refused at the default limit ...
+        expect_depth_exceeded(import(&doc), super::DEFAULT_MAX_DEPTH);
+        // ... and imported without recursion when the limit allows it.
+        let mut blobs = MemoryBlobStore::new();
+        let fragment = JsonTreeImporter::<_>::new(&mut blobs, None)
+            .with_max_depth(usize::MAX)
+            .import_str(&doc)
+            .expect("deep input imports");
+        let arrays = find!(
+            (node: Id),
+            pattern!(fragment.facts(), [{ ?node @ super::kind: super::kind_array }])
+        )
+        .count();
+        assert_eq!(arrays, depth);
+    }
+
+    /// Root id, BLAKE3 of the ordered facts, and fact count, recorded from
+    /// the importer at triblespace e77f8e67 with `id_salt = None`. Archive
+    /// identity depends on these never changing.
+    const GOLDEN: &[(&str, &str, &str, usize)] = &[
+        (
+            "null",
+            "2B4A4BD434B35C7CF395E7F13BEF4ED8",
+            "dbfeb85f3f1bf4657c71688e12ebd876df5b20077fb6356595e67dd1d92e68de",
+            1,
+        ),
+        (
+            "true",
+            "F6D597C71DC6B8E1A5EEFA183CBA0D78",
+            "ec4d98d2a6567b61cf66a86e64d6451fb983ec36bc931b909413d542bdec174d",
+            2,
+        ),
+        (
+            "false",
+            "16D8F8627E78352FC098A82D781500A1",
+            "c9b4656a8cd9b0a559d9f9f8392a5110189b65149a4696fcc129bb1c224f80c4",
+            2,
+        ),
+        (
+            r#""""#,
+            "B44093D9D4DFDB4A09206FED65D07C38",
+            "bad450cfd69d604a33ad2db5ae44e9321a8b3edf2e7992f73ce577a864d6e6dd",
+            2,
+        ),
+        (
+            r#""plain""#,
+            "03793CB3DEFC8BD11AD69124D2D9982F",
+            "933ccc7d4f4fbf9116c4ea4be3a49cf27270a8c0d75536c763d0b2381fc35865",
+            2,
+        ),
+        (
+            r#""esc \"q\" \\ \/ \b\f\n\r\t \u00e9 \u263A""#,
+            "F1472074009CE28D1DB1BF1AF20AE15D",
+            "f8f7b0be7cac98c8fed5e2ddae77912641da950329640a5af6fcc98d85549f78",
+            2,
+        ),
+        (
+            "0",
+            "2AD585590B310BEB5989EB32BF1A1874",
+            "820997c35cb64b0b39707ac238ff703ac78f8dfbd2b5e53b7d5038dd4cc0376e",
+            2,
+        ),
+        (
+            "-0",
+            "F4A45AFCF860A8E646726A81D5E4DB65",
+            "d25b0abbde70602846258ee15b5dde3a553bb20e15a4f5a9d94ceb7e0fdb8748",
+            2,
+        ),
+        (
+            "1.5e-3",
+            "F1FABE97CED50597F6001E8AA50EEB87",
+            "30af8c8d55a5026f3e4b723fe311f01a6d8aa8811bf624dc5ed5e090015ae324",
+            2,
+        ),
+        (
+            "1E+2",
+            "1F5FFBAE87BB32A7DD9F6B16A0C01395",
+            "482980e494da52e21899e880b0b1d1aa47bdcfbc42deb9a5d590d2df1211f401",
+            2,
+        ),
+        (
+            "[]",
+            "F3809F15292703583DA3CD42A3A316A2",
+            "de1221098fe4b3fdc10cec1a94a069ae7243241915d4da9e922e897c9993a161",
+            1,
+        ),
+        (
+            "{}",
+            "2F5563B933F5852111DDA9ADDFB38F8F",
+            "678e8ac742b64e83bf1d80b0ec55318b8b4656ba634ebf2e4d4091fe1f026a0d",
+            1,
+        ),
+        (
+            r#"[1, 1, "1", [true, null]]"#,
+            "7599CCC3AAE53A3AAAB72FC7221F0CEF",
+            "d6787b18b7d0a16720151af5daa1e613cd9ce8da8535f910a9f43a3a88d1a8d6",
+            33,
+        ),
+        (
+            r#"{"a": [1, 2, {"b": null}], "c": "\u00e9", "": {}}"#,
+            "0F9C4626E50FA6772864FF447B9E7655",
+            "c9fd3d64e8a9a97278059226fef246df3b64ae946375cc0a39d1368a2c429de8",
+            43,
+        ),
+        (
+            r#"{"k": 1, "k": 2, "j": "k"}"#,
+            "D4BA1587A68D409D378B9BD1D2748A18",
+            "0db516a3bb746434833096d56c3fcb9c760e0a25a4027ebe9f2f6758c634e5e2",
+            22,
+        ),
+    ];
+
+    #[test]
+    fn unsalted_ids_match_recorded_golden_values() {
+        for &(doc, root_hex, facts_hex, facts_len) in GOLDEN {
+            let fragment = import(doc).unwrap_or_else(|e| panic!("{doc}: {e}"));
+            let root = fragment.root().expect("rooted");
+            let mut hasher = blake3::Hasher::new();
+            for trible in fragment.facts().iter_ordered() {
+                hasher.update(&trible.data);
+            }
+            assert_eq!(format!("{root:X}"), root_hex, "root of {doc}");
+            assert_eq!(
+                hasher.finalize().to_hex().as_str(),
+                facts_hex,
+                "facts of {doc}"
+            );
+            assert_eq!(fragment.facts().len(), facts_len, "fact count of {doc}");
+        }
+    }
+
+    #[test]
+    fn a_salt_changes_ids() {
+        let mut blobs = MemoryBlobStore::new();
+        let salted = JsonTreeImporter::<_>::new(&mut blobs, Some([7u8; 32]))
+            .import_str("[1]")
+            .unwrap();
+        let plain = import("[1]").unwrap();
+        assert_ne!(salted.root(), plain.root());
     }
 }
