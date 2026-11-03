@@ -104,10 +104,10 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 
 use hex::ToHex;
+use zerocopy::FromBytes;
 use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 use zerocopy::KnownLayout;
-use zerocopy::TryFromBytes;
 use zerocopy::Unaligned;
 
 /// The length of a value in bytes.
@@ -132,7 +132,10 @@ pub type RawInline = [u8; INLINE_LEN];
 /// let ratio2: Ratio<i128> = value.try_from_inline().unwrap();
 /// assert_eq!(ratio, ratio2);
 /// ```
-#[derive(TryFromBytes, IntoBytes, Unaligned, Immutable, KnownLayout)]
+// Every 32-byte pattern is an `Inline` (schema validity is checked separately
+// by `validate`), so it is `FromBytes`, which also derives `TryFromBytes` and
+// `FromZeros`.
+#[derive(FromBytes, IntoBytes, Unaligned, Immutable, KnownLayout)]
 #[repr(transparent)]
 pub struct Inline<T: InlineEncoding> {
     /// The 32-byte representation of this value.
@@ -192,7 +195,7 @@ impl<S: InlineEncoding> Inline<S> {
     where
         O: InlineEncoding,
     {
-        unsafe { std::mem::transmute(self) }
+        zerocopy::transmute_ref!(self)
     }
 
     /// Transmute a raw value reference to a value reference.
@@ -212,7 +215,7 @@ impl<S: InlineEncoding> Inline<S> {
     /// assert_eq!(&value, value_ref2);
     /// ```
     pub fn as_transmute_raw(value: &RawInline) -> &Self {
-        unsafe { std::mem::transmute(value) }
+        zerocopy::transmute_ref!(value)
     }
 
     /// Deserialize a value with an abstract schema type to a concrete Rust type.
