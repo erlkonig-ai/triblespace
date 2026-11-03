@@ -18,7 +18,7 @@ im = "15.1.0"
 memmap2 = "0.9.5"
 json-event-parser = "0.2.2"
 winnow = "0.7.13"
-zerocopy = { version = "0.8", features = ["derive"] }
+zerocopy = { version = "0.8.63", features = ["derive"] }
 anybytes = { version = "0.20.3", features = ["bytes", "zerocopy", "winnow", "mmap"], path = "../../anybytes" }
 rand = "0.8"
 ux = "0.1.5"

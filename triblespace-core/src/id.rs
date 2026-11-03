@@ -22,6 +22,11 @@ use std::num::NonZero;
 use std::ops::Deref;
 
 use hex::FromHex;
+use zerocopy::Immutable;
+use zerocopy::IntoBytes;
+use zerocopy::KnownLayout;
+use zerocopy::TryFromBytes;
+use zerocopy::Unaligned;
 
 /// Re-export of [`fucid::fucid`].
 pub use fucid::fucid;
@@ -75,7 +80,10 @@ pub(crate) fn id_from_value(id: &RawInline) -> Option<RawId> {
 /// `Option<Id>` benefits from Option nieche optimizations.
 ///
 /// Note that it has an alignment of 1, and can be referenced as a `[u8; 16]` [RawId].
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+/// Its validity (not all zero) is checked by zerocopy's [`TryFromBytes`].
+#[derive(
+    Copy, Clone, Debug, PartialEq, Eq, TryFromBytes, KnownLayout, Immutable, IntoBytes, Unaligned,
+)]
 #[repr(C, packed(1))]
 pub struct Id {
     inner: NonZero<u128>,
@@ -84,7 +92,11 @@ pub struct Id {
 impl Id {
     /// Creates a new [`Id`] from a [RawId] 16 byte array.
     pub const fn new(id: RawId) -> Option<Self> {
-        unsafe { std::mem::transmute::<RawId, Option<Id>>(id) }
+        // Native-endian, so the 16 bytes keep their order in memory.
+        match NonZero::new(u128::from_ne_bytes(id)) {
+            Some(inner) => Some(Id { inner }),
+            None => None,
+        }
     }
 
     /// Parses a hexadecimal identifier string into an [`Id`].
@@ -102,17 +114,18 @@ impl Id {
     ///
     /// The caller must ensure that `id` is not the nil value of all zero bytes.
     pub const unsafe fn force(id: RawId) -> Self {
-        std::mem::transmute::<RawId, Id>(id)
+        Id {
+            // SAFETY: the caller guarantees that `id` is not all zero.
+            inner: unsafe { NonZero::new_unchecked(u128::from_ne_bytes(id)) },
+        }
     }
 
     /// Transmutes a reference to a [RawId] into a reference to an [`Id`].
     /// Returns `None` if the referenced RawId is nil (all zero).
     pub fn as_transmute_raw(id: &RawId) -> Option<&Self> {
-        if *id == [0; 16] {
-            None
-        } else {
-            Some(unsafe { std::mem::transmute::<&RawId, &Id>(id) })
-        }
+        // `Id` is `Unaligned` and exactly `ID_LEN` bytes, so the only
+        // failure left is validity: the nil id.
+        Id::try_ref_from_bytes(id).ok()
     }
 
     /// Takes ownership of this Id from the current write context (i.e. thread).
@@ -126,10 +139,9 @@ impl Id {
     ///
     /// This is `const` so schema identifiers can be composed at compile time.
     pub const fn raw(self) -> RawId {
-        // SAFETY: `Id` is a transparent 16-byte wrapper around a non-zero 128-bit
-        // integer. Its representation matches `RawId` by construction, as
-        // `Id::new` already transmutes from `RawId` to `Option<Id>`.
-        unsafe { std::mem::transmute::<Id, RawId>(self) }
+        // The inverse of `Id::new`: native-endian keeps the byte order.
+        let inner = self.inner;
+        inner.get().to_ne_bytes()
     }
 }
 
@@ -158,7 +170,7 @@ impl Deref for Id {
     type Target = RawId;
 
     fn deref(&self) -> &Self::Target {
-        unsafe { std::mem::transmute::<&Id, &RawId>(self) }
+        zerocopy::transmute_ref!(self)
     }
 }
 
@@ -280,7 +292,7 @@ pub use id_hex;
 /// Most methods defined on [`ExclusiveId`] are low-level primitives meant to be used for the implementation of new ownership management strategies,
 /// such as a transactional database that tracks checked out IDs for ownership, or distributed ledgers like blockchains.
 ///
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, TryFromBytes, KnownLayout, Immutable)]
 #[repr(transparent)]
 pub struct ExclusiveId {
     /// The underlying identifier.
@@ -319,7 +331,12 @@ impl ExclusiveId {
     ///
     /// * `id` - A reference to the [`Id`] to be transmuted.
     pub fn force_ref(id: &Id) -> &Self {
-        unsafe { std::mem::transmute(id) }
+        // `ExclusiveId` is a transparent `Id` plus a zero-sized marker, so it
+        // has exactly `Id`'s validity and every `&Id` converts.
+        match zerocopy::try_transmute_ref!(id) {
+            Ok(exclusive) => exclusive,
+            Err(_) => unreachable!("ExclusiveId has the validity of Id"),
+        }
     }
 
     /// Releases the [`ExclusiveId`], returning the underlying [`Id`].
