@@ -15,6 +15,7 @@ use crate::patch::ArchiveOwner;
 use crate::trible::Fragment;
 use crate::trible::Trible;
 use crate::trible::TribleSet;
+use crate::trible::TRIBLE_LEN;
 
 use anybytes::Bytes;
 use anybytes::View;
@@ -43,16 +44,59 @@ impl MetaDescribe for SimpleArchive {
     }
 }
 
+/// One archive row as a 16-aligned element: the same 64 bytes as a
+/// [`crate::trible::RawTrible`], in a type whose alignment the section keeps.
+type AlignedRow = [u128; 4];
+
+/// Write `set`'s rows in canonical EAV order into a disk-backed, off-heap
+/// section and return them as an archive blob.
+///
+/// The section is aligned to `AlignedRow` (16 bytes) inside a page-aligned
+/// mapping, so the blob's bytes start 16-aligned. The bytes themselves are
+/// the canonical rows, unchanged. An empty set maps nothing and encodes to
+/// empty bytes.
+///
+/// `encode` cannot report an error, so a failure to create or map the
+/// temporary file panics, as a failed heap allocation aborts. The section
+/// is reserved sparsely (as in the collection unions), so a full temporary
+/// filesystem faults on the row writes rather than panicking here.
+fn encode_ordered_rows(set: &TribleSet) -> Blob<SimpleArchive> {
+    use anybytes::area::ByteArea;
+    use zerocopy::IntoBytes;
+
+    let rows = set.len();
+    if rows == 0 {
+        return Blob::new(Bytes::empty());
+    }
+    let mut area = ByteArea::new().expect("SimpleArchive encode: create byte area");
+    let mut sections = area.sections();
+    let mut out = sections
+        .reserve::<AlignedRow>(rows)
+        .expect("SimpleArchive encode: reserve row section");
+    let mut written = 0;
+    for (slot, row) in out
+        .as_mut_slice()
+        .as_mut_bytes()
+        .chunks_exact_mut(TRIBLE_LEN)
+        .zip(set.eav.iter_ordered())
+    {
+        slot.copy_from_slice(row);
+        written += 1;
+    }
+    assert_eq!(written, rows, "SimpleArchive encode: row count mismatch");
+    let bytes = out
+        .freeze()
+        .expect("SimpleArchive encode: freeze row section");
+    Blob::new(bytes)
+}
+
 impl Encodes<TribleSet> for SimpleArchive
 where
     crate::inline::encodings::hash::Handle<SimpleArchive>: crate::inline::InlineEncoding,
 {
     type Output = Blob<SimpleArchive>;
     fn encode(source: TribleSet) -> Blob<SimpleArchive> {
-        let mut tribles: Vec<[u8; 64]> = Vec::with_capacity(source.len());
-        tribles.extend(source.eav.iter_ordered());
-        let bytes: Bytes = tribles.into();
-        Blob::new(bytes)
+        encode_ordered_rows(&source)
     }
 }
 
@@ -62,10 +106,7 @@ where
 {
     type Output = Blob<SimpleArchive>;
     fn encode(source: &TribleSet) -> Blob<SimpleArchive> {
-        let mut tribles: Vec<[u8; 64]> = Vec::with_capacity(source.len());
-        tribles.extend(source.eav.iter_ordered());
-        let bytes: Bytes = tribles.into();
-        Blob::new(bytes)
+        encode_ordered_rows(source)
     }
 }
 
