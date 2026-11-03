@@ -3,7 +3,13 @@
 //! the binaries alternately. Input preparation is excluded from every timing.
 //!
 //! usage: unarchive_phase_probe <rows> <mode> [inner]
-//! modes: par-hash | single-hash | serial | e2e | file:<path>:<par-hash|e2e>
+//! modes: par-hash | single-hash | serial | e2e | check-base | check-ztrible
+//!        | view-ztrible
+//!        | file:<path>:<mode>
+//! check-base is the decoders' hand-written canonical check with no per-row
+//! work; check-ztrible is an anybytes view as `[ZTrible]` (zerocopy validates
+//! the row invariant) followed by one strictly-increasing pass; view-ztrible
+//! is that view alone, to split the cost.
 //! Prints one line: mode, rows, threads, median ns/row and min ns/row over
 //! `inner` timed iterations after one warm-up.
 
@@ -12,6 +18,34 @@ use std::time::Instant;
 use anybytes::Bytes;
 use anybytes::View;
 use triblespace_core::blob::encodings::simplearchive::{phase_probe, try_from_archive_bytes};
+use zerocopy::IntoBytes;
+
+#[path = "../tests/support/ztrible.rs"]
+#[allow(dead_code)]
+mod ztrible;
+use ztrible::ZTrible;
+
+/// The canonical check through the prototype row type: the view proves every
+/// row valid, then one pass proves the rows strictly increasing. The pass has
+/// the same comparison shape and error order as the hand-written check.
+#[inline(never)]
+fn check_ztrible(bytes: Bytes) -> Result<View<[ZTrible]>, &'static str> {
+    let rows: View<[ZTrible]> = bytes.view().map_err(|_| "BadTrible")?;
+    let mut previous: Option<&[u8; 64]> = None;
+    for row in rows.iter() {
+        let row: &[u8; 64] = row.as_bytes().try_into().unwrap();
+        if let Some(previous) = previous {
+            if previous == row {
+                return Err("BadCanonicalizationRedundancy");
+            }
+            if previous > row {
+                return Err("BadCanonicalizationOrdering");
+            }
+        }
+        previous = Some(row);
+    }
+    Ok(rows)
+}
 
 fn splitmix(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -90,6 +124,26 @@ fn main() {
                 let h = phase_probe::validate_and_hash_single(slice).unwrap();
                 let e = start.elapsed();
                 std::hint::black_box(h);
+                e
+            }
+            "check-base" => {
+                let r = phase_probe::check_rows(std::hint::black_box(slice));
+                let e = start.elapsed();
+                r.unwrap();
+                e
+            }
+            "check-ztrible" => {
+                let v = check_ztrible(std::hint::black_box(bytes.clone())).unwrap();
+                let e = start.elapsed();
+                assert_eq!(v.len(), n);
+                drop(v);
+                e
+            }
+            "view-ztrible" => {
+                let v: View<[ZTrible]> = std::hint::black_box(bytes.clone()).view().unwrap();
+                let e = start.elapsed();
+                assert_eq!(v.len(), n);
+                drop(v);
                 e
             }
             "serial" => {

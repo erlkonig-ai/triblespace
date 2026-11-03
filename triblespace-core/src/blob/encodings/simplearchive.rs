@@ -376,6 +376,11 @@ pub mod phase_probe {
         Ok(hashes)
     }
 
+    /// The canonical check alone, as the decoders run it, with no per-row work.
+    pub fn check_rows(slice: &[[u8; 64]]) -> Result<(), UnarchiveError> {
+        validate_canonical_rows_with(slice, |_, _| {})
+    }
+
     /// The serial decoder over the whole archive, archive-backed when aligned.
     pub fn serial(bytes: Bytes) -> Result<TribleSet, UnarchiveError> {
         let Ok(packed): Result<View<[[u8; 64]]>, _> = bytes.clone().view() else {
