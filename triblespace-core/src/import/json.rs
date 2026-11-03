@@ -456,10 +456,9 @@ where
         }
     }
 
+    /// RFC 8259 whitespace only: space, tab, newline, carriage return.
     fn skip_ws(&self, bytes: &mut Bytes) {
-        while matches!(bytes.peek_token(), Some(b) if b.is_ascii_whitespace()) {
-            bytes.pop_front();
-        }
+        super::scanner::skip_ws(bytes);
     }
 
     fn consume_byte(&self, bytes: &mut Bytes, expected: u8) -> Result<(), JsonImportError> {
@@ -594,7 +593,7 @@ pub(crate) fn parse_string_common(
 
         let mut tentative = bytes.clone();
         let mut segment = take_while::<_, _, InputError<Bytes>>(0.., |b: u8| {
-            b != b'"' && b != b'\\' && b != b'\n' && b != b'\r'
+            b >= 0x20 && b != b'"' && b != b'\\'
         });
 
         if let Ok(prefix) = segment.parse_next(&mut tentative) {
@@ -613,7 +612,7 @@ pub(crate) fn parse_string_common(
         use winnow::Parser;
 
         let mut segment = take_while::<_, _, InputError<Bytes>>(0.., |b: u8| {
-            b != b'\\' && b != b'"' && b != b'\n' && b != b'\r'
+            b >= 0x20 && b != b'\\' && b != b'"'
         });
         let chunk = segment
             .parse_next(bytes)
@@ -643,10 +642,13 @@ pub(crate) fn parse_string_common(
                     _ => return Err(JsonImportError::Syntax("invalid escape sequence".into())),
                 }
             }
-            Some(b'\n') | Some(b'\r') | None => {
-                return Err(JsonImportError::Syntax("unterminated string".into()))
+            None => return Err(JsonImportError::Syntax("unterminated string".into())),
+            // RFC 8259: a control character (U+0000 to U+001F) must be escaped.
+            Some(_) => {
+                return Err(JsonImportError::Syntax(
+                    "unescaped control character in string".into(),
+                ))
             }
-            _ => unreachable!("peek_token only yields bytes"),
         }
     }
 }

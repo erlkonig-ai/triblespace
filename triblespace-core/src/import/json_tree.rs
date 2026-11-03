@@ -542,10 +542,9 @@ where
         id_from_digest(digest.as_ref())
     }
 
+    /// RFC 8259 whitespace only: space, tab, newline, carriage return.
     fn skip_ws(&self, bytes: &mut Bytes) {
-        while matches!(bytes.peek_token(), Some(b) if b.is_ascii_whitespace()) {
-            bytes.pop_front();
-        }
+        super::scanner::skip_ws(bytes);
     }
 
     fn consume_byte(&self, bytes: &mut Bytes, expected: u8) -> Result<(), JsonImportError> {
@@ -774,6 +773,25 @@ mod tests {
                 }
                 other => panic!("{doc}: expected LoneSurrogate, got {other:?}"),
             }
+        }
+    }
+
+    /// RFC 8259 whitespace is space, tab, newline and carriage return only:
+    /// a form feed is refused wherever it appears, and so is an unescaped
+    /// control character inside a string, while its escaped form decodes.
+    #[test]
+    fn only_json_whitespace_and_escaped_controls_are_accepted() {
+        for bad in [
+            "\x0c[]", "[\x0c1]", "[1\x0c]", "[\"a\"\x0c]", "{\x0c}", "[true\x0c]",
+            "\"a\x01b\"", "\"a\tb\"", "\"a\x1fb\"", "{\"k\x00\": 1}",
+        ] {
+            assert!(
+                matches!(import(bad), Err(JsonImportError::Syntax(_))),
+                "{bad:?} must be refused"
+            );
+        }
+        for good in ["[ 1 ]", "[\t1\n]", "\r\n[]", "\"a\\tb\"", "\"\\u0001\""] {
+            assert!(import(good).is_ok(), "{good:?} must import");
         }
     }
 
