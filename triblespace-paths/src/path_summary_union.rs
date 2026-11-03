@@ -37,11 +37,12 @@ use std::sync::Arc;
 use triblespace_core::prelude::entity;
 
 use triblespace_core::attribute::Attribute;
-use triblespace_core::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
+use triblespace_core::blob::encodings::simplearchive::{
+    CanonicalTribles, SimpleArchive, UnarchiveError,
+};
 use triblespace_core::blob::Blob;
 use triblespace_core::collection::descriptor;
 use triblespace_core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
-use triblespace_core::collection::simplearchive_union;
 use triblespace_core::collection::{
     CollectionAttachment, CollectionData, CollectionEncoding, CollectionOperationError, Cover,
     TryFromCover, TryFromCoverError,
@@ -53,7 +54,7 @@ use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
 use triblespace_core::inline::encodings::iu256::U256BE;
 use triblespace_core::inline::{Inline, TryFromInline};
 use triblespace_core::metadata::{self, MetaDescribe};
-use triblespace_core::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
+use triblespace_core::trible::{Fragment, TribleSet};
 
 use crate::persistence::{
     path_automaton_accepting_state, path_automaton_fingerprint, path_automaton_initial_state,
@@ -705,15 +706,9 @@ pub fn derive_element(
     source: &Blob<SimpleArchive>,
     automaton: &Automaton,
 ) -> Result<Blob<PathSummaryBlob>, RegularPathMappingError> {
-    simplearchive_union::validate_element(source).map_err(RegularPathMappingError::Source)?;
-    let edges = source.bytes.as_ref().chunks_exact(TRIBLE_LEN).map(|chunk| {
-        let raw: &[u8; TRIBLE_LEN] = chunk
-            .try_into()
-            .expect("validated SimpleArchive chunks have fixed trible length");
-        let trible = Trible::as_transmute_force_raw(raw)
-            .expect("validated SimpleArchive contains valid tribles");
-        GraphEdge::from(trible)
-    });
+    let rows = CanonicalTribles::validate(source.bytes.clone())
+        .map_err(RegularPathMappingError::Source)?;
+    let edges = rows.as_tribles().iter().map(GraphEdge::from);
     let summary = PathSummary::from_edges(automaton.clone(), edges);
     PathSummaryBlob::encode(&summary).map_err(RegularPathMappingError::Summary)
 }
@@ -724,12 +719,14 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use ed25519_dalek::VerifyingKey;
+    use triblespace_core::blob::Bytes;
     use triblespace_core::blob::IntoBlob;
     use triblespace_core::capability::policy::resource_policy;
     use triblespace_core::collection::records::{
         collection_mapping, collection_name, collection_parent, collection_representation,
         CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
     };
+    use triblespace_core::collection::simplearchive_union;
     use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy};
     use triblespace_core::id::ExclusiveId;
     use triblespace_core::inline::RawInline;
@@ -737,7 +734,7 @@ mod tests {
     use triblespace_core::prelude::entity;
     use triblespace_core::repo::{BlobStoreGet, SnapshotSource};
     use triblespace_core::trible::Fragment;
-    use triblespace_core::trible::TribleSet;
+    use triblespace_core::trible::{Trible, TribleSet};
 
     use crate::{PathIndex, Step, Transition};
 
@@ -948,6 +945,32 @@ mod tests {
             <PathSummaryBlob as CollectionEncoding>::validate_descriptor(&mismatched),
             Err(CollectionOperationError::Fatal(reason))
                 if reason.contains("do not match its fingerprint")
+        ));
+    }
+
+    /// A copy of `bytes` whose base is not 16-byte aligned.
+    fn misaligned_copy(bytes: &[u8]) -> Bytes {
+        let mut backing = vec![0u8; bytes.len() + 16];
+        let base = backing.as_ptr() as usize;
+        let offset = (1..16)
+            .find(|offset| (base + offset) % 16 != 0)
+            .expect("an unaligned offset below 16");
+        backing[offset..offset + bytes.len()].copy_from_slice(bytes);
+        let misaligned = Bytes::from(backing).slice(offset..offset + bytes.len());
+        assert_ne!(misaligned.as_ptr() as usize % 16, 0);
+        assert_eq!(&misaligned[..], bytes);
+        misaligned
+    }
+
+    #[test]
+    fn misaligned_source_is_a_bad_archive_not_a_summary() {
+        let automaton = plus(metadata::tag.id().raw());
+        let source = archive(&edge_facts(1, 2));
+        assert!(derive_element(&source, &automaton).is_ok());
+        let misaligned = Blob::<SimpleArchive>::new(misaligned_copy(&source.bytes));
+        assert!(matches!(
+            derive_element(&misaligned, &automaton),
+            Err(RegularPathMappingError::Source(UnarchiveError::BadArchive))
         ));
     }
 
