@@ -32,6 +32,16 @@ pub struct ZTriblePacked {
     pub v: [u8; 32],
 }
 
+/// `ZTriblePacked` aligned to 16 as a whole: the ids stay packed (align 1
+/// wherever else they are embedded), the row demands an aligned slice.
+#[derive(TryFromBytes, KnownLayout, Immutable, IntoBytes)]
+#[repr(C, align(16))]
+pub struct ATrible {
+    pub e: PackedId,
+    pub a: PackedId,
+    pub v: [u8; 32],
+}
+
 /// The canonical check in blocks of `block` rows: each block is validated as
 /// `[ZTrible]` and then checked strictly increasing, within itself and
 /// against the previous block's last row, while its rows are still in cache.

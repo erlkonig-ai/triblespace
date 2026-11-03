@@ -5,7 +5,7 @@
 mod ztrible;
 
 use triblespace_core::blob::encodings::simplearchive::{phase_probe, UnarchiveError};
-use ztrible::{check_ztrible_blocked, PackedId, ZTrible, ZTriblePacked};
+use ztrible::{check_ztrible_blocked, ATrible, PackedId, ZTrible, ZTriblePacked};
 use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes, Unaligned};
 
 fn splitmix(state: &mut u64) -> u64 {
@@ -244,4 +244,42 @@ fn ztrible_blocked_error_order_matches_base() {
         }
     }
     assert!(cases > 100, "{cases}");
+}
+
+/// A 16-aligned row of packed ids: 64 bytes, align 16, no padding. An
+/// aligned slice of valid rows is accepted, the same bytes one off an
+/// alignment boundary are refused as misaligned, and a zero entity is
+/// refused as invalid.
+#[test]
+fn atrible_is_aligned_and_refuses_misaligned_bytes() {
+    assert_eq!(core::mem::size_of::<ATrible>(), 64);
+    assert_eq!(core::mem::align_of::<ATrible>(), 16);
+    assert_eq!(core::mem::align_of::<PackedId>(), 1);
+
+    // u128 storage is 16-aligned; one spare element leaves room to shift.
+    let rows = 8;
+    let mut storage = vec![0u128; rows * 4 + 1];
+    for (i, word) in storage.iter_mut().enumerate() {
+        *word = 0x0101_0101_0101_0101_0101_0101_0101_0101 ^ (i as u128 + 1);
+    }
+    let bytes = storage.as_bytes();
+    assert_eq!(bytes.as_ptr() as usize % 16, 0);
+
+    let aligned = &bytes[..rows * 64];
+    let view = <[ATrible]>::try_ref_from_bytes(aligned).expect("aligned valid rows");
+    assert_eq!(view.len(), rows);
+    assert_eq!(view.as_bytes(), aligned);
+
+    let shifted = &bytes[1..1 + rows * 64];
+    assert!(matches!(
+        <[ATrible]>::try_ref_from_bytes(shifted),
+        Err(zerocopy::TryCastError::Alignment(_))
+    ));
+
+    let mut zeroed = storage.clone();
+    zeroed[4] = 0; // row 1's entity
+    assert!(matches!(
+        <[ATrible]>::try_ref_from_bytes(&zeroed.as_bytes()[..rows * 64]),
+        Err(zerocopy::TryCastError::Validity(_))
+    ));
 }
