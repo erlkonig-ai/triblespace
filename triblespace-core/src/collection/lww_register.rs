@@ -81,6 +81,8 @@ use crate::repo::BlobStoreGet;
 use crate::trible::{Fragment, Trible, A_START, E_START, TRIBLE_LEN, V_START};
 use anybytes::{Bytes, View};
 use itertools::Itertools;
+use zerocopy::byteorder::big_endian;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 #[cfg(test)]
 use super::records::CollectionHandle;
@@ -96,12 +98,68 @@ use super::{
 
 const ID_LEN: usize = 16;
 const KEY_LEN: usize = 32;
-const HEADER_LEN: usize = 16;
-const IDENTITY_ROW_LEN: usize = ID_LEN * 2;
-const ORDER_ROW_LEN: usize = ID_LEN + KEY_LEN;
 
 type RawId = [u8; ID_LEN];
 type RawKey = [u8; KEY_LEN];
+
+/// The two row counts that open a projection, big endian.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct Header {
+    identities: big_endian::U64,
+    orders: big_endian::U64,
+}
+
+/// One identity row: a state and the register it names. The derived order is
+/// the row's byte order, state first, which is the order the section is sorted by.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+    Unaligned,
+)]
+#[repr(C)]
+struct IdentityRow {
+    state: RawId,
+    register: RawId,
+}
+
+/// One order row: a state and its raw order key, sorted state first like
+/// [`IdentityRow`].
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    FromBytes,
+    IntoBytes,
+    KnownLayout,
+    Immutable,
+    Unaligned,
+)]
+#[repr(C)]
+struct OrderRow {
+    state: RawId,
+    key: RawKey,
+}
+
+const HEADER_LEN: usize = size_of::<Header>();
+const IDENTITY_ROW_LEN: usize = size_of::<IdentityRow>();
+const ORDER_ROW_LEN: usize = size_of::<OrderRow>();
+const _: () = assert!(HEADER_LEN == 16);
+const _: () = assert!(IDENTITY_ROW_LEN == ID_LEN * 2);
+const _: () = assert!(ORDER_ROW_LEN == ID_LEN + KEY_LEN);
 
 /// Canonical projection of the two fact halves needed by a stated LWW register.
 ///
@@ -214,15 +272,16 @@ impl Projection {
                 + self.identities.len() * IDENTITY_ROW_LEN
                 + self.orders.len() * ORDER_ROW_LEN,
         );
-        bytes.extend_from_slice(&identity_count.to_be_bytes());
-        bytes.extend_from_slice(&order_count.to_be_bytes());
+        let header = Header {
+            identities: identity_count.into(),
+            orders: order_count.into(),
+        };
+        bytes.extend_from_slice(header.as_bytes());
         for (state, register) in self.identities {
-            bytes.extend_from_slice(&state);
-            bytes.extend_from_slice(&register);
+            bytes.extend_from_slice(IdentityRow { state, register }.as_bytes());
         }
         for (state, key) in self.orders {
-            bytes.extend_from_slice(&state);
-            bytes.extend_from_slice(&key);
+            bytes.extend_from_slice(OrderRow { state, key }.as_bytes());
         }
         Blob::new(Bytes::from_source(bytes))
     }
@@ -236,27 +295,23 @@ fn checked_payload_len(identity_count: usize, order_count: usize) -> Option<usiz
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProjectionRows {
-    identities: View<[[u8; IDENTITY_ROW_LEN]]>,
-    orders: View<[[u8; ORDER_ROW_LEN]]>,
+    identities: View<[IdentityRow]>,
+    orders: View<[OrderRow]>,
 }
 
 impl ProjectionRows {
     fn decode(blob: &Blob<LwwRegisterBlob>) -> Result<Self, LwwRegisterError> {
         let bytes = blob.bytes.as_ref();
-        if bytes.len() < HEADER_LEN {
+        let Ok((header, _)) = Header::ref_from_prefix(bytes) else {
             return Err(LwwRegisterError::BadLength {
                 expected: HEADER_LEN,
                 actual: bytes.len(),
             });
-        }
-        let identity_count = usize::try_from(u64::from_be_bytes(
-            bytes[0..8].try_into().expect("eight-byte identity count"),
-        ))
-        .map_err(|_| LwwRegisterError::CountOverflow)?;
-        let order_count = usize::try_from(u64::from_be_bytes(
-            bytes[8..16].try_into().expect("eight-byte order count"),
-        ))
-        .map_err(|_| LwwRegisterError::CountOverflow)?;
+        };
+        let identity_count = usize::try_from(header.identities.get())
+            .map_err(|_| LwwRegisterError::CountOverflow)?;
+        let order_count =
+            usize::try_from(header.orders.get()).map_err(|_| LwwRegisterError::CountOverflow)?;
         let expected = checked_payload_len(identity_count, order_count)
             .ok_or(LwwRegisterError::CountOverflow)?;
         if bytes.len() != expected {
@@ -293,11 +348,7 @@ fn decode_projection(blob: &Blob<LwwRegisterBlob>) -> Result<Projection, LwwRegi
     let rows = ProjectionRows::decode(blob)?;
     let mut projection = Projection::default();
     let mut previous_identity = None;
-    for row in rows.identities.iter() {
-        let state: RawId = row[0..ID_LEN].try_into().expect("16-byte state id");
-        let register: RawId = row[ID_LEN..IDENTITY_ROW_LEN]
-            .try_into()
-            .expect("16-byte register id");
+    for &IdentityRow { state, register } in rows.identities.iter() {
         if state == [0; ID_LEN] {
             return Err(LwwRegisterError::NilState);
         }
@@ -313,11 +364,7 @@ fn decode_projection(blob: &Blob<LwwRegisterBlob>) -> Result<Projection, LwwRegi
     }
 
     let mut previous_order = None;
-    for row in rows.orders.iter() {
-        let state: RawId = row[0..ID_LEN].try_into().expect("16-byte state id");
-        let key: RawKey = row[ID_LEN..ORDER_ROW_LEN]
-            .try_into()
-            .expect("32-byte order key");
+    for &OrderRow { state, key } in rows.orders.iter() {
         if state == [0; ID_LEN] {
             return Err(LwwRegisterError::NilState);
         }
@@ -565,7 +612,7 @@ impl LwwIndex {
         }
     }
 
-    fn identity_rows(&self) -> impl Iterator<Item = &[u8; IDENTITY_ROW_LEN]> {
+    fn identity_rows(&self) -> impl Iterator<Item = &IdentityRow> {
         self.members
             .iter()
             .map(|member| member.identities.iter())
@@ -573,7 +620,7 @@ impl LwwIndex {
             .dedup()
     }
 
-    fn order_rows(&self) -> impl Iterator<Item = &[u8; ORDER_ROW_LEN]> {
+    fn order_rows(&self) -> impl Iterator<Item = &OrderRow> {
         self.members
             .iter()
             .map(|member| member.orders.iter())
@@ -583,22 +630,18 @@ impl LwwIndex {
 
     fn coordinate(&self, state: &RawId) -> Option<(RawId, RawKey)> {
         let register = self.members.iter().find_map(|member| {
-            let position = member
+            let position = member.identities.partition_point(|row| row.state < *state);
+            member
                 .identities
-                .partition_point(|row| row[..ID_LEN] < state[..]);
-            member.identities.get(position).and_then(|row| {
-                (row[..ID_LEN] == state[..])
-                    .then(|| row[ID_LEN..].try_into().expect("16-byte register id"))
-            })
+                .get(position)
+                .and_then(|row| (row.state == *state).then_some(row.register))
         })?;
         let key = self.members.iter().find_map(|member| {
-            let position = member
+            let position = member.orders.partition_point(|row| row.state < *state);
+            member
                 .orders
-                .partition_point(|row| row[..ID_LEN] < state[..]);
-            member.orders.get(position).and_then(|row| {
-                (row[..ID_LEN] == state[..])
-                    .then(|| row[ID_LEN..].try_into().expect("32-byte order key"))
-            })
+                .get(position)
+                .and_then(|row| (row.state == *state).then_some(row.key))
         })?;
         Some((register, key))
     }
@@ -616,24 +659,21 @@ impl LwwIndex {
         let mut complete = 0;
         let mut unresolved = 0;
         loop {
-            let identity_state = identities.peek().map(|row| &row[..ID_LEN]);
-            let order_state = orders.peek().map(|row| &row[..ID_LEN]);
+            let identity_state = identities.peek().map(|row| row.state);
+            let order_state = orders.peek().map(|row| row.state);
             let state: RawId = match (identity_state, order_state) {
                 (None, None) => break,
                 (Some(state), None) | (None, Some(state)) => state,
                 (Some(left), Some(right)) => left.min(right),
-            }
-            .try_into()
-            .expect("16-byte state id");
+            };
             if state == [0; ID_LEN] {
                 return Err(LwwRegisterError::NilState);
             }
 
             let mut register = None;
             let mut identity_conflict = false;
-            while identities.peek().is_some_and(|row| row[..ID_LEN] == state) {
-                let row = identities.next().expect("peeked identity row");
-                let value: RawId = row[ID_LEN..].try_into().expect("16-byte register id");
+            while identities.peek().is_some_and(|row| row.state == state) {
+                let value = identities.next().expect("peeked identity row").register;
                 if value == [0; ID_LEN] {
                     return Err(LwwRegisterError::NilRegister);
                 }
@@ -642,9 +682,8 @@ impl LwwIndex {
             }
             let mut key = None;
             let mut order_conflict = false;
-            while orders.peek().is_some_and(|row| row[..ID_LEN] == state) {
-                let row = orders.next().expect("peeked order row");
-                let value: RawKey = row[ID_LEN..].try_into().expect("32-byte order key");
+            while orders.peek().is_some_and(|row| row.state == state) {
+                let value = orders.next().expect("peeked order row").key;
                 order_conflict |= key.is_some_and(|prior| prior != value);
                 key = Some(value);
             }
@@ -734,7 +773,7 @@ impl LwwQuery {
     fn coordinates(&self) -> impl Iterator<Item = (RawId, RawId, RawKey)> + '_ {
         self.index
             .identity_rows()
-            .map(|row| row[..ID_LEN].try_into().expect("16-byte state id"))
+            .map(|row| row.state)
             .dedup()
             .filter_map(|state| {
                 self.index
@@ -1061,7 +1100,9 @@ mod tests {
         let first = attach(&[project(
             &(coordinate(&earlier, &register, 1) + identity(&split, &register)),
         )]);
-        let second = attach(&[project(&(coordinate(&later, &register, 2) + order(&split, 3)))]);
+        let second = attach(&[project(
+            &(coordinate(&later, &register, 2) + order(&split, 3)),
+        )]);
         assert_eq!(first.query().unwrap().winner(*register), Some(*earlier));
         let union = first.union(&second).query().unwrap();
         assert_eq!(union.winner(*register), Some(*split));
@@ -1464,6 +1505,30 @@ mod tests {
             .view()
             .unwrap();
         assert_eq!(attached.query().unwrap().winner(*register), Some(*state));
+    }
+
+    /// The projection's bytes are content-addressed, so the row and header
+    /// types must keep exactly the documented layout. Spelled out by hand
+    /// here, independent of those types.
+    #[test]
+    fn projection_layout_is_pinned_byte_for_byte() {
+        let projection = Projection {
+            identities: BTreeSet::from([([1; ID_LEN], [2; ID_LEN])]),
+            orders: BTreeSet::from([([3; ID_LEN], [4; KEY_LEN]), ([5; ID_LEN], [6; KEY_LEN])]),
+        };
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&1u64.to_be_bytes());
+        expected.extend_from_slice(&2u64.to_be_bytes());
+        expected.extend_from_slice(&[1; ID_LEN]);
+        expected.extend_from_slice(&[2; ID_LEN]);
+        expected.extend_from_slice(&[3; ID_LEN]);
+        expected.extend_from_slice(&[4; KEY_LEN]);
+        expected.extend_from_slice(&[5; ID_LEN]);
+        expected.extend_from_slice(&[6; KEY_LEN]);
+        let blob = projection.clone().encode();
+        assert_eq!(blob.bytes.as_ref(), &expected[..]);
+        assert_eq!(decode_projection(&blob), Ok(projection));
+        assert_eq!(empty().bytes.as_ref(), &[0u8; 16][..]);
     }
 
     #[test]
