@@ -22,7 +22,7 @@ use std::fmt;
 use anybytes::{Bytes, View};
 use itertools::{Either, Itertools};
 
-use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
+use crate::blob::encodings::simplearchive::{view_rows, SimpleArchive, UnarchiveError};
 use crate::blob::{Blob, BlobEncoding, TryFromBlob};
 use crate::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
 use crate::collection::{
@@ -36,7 +36,7 @@ use crate::inline::{Encodes, Inline};
 use crate::macros::entity;
 use crate::metadata::{self, MetaDescribe};
 use crate::repo::{BlobStoreGet, BlobStoreMeta, StoreRead};
-use crate::trible::{Fragment, RawTrible, Trible};
+use crate::trible::Fragment;
 
 /// Canonical flat entity-ID set; its collection join is ordinary set union.
 pub struct EntityIdSetBlob;
@@ -225,21 +225,17 @@ impl MetaDescribe for GenIdAttributeValuesMappingV1 {
 ///
 /// Subjects, timestamps, tags, and other attributes neither qualify nor become
 /// members of the set. A nil or malformed `GenId` value is not a typed match.
-/// The source is checked for safe row framing/layout, not canonical ordering;
-/// output sorting and deduplication are the new projection's own work.
+/// The source is viewed as `[Trible]`, which checks its length, its 16-byte
+/// alignment and every row's entity and attribute, but not canonical
+/// ordering; output sorting and deduplication are the new projection's own
+/// work.
 pub fn derive_element(
     source: &Blob<SimpleArchive>,
     attribute: Id,
 ) -> Result<Blob<EntityIdSetBlob>, EntityIdSetError> {
-    let rows: View<[RawTrible]> = source
-        .bytes
-        .clone()
-        .view()
-        .map_err(|_| EntityIdSetError::InvalidSource(UnarchiveError::BadArchive))?;
+    let rows = view_rows(source.bytes.clone()).map_err(EntityIdSetError::InvalidSource)?;
     let mut values = Vec::new();
-    for row in rows.iter() {
-        let trible = Trible::as_transmute_force_raw(row)
-            .ok_or(EntityIdSetError::InvalidSource(UnarchiveError::BadTrible))?;
+    for trible in rows.iter() {
         if *trible.a() == attribute {
             if let Ok(id) = trible.v::<GenId>().try_from_inline::<Id>() {
                 values.push(id.raw());
@@ -426,7 +422,7 @@ mod tests {
     use crate::inline::encodings::time::NsTAIInterval;
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::{SnapshotSource, WantRead};
-    use crate::trible::TribleSet;
+    use crate::trible::{Trible, TribleSet};
 
     fn id(byte: u8) -> Id {
         Id::new([byte; ID_LEN]).unwrap()
@@ -518,6 +514,15 @@ mod tests {
         assert_eq!(
             derive_element(&nil_subject, attribute).unwrap_err(),
             EntityIdSetError::InvalidSource(UnarchiveError::BadTrible),
+        );
+
+        let aligned = SimpleArchive::encode(rows.iter().copied().collect::<TribleSet>());
+        let misaligned = Blob::new(crate::blob::encodings::simplearchive::misaligned_copy(
+            &aligned.bytes,
+        ));
+        assert_eq!(
+            derive_element(&misaligned, attribute).unwrap_err(),
+            EntityIdSetError::InvalidSource(UnarchiveError::BadArchive),
         );
 
         // Projection does not audit earlier producers' canonical ordering.

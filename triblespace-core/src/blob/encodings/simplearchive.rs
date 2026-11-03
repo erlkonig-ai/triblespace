@@ -240,7 +240,10 @@ impl CanonicalTribles {
 }
 
 /// The zerocopy view: size and alignment, then the row rule on every row.
-fn view_rows(bytes: Bytes) -> Result<View<[Trible]>, UnarchiveError> {
+///
+/// This is the first two checks of [`CanonicalTribles`] without the ordering
+/// pass, for readers that accept rows in any order.
+pub(crate) fn view_rows(bytes: Bytes) -> Result<View<[Trible]>, UnarchiveError> {
     // An empty archive has no row to misalign, so it gets an aligned base
     // rather than being judged by wherever its empty slice happens to point.
     let bytes = if bytes.is_empty() {
