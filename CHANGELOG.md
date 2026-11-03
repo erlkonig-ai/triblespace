@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `CanonicalTribles` (in `blob::encodings::simplearchive`) is a zero-copy
+  `View<[Trible]>` that can only be built by validating bytes as a canonical
+  trible sequence: whole 64-byte rows on a 16-byte-aligned base
+  (`BadArchive`), the row rule on every row (`BadTrible`), then strictly
+  increasing byte order (`BadCanonicalizationRedundancy` /
+  `BadCanonicalizationOrdering`). Empty input is accepted at any address.
+  `validate_with` fuses per-row work into the ordering pass, and
+  `par_validate_map` (feature `parallel`) splits that pass across the rayon
+  pool. Accessors: `as_tribles`, `as_rows`, `len`, `is_empty`.
+
 - `Trible` is now `#[repr(C, align(16))] { e: Id, a: Id, v: RawInline }`
   with private fields, deriving zerocopy `TryFromBytes`, `KnownLayout`,
   `Immutable` and `IntoBytes`; its validity is the row rule (entity and

@@ -13,9 +13,11 @@ use crate::patch::hash_key;
 use crate::patch::ArchiveEntry;
 use crate::patch::ArchiveOwner;
 use crate::trible::Fragment;
+use crate::trible::RawTrible;
 use crate::trible::Trible;
 use crate::trible::TribleSet;
 
+use anybytes::view::ViewError;
 use anybytes::Bytes;
 use anybytes::View;
 use std::ptr::NonNull;
@@ -126,6 +128,159 @@ impl std::fmt::Display for UnarchiveError {
 }
 
 impl std::error::Error for UnarchiveError {}
+
+/// Archive rows proven canonical: every row is a well-formed [`Trible`], and
+/// the rows are strictly increasing in byte order, so they are also free of
+/// duplicates.
+///
+/// This is the shape the bytes of a [`SimpleArchive`] blob must have. The only
+/// way to obtain one is to validate bytes, so holding a `CanonicalTribles` is
+/// proof that the check ran. The rows stay where they are: the value is a
+/// zero-copy view into the source bytes and keeps them alive.
+///
+/// The checks run in a fixed order, and that order decides which error a bad
+/// archive reports:
+///
+/// 1. the length is a whole number of 64-byte rows and the base is 16-byte
+///    aligned, or [`UnarchiveError::BadArchive`];
+/// 2. no row has a nil entity or attribute, checked over the whole archive,
+///    or [`UnarchiveError::BadTrible`];
+/// 3. each row is greater than the one before it, or
+///    [`UnarchiveError::BadCanonicalizationRedundancy`] for an equal row and
+///    [`UnarchiveError::BadCanonicalizationOrdering`] for a smaller one.
+///
+/// Empty input is canonical whatever its address.
+#[derive(Clone, Debug)]
+pub struct CanonicalTribles {
+    rows: View<[Trible]>,
+}
+
+impl CanonicalTribles {
+    /// Validates `bytes` as a canonical trible sequence.
+    pub fn validate(bytes: Bytes) -> Result<Self, UnarchiveError> {
+        Self::validate_with(bytes, |_, _| {})
+    }
+
+    /// Validates `bytes` and calls `visit(index, trible)` for each row, in
+    /// order, once the row has passed the ordering check against the row
+    /// before it.
+    ///
+    /// This lets a caller fuse per-row work (hashing, indexing) into the
+    /// ordering pass instead of reading the rows a second time. On an error
+    /// `visit` has seen every row before the offending one, so whatever it
+    /// built is a prefix the caller should discard.
+    pub fn validate_with<F>(bytes: Bytes, mut visit: F) -> Result<Self, UnarchiveError>
+    where
+        F: FnMut(usize, &Trible),
+    {
+        let rows = view_rows(bytes)?;
+        check_increasing(&rows, &mut visit)?;
+        Ok(Self { rows })
+    }
+
+    /// Validates `bytes` with the ordering pass split across the rayon pool,
+    /// and returns `map(trible)` for every row in archive order.
+    ///
+    /// The rows are cut into one contiguous run per worker. The seams between
+    /// runs are checked before any run, so an ordering error that straddles
+    /// two runs is reported as such; each run then proves its own interior.
+    /// Ordering is transitive, so the two together are exactly the check
+    /// [`Self::validate`] performs, and the errors are the same kinds.
+    #[cfg(feature = "parallel")]
+    pub fn par_validate_map<T, F>(bytes: Bytes, map: F) -> Result<(Self, Vec<T>), UnarchiveError>
+    where
+        T: Clone + Default + Send,
+        F: Fn(&Trible) -> T + Sync,
+    {
+        use rayon::prelude::*;
+
+        let rows = view_rows(bytes)?;
+        let run_len = parallel_run_len(rows.len());
+        for seam in rows.chunks(run_len).collect::<Vec<_>>().windows(2) {
+            let last = seam[0].last().expect("non-empty run").as_raw();
+            let first = seam[1].first().expect("non-empty run").as_raw();
+            if last == first {
+                return Err(UnarchiveError::BadCanonicalizationRedundancy);
+            }
+            if last > first {
+                return Err(UnarchiveError::BadCanonicalizationOrdering);
+            }
+        }
+
+        let mut mapped = vec![T::default(); rows.len()];
+        rows.par_chunks(run_len)
+            .zip(mapped.par_chunks_mut(run_len))
+            .try_for_each(|(run, out)| {
+                check_increasing(run, |index, trible| out[index] = map(trible))
+            })?;
+        Ok((Self { rows }, mapped))
+    }
+
+    /// The rows as tribles.
+    pub fn as_tribles(&self) -> &[Trible] {
+        &self.rows
+    }
+
+    /// The rows as their raw 64-byte representation.
+    pub fn as_rows(&self) -> &[RawTrible] {
+        zerocopy::transmute_ref!(self.as_tribles())
+    }
+
+    /// The number of rows.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether there are no rows.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
+/// The zerocopy view: size and alignment, then the row rule on every row.
+fn view_rows(bytes: Bytes) -> Result<View<[Trible]>, UnarchiveError> {
+    // An empty archive has no row to misalign, so it gets an aligned base
+    // rather than being judged by wherever its empty slice happens to point.
+    let bytes = if bytes.is_empty() {
+        Bytes::from(Vec::<Trible>::new())
+    } else {
+        bytes
+    };
+    bytes.view().map_err(|err| match err {
+        ViewError::Alignment(_) | ViewError::Size(_) => UnarchiveError::BadArchive,
+        ViewError::Validity(_) => UnarchiveError::BadTrible,
+    })
+}
+
+/// One pass proving `rows` strictly increasing in byte order, calling `visit`
+/// on each row once it has been compared with its predecessor.
+#[inline]
+fn check_increasing(
+    rows: &[Trible],
+    mut visit: impl FnMut(usize, &Trible),
+) -> Result<(), UnarchiveError> {
+    let mut previous: Option<&RawTrible> = None;
+    for (index, trible) in rows.iter().enumerate() {
+        let row = trible.as_raw();
+        if let Some(previous) = previous {
+            if previous == row {
+                return Err(UnarchiveError::BadCanonicalizationRedundancy);
+            }
+            if previous > row {
+                return Err(UnarchiveError::BadCanonicalizationOrdering);
+            }
+        }
+        previous = Some(row);
+        visit(index, trible);
+    }
+    Ok(())
+}
+
+/// Rows per contiguous run when a linear pass is split across the rayon pool.
+#[cfg(feature = "parallel")]
+fn parallel_run_len(rows: usize) -> usize {
+    rows.div_ceil(rayon::current_num_threads().max(1)).max(1)
+}
 
 /// Below this many tribles, serial unarchive wins (rayon overhead
 /// dominates).
@@ -792,5 +947,177 @@ mod tests {
             assert_eq!(stats.2, len as u64, "heap fallback lost heap Leaves");
             assert_eq!(stats.3, 0, "heap fallback created LocalLeaves");
         }
+    }
+
+    #[test]
+    fn canonical_tribles_accepts_empty_input_at_any_address() {
+        assert!(CanonicalTribles::validate(Bytes::empty())
+            .unwrap()
+            .is_empty());
+        let rows = [fixture_row(0)];
+        let backing = Bytes::from(rows.to_vec());
+        for offset in 0..=3 {
+            let empty = backing.slice(offset..offset);
+            let canonical = CanonicalTribles::validate(empty).unwrap();
+            assert_eq!(canonical.len(), 0);
+            assert!(canonical.as_tribles().is_empty());
+            assert!(canonical.as_rows().is_empty());
+        }
+    }
+
+    #[test]
+    fn canonical_tribles_refuses_a_misaligned_base_as_bad_archive() {
+        let rows: Vec<[u8; 64]> = (0..3).map(fixture_row).collect();
+        let tribles: Vec<Trible> = rows
+            .iter()
+            .map(|row| Trible::force_raw(*row).unwrap())
+            .collect();
+        let aligned = Bytes::from(tribles);
+        assert_eq!(
+            CanonicalTribles::validate(aligned).unwrap().as_rows(),
+            &rows[..]
+        );
+
+        // A misaligned copy of the same rows: the base of a `Vec<u8>` is
+        // not promised, so the assert below keeps the test honest.
+        let mut backing = vec![0u8; 3 * 64 + 1];
+        backing[1..].copy_from_slice(rows.as_flattened());
+        let misaligned = Bytes::from(backing).slice(1..);
+        assert_ne!(misaligned.as_ptr() as usize % 16, 0);
+        assert_eq!(&misaligned[..], rows.as_flattened());
+        assert_eq!(
+            CanonicalTribles::validate(misaligned).unwrap_err(),
+            UnarchiveError::BadArchive,
+        );
+    }
+
+    #[test]
+    fn canonical_tribles_refuses_a_partial_row_as_bad_archive() {
+        let mut bytes = Bytes::from(vec![fixture_row(0), fixture_row(1)]);
+        assert!(bytes.take_suffix(1).is_some());
+        assert_eq!(
+            CanonicalTribles::validate(bytes).unwrap_err(),
+            UnarchiveError::BadArchive,
+        );
+    }
+
+    #[test]
+    fn canonical_tribles_refuses_nil_entity_or_attribute_as_bad_trible() {
+        for nil in [0..16, 16..32] {
+            let mut invalid = fixture_row(1);
+            invalid[nil].fill(0);
+            assert_eq!(
+                CanonicalTribles::validate(Bytes::from(vec![fixture_row(0), invalid])).unwrap_err(),
+                UnarchiveError::BadTrible,
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_tribles_refuses_duplicate_and_descending_rows() {
+        let (first, second) = (fixture_row(0), fixture_row(1));
+        assert_eq!(
+            CanonicalTribles::validate(Bytes::from(vec![first, second, second])).unwrap_err(),
+            UnarchiveError::BadCanonicalizationRedundancy,
+        );
+        assert_eq!(
+            CanonicalTribles::validate(Bytes::from(vec![second, first])).unwrap_err(),
+            UnarchiveError::BadCanonicalizationOrdering,
+        );
+    }
+
+    #[test]
+    fn canonical_tribles_checks_the_row_rule_before_ordering() {
+        // A descending pair followed by a nil row: the whole-archive row rule
+        // runs first, so the nil row is what is reported.
+        let mut nil = fixture_row(2);
+        nil[..16].fill(0);
+        assert_eq!(
+            CanonicalTribles::validate(Bytes::from(vec![fixture_row(1), fixture_row(0), nil]))
+                .unwrap_err(),
+            UnarchiveError::BadTrible,
+        );
+    }
+
+    #[test]
+    fn canonical_tribles_round_trips_an_encoded_set() {
+        let mut set = TribleSet::new();
+        for index in 0..100 {
+            set.insert(&Trible::force_raw(fixture_row(index * 7 % 100)).unwrap());
+        }
+        let blob: Blob<SimpleArchive> = (&set).to_blob();
+        let mut visited = Vec::new();
+        let canonical = CanonicalTribles::validate_with(blob.bytes.clone(), |index, trible| {
+            visited.push((index, *trible))
+        })
+        .unwrap();
+
+        assert_eq!(canonical.len(), set.len());
+        assert_eq!(canonical.as_rows().as_flattened(), &blob.bytes[..]);
+        let ordered: Vec<Trible> = set.iter_ordered().copied().collect();
+        assert_eq!(canonical.as_tribles(), &ordered[..]);
+        assert_eq!(
+            visited,
+            ordered.iter().copied().enumerate().collect::<Vec<_>>()
+        );
+        for (trible, row) in canonical.as_tribles().iter().zip(canonical.as_rows()) {
+            assert_eq!(trible.as_raw(), row);
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn canonical_tribles_parallel_map_matches_serial_and_errors() {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .unwrap()
+            .install(|| {
+                for len in [0usize, 1, 2, 5, 1_000] {
+                    let blob = fixture_blob(len);
+                    let mut serial = Vec::new();
+                    let canonical = CanonicalTribles::validate_with(blob.bytes.clone(), |_, t| {
+                        serial.push(hash_key(&t.as_raw()[..]))
+                    })
+                    .unwrap();
+                    let (parallel, hashes) =
+                        CanonicalTribles::par_validate_map(blob.bytes.clone(), |t| {
+                            hash_key(&t.as_raw()[..])
+                        })
+                        .unwrap();
+                    assert_eq!(parallel.as_rows(), canonical.as_rows());
+                    assert_eq!(hashes, serial);
+                }
+
+                let len = 1_000;
+                let run_len = parallel_run_len(len);
+                let mut seam_duplicate: Vec<[u8; 64]> = (0..len).map(fixture_row).collect();
+                seam_duplicate[run_len] = seam_duplicate[run_len - 1];
+                let mut inside_descending: Vec<[u8; 64]> = (0..len).map(fixture_row).collect();
+                inside_descending.swap(1, 2);
+                let mut nil: Vec<[u8; 64]> = (0..len).map(fixture_row).collect();
+                nil[len - 1][16..32].fill(0);
+                for (rows, expected) in [
+                    (
+                        seam_duplicate,
+                        UnarchiveError::BadCanonicalizationRedundancy,
+                    ),
+                    (
+                        inside_descending,
+                        UnarchiveError::BadCanonicalizationOrdering,
+                    ),
+                    (nil, UnarchiveError::BadTrible),
+                ] {
+                    let bytes = Bytes::from(rows);
+                    assert_eq!(
+                        CanonicalTribles::validate(bytes.clone()).unwrap_err(),
+                        expected
+                    );
+                    assert_eq!(
+                        CanonicalTribles::par_validate_map(bytes, |_| ()).unwrap_err(),
+                        expected,
+                    );
+                }
+            });
     }
 }
