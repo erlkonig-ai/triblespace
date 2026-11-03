@@ -62,12 +62,13 @@ use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
-use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
+use crate::blob::encodings::simplearchive::{CanonicalTribles, SimpleArchive, UnarchiveError};
 use crate::blob::{Blob, BlobEncoding};
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::hash::Handle;
+use crate::inline::encodings::UnknownInline;
 use crate::inline::Inline;
 use crate::macros::entity;
 use crate::metadata;
@@ -78,7 +79,7 @@ use crate::query::{
     VariableId, VariableSet,
 };
 use crate::repo::BlobStoreGet;
-use crate::trible::{Fragment, Trible, A_START, E_START, TRIBLE_LEN, V_START};
+use crate::trible::Fragment;
 use anybytes::{Bytes, View};
 use itertools::Itertools;
 use zerocopy::byteorder::big_endian;
@@ -407,46 +408,20 @@ pub fn derive_element(
     identity: Id,
     orders: Id,
 ) -> Result<Blob<LwwRegisterBlob>, LwwRegisterError> {
-    let bytes = source.bytes.as_ref();
-    if bytes.len() % TRIBLE_LEN != 0 {
-        return Err(LwwRegisterError::InvalidSource(UnarchiveError::BadArchive));
-    }
     let mut projection = Projection::default();
-    let mut previous = None;
-    for trible in bytes.chunks_exact(TRIBLE_LEN) {
-        let row: &[u8; TRIBLE_LEN] = trible.try_into().expect("64-byte archive row");
-        if Trible::as_transmute_force_raw(row).is_none() {
-            return Err(LwwRegisterError::InvalidSource(UnarchiveError::BadTrible));
-        }
-        if let Some(previous) = previous {
-            if previous == row {
-                return Err(LwwRegisterError::InvalidSource(
-                    UnarchiveError::BadCanonicalizationRedundancy,
-                ));
-            }
-            if previous > row {
-                return Err(LwwRegisterError::InvalidSource(
-                    UnarchiveError::BadCanonicalizationOrdering,
-                ));
-            }
-        }
-        previous = Some(row);
-        let state: RawId = trible[E_START..E_START + ID_LEN]
-            .try_into()
-            .expect("16-byte entity id");
-        let attribute = &trible[A_START..A_START + ID_LEN];
-        let value = &trible[V_START..V_START + KEY_LEN];
-        if attribute == &identity[..] {
+    CanonicalTribles::validate_with(source.bytes.clone(), |_, trible| {
+        let state: RawId = **trible.e();
+        let value = &trible.v::<UnknownInline>().raw;
+        if *trible.a() == identity {
             if let Some(register) = genid_value(value) {
                 projection.identities.insert((state, register));
             }
         }
-        if attribute == &orders[..] {
-            projection
-                .orders
-                .insert((state, value.try_into().expect("32-byte inline order value")));
+        if *trible.a() == orders {
+            projection.orders.insert((state, *value));
         }
-    }
+    })
+    .map_err(LwwRegisterError::InvalidSource)?;
     Ok(projection.encode())
 }
 
@@ -919,7 +894,7 @@ mod tests {
     use crate::prelude::*;
     use crate::query::register::{resolve, StatedOrder};
     use crate::repo::memoryrepo::MemoryRepo;
-    use crate::trible::TribleSet;
+    use crate::trible::{Trible, TribleSet, A_START, E_START, TRIBLE_LEN, V_START};
     use std::collections::BTreeSet;
 
     attributes! {
@@ -1344,6 +1319,21 @@ mod tests {
         assert_eq!(
             derive_element(&source, state_of.id(), written_at.id()),
             Err(LwwRegisterError::InvalidSource(UnarchiveError::BadTrible))
+        );
+    }
+
+    #[test]
+    fn derive_refuses_a_misaligned_source_as_a_bad_archive() {
+        let register = ufoid();
+        let state = ufoid();
+        let source = archive(&coordinate(&state, &register, 1));
+        let misaligned: Blob<SimpleArchive> = Blob::new(
+            crate::blob::encodings::simplearchive::misaligned_copy(&source.bytes),
+        );
+        assert!(derive_element(&source, state_of.id(), written_at.id()).is_ok());
+        assert_eq!(
+            derive_element(&misaligned, state_of.id(), written_at.id()),
+            Err(LwwRegisterError::InvalidSource(UnarchiveError::BadArchive))
         );
     }
 
