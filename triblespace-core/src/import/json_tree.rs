@@ -1142,7 +1142,7 @@ mod tests {
             let root = fragment.root().expect("rooted");
             let mut hasher = blake3::Hasher::new();
             for trible in fragment.facts().iter_ordered() {
-                hasher.update(&trible.data);
+                hasher.update(trible.as_raw());
             }
             assert_eq!(format!("{root:X}"), root_hex, "root of {doc}");
             assert_eq!(
