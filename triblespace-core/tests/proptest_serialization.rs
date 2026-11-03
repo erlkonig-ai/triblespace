@@ -90,7 +90,7 @@ proptest! {
 
     #[test]
     fn trible_force_raw_roundtrip(t in arb_trible()) {
-        let raw = t.data;
+        let raw = *t.as_raw();
         let restored = Trible::force_raw(raw).expect("valid trible");
         prop_assert_eq!(t, restored);
     }
@@ -100,8 +100,8 @@ proptest! {
         // e(), a(), v() should reconstruct the original data
         let e = t.e();
         let a = t.a();
-        prop_assert_eq!(&t.data[0..16], &e[..]);
-        prop_assert_eq!(&t.data[16..32], &a[..]);
+        prop_assert_eq!(&t.as_raw()[0..16], &e[..]);
+        prop_assert_eq!(&t.as_raw()[16..32], &a[..]);
     }
 
     // ── TribleSet deterministic serialization ──────────────────────────
@@ -124,8 +124,8 @@ proptest! {
         let archive: SuccinctArchive<OrderedUniverse> = (&set).into();
 
         // Iter should produce the same tribles
-        let mut from_set: Vec<[u8; 64]> = set.iter().map(|t| t.data).collect();
-        let mut from_archive: Vec<[u8; 64]> = archive.iter().map(|t| t.data).collect();
+        let mut from_set: Vec<[u8; 64]> = set.iter().map(|t| *t.as_raw()).collect();
+        let mut from_archive: Vec<[u8; 64]> = archive.iter().map(|t| *t.as_raw()).collect();
         from_set.sort();
         from_archive.sort();
         prop_assert_eq!(from_set, from_archive,
@@ -161,8 +161,8 @@ proptest! {
         let restored: SuccinctArchive<OrderedUniverse> = blob.try_from_blob()
             .expect("succinct archive blob should round-trip");
 
-        let mut from_original: Vec<[u8; 64]> = set.iter().map(|t| t.data).collect();
-        let mut from_restored: Vec<[u8; 64]> = restored.iter().map(|t| t.data).collect();
+        let mut from_original: Vec<[u8; 64]> = set.iter().map(|t| *t.as_raw()).collect();
+        let mut from_restored: Vec<[u8; 64]> = restored.iter().map(|t| *t.as_raw()).collect();
         from_original.sort();
         from_restored.sort();
         prop_assert_eq!(from_original, from_restored);
@@ -209,7 +209,7 @@ proptest! {
         let first_trible = set.iter().next().unwrap();
         let entity_val = {
             let mut v = [0u8; 32];
-            v[16..32].copy_from_slice(&first_trible.data[0..16]);
+            v[16..32].copy_from_slice(&first_trible.as_raw()[0..16]);
             Inline::<inlineencodings::GenId>::new(v)
         };
 
@@ -242,7 +242,7 @@ proptest! {
         let first = set.iter().next().unwrap();
         let attr_val = {
             let mut v = [0u8; 32];
-            v[16..32].copy_from_slice(&first.data[16..32]);
+            v[16..32].copy_from_slice(&first.as_raw()[16..32]);
             Inline::<inlineencodings::GenId>::new(v)
         };
 

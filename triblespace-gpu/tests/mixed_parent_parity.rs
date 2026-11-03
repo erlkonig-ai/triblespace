@@ -103,7 +103,7 @@ fn fixture(entities: u32, attributes: u32, values: u32) -> Fixture {
                 data[..16].copy_from_slice(entity);
                 data[16..32].copy_from_slice(attribute);
                 data[32..].copy_from_slice(&value);
-                set.insert(&Trible { data });
+                set.insert(&Trible::force_raw(data).expect("non-nil entity and attribute"));
             }
         }
         // Hubs, one per hub value under a rotating attribute.
@@ -112,7 +112,7 @@ fn fixture(entities: u32, attributes: u32, values: u32) -> Fixture {
             data[..16].copy_from_slice(entity);
             data[16..32].copy_from_slice(&attribute_ids[k % attribute_ids.len()]);
             data[32..].copy_from_slice(hub);
-            set.insert(&Trible { data });
+            set.insert(&Trible::force_raw(data).expect("non-nil entity and attribute"));
         }
     }
 

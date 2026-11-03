@@ -169,7 +169,7 @@ fn repeated_fragment(namespace: &str, count: usize) -> Fragment {
 }
 
 fn raw_facts(set: &TribleSet) -> BTreeSet<[u8; 64]> {
-    set.iter().map(|trible| trible.data).collect()
+    set.iter().map(|trible| *trible.as_raw()).collect()
 }
 
 fn assert_all_indexes(set: &TribleSet, expected: &BTreeSet<[u8; 64]>) {

@@ -522,7 +522,10 @@ mod tests {
 
         // Projection does not audit earlier producers' canonical ordering.
         let reordered = Blob::new(Bytes::from_source(
-            rows.iter().rev().map(|row| row.data).collect::<Vec<_>>(),
+            rows.iter()
+                .rev()
+                .map(|row| *row.as_raw())
+                .collect::<Vec<_>>(),
         ));
         assert_eq!(
             derive_element(&reordered, attribute).unwrap(),

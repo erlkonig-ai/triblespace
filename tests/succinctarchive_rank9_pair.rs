@@ -25,7 +25,7 @@ fn set(seed: u8) -> TribleSet {
         raw_trible([seed; 16], [0x12; 16], [0x82; 32]),
     ]
     .into_iter()
-    .map(|data| Trible { data })
+    .map(|data| Trible::force_raw(data).expect("non-nil entity and attribute"))
     .collect()
 }
 

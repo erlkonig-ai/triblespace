@@ -121,7 +121,7 @@ mod tests {
             assert_eq!(
                 facts
                     .iter_ordered()
-                    .map(|trible| trible.data)
+                    .map(|trible| *trible.as_raw())
                     .collect::<Vec<_>>(),
                 expected,
             );
@@ -205,7 +205,7 @@ mod tests {
         assert_eq!(
             facts
                 .iter_ordered()
-                .map(|trible| trible.data)
+                .map(|trible| *trible.as_raw())
                 .collect::<Vec<_>>(),
             [row(1), row(2), row(3)],
         );

@@ -24,7 +24,7 @@ fn synthetic_trible(seed: u64, ordinal: usize) -> Trible {
     }
     data[0] |= 0x80;
     data[16] |= 0x80;
-    Trible { data }
+    Trible::force_raw(data).expect("non-nil entity and attribute")
 }
 
 fn make_segments(rows: usize) -> [TribleSet; 3] {

@@ -131,7 +131,7 @@ fn patch_benchmark(c: &mut Criterion) {
             b.iter(|| {
                 let mut patch = PATCH::<64, IdentitySchema>::new();
                 for t in black_box(&samples) {
-                    let entry: Entry<64> = Entry::new(&t.data);
+                    let entry: Entry<64> = Entry::new(t.as_raw());
                     patch.insert(&entry);
                 }
                 patch
@@ -141,7 +141,7 @@ fn patch_benchmark(c: &mut Criterion) {
             let samples = random_tribles(i as usize);
             let mut patch = PATCH::<64, IdentitySchema>::new();
             for t in black_box(&samples) {
-                let entry: Entry<64> = Entry::new(&t.data);
+                let entry: Entry<64> = Entry::new(t.as_raw());
                 patch.insert(&entry);
             }
             b.iter(|| black_box(&patch).into_iter().count());
@@ -150,7 +150,7 @@ fn patch_benchmark(c: &mut Criterion) {
             let samples = random_tribles(i as usize);
             let mut patch = PATCH::<64, IdentitySchema>::new();
             for t in black_box(&samples) {
-                let entry: Entry<64> = Entry::new(&t.data);
+                let entry: Entry<64> = Entry::new(t.as_raw());
                 patch.insert(&entry);
             }
             b.iter(|| {
@@ -171,7 +171,7 @@ fn patch_benchmark(c: &mut Criterion) {
                 .map(|samples| {
                     let mut patch: PATCH<64, IdentitySchema> = PATCH::<64, IdentitySchema>::new();
                     for t in samples {
-                        let entry: Entry<64> = Entry::new(&t.data);
+                        let entry: Entry<64> = Entry::new(t.as_raw());
                         patch.insert(&entry);
                     }
                     patch

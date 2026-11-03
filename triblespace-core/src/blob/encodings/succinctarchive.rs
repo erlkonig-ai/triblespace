@@ -3820,7 +3820,10 @@ mod tests {
             for entry in entries {
                 let mut key = [0; 64];
                 key.iter_mut().set_from(entry.iter().cloned());
-                set.insert(&Trible{ data: key});
+                // A nil entity or attribute is not a trible; skip it.
+                if let Some(trible) = Trible::force_raw(key) {
+                    set.insert(&trible);
+                }
             }
 
             let _archive: SuccinctArchive<CompressedUniverse> = (&set).into();
@@ -3832,7 +3835,10 @@ mod tests {
             for entry in entries {
                 let mut key = [0; 64];
                 key.iter_mut().set_from(entry.iter().cloned());
-                set.insert(&Trible{ data: key});
+                // A nil entity or attribute is not a trible; skip it.
+                if let Some(trible) = Trible::force_raw(key) {
+                    set.insert(&trible);
+                }
             }
 
             let archive: SuccinctArchive<CompressedUniverse> = (&set).into();
@@ -3850,9 +3856,10 @@ mod tests {
         fn packed_leaf_build_matches_jerky_bytes(
             entries in prop::collection::vec(any::<[u8; 64]>(), 0..256)
         ) {
+            // A nil entity or attribute is not a trible; skip it.
             let set: TribleSet = entries
                 .into_iter()
-                .map(|data| Trible { data })
+                .filter_map(Trible::force_raw)
                 .collect();
             let packed: SuccinctArchive<OrderedUniverse> =
                 build_archive_from_tribleset_with_factory(&set, &PackedCpuWaveletFactory)
@@ -3877,7 +3884,7 @@ mod tests {
                 .map(|mut data| {
                     data[0] |= 1;
                     data[16] |= 1;
-                    Trible { data }
+                    Trible::force_raw(data).expect("non-nil entity and attribute")
                 })
                 .collect();
             let source: Blob<SimpleArchive> = (&set).to_blob();
@@ -4812,7 +4819,7 @@ mod tests {
                 data[16] = 2;
                 data[32] = 3;
                 data[60..].copy_from_slice(&row.to_be_bytes());
-                set.insert(&Trible { data });
+                set.insert(&Trible::force_raw(data).expect("non-nil entity and attribute"));
             }
             // One entity, one attribute, N distinct values: D = N + 2.
             let source: Blob<SimpleArchive> = (&set).to_blob();
@@ -5119,7 +5126,7 @@ mod tests {
         }
         data[0] |= 0x80;
         data[16] |= 0x80;
-        Trible { data }
+        Trible::force_raw(data).expect("non-nil entity and attribute")
     }
 
     #[cfg(feature = "parallel")]
@@ -5474,8 +5481,8 @@ mod tests {
             SuccinctArchiveRawBuildError::Source(UnarchiveError::BadTrible)
         );
 
-        let first = synthetic_trible(1).data;
-        let second = synthetic_trible(2).data;
+        let first = *synthetic_trible(1).as_raw();
+        let second = *synthetic_trible(2).as_raw();
         let mut duplicate = Vec::with_capacity(128);
         duplicate.extend_from_slice(&first);
         duplicate.extend_from_slice(&first);

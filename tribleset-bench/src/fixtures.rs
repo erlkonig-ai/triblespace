@@ -395,7 +395,7 @@ fn set_digest(set: &TribleSet) -> u64 {
     let mut accumulator: u64 = 0;
     for trible in set.iter() {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for word in trible.data.chunks_exact(8) {
+        for word in trible.as_raw().chunks_exact(8) {
             hash ^= u64::from_le_bytes(word.try_into().expect("eight-byte word"));
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }

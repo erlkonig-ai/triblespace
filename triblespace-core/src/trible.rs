@@ -352,6 +352,14 @@ impl Trible {
     pub fn v<V: InlineEncoding>(&self) -> &Inline<V> {
         Inline::as_transmute_raw(self.data[V_START..=V_END].try_into().unwrap())
     }
+
+    /// Returns the raw 64-byte EAV content of this trible.
+    ///
+    /// This is the byte form used on disk and on the wire, and the order
+    /// that [`Ord`] compares.
+    pub fn as_raw(&self) -> &RawTrible {
+        &self.data
+    }
 }
 
 crate::key_segmentation!(

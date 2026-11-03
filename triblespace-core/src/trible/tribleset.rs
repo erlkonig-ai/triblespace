@@ -472,7 +472,7 @@ impl TribleSet {
 
     /// Inserts a trible into all six covering indexes.
     pub fn insert(&mut self, trible: &Trible) {
-        let key = Entry::new(&trible.data);
+        let key = Entry::new(trible.as_raw());
         self.eav.insert(&key);
         self.eva.insert(&key);
         self.aev.insert(&key);
@@ -579,7 +579,7 @@ impl TribleSet {
 
     /// Returns `true` when the exact trible is present in the set.
     pub fn contains(&self, trible: &Trible) -> bool {
-        self.eav.has_prefix(&trible.data)
+        self.eav.has_prefix(trible.as_raw())
     }
 
     /// Creates a constraint over the intersection of the set's V-axis domain

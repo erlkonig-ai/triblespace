@@ -28,7 +28,7 @@ fn facts(start: u32, count: u32) -> TribleSet {
             data[16] = 2;
             data[32] = 3;
             data[60..].copy_from_slice(&ordinal.to_be_bytes());
-            Trible { data }
+            Trible::force_raw(data).expect("non-nil entity and attribute")
         })
         .collect()
 }
@@ -38,7 +38,9 @@ fn singleton_domain_source() -> Blob<SimpleArchive> {
     data[15] = 1;
     data[31] = 1;
     data[63] = 1;
-    let facts: TribleSet = [Trible { data }].into_iter().collect();
+    let facts: TribleSet = [Trible::force_raw(data).expect("non-nil entity and attribute")]
+        .into_iter()
+        .collect();
     facts.to_blob()
 }
 
@@ -52,7 +54,7 @@ fn varied_facts(start: u32, count: u32) -> TribleSet {
             data[28..32].copy_from_slice(&(ordinal % 5).to_be_bytes());
             data[32] = 3;
             data[60..].copy_from_slice(&ordinal.to_be_bytes());
-            Trible { data }
+            Trible::force_raw(data).expect("non-nil entity and attribute")
         })
         .collect()
 }

@@ -1756,7 +1756,7 @@ fn run_show(path: PathBuf, reference: String) -> Result<()> {
                 "  {:X} {:X} {}",
                 trible.e(),
                 trible.a(),
-                hex::encode_upper(&trible.data[32..64])
+                hex::encode_upper(&trible.as_raw()[32..64])
             );
         }
 

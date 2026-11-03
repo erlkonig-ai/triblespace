@@ -973,7 +973,7 @@ mod tests {
         data[..16].copy_from_slice(&e);
         data[16..32].copy_from_slice(&a);
         data[32..].copy_from_slice(&v);
-        set.insert(&Trible { data });
+        set.insert(&Trible::force_raw(data).expect("non-nil entity and attribute"));
     }
 
     /// Exercises the actual batching boundary rather than only Jerky's batch

@@ -18,7 +18,7 @@ fn source(start: u32, rows: u32) -> Blob<SimpleArchive> {
             data[28..32].copy_from_slice(&(ordinal % 17).to_be_bytes());
             data[32] = 3;
             data[60..].copy_from_slice(&ordinal.to_be_bytes());
-            Trible { data }
+            Trible::force_raw(data).expect("non-nil entity and attribute")
         })
         .collect();
     facts.to_blob()

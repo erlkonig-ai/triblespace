@@ -119,7 +119,7 @@ fn controls(output: Option<&Path>) -> ProbeResult<()> {
     SuccinctArchiveBlob::validate(&merged)?;
     let runtime = SuccinctArchive::<OrderedUniverse>::try_from_blob(merged.clone())?;
     let rebuilt_runtime = SuccinctArchive::<OrderedUniverse>::try_from_blob(rebuilt)?;
-    let actual: Vec<_> = runtime.iter().map(|row| row.data).collect();
+    let actual: Vec<_> = runtime.iter().map(|row| *row.as_raw()).collect();
     assert_eq!(actual.as_slice().as_flattened(), expected.bytes.as_ref());
     for rotation in SuccinctRotation::ALL {
         let mut fingerprint = blake3::Hasher::new();

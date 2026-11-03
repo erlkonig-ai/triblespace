@@ -86,7 +86,7 @@ proptest! {
 
         // Every proposed entity must appear in at least one trible
         for entity_raw in &proposals {
-            let found = set.iter().any(|t| &t.data[0..16] == &entity_raw[16..32]);
+            let found = set.iter().any(|t| &t.as_raw()[0..16] == &entity_raw[16..32]);
             prop_assert!(found,
                 "proposed entity not found in any trible");
         }
@@ -102,9 +102,9 @@ proptest! {
         // Every result triple must exist in the set
         for (e, a, v) in &results {
             let found = set.iter().any(|t| {
-                &t.data[0..16] == &e.raw[16..32]
-                    && &t.data[16..32] == &a.raw[16..32]
-                    && &t.data[32..64] == &v.raw[..]
+                &t.as_raw()[0..16] == &e.raw[16..32]
+                    && &t.as_raw()[16..32] == &a.raw[16..32]
+                    && &t.as_raw()[32..64] == &v.raw[..]
             });
             prop_assert!(found, "query result not in set");
         }
@@ -128,12 +128,12 @@ proptest! {
 
             let mut binding = BindingStore::new();
             let mut e_val = [0u8; 32];
-            e_val[16..32].copy_from_slice(&t.data[0..16]);
+            e_val[16..32].copy_from_slice(&t.as_raw()[0..16]);
             binding.bind(e.index, &e_val);
             let mut a_val = [0u8; 32];
-            a_val[16..32].copy_from_slice(&t.data[16..32]);
+            a_val[16..32].copy_from_slice(&t.as_raw()[16..32]);
             binding.bind(a.index, &a_val);
-            binding.bind(v.index, &t.data[32..64].try_into().unwrap());
+            binding.bind(v.index, &t.as_raw()[32..64].try_into().unwrap());
 
             prop_assert!(constraint.satisfied(&binding.view()),
                 "existing triple should satisfy constraint");
@@ -155,12 +155,12 @@ proptest! {
 
             let mut binding = BindingStore::new();
             let mut e_val = [0u8; 32];
-            e_val[16..32].copy_from_slice(&fake.data[0..16]);
+            e_val[16..32].copy_from_slice(&fake.as_raw()[0..16]);
             binding.bind(e.index, &e_val);
             let mut a_val = [0u8; 32];
-            a_val[16..32].copy_from_slice(&fake.data[16..32]);
+            a_val[16..32].copy_from_slice(&fake.as_raw()[16..32]);
             binding.bind(a.index, &a_val);
-            binding.bind(v.index, &fake.data[32..64].try_into().unwrap());
+            binding.bind(v.index, &fake.as_raw()[32..64].try_into().unwrap());
 
             prop_assert!(!constraint.satisfied(&binding.view()),
                 "absent triple should not satisfy constraint");

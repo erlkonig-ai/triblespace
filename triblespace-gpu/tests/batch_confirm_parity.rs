@@ -134,7 +134,7 @@ fn fixture() -> Fixture {
                 data[..16].copy_from_slice(entity);
                 data[16..32].copy_from_slice(attribute);
                 data[32..].copy_from_slice(&value);
-                set.insert(&Trible { data });
+                set.insert(&Trible::force_raw(data).expect("non-nil entity and attribute"));
             }
         }
     }
@@ -593,7 +593,7 @@ fn confirm_crossover_sweep() {
             data[..16].copy_from_slice(entity);
             data[16..32].copy_from_slice(attribute);
             data[32..].copy_from_slice(&value);
-            set.insert(&Trible { data });
+            set.insert(&Trible::force_raw(data).expect("non-nil entity and attribute"));
         }
     }
     let archive: SuccinctArchive<OrderedUniverse> = (&set).into();

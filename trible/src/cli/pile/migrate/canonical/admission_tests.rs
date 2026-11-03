@@ -27,7 +27,7 @@ fn sorted(mut rows: Vec<Value>) -> Vec<Value> {
     rows
 }
 fn facts(set: &TribleSet) -> Vec<String> {
-    let mut rows: Vec<_> = set.iter().map(|t| hex::encode(t.data)).collect();
+    let mut rows: Vec<_> = set.iter().map(|t| hex::encode(t.as_raw())).collect();
     rows.sort();
     rows
 }
