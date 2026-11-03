@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `TribleSet`'s six indexes are private. Read them through `eav()`,
+  `eva()`, `aev()`, `ave()`, `vea()` and `vae()`, which return shared
+  references only. `insert_archive` now takes the `&Trible` and its
+  `Arc<dyn ArchiveOwner>` instead of an `ArchiveEntry`, and is an
+  `unsafe fn` carrying `ArchiveEntry::new`'s lifetime and immutability
+  conditions. With every key inserted from a valid, aligned `Trible`,
+  `iter` and `iter_ordered` no longer re-check each row (a debug assertion
+  keeps the check): count-only iteration of an archive-backed set is 21%
+  faster per item at 1M rows and 37% at 10M on sky, field-reading
+  iteration 1-5%.
+
 - `ObjectStoreSnapshot::get` copies a fetched body whose base is not 16-byte
   aligned into aligned storage before building the `Blob`, so typed views
   such as a `SimpleArchive` decode no longer fail with `BadArchive` because
