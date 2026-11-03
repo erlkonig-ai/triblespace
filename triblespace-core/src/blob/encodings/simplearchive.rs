@@ -346,6 +346,46 @@ fn check_archive_run_boundaries(runs: &[&[[u8; 64]]]) -> Result<(), UnarchiveErr
     Ok(())
 }
 
+/// Entry points for timing the unarchive phases separately, used by the
+/// `unarchive_phase_probe` example. Not API: they exist so one probe source
+/// compiles against two revisions of the decoder.
+#[doc(hidden)]
+#[cfg(feature = "parallel")]
+pub mod phase_probe {
+    use super::*;
+
+    /// Phase 2 of the parallel decoder alone: validate and hash in worker runs.
+    pub fn validate_and_hash_parallel(slice: &[[u8; 64]]) -> Result<Vec<u128>, UnarchiveError> {
+        use rayon::prelude::*;
+        let n_threads = rayon::current_num_threads().max(1);
+        let scan_size = slice.len().div_ceil(n_threads).max(1);
+        let mut hashes = vec![0u128; slice.len()];
+        slice
+            .par_chunks(scan_size)
+            .zip(hashes.par_chunks_mut(scan_size))
+            .try_for_each(|(rows, out)| validate_and_hash_archive_into(rows, out))?;
+        Ok(hashes)
+    }
+
+    /// The same validation and hashing on the calling thread, as one run.
+    pub fn validate_and_hash_single(slice: &[[u8; 64]]) -> Result<Vec<u128>, UnarchiveError> {
+        let mut hashes = vec![0u128; slice.len()];
+        validate_and_hash_archive_into(slice, &mut hashes)?;
+        Ok(hashes)
+    }
+
+    /// The serial decoder over the whole archive, archive-backed when aligned.
+    pub fn serial(bytes: Bytes) -> Result<TribleSet, UnarchiveError> {
+        let Ok(packed): Result<View<[[u8; 64]]>, _> = bytes.clone().view() else {
+            return Err(UnarchiveError::BadArchive);
+        };
+        let slice: &[[u8; 64]] = &packed;
+        let owner: Option<Arc<dyn ArchiveOwner>> = ((slice.as_ptr() as usize) & 0x0f == 0)
+            .then(|| Arc::new(bytes.clone()) as Arc<dyn ArchiveOwner>);
+        serial_unarchive(slice, owner.as_ref())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
