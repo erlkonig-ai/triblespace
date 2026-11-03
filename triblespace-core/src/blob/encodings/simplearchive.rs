@@ -189,33 +189,49 @@ fn serial_unarchive(
     owner: Option<&Arc<dyn ArchiveOwner>>,
 ) -> Result<TribleSet, UnarchiveError> {
     let mut tribles = TribleSet::new();
-    let mut prev_trible: Option<&[u8; 64]> = None;
-    for t in slice.iter() {
-        let Some(trible) = Trible::as_transmute_force_raw(t) else {
+    validate_canonical_rows_with(slice, |_, t| match owner {
+        Some(owner_arc) => {
+            // SAFETY: `t` points into the archive bytes kept alive
+            // by `owner_arc`, and base-alignment + 64-byte stride
+            // guarantees this element is 16-byte aligned.
+            let ptr = NonNull::from(t);
+            let entry = unsafe { ArchiveEntry::new(ptr, owner_arc) };
+            tribles.insert_archive(&entry);
+        }
+        None => tribles.insert(Trible::as_transmute_raw_unchecked(t)),
+    })?;
+    Ok(tribles)
+}
+
+/// The canonical-archive check: every row is a valid trible (entity and
+/// attribute not nil) and rows are strictly increasing, so none repeats.
+///
+/// `each(index, row)` runs for every row once that row has passed, in order,
+/// so a caller can fuse its own per-row work (hashing, insertion) into the
+/// same pass. On the first failure it returns the error and calls `each` for
+/// no later row.
+#[inline]
+fn validate_canonical_rows_with<F>(rows: &[[u8; 64]], mut each: F) -> Result<(), UnarchiveError>
+where
+    F: FnMut(usize, &[u8; 64]),
+{
+    let mut previous: Option<&[u8; 64]> = None;
+    for (index, row) in rows.iter().enumerate() {
+        if Trible::as_transmute_force_raw(row).is_none() {
             return Err(UnarchiveError::BadTrible);
-        };
-        if let Some(prev) = prev_trible {
-            if prev == t {
+        }
+        if let Some(previous) = previous {
+            if previous == row {
                 return Err(UnarchiveError::BadCanonicalizationRedundancy);
             }
-            if prev > t {
+            if previous > row {
                 return Err(UnarchiveError::BadCanonicalizationOrdering);
             }
         }
-        prev_trible = Some(t);
-        match owner {
-            Some(owner_arc) => {
-                // SAFETY: `t` points into the archive bytes kept alive
-                // by `owner_arc`, and base-alignment + 64-byte stride
-                // guarantees this element is 16-byte aligned.
-                let ptr = NonNull::from(t);
-                let entry = unsafe { ArchiveEntry::new(ptr, owner_arc) };
-                tribles.insert_archive(&entry);
-            }
-            None => tribles.insert(trible),
-        }
+        previous = Some(row);
+        each(index, row);
     }
-    Ok(tribles)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -236,24 +252,10 @@ fn validate_and_hash_archive_into(
     slice: &[[u8; 64]],
     hashes: &mut [u128],
 ) -> Result<(), UnarchiveError> {
-    debug_assert_eq!(slice.len(), hashes.len());
-    let mut previous: Option<&[u8; 64]> = None;
-    for (row, hash) in slice.iter().zip(hashes.iter_mut()) {
-        if Trible::as_transmute_force_raw(row).is_none() {
-            return Err(UnarchiveError::BadTrible);
-        }
-        if let Some(previous) = previous {
-            if previous == row {
-                return Err(UnarchiveError::BadCanonicalizationRedundancy);
-            }
-            if previous > row {
-                return Err(UnarchiveError::BadCanonicalizationOrdering);
-            }
-        }
-        previous = Some(row);
-        *hash = hash_key(&row[..]);
-    }
-    Ok(())
+    assert_eq!(slice.len(), hashes.len());
+    validate_canonical_rows_with(slice, |index, row| {
+        hashes[index] = hash_key(&row[..]);
+    })
 }
 
 /// Whether every row of an archive this long has an ordinal the partition
