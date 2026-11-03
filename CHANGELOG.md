@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- The archive readers validate through `CanonicalTribles` and read typed
+  rows: `simplearchive_union` (`validate_element`, `join`, `join_all`,
+  `validate_merge`), `lww_register::derive_element`,
+  `latest::derive_element`, `SuccinctArchiveBlob::build_from_simple_archive`
+  and `triblespace-paths`' `path_summary_union::derive_element`.
+  `entity_id_set::derive_element`, which does not audit ordering, views its
+  source as a validated `View<[Trible]>`. The union writers reserve
+  `Section<Trible>` and copy rows in with `Section::write`. Behaviour
+  changes: a source or element whose base is not 16-byte aligned is
+  `BadArchive` in every one of them (most reported `BadTrible` for it), and
+  a nil row anywhere is reported before an ordering error.
+
 - `CanonicalTribles` (in `blob::encodings::simplearchive`) is a zero-copy
   `View<[Trible]>` that can only be built by validating bytes as a canonical
   trible sequence: whole 64-byte rows on a 16-byte-aligned base
@@ -34,9 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Debug` output are unchanged. The `pub data` field and
   `Trible::as_transmute_raw_unchecked` are removed: read bytes with
   `Trible::as_raw`, build from bytes with `Trible::force_raw`.
-  `Trible::as_transmute_force_raw` now also returns `None` for a row that is
-  not 16-byte aligned. `SimpleArchive` encodes from a `Vec<Trible>`, so its
-  bytes are 16-byte aligned by type.
+  `Trible::as_transmute_force_raw` is removed too: borrow rows in place
+  through `CanonicalTribles` or a `View<[Trible]>`. `SimpleArchive` encodes
+  from a `Vec<Trible>`, so its bytes are 16-byte aligned by type.
 
 - `/triblespace/pile-sync/36`: a cut-off cached RIBLT exchange resumes where
   it stopped. Each host keeps the raw peer cells it received, verbatim as

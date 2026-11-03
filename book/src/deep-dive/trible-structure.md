@@ -38,6 +38,27 @@ like "tribble" from Star Trek – hence the project's mascot, Robert the
 tribble. This rigid layout keeps the representation friendly to SIMD
 optimisations and allows the storage layer to compute sizes deterministically.
 
+In Rust the record is the `Trible` struct, `#[repr(C, align(16))]` with three
+private fields in exactly that order (`e: Id`, `a: Id`, `v: RawInline`) and
+no padding, so its bytes are the bytes on disk and on the wire.
+`Trible::as_raw` lends them out as a `&[u8; 64]`. A trible's only validity
+rule is that neither the entity nor the attribute is nil (all zero), and
+zerocopy checks it whenever bytes become a `Trible`: `Trible::force_raw`
+copies one row in, and a `View<[Trible]>` borrows many in place. Such a view
+also requires a 16‑byte‑aligned base, which pile records (256‑byte aligned)
+and archives encoded from a `Vec<Trible>` always have. The derived `Ord`
+compares the fields in layout order and each field by its raw bytes, so
+tribles sort exactly as their 64 bytes do.
+
+A `SimpleArchive` blob is a sequence of such rows in strictly increasing
+order. Readers obtain it as `CanonicalTribles`, which can only be built by
+validating bytes: the length and alignment (`BadArchive`), then the row rule
+on every row (`BadTrible`), then strict increase
+(`BadCanonicalizationRedundancy` or `BadCanonicalizationOrdering`). Empty
+input is accepted at any address. Holding a `CanonicalTribles` proves those
+checks ran, so code downstream of it reads typed rows instead of
+re-validating byte chunks.
+
 ## Index permutations
 
 `TribleSet`s index each fact under all six permutations of entity (E),

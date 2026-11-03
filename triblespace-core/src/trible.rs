@@ -261,45 +261,6 @@ impl Trible {
         Trible::try_read_from_bytes(&data).ok()
     }
 
-    /// Views a raw trible reference as a trible reference.
-    /// Circumvents the ownership system, and is useful for loading existing trible data,
-    /// just like [Trible::force] and [Trible::force_raw].
-    ///
-    /// # Arguments
-    ///
-    /// * `data` - The raw trible reference.
-    ///
-    /// # Returns
-    ///
-    /// A trible reference if `data` is 16-byte aligned and the entity and
-    /// attribute are not nil (i.e. they are not all zeroes), otherwise `None`.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use triblespace_core::prelude::*;
-    ///
-    /// // A `[u8; 64]` has alignment 1; this wrapper gives it the 16-byte
-    /// // alignment a `&Trible` requires.
-    /// #[repr(align(16))]
-    /// struct Aligned([u8; 64]);
-    ///
-    /// let data = Aligned([
-    ///   // Entity
-    ///   0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-    ///   // Attribute
-    ///   16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
-    ///   // Inline
-    ///   32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
-    ///   48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
-    /// ]);
-    /// let trible = Trible::as_transmute_force_raw(&data.0);
-    /// assert!(trible.is_some());
-    /// ```
-    pub fn as_transmute_force_raw(data: &RawTrible) -> Option<&Self> {
-        Trible::try_ref_from_bytes(data).ok()
-    }
-
     /// Returns the entity of the trible.
     ///
     /// # Returns
