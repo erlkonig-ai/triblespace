@@ -35,6 +35,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 use triblespace_core::prelude::entity;
+use triblespace_core::prelude::View;
 
 use triblespace_core::attribute::Attribute;
 use triblespace_core::blob::encodings::simplearchive::{
@@ -706,7 +707,9 @@ pub fn derive_element(
     source: &Blob<SimpleArchive>,
     automaton: &Automaton,
 ) -> Result<Blob<PathSummaryBlob>, RegularPathMappingError> {
-    let rows = CanonicalTribles::validate(source.bytes.clone())
+    let rows = source
+        .clone()
+        .try_from_blob::<View<CanonicalTribles>>()
         .map_err(RegularPathMappingError::Source)?;
     let edges = rows.as_tribles().iter().map(GraphEdge::from);
     let summary = PathSummary::from_edges(automaton.clone(), edges);

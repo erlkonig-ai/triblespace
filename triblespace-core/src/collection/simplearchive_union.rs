@@ -24,6 +24,7 @@ use std::io;
 
 use anybytes::area::{ByteArea, Section};
 use anybytes::Bytes;
+use anybytes::View;
 use ed25519_dalek::SigningKey;
 
 use crate::blob::encodings::simplearchive::{CanonicalTribles, SimpleArchive, UnarchiveError};
@@ -411,7 +412,7 @@ pub fn join_all(
         .iter()
         .map(canonical_rows)
         .collect::<Result<Vec<_>, _>>()?;
-    let rows: Vec<&[Trible]> = canonical.iter().map(CanonicalTribles::as_tribles).collect();
+    let rows: Vec<&[Trible]> = canonical.iter().map(|rows| rows.as_tribles()).collect();
     let nonempty: Vec<usize> = (0..members.len())
         .filter(|&index| !rows[index].is_empty())
         .collect();
@@ -515,7 +516,7 @@ pub fn validate_merge(
     for (index, rows) in input_rows.iter().enumerate() {
         streams[index] = rows
             .as_ref()
-            .map(CanonicalTribles::as_tribles)
+            .map(|rows| rows.as_tribles())
             .map_err(
                 |&source| SimpleArchiveUnionValidationError::InvalidElement {
                     role: ElementRole::MergeInput(index),
@@ -652,8 +653,8 @@ fn freeze_union_rows(
     Ok(Blob::new(rows.freeze()?.slice(..len)))
 }
 
-fn canonical_rows(blob: &Blob<SimpleArchive>) -> Result<CanonicalTribles, UnarchiveError> {
-    CanonicalTribles::validate(blob.bytes.clone())
+fn canonical_rows(blob: &Blob<SimpleArchive>) -> Result<View<CanonicalTribles>, UnarchiveError> {
+    blob.clone().try_from_blob()
 }
 
 struct UnionRows<'a> {

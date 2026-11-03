@@ -51,12 +51,15 @@ compares the fields in layout order and each field by its raw bytes, so
 tribles sort exactly as their 64 bytes do.
 
 A `SimpleArchive` blob is a sequence of such rows in strictly increasing
-order. Readers obtain it as `CanonicalTribles`, which can only be built by
-validating bytes: the length and alignment (`BadArchive`), then the row rule
-on every row (`BadTrible`), then strict increase
-(`BadCanonicalizationRedundancy` or `BadCanonicalizationOrdering`). Empty
-input is accepted at any address. Holding a `CanonicalTribles` proves those
-checks ran, so code downstream of it reads typed rows instead of
+order. Readers obtain it in place as a `View<CanonicalTribles>`
+(`blob.try_from_blob::<View<CanonicalTribles>>()`). `CanonicalTribles` is to
+`[Trible]` what `str` is to `[u8]`: the same bytes with one more invariant,
+here strict increase. It can only be built by checking: from bytes, the
+length and alignment (`BadArchive`), then the row rule on every row
+(`BadTrible`), then strict increase (`BadCanonicalizationRedundancy` or
+`BadCanonicalizationOrdering`); from a `&[Trible]`, the last check alone.
+Empty input is accepted at any address. Holding a `CanonicalTribles` proves
+those checks ran, so code downstream of it reads typed rows instead of
 re-validating byte chunks.
 
 ## Index permutations

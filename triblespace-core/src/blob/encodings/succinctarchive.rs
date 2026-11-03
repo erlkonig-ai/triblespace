@@ -58,6 +58,7 @@ use itertools::Itertools;
 
 use anybytes::area::{ByteArea, Section, SectionHandle, SectionWriter};
 use anybytes::Bytes;
+use anybytes::View;
 use jerky::bit_vector::rank9sel::Rank9SelIndex;
 use jerky::bit_vector::Access;
 use jerky::bit_vector::BitVector;
@@ -272,7 +273,7 @@ impl SuccinctArchiveBlob {
         source: &Blob<SimpleArchive>,
         encode: impl FnOnce(&[RawInline], &mut [[u32; 3]]) -> Result<Bytes, portable::PortableError>,
     ) -> Result<Blob<Self>, SuccinctArchiveRawBuildError> {
-        let canonical = CanonicalTribles::validate(source.bytes.clone())?;
+        let canonical: View<CanonicalTribles> = source.clone().try_from_blob()?;
         let tribles = canonical.as_tribles();
         let row_count = tribles.len();
         if row_count > u32::MAX as usize {

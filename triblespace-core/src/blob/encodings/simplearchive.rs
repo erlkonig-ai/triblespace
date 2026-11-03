@@ -137,13 +137,45 @@ impl std::error::Error for UnarchiveError {}
 /// the rows are strictly increasing in byte order, so they are also free of
 /// duplicates.
 ///
-/// This is the shape the bytes of a [`SimpleArchive`] blob must have. The only
-/// way to obtain one is to validate bytes, so holding a `CanonicalTribles` is
-/// proof that the check ran. The rows stay where they are: the value is a
-/// zero-copy view into the source bytes and keeps them alive.
+/// This is the shape the bytes of a [`SimpleArchive`] blob must have. It is a
+/// dynamically sized type over `[Trible]`, the way `str` is over `[u8]`: it is
+/// bit-identical to the rows it wraps and adds only the ordering invariant.
+/// It is held behind a reference, or as a zero-copy [`View<CanonicalTribles>`]
+/// that borrows the rows where they lie and keeps the source bytes alive.
+/// [`SimpleArchive`] stays the encoding marker, as `UTF8String` does for
+/// `View<str>`, so decoding a blob in place is
 ///
-/// The checks run in a fixed order, and that order decides which error a bad
-/// archive reports:
+/// ```
+/// # use triblespace_core::blob::{Blob, IntoBlob};
+/// # use triblespace_core::blob::encodings::simplearchive::{CanonicalTribles, SimpleArchive};
+/// # use triblespace_core::trible::TribleSet;
+/// # use anybytes::View;
+/// # let blob: Blob<SimpleArchive> = TribleSet::new().to_blob();
+/// let rows: View<CanonicalTribles> = blob.try_from_blob().unwrap();
+/// # assert!(rows.is_empty());
+/// ```
+///
+/// next to `blob.try_from_blob::<TribleSet>()`, which builds the indexes.
+///
+/// Every safe way to obtain one checks the ordering: [`Self::from_tribles`]
+/// for rows that are already tribles, and [`Self::validate`],
+/// [`Self::validate_with`], [`Self::par_validate_map`] and the
+/// [`TryFromBlob`] impl for bytes. Holding one is therefore proof that the
+/// check ran. The type deliberately implements neither zerocopy's
+/// `TryFromBytes` nor `FromBytes` (nor `KnownLayout`): either would make
+/// anybytes' generic `Bytes::view` a safe constructor that skips the
+/// ordering check. It implements only `Immutable` and `IntoBytes`, which
+/// read a value and never build one.
+///
+/// ```compile_fail,E0277
+/// use anybytes::Bytes;
+/// use triblespace_core::blob::encodings::simplearchive::CanonicalTribles;
+///
+/// let _ = Bytes::empty().view::<CanonicalTribles>();
+/// ```
+///
+/// The byte checks run in a fixed order, and that order decides which error
+/// a bad archive reports:
 ///
 /// 1. the length is a whole number of 64-byte rows and the base is 16-byte
 ///    aligned, or [`UnarchiveError::BadArchive`];
@@ -154,14 +186,41 @@ impl std::error::Error for UnarchiveError {}
 ///    [`UnarchiveError::BadCanonicalizationOrdering`] for a smaller one.
 ///
 /// Empty input is canonical whatever its address.
-#[derive(Clone, Debug)]
-pub struct CanonicalTribles {
-    rows: View<[Trible]>,
-}
+#[derive(Debug, zerocopy::Immutable, zerocopy::IntoBytes)]
+#[repr(transparent)]
+pub struct CanonicalTribles([Trible]);
 
 impl CanonicalTribles {
+    /// Checks that `rows` are strictly increasing in byte order.
+    ///
+    /// The rows are already tribles, so the row rule holds by type and only
+    /// the third check applies: an equal neighbour is
+    /// [`UnarchiveError::BadCanonicalizationRedundancy`] and a smaller one
+    /// [`UnarchiveError::BadCanonicalizationOrdering`].
+    pub fn from_tribles(rows: &[Trible]) -> Result<&Self, UnarchiveError> {
+        check_increasing(rows, |_, _| {})?;
+        // SAFETY: `check_increasing` just proved the rows strictly increasing.
+        Ok(unsafe { Self::from_tribles_unchecked(rows) })
+    }
+
+    /// Wraps `rows` without checking them. This is the only place a
+    /// `CanonicalTribles` comes into being.
+    ///
+    /// # Safety
+    ///
+    /// `rows` must be strictly increasing in byte order (each row greater
+    /// than the one before it). Code that holds a `CanonicalTribles` relies
+    /// on that, as code that holds a `str` relies on UTF-8.
+    unsafe fn from_tribles_unchecked(rows: &[Trible]) -> &Self {
+        // SAFETY: `CanonicalTribles` is `repr(transparent)` over `[Trible]`,
+        // so the two have the same layout and the same pointer metadata (the
+        // row count), and the cast keeps the borrow's lifetime. The ordering
+        // invariant is the caller's obligation.
+        unsafe { &*(rows as *const [Trible] as *const Self) }
+    }
+
     /// Validates `bytes` as a canonical trible sequence.
-    pub fn validate(bytes: Bytes) -> Result<Self, UnarchiveError> {
+    pub fn validate(bytes: Bytes) -> Result<View<Self>, UnarchiveError> {
         Self::validate_with(bytes, |_, _| {})
     }
 
@@ -173,13 +232,17 @@ impl CanonicalTribles {
     /// ordering pass instead of reading the rows a second time. On an error
     /// `visit` has seen every row before the offending one, so whatever it
     /// built is a prefix the caller should discard.
-    pub fn validate_with<F>(bytes: Bytes, mut visit: F) -> Result<Self, UnarchiveError>
+    pub fn validate_with<F>(bytes: Bytes, mut visit: F) -> Result<View<Self>, UnarchiveError>
     where
         F: FnMut(usize, &Trible),
     {
         let rows = view_rows(bytes)?;
         check_increasing(&rows, &mut visit)?;
-        Ok(Self { rows })
+        // SAFETY: `check_increasing` just proved the rows strictly increasing.
+        let canonical = unsafe { Self::from_tribles_unchecked(&rows) };
+        Ok(rows
+            .field_to_view(canonical)
+            .expect("the canonical rows are the bytes of the view"))
     }
 
     /// Validates `bytes` with the row rule and the ordering pass split across
@@ -195,7 +258,10 @@ impl CanonicalTribles {
     /// the errors are the same kinds in the same precedence: an ordering
     /// error is reported only once no row anywhere breaks the row rule.
     #[cfg(feature = "parallel")]
-    pub fn par_validate_map<T, F>(bytes: Bytes, map: F) -> Result<(Self, Vec<T>), UnarchiveError>
+    pub fn par_validate_map<T, F>(
+        bytes: Bytes,
+        map: F,
+    ) -> Result<(View<Self>, Vec<T>), UnarchiveError>
     where
         T: Clone + Default + Send,
         F: Fn(&Trible) -> T + Sync,
@@ -234,15 +300,20 @@ impl CanonicalTribles {
         let tribles: &[Trible] =
             unsafe { std::slice::from_raw_parts(rows.as_ptr().cast::<Trible>(), rows.len()) };
         debug_assert!(<[Trible]>::try_ref_from_bytes(tribles.as_bytes()).is_ok());
-        let rows = rows
-            .field_to_view(tribles)
-            .expect("the tribles are the bytes of the aligned rows");
-        Ok((Self { rows }, mapped))
+        // SAFETY: the seams were checked and every run proved its own interior
+        // strictly increasing, and the runs cover `rows` contiguously, so by
+        // transitivity the whole sequence is strictly increasing.
+        let canonical = unsafe { Self::from_tribles_unchecked(tribles) };
+        debug_assert!(Self::from_tribles(tribles).is_ok());
+        let canonical = rows
+            .field_to_view(canonical)
+            .expect("the canonical rows are the bytes of the aligned rows");
+        Ok((canonical, mapped))
     }
 
     /// The rows as tribles.
     pub fn as_tribles(&self) -> &[Trible] {
-        &self.rows
+        &self.0
     }
 
     /// The rows as their raw 64-byte representation.
@@ -252,12 +323,22 @@ impl CanonicalTribles {
 
     /// The number of rows.
     pub fn len(&self) -> usize {
-        self.rows.len()
+        self.0.len()
     }
 
     /// Whether there are no rows.
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.0.is_empty()
+    }
+}
+
+/// The zero-copy decode of a [`SimpleArchive`] blob: the rows in place,
+/// validated as [`CanonicalTribles::validate`] does, with the same errors.
+impl TryFromBlob<SimpleArchive> for View<CanonicalTribles> {
+    type Error = UnarchiveError;
+
+    fn try_from_blob(blob: Blob<SimpleArchive>) -> Result<Self, Self::Error> {
+        CanonicalTribles::validate(blob.bytes)
     }
 }
 
@@ -552,6 +633,160 @@ mod tests {
         let bytes: Bytes = rows.into();
         Blob::new(bytes)
     }
+
+    fn tribles(rows: &[[u8; 64]]) -> Vec<Trible> {
+        rows.iter()
+            .map(|row| Trible::force_raw(*row).expect("fixture rows are valid tribles"))
+            .collect()
+    }
+
+    #[test]
+    fn canonical_tribles_from_tribles_wraps_the_rows_in_place() {
+        let empty = CanonicalTribles::from_tribles(&[]).unwrap();
+        assert!(empty.is_empty());
+
+        let rows = tribles(&(0..5).map(fixture_row).collect::<Vec<_>>());
+        let canonical = CanonicalTribles::from_tribles(&rows).unwrap();
+        assert_eq!(canonical.len(), rows.len());
+        assert_eq!(canonical.as_tribles(), &rows[..]);
+        assert!(std::ptr::eq(canonical.as_tribles(), &rows[..]));
+        assert_eq!(
+            zerocopy::IntoBytes::as_bytes(canonical),
+            zerocopy::IntoBytes::as_bytes(&rows[..])
+        );
+    }
+
+    /// Every safe constructor of `CanonicalTribles` runs the ordering check
+    /// and reports the same error for the same rows.
+    #[test]
+    fn canonical_tribles_every_constructor_refuses_bad_ordering() {
+        let (a, b, c) = (fixture_row(0), fixture_row(1), fixture_row(2));
+        let cases = [
+            (vec![a, a], UnarchiveError::BadCanonicalizationRedundancy),
+            (vec![a, b, b], UnarchiveError::BadCanonicalizationRedundancy),
+            (vec![b, a], UnarchiveError::BadCanonicalizationOrdering),
+            (vec![a, c, b], UnarchiveError::BadCanonicalizationOrdering),
+            // An equal pair before a smaller row: the first offence wins.
+            (vec![b, b, a], UnarchiveError::BadCanonicalizationRedundancy),
+        ];
+        for (rows, expected) in cases {
+            let typed = tribles(&rows);
+            assert_eq!(
+                CanonicalTribles::from_tribles(&typed).unwrap_err(),
+                expected
+            );
+            let bytes = Bytes::from(rows.clone());
+            assert_eq!(
+                CanonicalTribles::validate(bytes.clone()).unwrap_err(),
+                expected
+            );
+            let mut visited = 0;
+            assert_eq!(
+                CanonicalTribles::validate_with(bytes.clone(), |_, _| visited += 1).unwrap_err(),
+                expected
+            );
+            assert!(visited < rows.len(), "visit saw the offending row");
+            assert_eq!(
+                Blob::<SimpleArchive>::new(bytes.clone())
+                    .try_from_blob::<View<CanonicalTribles>>()
+                    .unwrap_err(),
+                expected
+            );
+            #[cfg(feature = "parallel")]
+            assert_eq!(
+                CanonicalTribles::par_validate_map(bytes.clone(), |_| ()).unwrap_err(),
+                expected
+            );
+            assert_eq!(
+                TribleSet::try_from_blob(Blob::new(bytes)).unwrap_err(),
+                expected
+            );
+        }
+    }
+
+    /// The zero-copy decode of a blob is its rows in place, in the order and
+    /// with the content the indexing decode reads.
+    #[test]
+    fn zero_copy_decode_matches_tribleset_decode() {
+        for len in [0usize, 1, 2, 257, PARALLEL_THRESHOLD_FOR_TESTS + 1] {
+            let blob = fixture_blob(len);
+            let set: TribleSet = blob.clone().try_from_blob().unwrap();
+            let view: View<CanonicalTribles> = blob.clone().try_from_blob().unwrap();
+            let decoded: Vec<Trible> = set.iter_ordered().copied().collect();
+            assert_eq!(view.len(), len);
+            assert_eq!(view.as_tribles(), &decoded[..]);
+            assert_eq!(view.as_rows().as_flattened(), &blob.bytes[..]);
+            if len > 0 {
+                assert_eq!(view.as_tribles().as_ptr().cast::<u8>(), blob.bytes.as_ptr());
+            }
+            // The view hands its bytes back unchanged.
+            assert_eq!(&view.clone().bytes()[..], &blob.bytes[..]);
+        }
+        let set: TribleSet = (0..100)
+            .map(|index| Trible::force_raw(fixture_row(index * 7 % 100)).unwrap())
+            .fold(TribleSet::new(), |mut set, trible| {
+                set.insert(&trible);
+                set
+            });
+        let blob: Blob<SimpleArchive> = (&set).to_blob();
+        let view: View<CanonicalTribles> = blob.try_from_blob().unwrap();
+        assert_eq!(
+            view.as_tribles(),
+            &set.iter_ordered().copied().collect::<Vec<_>>()[..]
+        );
+    }
+
+    /// The decode keeps the other errors exactly as the byte checks report
+    /// them.
+    #[test]
+    fn zero_copy_decode_keeps_archive_and_trible_errors() {
+        let rows: Vec<[u8; 64]> = (0..3).map(fixture_row).collect();
+        let decode = |bytes: Bytes| {
+            Blob::<SimpleArchive>::new(bytes).try_from_blob::<View<CanonicalTribles>>()
+        };
+        assert_eq!(
+            decode(misaligned_copy(rows.as_flattened())).unwrap_err(),
+            UnarchiveError::BadArchive
+        );
+        let mut partial = Bytes::from(rows.clone());
+        assert!(partial.take_suffix(1).is_some());
+        assert_eq!(decode(partial).unwrap_err(), UnarchiveError::BadArchive);
+        let mut nil = rows;
+        nil[2][16..32].fill(0);
+        nil.swap(0, 1);
+        assert_eq!(
+            decode(Bytes::from(nil)).unwrap_err(),
+            UnarchiveError::BadTrible
+        );
+        assert!(decode(Bytes::empty()).unwrap().is_empty());
+    }
+
+    /// The encoding marker and its metadata are untouched by the zero-copy
+    /// face: the schema id and the described metadata stay byte-identical.
+    #[test]
+    fn simple_archive_schema_identity_is_golden() {
+        assert_eq!(
+            <SimpleArchive as MetaDescribe>::id(),
+            id_hex!("8F4A27C8581DADCBA1ADA8BA228069B6")
+        );
+        let described: Blob<SimpleArchive> = SimpleArchive::describe().facts().to_blob();
+        let handle: String = described
+            .get_handle()
+            .raw
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect();
+        println!("GOLDEN simplearchive metadata handle = {handle}");
+        assert_eq!(handle, SIMPLE_ARCHIVE_METADATA_HANDLE);
+    }
+
+    const SIMPLE_ARCHIVE_METADATA_HANDLE: &str =
+        "37AFF68935E6B442A470F775E1B84C33939810C205ADE4521B8175DCA6A42D7D";
+
+    #[cfg(feature = "parallel")]
+    const PARALLEL_THRESHOLD_FOR_TESTS: usize = PARALLEL_UNARCHIVE_THRESHOLD;
+    #[cfg(not(feature = "parallel"))]
+    const PARALLEL_THRESHOLD_FOR_TESTS: usize = 4096;
 
     #[test]
     fn fragment_encoding_archives_only_content_facts() {

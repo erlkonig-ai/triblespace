@@ -19,15 +19,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BadArchive` in every one of them (most reported `BadTrible` for it), and
   a nil row anywhere is reported before an ordering error.
 
-- `CanonicalTribles` (in `blob::encodings::simplearchive`) is a zero-copy
-  `View<[Trible]>` that can only be built by validating bytes as a canonical
-  trible sequence: whole 64-byte rows on a 16-byte-aligned base
-  (`BadArchive`), the row rule on every row (`BadTrible`), then strictly
-  increasing byte order (`BadCanonicalizationRedundancy` /
-  `BadCanonicalizationOrdering`). Empty input is accepted at any address.
+- `CanonicalTribles` (in `blob::encodings::simplearchive`) is a
+  `#[repr(transparent)]` dynamically sized type over `[Trible]`, as `str` is
+  over `[u8]`, carrying the invariant that the rows are strictly increasing
+  in byte order. It is held as `&CanonicalTribles` or as a zero-copy
+  `View<CanonicalTribles>`, and `blob.try_from_blob::<View<CanonicalTribles>>()`
+  is the in-place decode of a `SimpleArchive` blob next to
+  `try_from_blob::<TribleSet>()`. `SimpleArchive` stays the encoding marker
+  and its id is unchanged. Every safe constructor checks: `from_tribles`
+  (ordering only, `BadCanonicalizationRedundancy` /
+  `BadCanonicalizationOrdering`), and for bytes `validate`, `validate_with`,
+  `par_validate_map` (feature `parallel`) and the `TryFromBlob` impl, which
+  check whole 64-byte rows on a 16-byte-aligned base (`BadArchive`), the row
+  rule on every row (`BadTrible`), then ordering. Empty input is accepted at
+  any address. The type implements zerocopy `Immutable` and `IntoBytes` but
+  never `TryFromBytes` or `FromBytes`, so `Bytes::view` cannot build one.
   `validate_with` fuses per-row work into the ordering pass, and
-  `par_validate_map` (feature `parallel`) splits that pass across the rayon
-  pool. Accessors: `as_tribles`, `as_rows`, `len`, `is_empty`.
+  `par_validate_map` splits that pass across the rayon pool. Accessors:
+  `as_tribles`, `as_rows`, `len`, `is_empty`.
 
 - `SimpleArchive` decoding (`TribleSet::try_from_blob`,
   `try_from_archive_bytes`, `try_from_blob_heap_only`) validates through
