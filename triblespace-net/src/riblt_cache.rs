@@ -35,6 +35,8 @@ use std::sync::{Arc, Mutex};
 use riblt::{CodedSymbol, HashKey, HashedSymbol, RandomMapping, Symbol};
 use siphasher::sip::SipHasher24;
 use triblespace_core::collection::CollectionHandle;
+use zerocopy::byteorder::big_endian;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::exchange::Tree;
 use crate::patch_repair::PatchSummary;
@@ -125,10 +127,26 @@ impl Record for Cell {
     }
 }
 
+/// One whole RIBLT_CELL frame as it sits in the cache and on the wire: the
+/// stream header (kind, payload length), then the payload (index, symbol,
+/// checksum, signed count). Big endian throughout; alignment 1, so a frame
+/// can be read from any offset of a mapped chunk.
+#[derive(FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[repr(C)]
+struct CellFrameBytes {
+    kind: u8,
+    length: big_endian::U32,
+    index: big_endian::U32,
+    symbol: [u8; 32],
+    hash: big_endian::U64,
+    count: big_endian::I64,
+}
+
 /// RIBLT_CELL's payload: index:u32, symbol32, hash:u64, count:i64.
 pub(crate) const CELL_PAYLOAD_BYTES: usize = 4 + 32 + 8 + 8;
 /// One whole RIBLT_CELL frame on the wire: kind:u8, length:u32, payload.
-pub(crate) const CELL_FRAME_BYTES: usize = 1 + 4 + CELL_PAYLOAD_BYTES;
+pub(crate) const CELL_FRAME_BYTES: usize = size_of::<CellFrameBytes>();
+const _: () = assert!(CELL_FRAME_BYTES == 1 + 4 + CELL_PAYLOAD_BYTES);
 
 /// One cell at its index, stored as exactly the bytes its RIBLT_CELL frame
 /// puts on the wire (big endian, framing included). All zero bytes load as
@@ -143,37 +161,46 @@ impl CellFrame {
     /// Parse one canonical frame. `None` unless the header is exactly a
     /// RIBLT_CELL frame of [`CELL_PAYLOAD_BYTES`].
     pub(crate) fn parse(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != CELL_FRAME_BYTES
-            || bytes[0] != crate::walk_stream::FRAME_RIBLT_CELL
-            || bytes[1..5] != (CELL_PAYLOAD_BYTES as u32).to_be_bytes()
+        let frame = CellFrameBytes::ref_from_bytes(bytes).ok()?;
+        if frame.kind != crate::walk_stream::FRAME_RIBLT_CELL
+            || frame.length.get() != CELL_PAYLOAD_BYTES as u32
         {
             return None;
         }
-        Some(Self::load(bytes))
+        Some(Self::from_frame(frame))
+    }
+
+    fn from_frame(frame: &CellFrameBytes) -> Self {
+        Self {
+            index: frame.index.get(),
+            cell: Cell {
+                symbol: KeySymbol(frame.symbol),
+                hash: frame.hash.get(),
+                count: frame.count.get(),
+            },
+        }
     }
 }
 
 impl Record for CellFrame {
     const BYTES: usize = CELL_FRAME_BYTES;
 
+    /// The header is not checked here: an all-zero slot is the empty cell
+    /// at index 0, as [`Record`] requires. [`CellFrame::parse`] checks it.
     fn load(bytes: &[u8]) -> Self {
-        Self {
-            index: u32::from_be_bytes(bytes[5..9].try_into().unwrap()),
-            cell: Cell {
-                symbol: KeySymbol(bytes[9..41].try_into().unwrap()),
-                hash: u64::from_be_bytes(bytes[41..49].try_into().unwrap()),
-                count: i64::from_be_bytes(bytes[49..57].try_into().unwrap()),
-            },
-        }
+        Self::from_frame(CellFrameBytes::ref_from_bytes(bytes).expect("one whole cell frame"))
     }
 
     fn store(&self, bytes: &mut [u8]) {
-        bytes[0] = crate::walk_stream::FRAME_RIBLT_CELL;
-        bytes[1..5].copy_from_slice(&(CELL_PAYLOAD_BYTES as u32).to_be_bytes());
-        bytes[5..9].copy_from_slice(&self.index.to_be_bytes());
-        bytes[9..41].copy_from_slice(&self.cell.symbol.0);
-        bytes[41..49].copy_from_slice(&self.cell.hash.to_be_bytes());
-        bytes[49..57].copy_from_slice(&self.cell.count.to_be_bytes());
+        let frame = CellFrameBytes {
+            kind: crate::walk_stream::FRAME_RIBLT_CELL,
+            length: (CELL_PAYLOAD_BYTES as u32).into(),
+            index: self.index.into(),
+            symbol: self.cell.symbol.0,
+            hash: self.cell.hash.into(),
+            count: self.cell.count.into(),
+        };
+        bytes.copy_from_slice(frame.as_bytes());
     }
 }
 
@@ -302,7 +329,13 @@ impl Generation {
         cells.unshare(start).map_err(|_| CacheError::Storage)?;
         cells.resize(length).map_err(|_| CacheError::Storage)?;
         for index in start..length {
-            cells.set(index, &CellFrame { index: index as u32, cell: Cell::default() });
+            cells.set(
+                index,
+                &CellFrame {
+                    index: index as u32,
+                    cell: Cell::default(),
+                },
+            );
         }
         // Failed growth must not publish a partial tail.
         if let Err(error) = scatter(&self.source, &self.key, cells, start, 1) {
