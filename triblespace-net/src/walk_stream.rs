@@ -692,7 +692,7 @@ mod sim_tests {
             let (frame, payload) = root.encode();
             write_frame(&mut send, frame, &payload).await.unwrap();
             let Some(Command::Incoming {
-                peer,
+                link,
                 collection: opened,
                 kind: opened_kind,
                 mut recv,
@@ -701,7 +701,8 @@ mod sim_tests {
             else {
                 panic!("the walk task never got the stream");
             };
-            assert_eq!(peer, opener.peer);
+            assert_eq!(link.peer(), opener.peer);
+            assert_eq!(link.id(), acceptor.table.current(opener.peer).unwrap().link().id());
             assert_eq!(opened, collection);
             assert_eq!(opened_kind, kind);
             // The stream carries on from the Open frame.

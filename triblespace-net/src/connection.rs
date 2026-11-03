@@ -1046,10 +1046,12 @@ async fn accept_loop<T: Transport, S: Service>(
     if let Some(table) = shared.upgrade() {
         table.table.lock().unwrap().remove(&state);
         if state.announced.load(Ordering::SeqCst) {
-            // The walks forget what the peer confirmed and what landed
-            // from it.
+            // The walks cancel this connection's exchanges, leaving a
+            // replacement's walks and peer state intact.
             if let Some(walks) = table.walks.get() {
-                walks.closed(state.peer);
+                walks.closed(Link {
+                    state: state.clone(),
+                });
             }
             let service = table.service.clone();
             drop(table);
@@ -1156,7 +1158,9 @@ async fn stream<T: Transport, S: Service>(
                     Some(walks),
                 ) => {
                     walks.incoming(
-                        state.peer,
+                        Link {
+                            state: state.clone(),
+                        },
                         collection,
                         kind,
                         algorithm,

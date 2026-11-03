@@ -42,12 +42,12 @@ fn two_way_walks_are_cached_riblt_without_configuration() {
     walks.observe(local.snapshot());
 
     for kind in [WalkKind::Commit, WalkKind::Derive, WalkKind::References] {
-        let exchange = walks.start(peer.id(), collection, kind).unwrap();
+        let exchange = walks.start(0, peer.id(), collection, kind).unwrap();
         assert_eq!(exchange.algorithm(), Algorithm::CachedRiblt);
         assert_eq!(exchange.offer_role(), None);
         assert_eq!(
             walks
-                .start_incoming(peer.id(), collection, kind, Algorithm::CachedRiblt, None)
+                .start_incoming(0, peer.id(), collection, kind, Algorithm::CachedRiblt, None)
                 .unwrap()
                 .algorithm(),
             Algorithm::CachedRiblt,
@@ -57,7 +57,7 @@ fn two_way_walks_are_cached_riblt_without_configuration() {
     // Grant walks are Prefix, the deliberate exception (grant_walk_tests).
     assert_eq!(
         walks
-            .start(peer.id(), collection, WalkKind::Authorization)
+            .start(0, peer.id(), collection, WalkKind::Authorization)
             .unwrap()
             .algorithm(),
         Algorithm::Prefix,
@@ -80,7 +80,7 @@ fn an_incoming_two_way_prefix_walk_of_data_is_refused_and_logged() {
         let log = logged(|| {
             joined = Some(
                 walks
-                    .start_incoming(peer.id(), collection, kind, Algorithm::Prefix, None)
+                    .start_incoming(0, peer.id(), collection, kind, Algorithm::Prefix, None)
                     .is_some(),
             );
         });
@@ -95,7 +95,7 @@ fn an_incoming_two_way_prefix_walk_of_data_is_refused_and_logged() {
     let log = logged(|| {
         assert!(
             walks
-                .start_incoming(peer.id(), collection, WalkKind::Authorization, Algorithm::Prefix, None)
+                .start_incoming(0, peer.id(), collection, WalkKind::Authorization, Algorithm::Prefix, None)
                 .is_some()
         );
     });

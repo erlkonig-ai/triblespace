@@ -1085,7 +1085,7 @@ async fn riblt_runtime_one_way_walks_use_prefix_and_refuse_incoming_riblt() {
     local.observe();
     let mut exchange = local
         .walks
-        .start(peer.id(), collection, WalkKind::Commit)
+        .start(0, peer.id(), collection, WalkKind::Commit)
         .unwrap();
     assert_eq!(exchange.algorithm(), Algorithm::Prefix);
     assert!(exchange.receives());
@@ -1121,7 +1121,7 @@ async fn riblt_runtime_one_way_walks_use_prefix_and_refuse_incoming_riblt() {
     let (recv, send) = tokio::io::split(stream);
     let reset = Arc::new(Mutex::new(None));
     task.incoming(
-        peer.id(),
+        crate::connection::Link::detached(0, peer.id()).0,
         collection,
         WalkKind::Commit,
         Algorithm::CachedRiblt,
@@ -1261,7 +1261,7 @@ async fn riblt_runtime_simultaneous_open_tie_break_keeps_cached_and_refuses_two_
             assert_eq!(
                 local
                     .walks
-                    .start(peer.id(), collection, WalkKind::Commit)
+                    .start(0, peer.id(), collection, WalkKind::Commit)
                     .unwrap()
                     .algorithm(),
                 Algorithm::CachedRiblt
@@ -1292,6 +1292,7 @@ async fn riblt_runtime_simultaneous_open_tie_break_keeps_cached_and_refuses_two_
                 exchange_key,
                 Running {
                     id: 777,
+                    connection: 0,
                     opened: true,
                     acks: old_acks,
                     _replace: old_replace,
@@ -1302,7 +1303,7 @@ async fn riblt_runtime_simultaneous_open_tie_break_keeps_cached_and_refuses_two_
             let (mut read, _write) = tokio::io::split(script);
             let reset = Arc::new(Mutex::new(None));
             task.incoming(
-                peer.id(),
+                crate::connection::Link::detached(0, peer.id()).0,
                 collection,
                 WalkKind::Commit,
                 incoming,
@@ -1378,7 +1379,7 @@ async fn riblt_runtime_task_retains_prefix_agreement_but_releases_cached_source_
         local
             .walks
             .agreed
-            .replace(&Entry::with_value(&agreement_key, source));
+            .replace(&Entry::with_value(&agreement_key, Agreement { connection: 0, tree: source }));
         let health = local.health.clone();
         let net = SimNet::new(0xC014, SimConfig::default());
         let harness = net.join(&local.key);
@@ -1405,7 +1406,7 @@ async fn riblt_runtime_task_retains_prefix_agreement_but_releases_cached_source_
             .unwrap();
         assert_eq!(exchange.algorithm(), selected);
         let key = (peer, collection.raw, kind);
-        let (driver, _acked, _replaced) = task.register(key, false, &exchange);
+        let (driver, _acked, _replaced) = task.register(key, 0, false, &exchange);
         let root = exchange.next_delta().unwrap();
         match &root {
             Frame::Subtree { summary, .. } => {

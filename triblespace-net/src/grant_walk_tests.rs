@@ -182,13 +182,13 @@ fn two_grant_pins_converge_to_their_union_with_the_exact_bytes() {
 
     let opened = a
         .walks
-        .start(b.id(), r, AUTH)
+        .start(0, b.id(), r, AUTH)
         .expect("a walk over any resource R starts from the grant index");
     assert_eq!(opened.algorithm(), Algorithm::Prefix);
     assert_eq!(opened.offer_role(), None, "both take part in R: two-way");
     let joined = b
         .walks
-        .start_incoming(a.id(), r, AUTH, opened.algorithm(), opened.offer_role())
+        .start_incoming(0, a.id(), r, AUTH, opened.algorithm(), opened.offer_role())
         .unwrap();
     let mut a = Side::with(a, opened);
     let mut b = Side::with(b, joined);
@@ -216,14 +216,14 @@ fn a_walk_to_a_non_participant_sends_nothing_and_to_a_participant_sends_r() {
     let (r, handle) = rooted(&alice, "disclosed", &mut [&mut a]);
     insert(&mut a, &[&grant(r, &alice, handle, &bob)]);
 
-    let mut to_stranger = a.walks.start(id(&stranger), r, AUTH).unwrap();
+    let mut to_stranger = a.walks.start(0, id(&stranger), r, AUTH).unwrap();
     assert_eq!(to_stranger.offer_role(), Some(OfferRole::Receive));
     assert_eq!(to_stranger.next_delta(), Some(root(empty())));
     assert_eq!(to_stranger.next_delta(), Some(Frame::Done));
     assert!(to_stranger.next_body().is_none());
 
     // Positive control: the same R to a participant carries its grants.
-    let mut to_bob = a.walks.start(id(&bob), r, AUTH).unwrap();
+    let mut to_bob = a.walks.start(0, id(&bob), r, AUTH).unwrap();
     assert_eq!(to_bob.offer_role(), None);
     let local = a.serving().grants().summary(r);
     assert_eq!(local.leaf_count(), 1);
@@ -249,10 +249,10 @@ fn an_open_read_reader_peered_for_c_keeps_a_late_write_grant_and_an_unpeered_one
         if peered {
             peer_with(&reader, c, writer.id());
         }
-        let opened = writer.walks.start(reader.id(), c, AUTH).unwrap();
+        let opened = writer.walks.start(0, reader.id(), c, AUTH).unwrap();
         let joined = reader
             .walks
-            .start_incoming(writer.id(), c, AUTH, opened.algorithm(), opened.offer_role())
+            .start_incoming(0, writer.id(), c, AUTH, opened.algorithm(), opened.offer_role())
             .unwrap();
         let mut writer = Side::with(writer, opened);
         let mut reader = Side::with(reader, joined);
@@ -286,7 +286,7 @@ fn a_proof_over_another_resource_is_skipped_and_the_walk_confirms() {
     let before = proof_count(&mut bob);
     let joined = bob
         .walks
-        .start_incoming(id(&stranger), c, AUTH, Algorithm::Prefix, None)
+        .start_incoming(0, id(&stranger), c, AUTH, Algorithm::Prefix, None)
         .unwrap();
     let mut side = Side::with(bob, joined);
     scripted(&mut side, c, &[value(&foreign), value(&valid)]);
@@ -300,7 +300,7 @@ fn a_proof_over_another_resource_is_skipped_and_the_walk_confirms() {
     bob.hold("skips foreign", policy);
     let joined = bob
         .walks
-        .start_incoming(id(&stranger), c, AUTH, Algorithm::Prefix, None)
+        .start_incoming(0, id(&stranger), c, AUTH, Algorithm::Prefix, None)
         .unwrap();
     let mut side = Side::with(bob, joined);
     scripted(&mut side, c, &[([0x55; KEY_BYTES], vec![1, 2, 3])]);
@@ -318,7 +318,7 @@ fn a_wrong_root_proof_over_an_unknown_r_is_skipped_and_the_agreement_is_the_rece
     let before = proof_count(&mut bob);
     let joined = bob
         .walks
-        .start_incoming(id(&stranger), r, AUTH, Algorithm::Prefix, None)
+        .start_incoming(0, id(&stranger), r, AUTH, Algorithm::Prefix, None)
         .expect("an R absent here is walked from an empty pin");
     let mut side = Side::with(bob, joined);
     scripted(&mut side, r, &[value(&wrong)]);
@@ -348,7 +348,7 @@ fn a_walk_counts_what_it_skipped_and_not_what_it_landed() {
     let valid = grant(c, &alice, write_capability(), &bob_key);
     let joined = bob
         .walks
-        .start_incoming(id(&stranger), c, AUTH, Algorithm::Prefix, None)
+        .start_incoming(0, id(&stranger), c, AUTH, Algorithm::Prefix, None)
         .unwrap();
     let mut side = Side::with(bob, joined);
     scripted(&mut side, c, &[value(&foreign), value(&valid)]);
@@ -370,7 +370,7 @@ fn an_incoming_walk_over_an_absent_r_starts_empty_and_receives() {
     let absent = CollectionHandle::new([0x88; 32]);
     let mut joined = bob
         .walks
-        .start_incoming(id(&key(0x80)), absent, AUTH, Algorithm::Prefix, None)
+        .start_incoming(0, id(&key(0x80)), absent, AUTH, Algorithm::Prefix, None)
         .expect("Bob's case: nothing about R is held yet");
     assert!(joined.receives());
     assert_eq!(joined.next_delta(), Some(root(empty())));
@@ -383,7 +383,7 @@ fn a_cached_riblt_grant_walk_is_refused_and_a_prefix_one_accepted() {
     let peer = id(&key(0x90));
     assert!(
         bob.walks
-            .start_incoming(peer, c, AUTH, Algorithm::CachedRiblt, None)
+            .start_incoming(0, peer, c, AUTH, Algorithm::CachedRiblt, None)
             .is_none()
     );
     assert!(
@@ -393,7 +393,7 @@ fn a_cached_riblt_grant_walk_is_refused_and_a_prefix_one_accepted() {
     );
     assert!(
         bob.walks
-            .start_incoming(peer, c, AUTH, Algorithm::Prefix, None)
+            .start_incoming(0, peer, c, AUTH, Algorithm::Prefix, None)
             .is_some(),
         "positive control"
     );
@@ -413,17 +413,17 @@ fn a_cold_grantee_receives_one_way_and_a_proof_it_cannot_validate_does_not_land(
     let mut bob = Node::new(0xA1);
     bob.observe();
 
-    let opened = bob.walks.start(a.id(), r, AUTH).unwrap();
+    let opened = bob.walks.start(0, a.id(), r, AUTH).unwrap();
     assert_eq!(opened.offer_role(), Some(OfferRole::Receive));
     assert!(
         a.walks
-            .start_incoming(id(&stranger), r, AUTH, Algorithm::Prefix, Some(OfferRole::Receive))
+            .start_incoming(0, id(&stranger), r, AUTH, Algorithm::Prefix, Some(OfferRole::Receive))
             .is_none(),
         "nobody would send"
     );
     let joined = a
         .walks
-        .start_incoming(bob.id(), r, AUTH, opened.algorithm(), opened.offer_role())
+        .start_incoming(0, bob.id(), r, AUTH, opened.algorithm(), opened.offer_role())
         .expect("positive control: Alice sends to a participant");
     assert_eq!(joined.offer_role(), Some(OfferRole::Send));
     let mut bob = Side::with(bob, opened);
@@ -460,7 +460,7 @@ fn a_walk_keeps_no_bytes_of_the_grants_it_does_not_keep() {
     let valid = grant(c, &alice, write_capability(), &bob_key);
     let joined = bob
         .walks
-        .start_incoming(id(&stranger), c, AUTH, Algorithm::Prefix, None)
+        .start_incoming(0, id(&stranger), c, AUTH, Algorithm::Prefix, None)
         .unwrap();
     let mut side = Side::with(bob, joined);
     let mut values: Vec<_> = foreign.iter().map(value).collect();
@@ -504,8 +504,9 @@ fn a_write_only_peering_is_sent_no_grants() {
         assert_eq!(local.leaf_count(), 1);
         peer_sending(&a, c, id(&writer), sends);
 
-        let mut opened = a.walks.start(id(&writer), c, AUTH).unwrap();
+        let mut opened = a.walks.start(0, id(&writer), c, AUTH).unwrap();
         let joined = a.walks.start_incoming(
+            0,
             id(&writer),
             c,
             AUTH,

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- A delayed connection close cancels only walks on that connection. Walks,
+  queued grant requests and peer accounting on a replacement survive. Prefix
+  agreement is reused only on the connection that confirmed it, so a restarted
+  peer never inherits an old base; the wire and ALPN are unchanged.
+
 - `/triblespace/pile-sync/36`: a cut-off cached RIBLT exchange resumes where
   it stopped. Each host keeps the raw peer cells it received, verbatim as
   RIBLT_CELL frames, keyed by profile and the peer's announced root (never by

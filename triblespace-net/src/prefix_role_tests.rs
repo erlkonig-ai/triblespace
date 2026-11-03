@@ -57,17 +57,18 @@ fn prefix_offer_open_role_mismatch_and_data_pull_are_refused() {
         // Grant walks choose their direction by participation instead
         // (grant_walk_tests).
         for kind in [WalkKind::Commit, WalkKind::Derive] {
-            let outgoing = local.walks.start(peer.id(), collection, kind).unwrap();
+            let outgoing = local.walks.start(0, peer.id(), collection, kind).unwrap();
             assert_eq!(outgoing.offer_role(), Some(wrong));
             assert!(
                 local
                     .walks
-                    .start_incoming(peer.id(), collection, kind, Algorithm::Prefix, Some(wrong))
+                    .start_incoming(0, peer.id(), collection, kind, Algorithm::Prefix, Some(wrong))
                     .is_none()
             );
             let accepted = local
                 .walks
                 .start_incoming(
+                    0,
                     peer.id(),
                     collection,
                     kind,
@@ -79,7 +80,7 @@ fn prefix_offer_open_role_mismatch_and_data_pull_are_refused() {
             assert!(
                 local
                     .walks
-                    .start_incoming(peer.id(), collection, kind, Algorithm::Prefix, None)
+                    .start_incoming(0, peer.id(), collection, kind, Algorithm::Prefix, None)
                     .is_none(),
                 "profile 0 on COMMIT/DERIVE asks for two-way Prefix and is refused"
             );
@@ -87,6 +88,7 @@ fn prefix_offer_open_role_mismatch_and_data_pull_are_refused() {
                 local
                     .walks
                     .start_incoming(
+                        0,
                         peer.id(),
                         collection,
                         kind,
@@ -100,6 +102,7 @@ fn prefix_offer_open_role_mismatch_and_data_pull_are_refused() {
             local
                 .walks
                 .start_incoming(
+                    0,
                     peer.id(),
                     collection,
                     WalkKind::References,
@@ -117,6 +120,7 @@ fn prefix_offer_open_role_mismatch_and_data_pull_are_refused() {
             local
                 .walks
                 .start_incoming(
+                    0,
                     peer.id(),
                     collection,
                     WalkKind::Commit,

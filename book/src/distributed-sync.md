@@ -295,6 +295,14 @@ closes once no request stream is in flight on it and no frame has crossed it
 for two seconds. What this side had asked to peer for on it, it asks for again
 on the connection kept.
 
+A close notification names the connection that ended, even if it waited in the
+walk task's queue while a replacement started. It cancels only that connection's
+walks and forgets only its Prefix agreements. A Prefix base is never reused on
+a replacement connection: the same authenticated peer may have restarted and
+lost it. Queued grant requests and unknown-resource charges remain peer-scoped
+while a current connection survives; the last close clears them and marks
+receive-completion evidence disconnected. No wire negotiation is involved.
+
 A connection closes after 120 seconds without a frame on any of its streams,
 sent or received. Push timers cap at 60 seconds, so a connection that
 carries a peering does not go idle. Above 64 connections in one direction the
