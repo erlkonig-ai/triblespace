@@ -8,7 +8,7 @@ mod universe;
 // source-bound Rank9 accelerated roots never pass through this module.
 mod portable;
 
-use crate::blob::encodings::simplearchive::{SimpleArchive, UnarchiveError};
+use crate::blob::encodings::simplearchive::{CanonicalTribles, SimpleArchive, UnarchiveError};
 use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::TryFromBlob;
@@ -229,8 +229,9 @@ impl SuccinctArchiveBlob {
     /// Derives the canonical portable Ring artifact directly from one
     /// canonical `SimpleArchive` blob.
     ///
-    /// The source is validated in its existing 64-byte EAV order, then mapped
-    /// into one ordered raw-value domain. Five stable counting-sort passes
+    /// The source is validated as [`CanonicalTribles`] (a misaligned source
+    /// is [`UnarchiveError::BadArchive`]), then mapped into one ordered
+    /// raw-value domain. Five stable counting-sort passes
     /// derive the remaining Ring rotations while their prefixes, pair-change
     /// masks, and minimal-width wavelet planes are written directly into the
     /// final portable allocation. The method constructs neither a six-PATCH
@@ -271,11 +272,9 @@ impl SuccinctArchiveBlob {
         source: &Blob<SimpleArchive>,
         encode: impl FnOnce(&[RawInline], &mut [[u32; 3]]) -> Result<Bytes, portable::PortableError>,
     ) -> Result<Blob<Self>, SuccinctArchiveRawBuildError> {
-        let bytes = source.bytes.as_ref();
-        if bytes.len() % 64 != 0 {
-            return Err(UnarchiveError::BadArchive.into());
-        }
-        let row_count = bytes.len() / 64;
+        let canonical = CanonicalTribles::validate(source.bytes.clone())?;
+        let tribles = canonical.as_tribles();
+        let row_count = tribles.len();
         if row_count > u32::MAX as usize {
             return Err(SuccinctArchiveRawBuildError::TooManyRows(row_count));
         }
@@ -289,27 +288,10 @@ impl SuccinctArchiveBlob {
         let mut writer = area.sections();
         let mut domain = portable::reserve::<RawInline>(&mut writer, domain_capacity)
             .map_err(raw_build_codec_error)?;
-        let mut previous: Option<&[u8]> = None;
-        for (position, chunk) in bytes.chunks_exact(64).enumerate() {
-            let row: &[u8; 64] = chunk.try_into().expect("exact SimpleArchive row");
-            if Trible::as_transmute_force_raw(row).is_none() {
-                return Err(UnarchiveError::BadTrible.into());
-            }
-            if let Some(previous) = previous {
-                if previous == chunk {
-                    return Err(UnarchiveError::BadCanonicalizationRedundancy.into());
-                }
-                if previous > chunk {
-                    return Err(UnarchiveError::BadCanonicalizationOrdering.into());
-                }
-            }
-            previous = Some(chunk);
-
-            let entity: &[u8; 16] = row[..16].try_into().expect("entity width");
-            let attribute: &[u8; 16] = row[16..32].try_into().expect("attribute width");
-            domain[position * 3] = id_into_value(entity);
-            domain[position * 3 + 1] = id_into_value(attribute);
-            domain[position * 3 + 2] = row[32..].try_into().expect("value width");
+        for (position, trible) in tribles.iter().enumerate() {
+            domain[position * 3] = id_into_value(trible.e());
+            domain[position * 3 + 1] = id_into_value(trible.a());
+            domain[position * 3 + 2] = trible.v::<UnknownInline>().raw;
         }
         domain.sort_unstable();
         let mut domain_len = 0;
@@ -326,13 +308,10 @@ impl SuccinctArchiveBlob {
 
         let mut eav_rows =
             portable::reserve::<[u32; 3]>(&mut writer, row_count).map_err(raw_build_codec_error)?;
-        for (position, chunk) in bytes.chunks_exact(64).enumerate() {
-            let row: &[u8; 64] = chunk.try_into().expect("exact SimpleArchive row");
-            let entity: &[u8; 16] = row[..16].try_into().expect("entity width");
-            let attribute: &[u8; 16] = row[16..32].try_into().expect("attribute width");
-            let entity = id_into_value(entity);
-            let attribute = id_into_value(attribute);
-            let value: RawInline = row[32..].try_into().expect("value width");
+        for (position, trible) in tribles.iter().enumerate() {
+            let entity = id_into_value(trible.e());
+            let attribute = id_into_value(trible.a());
+            let value = trible.v::<UnknownInline>().raw;
             eav_rows[position] = [
                 u32::try_from(
                     domain
@@ -5504,6 +5483,19 @@ mod tests {
         assert_eq!(
             SuccinctArchiveBlob::build_from_simple_archive(&descending).unwrap_err(),
             SuccinctArchiveRawBuildError::Source(UnarchiveError::BadCanonicalizationOrdering)
+        );
+
+        let aligned: Blob<SimpleArchive> = (0..3)
+            .map(synthetic_trible)
+            .collect::<TribleSet>()
+            .to_blob();
+        assert!(SuccinctArchiveBlob::build_from_simple_archive(&aligned).is_ok());
+        let misaligned = Blob::<SimpleArchive>::new(
+            crate::blob::encodings::simplearchive::misaligned_copy(&aligned.bytes),
+        );
+        assert_eq!(
+            SuccinctArchiveBlob::build_from_simple_archive(&misaligned).unwrap_err(),
+            SuccinctArchiveRawBuildError::Source(UnarchiveError::BadArchive)
         );
     }
 }
