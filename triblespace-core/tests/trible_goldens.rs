@@ -270,6 +270,10 @@ fn golden_simple_archive_bytes() {
         "archive handle changed"
     );
 
+    // An owned set encodes through its own impl; it must give the same bytes.
+    let owned: Blob<SimpleArchive> = set.clone().to_blob();
+    assert_eq!(&owned.bytes[..], bytes, "owned set encodes differently");
+
     // The archive decodes back to the same set.
     let decoded: TribleSet = blob.try_from_blob().expect("canonical archive decodes");
     assert_eq!(decoded, set);
@@ -290,6 +294,14 @@ fn golden_simple_archive_of_intrinsic_fragment() {
     assert_eq!(
         handle, "F76A263AB4608A56C3C70DE5069FFF4740D2EA50766B3AE865445A3DCC47EA40",
         "fragment archive handle changed"
+    );
+
+    // An owned fragment encodes through its own impl; it must agree.
+    let owned: Blob<SimpleArchive> = fragment.clone().to_blob();
+    assert_eq!(
+        hex_upper(&owned.get_handle().raw),
+        handle,
+        "owned fragment encodes differently"
     );
 }
 
