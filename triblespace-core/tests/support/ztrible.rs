@@ -21,3 +21,13 @@ pub struct ZTrible {
     pub a: Unalign<NonZero<u128>>,
     pub v: [u8; 32],
 }
+
+/// `ZTrible` with the ids typed as `PackedId`, the field type the real
+/// `Trible` would carry.
+#[derive(TryFromBytes, KnownLayout, Immutable, IntoBytes, Unaligned)]
+#[repr(C)]
+pub struct ZTriblePacked {
+    pub e: PackedId,
+    pub a: PackedId,
+    pub v: [u8; 32],
+}

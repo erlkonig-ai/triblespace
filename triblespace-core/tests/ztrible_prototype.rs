@@ -4,8 +4,8 @@
 #[path = "support/ztrible.rs"]
 mod ztrible;
 
-use ztrible::{PackedId, ZTrible};
-use zerocopy::{IntoBytes, TryFromBytes};
+use ztrible::{PackedId, ZTrible, ZTriblePacked};
+use zerocopy::{Immutable, IntoBytes, KnownLayout, TryFromBytes, Unaligned};
 
 fn splitmix(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -120,4 +120,66 @@ fn ztrible_anybytes_view_validates() {
     assert_eq!(view.len(), 1000);
     rows[3][..16].fill(0);
     assert!(Bytes::from(rows).view::<[ZTrible]>().is_err());
+}
+
+/// One id: random, all zero, or a single non-zero byte at a random position.
+fn id_case(state: &mut u64, out: &mut [u8]) {
+    out.fill(0);
+    match splitmix(state) % 3 {
+        0 => {
+            out[..8].copy_from_slice(&splitmix(state).to_le_bytes());
+            out[8..].copy_from_slice(&splitmix(state).to_le_bytes());
+        }
+        1 => {}
+        _ => out[(splitmix(state) % 16) as usize] = (splitmix(state) % 255) as u8 + 1,
+    }
+}
+
+#[test]
+fn ztrible_packed_id_fields_match_ztrible() {
+    fn derives<T>()
+    where
+        T: ?Sized + TryFromBytes + KnownLayout + Immutable + IntoBytes + Unaligned,
+    {
+    }
+    derives::<ZTrible>();
+    derives::<ZTriblePacked>();
+    derives::<[ZTriblePacked]>();
+    assert_eq!(core::mem::size_of::<ZTriblePacked>(), 64);
+    assert_eq!(core::mem::align_of::<ZTriblePacked>(), 1);
+    let mut state = 5;
+    let mut rows: Vec<[u8; 64]> = Vec::with_capacity(100_000);
+    let (mut accepted, mut rejected) = (0, 0);
+    for _ in 0..100_000 {
+        let mut row = valid_row(&mut state);
+        id_case(&mut state, &mut row[..16]);
+        id_case(&mut state, &mut row[16..32]);
+        let z = ZTrible::try_ref_from_bytes(&row).is_ok();
+        let p = ZTriblePacked::try_ref_from_bytes(&row);
+        assert_eq!(z, p.is_ok(), "row {row:?}");
+        if let Ok(p) = p {
+            assert_eq!(p.as_bytes(), &row[..]);
+            assert_eq!(p.e.as_bytes(), &row[..16]);
+            assert_eq!(p.a.as_bytes(), &row[16..32]);
+            accepted += 1;
+        } else {
+            rejected += 1;
+        }
+        rows.push(row);
+    }
+    // Both outcomes are exercised: 5/9 of rows have a zero id.
+    assert!(accepted > 30_000 && rejected > 40_000, "{accepted} {rejected}");
+    // Slices: each type rejects a slice exactly when it holds a rejected row.
+    for window in rows.chunks(7) {
+        assert_eq!(
+            <[ZTrible]>::try_ref_from_bytes(window.as_bytes()).is_ok(),
+            <[ZTriblePacked]>::try_ref_from_bytes(window.as_bytes()).is_ok()
+        );
+    }
+    let good: Vec<[u8; 64]> = rows
+        .iter()
+        .copied()
+        .filter(|r| ZTrible::try_ref_from_bytes(r).is_ok())
+        .collect();
+    assert!(<[ZTriblePacked]>::try_ref_from_bytes(good.as_bytes()).is_ok());
 }
