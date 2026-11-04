@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `Telemetry::layer_from_collection` accepts an explicitly opened pile,
+  collection and signer, returning initialization errors to the caller. The
+  environment constructor shares its initialization and keeps its existing
+  destination, key and failure behavior.
+
 - `ObjectStoreSnapshot::get` copies a fetched body whose base is not 16-byte
   aligned into aligned storage before building the `Blob`, so typed views
   such as a `SimpleArchive` decode no longer fail with `BadArchive` because

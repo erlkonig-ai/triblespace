@@ -12,6 +12,9 @@
 //! the exhaust to every machine that holds a copy. A telemetry sink that
 //! silently picks a destination the caller did not name is worse than no
 //! telemetry, so an unset `TELEMETRY_PILE` now disables telemetry outright.
+//! Applications that already resolve an operational destination and its signer
+//! can pass those explicitly to [`Telemetry::layer_from_collection`]. Neither
+//! constructor installs a subscriber or chooses the caller's span filter.
 //!
 //! # Why this writes to a `Pile`, and what would have to change
 //!
@@ -367,7 +370,8 @@ pub fn current_span_entity() -> Option<Id> {
 
 /// Tracing layer that turns spans into TribleSpace telemetry.
 ///
-/// Construct via [`Telemetry::layer_from_env`] and attach to your application's subscriber.
+/// Construct via [`Telemetry::layer_from_env`] or
+/// [`Telemetry::layer_from_collection`] and attach to your application's subscriber.
 pub struct TelemetryLayer {
     inner: Arc<TelemetryInner>,
 }
@@ -532,6 +536,29 @@ pub struct Telemetry {
 }
 
 impl Telemetry {
+    /// Start a sink in the caller's explicit collection using its existing signer.
+    ///
+    /// Takes ownership of the open pile and closes it on initialization failure.
+    /// The caller selects the destination, collection and authority; this does
+    /// not inspect environment variables, generate a key or install a subscriber.
+    /// Like an ordinary collection commit, it does not grant or check admission;
+    /// the caller supplies a source collection admitting this signer.
+    /// Keep the returned guard alive until the scoped subscriber and its spans
+    /// have finished. Span closes flush pending facts when `flush_interval` has
+    /// elapsed; this is not a background timer or a per-span durability promise.
+    pub fn layer_from_collection(
+        session_name: &str,
+        pile: Pile,
+        collection: Collection<SimpleArchive>,
+        signing_key: SigningKey,
+        flush_interval: Duration,
+    ) -> Result<(TelemetryLayer, Self), String> {
+        Self::initialize(
+            session_name, pile, collection, signing_key, flush_interval,
+            Instant::now(), *genid(),
+        )
+    }
+
     /// Start a telemetry sink and return a layer that writes spans into it.
     ///
     /// This does **not** install a tracing subscriber. Embed the returned layer into your
@@ -605,6 +632,20 @@ impl Telemetry {
                 return None;
             }
         };
+        Self::initialize(
+            session_name, pile, collection, signing_key, flush_interval, base, session_id,
+        ).ok()
+    }
+
+    fn initialize(
+        session_name: &str,
+        pile: Pile,
+        collection: Collection<SimpleArchive>,
+        signing_key: SigningKey,
+        flush_interval: Duration,
+        base: Instant,
+        session_id: Id,
+    ) -> Result<(TelemetryLayer, Self), String> {
         let mut destination = TelemetryDestination {
             pile,
             collection,
@@ -621,9 +662,11 @@ impl Telemetry {
             schema::name: session_name,
             schema::begin_ns: 0u64,
         };
-        if destination.commit(self_describing(init)).is_err() || destination.flush().is_err() {
+        if let Err(error) = destination.commit(self_describing(init))
+            .and_then(|()| destination.flush())
+        {
             let _ = destination.close();
-            return None;
+            return Err(format!("initialize telemetry session: {error}"));
         }
 
         let inner = Arc::new(TelemetryInner {
@@ -640,7 +683,7 @@ impl Telemetry {
             inner: inner.clone(),
         };
 
-        Some((layer, Self { inner }))
+        Ok((layer, Self { inner }))
     }
 
     /// Convenience for standalone processes: start telemetry and install a global subscriber
@@ -783,6 +826,81 @@ mod tests {
     use crate::core::repo::SnapshotSource;
 
     static TELEMETRY_ENV: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn explicit_collection_uses_supplied_authority_and_flushes_under_an_open_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("explicit.pile");
+        std::fs::File::create(&path).unwrap();
+        let signer = SigningKey::from_bytes(&[37; 32]);
+        let root = signer.verifying_key();
+        let mut pile = Pile::open(&path).unwrap();
+        let collection = pile.collection("explicit", CollectionPolicy::new(
+            AdmissionPolicy::direct(root), AdmissionPolicy::direct(root),
+        )).unwrap();
+        let (layer, guard) = Telemetry::layer_from_collection(
+            "explicit test", pile, collection, signer, Duration::ZERO,
+        ).unwrap();
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            let parent = tracing::info_span!("open_parent", decision_id = tracing::field::Empty);
+            let _entered = parent.enter();
+            let parent_id = current_span_entity().unwrap();
+            let child_id = {
+                let child = tracing::info_span!("completed_child", append_ok = tracing::field::Empty);
+                let _entered = child.enter();
+                let id = current_span_entity().unwrap();
+                child.record("append_ok", true);
+                id
+            };
+            // A fresh policy-admitted read, before parent/guard drop. No raw
+            // archive scan bypasses the supplied collection's authority.
+            let mut reader = Pile::open(&path).unwrap();
+            let snapshot = reader.snapshot().unwrap();
+            let facts: TribleSet = collection.read(&snapshot).unwrap();
+            assert!(exists!(pattern!(&facts, [{ child_id @
+                schema::parent: parent_id, schema::end_ns: _?end,
+            }])));
+            assert!(exists!(pattern!(&facts, [
+                { child_id @ schema::field: _?field },
+                { _?field @ schema::field_name: "append_ok", schema::field_value: "true" },
+            ])));
+            assert!(!exists!(pattern!(&facts, [{ parent_id @ schema::end_ns: _?end }])));
+            assert!(!exists!(pattern!(&facts, [
+                { parent_id @ schema::field: _?field },
+                { _?field @ schema::field_name: "decision_id" },
+            ])));
+            drop(snapshot);
+            reader.close().unwrap();
+        });
+        drop(guard);
+    }
+
+    #[test]
+    fn explicit_collection_reports_checked_write_failure_without_changing_bytes() {
+        use crate::core::repo::pile::PileFile;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read-only.pile");
+        std::fs::File::create(&path).unwrap();
+        let signer = SigningKey::from_bytes(&[38; 32]);
+        let root = signer.verifying_key();
+        let mut pile = Pile::open(&path).unwrap();
+        let collection = pile.collection("explicit", CollectionPolicy::new(
+            AdmissionPolicy::direct(root), AdmissionPolicy::direct(root),
+        )).unwrap();
+        pile.close().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        // An ordinary read-only OS descriptor rejects the first append. No
+        // invalid pointer, truncation or invented authority failure is involved.
+        let read_only = Pile::new(PileFile::open_read_only(&path).unwrap());
+        let result = Telemetry::layer_from_collection(
+            "cannot write", read_only, collection, signer, Duration::ZERO,
+        );
+        let Err(error) = result else { panic!("read-only sink must fail") };
+        assert!(error.starts_with("initialize telemetry session:"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        Pile::open(&path).unwrap().close().unwrap();
+    }
 
     /// Every fact the pile holds, read back through a fresh `Pile` with no
     /// state carried over from the writing process.
