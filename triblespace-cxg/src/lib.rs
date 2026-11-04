@@ -60,6 +60,39 @@ impl Category for &'static str {
 
 type Name = Inline<Handle<UTF8String>>;
 
+/// Where a unit's string blobs are read from.
+pub trait Texts {
+    fn text(&self, handle: Name) -> Option<String>;
+}
+
+impl<B: BlobStoreGet> Texts for B {
+    fn text(&self, handle: Name) -> Option<String> {
+        self.get::<View<str>, UTF8String>(handle)
+            .ok()
+            .map(|text| text.as_ref().to_owned())
+    }
+}
+
+/// The unit a grammar covers: its facts, and the text behind their string
+/// handles, which anchors need wherever an exact handle comparison is not
+/// enough (a prefix, a vocabulary, the shape of an id).
+#[derive(Clone, Copy)]
+pub struct Unit<'u> {
+    pub facts: &'u TribleSet,
+    texts: &'u dyn Texts,
+}
+
+impl<'u> Unit<'u> {
+    pub fn new(facts: &'u TribleSet, texts: &'u dyn Texts) -> Self {
+        Unit { facts, texts }
+    }
+
+    /// The text of a string handle, when the unit's blobs hold it.
+    pub fn text(&self, handle: Name) -> Option<String> {
+        self.texts.text(handle)
+    }
+}
+
 /// How many total covers an occurrence has under a category.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Count {
@@ -101,7 +134,7 @@ pub enum Step {
 
 /// A child category computed from the anchor's entity and the category the
 /// anchor was asked for: how context a parent decides reaches its children.
-pub type Within<C> = Arc<dyn Fn(&TribleSet, Id, &C) -> C + Send + Sync>;
+pub type Within<C> = Arc<dyn Fn(&Unit, Id, &C) -> C + Send + Sync>;
 
 /// What a constituent does with the members it claims.
 #[derive(Clone)]
@@ -130,10 +163,10 @@ impl<C: fmt::Debug> fmt::Debug for Role<C> {
 
 impl<C: Clone> Role<C> {
     /// The category a child must be covered as, when this role has one.
-    fn child(&self, facts: &TribleSet, anchor: Id, category: &C) -> Option<C> {
+    fn child(&self, unit: &Unit, anchor: Id, category: &C) -> Option<C> {
         match self {
             Role::Child(c) => Some(c.clone()),
-            Role::Within(f) => Some(f(facts, anchor, category)),
+            Role::Within(f) => Some(f(unit, anchor, category)),
             Role::Value | Role::Drop(_) => None,
         }
     }
@@ -169,7 +202,7 @@ impl<C> Constituent<C> {
 
 /// A query over the anchor occurrence's entity, given the category it is
 /// asked for.
-pub type Anchor<C> = Box<dyn Fn(&TribleSet, Id, &C) -> bool + Send + Sync>;
+pub type Anchor<C> = Box<dyn Fn(&Unit, Id, &C) -> bool + Send + Sync>;
 pub type Emit<C> = Box<dyn Fn(&Instance<C>) -> Fragment + Send + Sync>;
 
 /// A construction: family, anchor, constituents and emit.
@@ -185,7 +218,7 @@ pub struct Construction<C: Category> {
 
 /// An accepted construction instance, as handed to its emit.
 pub struct Instance<'a, C> {
-    pub facts: &'a TribleSet,
+    pub unit: Unit<'a>,
     pub anchor: Id,
     /// The category the instance covers, with whatever context it carries.
     pub category: &'a C,
@@ -318,20 +351,14 @@ impl<C: Category> Grammar<C> {
     }
 
     /// The number of covers of `root` as `category`, without emitting.
-    pub fn count(&self, facts: &TribleSet, root: Id, category: &C) -> Count {
-        Run::new(self, facts).count(root, category)
+    pub fn count(&self, unit: Unit, root: Id, category: &C) -> Count {
+        Run::new(self, unit).count(root, category)
     }
 
     /// The image of the unit's single total cover, or every finding that
     /// explains why there is none.
-    pub fn cover<B: BlobStoreGet>(
-        &self,
-        facts: &TribleSet,
-        blobs: &B,
-        root: Id,
-        category: &C,
-    ) -> Result<Fragment, Vec<Finding<C>>> {
-        let mut run = Run::new(self, facts);
+    pub fn cover(&self, unit: Unit, root: Id, category: &C) -> Result<Fragment, Vec<Finding<C>>> {
+        let mut run = Run::new(self, unit);
         if run.count(root, category) == Count::One {
             let mut image = Fragment::empty();
             match run.emit(root, category, &mut image) {
@@ -346,7 +373,7 @@ impl<C: Category> Grammar<C> {
             }
         }
         let mut findings = Vec::new();
-        run.diagnose(root, category, &mut Vec::new(), blobs, &mut findings);
+        run.diagnose(root, category, &mut Vec::new(), &mut findings);
         Err(findings)
     }
 }
@@ -359,17 +386,17 @@ enum Fit {
 
 struct Run<'g, 'u, C: Category> {
     grammar: &'g Grammar<C>,
-    facts: &'u TribleSet,
+    unit: Unit<'u>,
     counts: HashMap<(Id, C), Count>,
     open: HashSet<(Id, C)>,
     emitted: HashMap<(Id, C), Id>,
 }
 
 impl<'g, 'u, C: Category> Run<'g, 'u, C> {
-    fn new(grammar: &'g Grammar<C>, facts: &'u TribleSet) -> Self {
+    fn new(grammar: &'g Grammar<C>, unit: Unit<'u>) -> Self {
         Run {
             grammar,
-            facts,
+            unit,
             counts: HashMap::new(),
             open: HashSet::new(),
             emitted: HashMap::new(),
@@ -377,7 +404,7 @@ impl<'g, 'u, C: Category> Run<'g, 'u, C> {
     }
 
     fn members(&self, e: Id) -> Vec<Member> {
-        let facts = self.facts;
+        let facts = self.unit.facts;
         let mut members: Vec<Member> = find!(
             (name: Name, value: Id),
             pattern!(facts, [
@@ -458,7 +485,7 @@ impl<'g, 'u, C: Category> Run<'g, 'u, C> {
         category: &C,
         members: &[Member],
     ) -> Option<(Count, Vec<Vec<Part>>)> {
-        if !(c.anchor)(self.facts, e, category) {
+        if !(c.anchor)(&self.unit, e, category) {
             return None;
         }
         let Fit::Applies(parts) = self.fit(c, members) else {
@@ -466,7 +493,7 @@ impl<'g, 'u, C: Category> Run<'g, 'u, C> {
         };
         let mut n = Count::One;
         for (k, con) in c.constituents.iter().enumerate() {
-            if let Some(child) = con.role.child(self.facts, e, category) {
+            if let Some(child) = con.role.child(&self.unit, e, category) {
                 for part in &parts[k] {
                     n = n.mul(self.count(part.value, &child));
                 }
@@ -513,14 +540,14 @@ impl<'g, 'u, C: Category> Run<'g, 'u, C> {
         }
         let (c, mut parts) = chosen.expect("a count of One has exactly one instance of count One");
         for (k, con) in c.constituents.iter().enumerate() {
-            if let Some(child) = con.role.child(self.facts, e, category) {
+            if let Some(child) = con.role.child(&self.unit, e, category) {
                 for part in &mut parts[k] {
                     part.child = Some(self.emit(part.value, &child, image)?);
                 }
             }
         }
         let fragment = (c.emit)(&Instance {
-            facts: self.facts,
+            unit: self.unit,
             anchor: e,
             category,
             parts: &parts,
@@ -533,16 +560,16 @@ impl<'g, 'u, C: Category> Run<'g, 'u, C> {
         Ok(root)
     }
 
-    fn diagnose<B: BlobStoreGet>(
+    fn diagnose(
         &mut self,
         e: Id,
         category: &C,
         path: &mut Vec<PathStep>,
-        blobs: &B,
         findings: &mut Vec<Finding<C>>,
     ) {
+        let unit = self.unit;
         let here = |problem: Problem, path: &[PathStep]| Finding {
-            path: render_path(path, blobs),
+            path: render_path(path, &unit),
             category: category.clone(),
             problem,
         };
@@ -552,7 +579,7 @@ impl<'g, 'u, C: Category> Run<'g, 'u, C> {
         let mut candidates = Vec::new();
         for &i in grammar.by_category.get(&category.family()).into_iter().flatten() {
             let c = &grammar.constructions[i];
-            if (c.anchor)(self.facts, e, category) {
+            if (c.anchor)(&self.unit, e, category) {
                 candidates.push(c);
             }
         }
@@ -582,20 +609,20 @@ impl<'g, 'u, C: Category> Run<'g, 'u, C> {
                 Fit::Unclaimed(steps) => findings.push(here(
                     Problem::Unclaimed {
                         construction: c.name,
-                        members: steps.iter().map(|s| render_step(s, blobs)).collect(),
+                        members: steps.iter().map(|s| render_step(s, &unit)).collect(),
                     },
                     path,
                 )),
                 Fit::Applies(parts) => {
                     for (k, con) in c.constituents.iter().enumerate() {
-                        let Some(child) = con.role.child(self.facts, e, category) else {
+                        let Some(child) = con.role.child(&self.unit, e, category) else {
                             continue;
                         };
                         for part in &parts[k] {
                             if self.open.contains(&(part.value, child.clone())) {
                                 path.push(part.step);
                                 findings.push(Finding {
-                                    path: render_path(path, blobs),
+                                    path: render_path(path, &unit),
                                     category: child.clone(),
                                     problem: Problem::Cycle,
                                 });
@@ -604,7 +631,7 @@ impl<'g, 'u, C: Category> Run<'g, 'u, C> {
                             }
                             if self.count(part.value, &child) != Count::One {
                                 path.push(part.step);
-                                self.diagnose(part.value, &child, path, blobs, findings);
+                                self.diagnose(part.value, &child, path, findings);
                                 path.pop();
                             }
                         }
@@ -616,19 +643,18 @@ impl<'g, 'u, C: Category> Run<'g, 'u, C> {
     }
 }
 
-fn render_step<B: BlobStoreGet>(step: &PathStep, blobs: &B) -> String {
+fn render_step(step: &PathStep, unit: &Unit) -> String {
     match step {
-        PathStep::Field(handle) => match blobs.get::<View<str>, UTF8String>(*handle) {
-            Ok(name) => name.as_ref().to_owned(),
-            Err(_) => String::from("<unresolved field name>"),
-        },
+        PathStep::Field(handle) => unit
+            .text(*handle)
+            .unwrap_or_else(|| String::from("<unresolved field name>")),
         PathStep::Index(index) => index.to_string(),
     }
 }
 
-fn render_path<B: BlobStoreGet>(path: &[PathStep], blobs: &B) -> String {
+fn render_path(path: &[PathStep], unit: &Unit) -> String {
     if path.is_empty() {
         return String::from("/");
     }
-    path.iter().map(|s| format!("/{}", render_step(s, blobs))).collect()
+    path.iter().map(|s| format!("/{}", render_step(s, unit))).collect()
 }

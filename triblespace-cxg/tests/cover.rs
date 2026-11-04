@@ -10,7 +10,7 @@ use triblespace_core::prelude::*;
 use triblespace_core::trible::{Fragment, TribleSet};
 use std::sync::Arc;
 
-use triblespace_cxg::{Anchor, Category, Constituent, Construction, Count, Grammar, Problem, Role, Step};
+use triblespace_cxg::{Anchor, Category, Constituent, Construction, Count, Grammar, Problem, Role, Step, Unit};
 
 type Name = Inline<Handle<UTF8String>>;
 
@@ -24,23 +24,29 @@ mod out {
     }
 }
 
-struct Unit {
+struct Doc {
     fragment: Fragment,
     root: Id,
     blobs: MemoryBlobStoreSnapshot,
 }
 
-fn unit(json: &str) -> Unit {
+fn unit(json: &str) -> Doc {
     let mut store = MemoryBlobStore::new();
     let fragment = JsonTreeImporter::<_>::new(&mut store, None)
         .import_str(json)
         .expect("json imports");
     let root = fragment.root().expect("rooted import");
     let blobs = fragment.blobs().clone().snapshot().expect("snapshot");
-    Unit {
+    Doc {
         fragment,
         root,
         blobs,
+    }
+}
+
+impl Doc {
+    fn view(&self) -> Unit<'_> {
+        Unit::new(self.fragment.facts(), &self.blobs)
     }
 }
 
@@ -60,7 +66,8 @@ fn string_of(facts: &TribleSet, node: Id) -> Option<Name> {
 fn typed<C: 'static>(kind: &'static str) -> Anchor<C> {
     let type_name = handle("type");
     let wanted = handle(kind);
-    Box::new(move |facts, e, _| {
+    Box::new(move |unit: &Unit, e, _| {
+        let facts = unit.facts;
         exists!(pattern!(facts, [
             { e @ json_tree::object_field: _?field },
             { _?field @ json_tree::field_name: type_name, json_tree::field_value: _?value },
@@ -70,7 +77,7 @@ fn typed<C: 'static>(kind: &'static str) -> Anchor<C> {
 }
 
 fn kind_is<C: 'static>(kind: Id) -> Anchor<C> {
-    Box::new(move |facts, e, _| exists!(pattern!(facts, [{ e @ json_tree::kind: kind }])))
+    Box::new(move |unit: &Unit, e, _| exists!(pattern!(unit.facts, [{ e @ json_tree::kind: kind }])))
 }
 
 fn string() -> Construction<&'static str> {
@@ -80,7 +87,7 @@ fn string() -> Construction<&'static str> {
         anchor: kind_is(json_tree::kind_string),
         constituents: vec![],
         emit: Box::new(|inst| {
-            let h = string_of(inst.facts, inst.anchor).expect("a string node has its text");
+            let h = string_of(inst.unit.facts, inst.anchor).expect("a string node has its text");
             entity! { _ @ out::said: h }
         }),
     }
@@ -114,7 +121,7 @@ fn tool_message() -> Construction<&'static str> {
         ],
         emit: Box::new(|inst| {
             let name = inst.values(1).next().expect("name value");
-            let h = string_of(inst.facts, name).expect("tool name is a string");
+            let h = string_of(inst.unit.facts, name).expect("tool name is a string");
             entity! { _ @ out::tool: h }
         }),
     }
@@ -153,9 +160,9 @@ fn said(image: &Fragment) -> Vec<Name> {
 fn a_well_formed_unit_has_exactly_one_cover() {
     let u = unit(r#"[{"type":"text","text":"hi"},{"type":"tool","name":"exec","input":{"cmd":"ls"}}]"#);
     let g = grammar(standard());
-    assert_eq!(g.count(u.fragment.facts(), u.root, &"list"), Count::One);
+    assert_eq!(g.count(u.view(), u.root, &"list"), Count::One);
     let image = g
-        .cover(u.fragment.facts(), &u.blobs, u.root, &"list")
+        .cover(u.view(), u.root, &"list")
         .expect("one cover");
     assert_eq!(said(&image), vec![handle("hi")]);
     let items = find!((i: Id), pattern!(image.facts(), [{ _?l @ out::item: ?i }])).count();
@@ -167,7 +174,7 @@ fn an_unclaimed_member_fails_the_unit_and_is_named() {
     let u = unit(r#"[{"type":"text","text":"hi"},{"type":"text","text":"yo","extra":1}]"#);
     let g = grammar(standard());
     let findings = g
-        .cover(u.fragment.facts(), &u.blobs, u.root, &"list")
+        .cover(u.view(), u.root, &"list")
         .expect_err("the extra member is not understood");
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert_eq!(findings[0].path, "/1");
@@ -184,7 +191,7 @@ fn an_unclaimed_member_fails_the_unit_and_is_named() {
 fn an_unknown_shape_is_reported_where_it_is() {
     let u = unit(r#"[{"type":"image","url":"x"}]"#);
     let findings = grammar(standard())
-        .cover(u.fragment.facts(), &u.blobs, u.root, &"list")
+        .cover(u.view(), u.root, &"list")
         .expect_err("no construction for images");
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert_eq!(findings[0].path, "/0");
@@ -196,7 +203,7 @@ fn an_unknown_shape_is_reported_where_it_is() {
 fn a_missing_required_member_means_the_construction_does_not_apply() {
     let u = unit(r#"[{"type":"tool"}]"#);
     let findings = grammar(standard())
-        .cover(u.fragment.facts(), &u.blobs, u.root, &"list")
+        .cover(u.view(), u.root, &"list")
         .expect_err("a tool message needs a name");
     assert_eq!(
         findings[0].problem,
@@ -215,9 +222,9 @@ fn two_covering_constructions_are_an_ambiguity_not_a_choice() {
     cs.push(twin);
     let u = unit(r#"[{"type":"text","text":"hi"}]"#);
     let g = grammar(cs);
-    assert_eq!(g.count(u.fragment.facts(), u.root, &"list"), Count::Many);
+    assert_eq!(g.count(u.view(), u.root, &"list"), Count::Many);
     let findings = g
-        .cover(u.fragment.facts(), &u.blobs, u.root, &"list")
+        .cover(u.view(), u.root, &"list")
         .expect_err("ambiguous");
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert_eq!(findings[0].path, "/0");
@@ -245,8 +252,8 @@ fn an_anchor_whose_child_fails_is_not_an_alternative() {
     });
     let u = unit(r#"[{"type":"text","text":"hi"}]"#);
     let g = grammar(cs);
-    assert_eq!(g.count(u.fragment.facts(), u.root, &"list"), Count::One);
-    g.cover(u.fragment.facts(), &u.blobs, u.root, &"list")
+    assert_eq!(g.count(u.view(), u.root, &"list"), Count::One);
+    g.cover(u.view(), u.root, &"list")
         .expect("the other analysis has no cover");
 }
 
@@ -259,7 +266,7 @@ fn shared_subtrees_are_counted_at_every_path() {
     let u = unit(r#"[{"type":"text","text":"hi"},{"type":"text","text":"hi"}]"#);
     let g = grammar(standard());
     let image = g
-        .cover(u.fragment.facts(), &u.blobs, u.root, &"list")
+        .cover(u.view(), u.root, &"list")
         .expect("one cover");
     let items = find!((i: Id), pattern!(image.facts(), [{ _?l @ out::item: ?i }])).count();
     assert_eq!(items, 1, "the same message at two paths is one emitted entity");
@@ -268,7 +275,7 @@ fn shared_subtrees_are_counted_at_every_path() {
     let mut twin = text_message();
     twin.name = "text_message_twin";
     cs.push(twin);
-    assert_eq!(grammar(cs).count(u.fragment.facts(), u.root, &"list"), Count::Many);
+    assert_eq!(grammar(cs).count(u.view(), u.root, &"list"), Count::Many);
 }
 
 #[test]
@@ -280,7 +287,7 @@ fn one_entity_under_two_categories_emits_two_roots() {
     tool_string.name = "tool_string";
     tool_string.category = "tool_name";
     tool_string.emit = Box::new(|inst| {
-        let h = string_of(inst.facts, inst.anchor).expect("text");
+        let h = string_of(inst.unit.facts, inst.anchor).expect("text");
         entity! { _ @ out::tool: h }
     });
     let pair = Construction {
@@ -301,7 +308,7 @@ fn one_entity_under_two_categories_emits_two_roots() {
     };
     let g = grammar(vec![speech_string, tool_string, pair]);
     let image = g
-        .cover(u.fragment.facts(), &u.blobs, u.root, &"pair")
+        .cover(u.view(), u.root, &"pair")
         .expect("one cover");
     assert_eq!(said(&image), vec![handle("exec")]);
 }
@@ -311,12 +318,12 @@ fn empty_containers_are_accounted_for() {
     let g = grammar(standard());
     let u = unit("[]");
     let image = g
-        .cover(u.fragment.facts(), &u.blobs, u.root, &"list")
+        .cover(u.view(), u.root, &"list")
         .expect("an empty list has one cover");
     assert!(image.root().is_some());
 
     let u = unit(r#"[{"type":"tool","name":"exec","input":{}}]"#);
-    g.cover(u.fragment.facts(), &u.blobs, u.root, &"list")
+    g.cover(u.view(), u.root, &"list")
         .expect("an empty input object is consumed as a value");
 }
 
@@ -324,12 +331,12 @@ fn empty_containers_are_accounted_for() {
 fn the_image_does_not_depend_on_construction_order() {
     let u = unit(r#"[{"type":"text","text":"a"},{"type":"tool","name":"exec"},{"type":"text","text":"b"}]"#);
     let forward = grammar(standard())
-        .cover(u.fragment.facts(), &u.blobs, u.root, &"list")
+        .cover(u.view(), u.root, &"list")
         .expect("one cover");
     let mut reversed = standard();
     reversed.reverse();
     let backward = grammar(reversed)
-        .cover(u.fragment.facts(), &u.blobs, u.root, &"list")
+        .cover(u.view(), u.root, &"list")
         .expect("one cover");
     assert_eq!(forward.facts(), backward.facts());
     assert_eq!(forward.root(), backward.root());
@@ -368,9 +375,9 @@ fn a_cycle_written_by_a_bug_terminates_and_is_reported() {
         }),
     };
     let g = grammar(vec![nested]);
-    assert_eq!(g.count(&facts, u.root, &"tree"), Count::Zero);
+    assert_eq!(g.count(Unit::new(&facts, &u.blobs), u.root, &"tree"), Count::Zero);
     let findings = g
-        .cover(&facts, &u.blobs, u.root, &"tree")
+        .cover(Unit::new(&facts, &u.blobs), u.root, &"tree")
         .expect_err("a cycle has no finite cover");
     assert!(findings.iter().any(|f| f.problem == Problem::Cycle), "{findings:?}");
 }
@@ -393,7 +400,7 @@ fn an_id_keyed_object_is_covered_member_by_member() {
     let g = grammar(cs);
     let u = unit(r#"{"ab12":{"type":"text","text":"x"},"cd34":{"type":"text","text":"y"}}"#);
     let image = g
-        .cover(u.fragment.facts(), &u.blobs, u.root, &"by_id")
+        .cover(u.view(), u.root, &"by_id")
         .expect("one cover");
     assert_eq!(said(&image), {
         let mut v = vec![handle("x"), handle("y")];
@@ -402,7 +409,7 @@ fn an_id_keyed_object_is_covered_member_by_member() {
     });
     let u = unit(r#"{"ab12":{"type":"text","text":"x"},"cd34":{"type":"image"}}"#);
     let findings = g
-        .cover(u.fragment.facts(), &u.blobs, u.root, &"by_id")
+        .cover(u.view(), u.root, &"by_id")
         .expect_err("one member has no construction");
     assert_eq!(findings.len(), 1, "{findings:?}");
     assert_eq!(findings[0].path, "/cd34");
@@ -438,7 +445,8 @@ fn context_grammar(with_own: bool) -> Grammar<Cat> {
             Constituent::new(Step::Field("model"), Role::Drop("read by the content's category")),
             Constituent::new(
                 Step::Field("thinking"),
-                Role::Within(Arc::new(move |facts: &TribleSet, e: Id, _: &Cat| {
+                Role::Within(Arc::new(move |unit: &Unit, e: Id, _: &Cat| {
+                    let facts = unit.facts;
                     let model = find!(
                         (h: Name),
                         pattern!(facts, [
@@ -451,7 +459,9 @@ fn context_grammar(with_own: bool) -> Grammar<Cat> {
                     .next();
                     Cat {
                         path: "thinking",
-                        summarized: model == Some(handle(summarized_prefix)),
+                        summarized: model
+                            .and_then(|h| unit.text(h))
+                            .is_some_and(|text| text.starts_with(summarized_prefix)),
                     }
                 })),
             ),
@@ -464,24 +474,26 @@ fn context_grammar(with_own: bool) -> Grammar<Cat> {
     let summary = Construction::<Cat> {
         name: "summary",
         category: "thinking",
-        anchor: Box::new(|facts, e, cat: &Cat| {
+        anchor: Box::new(|unit: &Unit, e, cat: &Cat| {
+            let facts = unit.facts;
             cat.summarized && exists!(pattern!(facts, [{ e @ json_tree::kind: json_tree::kind_string }]))
         }),
         constituents: vec![],
         emit: Box::new(|inst| {
-            let h = string_of(inst.facts, inst.anchor).expect("text");
+            let h = string_of(inst.unit.facts, inst.anchor).expect("text");
             entity! { _ @ out::tool: h }
         }),
     };
     let own = Construction::<Cat> {
         name: "own_thinking",
         category: "thinking",
-        anchor: Box::new(|facts, e, cat: &Cat| {
+        anchor: Box::new(|unit: &Unit, e, cat: &Cat| {
+            let facts = unit.facts;
             !cat.summarized && exists!(pattern!(facts, [{ e @ json_tree::kind: json_tree::kind_string }]))
         }),
         constituents: vec![],
         emit: Box::new(|inst| {
-            let h = string_of(inst.facts, inst.anchor).expect("text");
+            let h = string_of(inst.unit.facts, inst.anchor).expect("text");
             entity! { _ @ out::said: h }
         }),
     };
@@ -518,16 +530,16 @@ fn a_parent_passes_context_down_in_the_category() {
 
     // The same thinking string, under two records whose model differs, is
     // classified by the context the record passed down.
-    let u = unit(r#"{"model":"claude-4","thinking":"hmm"}"#);
-    let image = g.cover(u.fragment.facts(), &u.blobs, u.root, &start).expect("one cover");
+    let u = unit(r#"{"model":"claude-4-opus","thinking":"hmm"}"#);
+    let image = g.cover(u.view(), u.root, &start).expect("one cover");
     assert!(said(&image).is_empty());
     assert_eq!(
         find!((h: Name), pattern!(image.facts(), [{ _?e @ out::tool: ?h }])).count(),
         1,
         "a summarized record's thinking is a summary"
     );
-    let u = unit(r#"{"model":"claude-3","thinking":"hmm"}"#);
-    let image = g.cover(u.fragment.facts(), &u.blobs, u.root, &start).expect("one cover");
+    let u = unit(r#"{"model":"claude-3-7-sonnet","thinking":"hmm"}"#);
+    let image = g.cover(u.view(), u.root, &start).expect("one cover");
     assert_eq!(said(&image), vec![handle("hmm")], "otherwise it is her own");
 }
 
@@ -536,8 +548,8 @@ fn one_shared_subtree_under_two_contexts_in_one_unit_is_counted_and_emitted_per_
     // Sol, 2026-11-04: the full computed category must be the memo key, or a
     // subtree shared under two record conditions mixes. Both visit orders.
     for json in [
-        r#"[{"model":"claude-4","thinking":"hmm"},{"model":"claude-3","thinking":"hmm"}]"#,
-        r#"[{"model":"claude-3","thinking":"hmm"},{"model":"claude-4","thinking":"hmm"}]"#,
+        r#"[{"model":"claude-4-opus","thinking":"hmm"},{"model":"claude-3-7-sonnet","thinking":"hmm"}]"#,
+        r#"[{"model":"claude-3-7-sonnet","thinking":"hmm"},{"model":"claude-4-opus","thinking":"hmm"}]"#,
     ] {
         let g = context_grammar(true);
         let u = unit(json);
@@ -545,7 +557,7 @@ fn one_shared_subtree_under_two_contexts_in_one_unit_is_counted_and_emitted_per_
             path: "records",
             summarized: false,
         };
-        let image = g.cover(u.fragment.facts(), &u.blobs, u.root, &start).expect("one cover");
+        let image = g.cover(u.view(), u.root, &start).expect("one cover");
         assert_eq!(said(&image), vec![handle("hmm")], "{json}: her own, once");
         assert_eq!(
             find!((h: Name), pattern!(image.facts(), [{ _?e @ out::tool: ?h }])).count(),
@@ -555,7 +567,7 @@ fn one_shared_subtree_under_two_contexts_in_one_unit_is_counted_and_emitted_per_
         // Without a construction for her own thinking, the unsummarized
         // context has no cover, whichever context the walk reaches first.
         let findings = context_grammar(false)
-            .cover(u.fragment.facts(), &u.blobs, u.root, &start)
+            .cover(u.view(), u.root, &start)
             .expect_err("one context has no construction");
         assert_eq!(findings.len(), 1, "{json}: {findings:?}");
         assert_eq!(findings[0].problem, Problem::NoConstruction, "{json}");
