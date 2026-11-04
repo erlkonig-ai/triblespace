@@ -13,7 +13,7 @@ use triblespace_core::collection::simplearchive_union;
 use triblespace_core::collection::{
     Collection, CollectionAttachment, CollectionData, CollectionMap, CollectionMerge,
     CollectionPolicy, CollectionRead, CollectionRecord, CollectionSnapshotExt, CollectionStore,
-    CollectionStoreExt, TryFromCover,
+    CollectionStoreExt, TryFromCover, MERGE_INPUTS,
 };
 use triblespace_core::id::ExclusiveId;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -217,17 +217,30 @@ impl Stream {
     fn below(&mut self, bound: u64) -> u64 {
         self.next() % bound
     }
+
+    /// `count` distinct entries of `from`, which must hold at least that many.
+    fn sample(&mut self, from: &[CollectionData], count: usize) -> Vec<CollectionData> {
+        let mut pool = from.to_vec();
+        (0..count)
+            .map(|_| pool.swap_remove(self.below(pool.len() as u64) as usize))
+            .collect()
+    }
 }
 
 /// Every believed node of `root`'s lattice: the frontier and everything the
-/// host's joins name beneath it.
+/// host's joins name beneath it. With `below`, only that node and everything
+/// the host's joins name beneath it.
 fn lattice_nodes<R: triblespace_core::repo::StoreRead>(
     snapshot: &R,
     root: Collection<SimpleArchive>,
+    below: Option<CollectionData>,
 ) -> Vec<CollectionData> {
     let coverage = snapshot.coverage(&BTreeSet::from([root.handle()])).unwrap();
     let mut seen = BTreeSet::new();
-    let mut pending: Vec<CollectionData> = coverage.frontier(root.handle()).collect();
+    let mut pending: Vec<CollectionData> = match below {
+        Some(node) => vec![node],
+        None => coverage.frontier(root.handle()).collect(),
+    };
     while let Some(node) = pending.pop() {
         if !seen.insert(node) {
             continue;
@@ -246,6 +259,7 @@ fn lattice_nodes<R: triblespace_core::repo::StoreRead>(
 /// union of every foundation.
 #[test]
 fn attached_covers_answer_like_the_summary_of_the_union() {
+    let (mut host_merges, mut absorptions) = (0usize, 0usize);
     for seed in 0..24u64 {
         let mut random = Stream(seed.wrapping_mul(0x51D7_348D_A7C9_2E11) + 7);
         let (mut store, root, target) = attached_paths(&format!("random-{seed}"));
@@ -265,19 +279,35 @@ fn attached_covers_answer_like_the_summary_of_the_union() {
             block_on(store.maintain(root, &key)).unwrap();
         }
         // Host merges over random, possibly overlapping, nodes, and
-        // absorptions of a node into one that already covers it.
+        // absorptions of nodes into one that already covers them. A MERGE
+        // joins exactly MERGE_INPUTS distinct nodes, so an absorption names a
+        // node and MERGE_INPUTS - 1 nodes it already stands on.
         for _ in 0..random.below(4) {
             let snapshot = store.snapshot().unwrap();
-            let nodes = lattice_nodes(&snapshot, root);
-            if nodes.len() < 2 {
+            let nodes = lattice_nodes(&snapshot, root, None);
+            if nodes.len() < MERGE_INPUTS {
                 break;
             }
-            let picked: BTreeSet<CollectionData> = (0..2 + random.below(2))
-                .map(|_| nodes[random.below(nodes.len() as u64) as usize])
+            let covering: Vec<(CollectionData, Vec<CollectionData>)> = nodes
+                .iter()
+                .map(|&node| {
+                    let beneath: Vec<CollectionData> = lattice_nodes(&snapshot, root, Some(node))
+                        .into_iter()
+                        .filter(|&below| below != node)
+                        .collect();
+                    (node, beneath)
+                })
+                .filter(|(_, beneath)| beneath.len() >= MERGE_INPUTS - 1)
                 .collect();
-            if picked.len() < 2 {
-                continue;
-            }
+            let picked: BTreeSet<CollectionData> = if !covering.is_empty() && random.below(2) == 0 {
+                let (node, beneath) = &covering[random.below(covering.len() as u64) as usize];
+                let mut picked = random.sample(beneath, MERGE_INPUTS - 1);
+                picked.push(*node);
+                picked.into_iter().collect()
+            } else {
+                random.sample(&nodes, MERGE_INPUTS).into_iter().collect()
+            };
+            assert_eq!(picked.len(), MERGE_INPUTS);
             let blobs: Vec<Blob<SimpleArchive>> = picked
                 .iter()
                 .map(|node| {
@@ -291,6 +321,10 @@ fn attached_covers_answer_like_the_summary_of_the_union() {
                 simplearchive_union::join(&joined, blob).unwrap()
             });
             let result = store.put::<SimpleArchive, _>(joined).unwrap();
+            host_merges += 1;
+            if picked.contains(&Handle::<SimpleArchive>::to_hash(result)) {
+                absorptions += 1;
+            }
             store
                 .insert(CollectionRecord::Merge(
                     CollectionMerge::sign(
@@ -305,7 +339,7 @@ fn attached_covers_answer_like_the_summary_of_the_union() {
         }
         // Random attachment presence, at any node.
         let snapshot = store.snapshot().unwrap();
-        for node in lattice_nodes(&snapshot, root) {
+        for node in lattice_nodes(&snapshot, root, None) {
             if random.below(2) == 0 {
                 continue;
             }
@@ -377,4 +411,10 @@ fn attached_covers_answer_like_the_summary_of_the_union() {
             "seed {seed}: a cover of attachments must answer like the union"
         );
     }
+    // The seeds still reach both kinds of extra host equation.
+    assert!(
+        host_merges > absorptions,
+        "no seed signed a plain host merge"
+    );
+    assert!(absorptions > 0, "no seed signed an absorption");
 }
