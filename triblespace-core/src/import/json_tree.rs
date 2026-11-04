@@ -49,6 +49,9 @@ attributes! {
     "38C7B1CDEA580DE70A520B2C8CBC4F14" unsafe as pub field_index: U256BE;
     /// Inline entity referenced by an object field entry.
     "6E6CA175F925B6AA0844D357B409F15A" unsafe as pub field_value: GenId;
+    /// An entry (`kind_field`) of an object. An object has one per member,
+    /// as an unordered set. Anchor minted with `trible genid` on 2026-11-04.
+    "B45722CAC844706E9C4DE0D5DCAB542E" as pub object_field: GenId;
     /// Parent entity of an array entry.
     "B49E6499D0A2CF5DD9A1E72D9D047747" unsafe as pub array_parent: GenId;
     /// Zero-based index of an array element.
@@ -609,7 +612,7 @@ mod tests {
     use crate::import::json::JsonImportError;
     use crate::inline::encodings::hash::Handle;
     use crate::inline::{Inline, InlineEncoding, RawInline};
-    use crate::macros::{find, pattern};
+    use crate::macros::{entity, find, pattern};
     use crate::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
     use crate::trible::Fragment;
 
@@ -962,6 +965,7 @@ mod tests {
             r#"["kept", 1e5, "x" "y"]"#.to_owned(),
             r#"["kept"] trailing"#.to_owned(),
             format!(r#"["kept", {}{}]"#, "[".repeat(200), "]".repeat(200)),
+            r#"["kept", {"name": 1, "name": 2}]"#.to_owned(),
         ];
         for doc in &bad {
             assert!(importer.import_str(doc).is_err(), "{doc} must be refused");
@@ -1162,5 +1166,245 @@ mod tests {
             .unwrap();
         let plain = import("[1]").unwrap();
         assert_ne!(salted.root(), plain.root());
+    }
+
+    #[test]
+    fn a_salt_changes_object_ids() {
+        let mut blobs = MemoryBlobStore::new();
+        let salted = JsonTreeImporter::<_>::new(&mut blobs, Some([7u8; 32]))
+            .import_str(r#"{"a":1}"#)
+            .unwrap();
+        let plain = import(r#"{"a":1}"#).unwrap();
+        assert_ne!(salted.root(), plain.root());
+        let mut blobs = MemoryBlobStore::new();
+        let reordered = JsonTreeImporter::<_>::new(&mut blobs, Some([7u8; 32]))
+            .import_str(r#"{"b":2,"a":1}"#)
+            .unwrap();
+        let mut blobs = MemoryBlobStore::new();
+        let ordered = JsonTreeImporter::<_>::new(&mut blobs, Some([7u8; 32]))
+            .import_str(r#"{"a":1,"b":2}"#)
+            .unwrap();
+        assert_eq!(reordered.root(), ordered.root());
+        assert_eq!(reordered.facts(), ordered.facts());
+    }
+
+    fn assert_same_import(a: &str, b: &str) {
+        let left = import(a).unwrap_or_else(|e| panic!("{a}: {e}"));
+        let right = import(b).unwrap_or_else(|e| panic!("{b}: {e}"));
+        assert_eq!(left.root(), right.root(), "root of {a} vs {b}");
+        assert_eq!(left.facts(), right.facts(), "facts of {a} vs {b}");
+    }
+
+    #[test]
+    fn flat_object_member_order_does_not_change_the_import() {
+        for (a, b) in [
+            (r#"{"a":1,"b":2}"#, r#"{"b":2,"a":1}"#),
+            (r#"{"a":1,"b":2,"c":3}"#, r#"{"c":3,"a":1,"b":2}"#),
+            (r#"{"x":"1","y":1}"#, r#"{ "y" : 1 , "x" : "1" }"#),
+            (r#"{"\u0061":true,"b":null}"#, r#"{"b":null,"a":true}"#),
+        ] {
+            assert_same_import(a, b);
+        }
+    }
+
+    #[test]
+    fn nested_object_member_order_does_not_change_the_import() {
+        for (a, b) in [
+            (
+                r#"{"o":{"a":1,"b":{"c":true,"d":null}},"z":[{"p":1,"q":2}]}"#,
+                r#"{"z":[{"q":2,"p":1}],"o":{"b":{"d":null,"c":true},"a":1}}"#,
+            ),
+            (
+                r#"[{"a":1,"b":2},{"c":3,"d":4}]"#,
+                r#"[{"b":2,"a":1},{"d":4,"c":3}]"#,
+            ),
+            (r#"[[{"k":"v","w":[]}]]"#, r#"[[{"w":[],"k":"v"}]]"#),
+        ] {
+            assert_same_import(a, b);
+        }
+    }
+
+    #[test]
+    fn array_element_order_still_changes_the_import() {
+        for (a, b) in [
+            ("[1,2]", "[2,1]"),
+            (r#"[{"a":1},{"b":2}]"#, r#"[{"b":2},{"a":1}]"#),
+            (r#"{"k":[1,2]}"#, r#"{"k":[2,1]}"#),
+            (r#"{"k":[{"a":1,"b":2},3]}"#, r#"{"k":[3,{"b":2,"a":1}]}"#),
+        ] {
+            let left = import(a).unwrap();
+            let right = import(b).unwrap();
+            assert_ne!(left.root(), right.root(), "{a} vs {b}");
+        }
+    }
+
+    /// The Merkle shape an object import must have, built with `entity!`
+    /// alone: each entry is the intrinsic entity of its kind, name and
+    /// value; the object is the intrinsic entity of its kind and its set of
+    /// entries. Returns the object rooted over every fact of the tree.
+    fn expected_object(members: Vec<(&str, Fragment)>) -> Fragment {
+        let mut entries = Fragment::empty();
+        let mut facts = crate::trible::TribleSet::new();
+        for (name, value) in members {
+            let value_id = value.root().expect("member values are rooted");
+            facts += value.facts().clone();
+            let name_handle: Inline<Handle<UTF8String>> = name.to_owned().to_blob().get_handle();
+            entries += entity! {
+                super::kind: super::kind_field,
+                super::field_name: name_handle,
+                super::field_value: value_id,
+            };
+        }
+        let object = entity! {
+            super::kind: super::kind_object,
+            super::object_field*: entries,
+        };
+        let root = object.root().expect("entity! roots the object");
+        facts += object.facts().clone();
+        Fragment::rooted(root, facts)
+    }
+
+    fn scalar(doc: &str) -> Fragment {
+        import(doc).unwrap_or_else(|e| panic!("{doc}: {e}"))
+    }
+
+    fn assert_import_matches(doc: &str, expected: &Fragment) {
+        let imported = import(doc).unwrap_or_else(|e| panic!("{doc}: {e}"));
+        assert_eq!(
+            format!("{:X}", imported.root().unwrap()),
+            format!("{:X}", expected.root().unwrap()),
+            "root of {doc}"
+        );
+        assert_eq!(imported.facts(), expected.facts(), "facts of {doc}");
+    }
+
+    #[test]
+    fn object_import_is_the_entity_merkle_tree() {
+        assert_import_matches("{}", &expected_object(vec![]));
+        let flat = expected_object(vec![("a", scalar("1")), ("b", scalar("2"))]);
+        assert_import_matches(r#"{"a":1,"b":2}"#, &flat);
+        assert_import_matches(r#"{"b":2,"a":1}"#, &flat);
+        let nested = expected_object(vec![
+            ("o", expected_object(vec![("k", scalar(r#""v""#))])),
+            ("t", scalar("true")),
+        ]);
+        assert_import_matches(r#"{"o":{"k":"v"},"t":true}"#, &nested);
+        // An entry is shared by every object holding the same member.
+        let shared = expected_object(vec![
+            ("x", expected_object(vec![("k", scalar("null"))])),
+            (
+                "y",
+                expected_object(vec![("k", scalar("null")), ("j", scalar("0"))]),
+            ),
+        ]);
+        assert_import_matches(r#"{"x":{"k":null},"y":{"j":0,"k":null}}"#, &shared);
+    }
+
+    #[test]
+    fn object_entries_carry_only_kind_name_and_value() {
+        let fragment = import(r#"{"a":1,"b":[true]}"#).unwrap();
+        let root = fragment.root().unwrap();
+        let entries = find!(
+            (entry: Id),
+            pattern!(fragment.facts(), [{ root @ super::object_field: ?entry }])
+        )
+        .map(|(entry,)| entry)
+        .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2);
+        for entry in entries {
+            let facts = fragment.facts().iter().filter(|t| *t.e() == entry).count();
+            assert_eq!(facts, 3, "kind, field_name and field_value only");
+        }
+        let object_facts = fragment.facts().iter().filter(|t| *t.e() == root).count();
+        assert_eq!(object_facts, 3, "kind and one object_field per member");
+    }
+
+    /// Unsalted object roots, recorded on 2026-11-04 from the `entity!`
+    /// construction in `expected_object` (not from the importer).
+    const OBJECT_ROOT_GOLDEN: &[(&str, &str)] = &[
+        ("{}", "A2272F5AEE841D9018749552F835011C"),
+        (r#"{"a":1,"b":2}"#, "CC4958C518FF310C6DAAB30D6589CE7F"),
+        (r#"{"b":2,"a":1}"#, "CC4958C518FF310C6DAAB30D6589CE7F"),
+        (
+            r#"{"o":{"k":"v"},"t":true}"#,
+            "F86FD7922BDB78672852E8C4460A7434",
+        ),
+        (
+            r#"{"x":{"k":null},"y":{"j":0,"k":null}}"#,
+            "1EFED793FD3DCB32BC73122D8762E74C",
+        ),
+    ];
+
+    #[test]
+    fn unsalted_object_roots_match_recorded_golden_values() {
+        for &(doc, root_hex) in OBJECT_ROOT_GOLDEN {
+            let root = import(doc).unwrap().root().unwrap();
+            assert_eq!(format!("{root:X}"), root_hex, "root of {doc}");
+        }
+    }
+
+    fn expect_duplicate_key(doc: &str, key: &str) {
+        match import(doc) {
+            Err(JsonImportError::DuplicateKey { key: got }) => assert_eq!(got, key, "{doc}"),
+            other => panic!("{doc}: expected DuplicateKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_member_name_is_refused_with_the_key() {
+        for (doc, key) in [
+            (r#"{"k":1,"k":2}"#, "k"),
+            (r#"{"k":1,"k":1}"#, "k"),
+            (r#"{"k":1,"j":2,"k":3}"#, "k"),
+            (r#"{"a":1,"\u0061":2}"#, "a"),
+            (r#"{"":1,"":2}"#, ""),
+            (r#"{"\ud83d\ude00":1,"\uD83D\uDE00":2}"#, "\u{1F600}"),
+        ] {
+            expect_duplicate_key(doc, key);
+        }
+    }
+
+    #[test]
+    fn nested_duplicate_member_name_is_refused() {
+        for (doc, key) in [
+            (r#"{"a":{"k":1,"j":0,"k":2}}"#, "k"),
+            (r#"[1,{"x":[{"k":null,"k":null}]}]"#, "k"),
+            (r#"[{"k":1},{"k":2,"k":3}]"#, "k"),
+            (r#"{"o":{"p":{"q":[],"q":{}}},"z":0}"#, "q"),
+        ] {
+            expect_duplicate_key(doc, key);
+        }
+    }
+
+    #[test]
+    fn the_same_name_in_different_objects_is_not_a_duplicate() {
+        for doc in [
+            r#"[{"k":1},{"k":2}]"#,
+            r#"{"k":{"k":1}}"#,
+            r#"{"k":1,"K":2}"#,
+            r#"{"k":[{"k":{"k":null}}]}"#,
+        ] {
+            import(doc).unwrap_or_else(|e| panic!("{doc}: {e}"));
+        }
+    }
+
+    /// A syntax error anywhere, or an unpaired surrogate, takes precedence
+    /// over a duplicate member name, as it does over `LoneSurrogate`.
+    #[test]
+    fn syntax_and_surrogate_errors_take_precedence_over_duplicate_keys() {
+        for doc in [
+            r#"{"k":1,"k":2"#,
+            r#"{"k":1,"k":2} x"#,
+            r#"[{"k":1,"k":2},]"#,
+        ] {
+            match import(doc) {
+                Err(JsonImportError::Syntax(_)) => {}
+                other => panic!("{doc}: expected a syntax error, got {other:?}"),
+            }
+        }
+        match import(r#"{"k":1,"k":"\ud800"}"#) {
+            Err(JsonImportError::LoneSurrogate { code_unit }) => assert_eq!(code_unit, 0xD800),
+            other => panic!("expected LoneSurrogate, got {other:?}"),
+        }
     }
 }

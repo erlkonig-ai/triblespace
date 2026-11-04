@@ -71,6 +71,14 @@ pub enum JsonImportError {
         /// a value may have).
         max_depth: usize,
     },
+    /// One object names the same member twice (compared after escapes are
+    /// decoded, so `"a"` and `"\u0061"` are the same name). JSON leaves the
+    /// meaning of such an object to the reader, so the lossless importer
+    /// refuses it rather than keeping or merging either value.
+    DuplicateKey {
+        /// The repeated member name, decoded.
+        key: String,
+    },
 }
 
 impl fmt::Display for JsonImportError {
@@ -91,6 +99,9 @@ impl fmt::Display for JsonImportError {
             Self::DepthExceeded { max_depth } => {
                 write!(f, "JSON nests deeper than the limit of {max_depth}")
             }
+            Self::DuplicateKey { key } => {
+                write!(f, "JSON object names the member {key:?} more than once")
+            }
         }
     }
 }
@@ -101,7 +112,8 @@ impl std::error::Error for JsonImportError {
             Self::PrimitiveRoot
             | Self::Syntax(_)
             | Self::LoneSurrogate { .. }
-            | Self::DepthExceeded { .. } => None,
+            | Self::DepthExceeded { .. }
+            | Self::DuplicateKey { .. } => None,
             Self::EncodeString { source, .. } | Self::EncodeNumber { source, .. } => {
                 Some(source.as_error())
             }
