@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `import::json_tree`: an object is the set of its members, so member order
+  no longer reaches any id: `{"a":1,"b":2}` and `{"b":2,"a":1}` import to the
+  same root and facts. Each member entry is the intrinsic entity of
+  `kind: kind_field`, `field_name` and `field_value` (no parent, no index),
+  and the object the intrinsic entity of `kind: kind_object` and one new
+  `object_field` (anchor `B45722CAC844706E9C4DE0D5DCAB542E`) per entry, the
+  Merkle tree `entity!` builds; entries are shared between objects. The
+  `field_parent` and `field_index` attributes are gone. A member name
+  repeated within one object fails the import with the new
+  `JsonImportError::DuplicateKey { key }`, after syntax and lone-surrogate
+  errors, and puts nothing. Unsalted ids of documents that contain an object
+  change (golden rows re-recorded); scalars and object-free arrays keep
+  theirs. Array order, number tokens and decoded strings are unchanged.
+
 - `import::json_tree`: surrogate-pair escapes (`\ud83d\ude00`) decode to one
   scalar value; an unpaired surrogate is refused with the new
   `JsonImportError::LoneSurrogate { code_unit }` instead of a generic syntax

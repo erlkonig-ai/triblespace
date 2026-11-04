@@ -19,8 +19,9 @@ deterministic JSON importers and an N-Triples (RDF) importer:
   when independently imported corpora must not share identities. Each `import_*` call
   returns a [`Fragment`](../src/trible/fragment.rs) that exports the root entity
   id(s) and contains the emitted facts.
-- `JsonTreeImporter` preserves the full JSON structure and ordering by emitting
-  explicit node and entry entities (a JSON AST). It derives content-addressed
+- `JsonTreeImporter` preserves the full JSON structure and array order by
+  emitting explicit node and entry entities (a JSON AST); objects are sets of
+  members, so member order does not affect their ids. It derives content-addressed
   identifiers from the JSON values themselves so identical subtrees deduplicate
   across overlapping imports. Unlike the object importer it can represent
   arbitrary JSON roots, including primitives. Each `import_*` call returns a
@@ -106,12 +107,20 @@ related documents in separate batches.
 
 `JsonTreeImporter` trades the compact attribute/value encoding for a
 lossless JSON AST representation. Each JSON value becomes a node tagged with a
-kind (`json_tree::kind_*`). Objects and arrays emit explicit entry entities
-that store field names and indices (`json_tree::field_*` and
-`json_tree::array_*`), preserving ordering and allowing repeated keys.
-Numbers are stored as raw decimal strings via `Handle<UTF8String>` so
-precision is not lost. Array and field indices are stored as `U256BE` to keep
-ordering exact even for large collections.
+kind (`json_tree::kind_*`). Arrays emit one entry entity per element that
+stores its index (`json_tree::array_*`), stored as `U256BE` so ordering stays
+exact even for large arrays. Objects follow the `entity!` Merkle shape: each
+member is an entry identified by its name and its value
+(`json_tree::field_name`, `json_tree::field_value`), and the object is
+identified by its kind and the set of its entries (`json_tree::object_field`).
+Member order is therefore not part of an object's identity: `{"a":1,"b":2}`
+and `{"b":2,"a":1}` import to the same root and the same facts, and an entry
+is shared by every object that holds the same member. "Lossless" means the
+information, not the bytes. A name repeated within one object (compared after
+escapes are decoded) has no agreed meaning, so the import fails with
+`JsonImportError::DuplicateKey` and puts nothing into the store. Numbers are
+stored as raw decimal strings via `Handle<UTF8String>` so precision is not
+lost.
 
 Because node identifiers are derived from the content of each value, identical
 subtrees converge automatically when you import overlapping backups. This makes

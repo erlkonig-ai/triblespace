@@ -1,9 +1,12 @@
-//! Lossless JSON importer that preserves structure and ordering.
+//! Lossless JSON importer that preserves structure and array order.
 //!
-//! Every JSON value becomes a node tagged with a kind. Objects and arrays are
-//! expressed via explicit entry entities that record field names or indices.
-//! Entity ids are content-addressed so identical subtrees deduplicate across
-//! imports.
+//! Every JSON value becomes a node tagged with a kind. An array records its
+//! elements as entry entities with indices. An object is the set of its
+//! members: each member is an entry entity identified by its name and its
+//! value, and the object is identified by its kind and that set, so member
+//! order does not reach any id (lossless means information, not bytes). A
+//! name repeated within one object is refused. Entity ids are
+//! content-addressed so identical subtrees deduplicate across imports.
 
 use std::collections::HashSet;
 
@@ -19,12 +22,15 @@ use crate::inline::encodings::boolean::Boolean;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::hash::{Blake3, Handle};
 use crate::inline::encodings::iu256::U256BE;
+use crate::inline::InlineEncoding;
 use crate::inline::{Inline, RawInline};
 use crate::macros::{entity, id_hex};
 use crate::metadata;
 use crate::repo::BlobStore;
-use crate::trible::Fragment;
 use crate::trible::TribleSet;
+use crate::trible::{
+    build_intrinsic_entity, build_namespaced_intrinsic_entity, Fragment, IntrinsicEntityRow,
+};
 use triblespace_core_macros::attributes;
 
 pub use crate::import::json::DEFAULT_MAX_DEPTH;
@@ -41,12 +47,8 @@ attributes! {
     "428E02672FFD0D010D95AE641ADE1730" unsafe as pub number_raw: Handle<UTF8String>;
     /// Boolean value.
     "6F43FC771207574BF4CC58D3080C313C" unsafe as pub boolean: Boolean;
-    /// Parent entity of an object field entry.
-    "97A4ACD83EC9EA29EE7E487BB058C437" unsafe as pub field_parent: GenId;
     /// Field name stored as a UTF8String blob.
     "2B9FCF2A60C9B05FADDA9F022762B822" unsafe as pub field_name: Handle<UTF8String>;
-    /// Ordinal position of a field within its parent object.
-    "38C7B1CDEA580DE70A520B2C8CBC4F14" unsafe as pub field_index: U256BE;
     /// Inline entity referenced by an object field entry.
     "6E6CA175F925B6AA0844D357B409F15A" unsafe as pub field_value: GenId;
     /// An entry (`kind_field`) of an object. An object has one per member,
@@ -78,7 +80,7 @@ pub const kind_bool: Id = id_hex!("7D3079C5E20658B6CA5F54771B5D0D30");
 /// JSON null node.
 #[allow(non_upper_case_globals)]
 pub const kind_null: Id = id_hex!("FC1DCF98A3A8418D6090EBD367CFFD7A");
-/// Object field entry.
+/// Object field entry: one member's name and value.
 #[allow(non_upper_case_globals)]
 pub const kind_field: Id = id_hex!("890FC1F34B9FAD18F93E6EDF1B69A1A2");
 /// Array entry.
@@ -104,7 +106,11 @@ pub fn build_json_tree_metadata() -> Fragment {
     metadata += describe_kind(kind_number, "json.kind.number", "JSON number node.");
     metadata += describe_kind(kind_bool, "json.kind.bool", "JSON boolean node.");
     metadata += describe_kind(kind_null, "json.kind.null", "JSON null node.");
-    metadata += describe_kind(kind_field, "json.kind.field", "JSON object field entry.");
+    metadata += describe_kind(
+        kind_field,
+        "json.kind.field",
+        "JSON object field entry: a member name and its value.",
+    );
     metadata += describe_kind(
         kind_array_entry,
         "json.kind.array_entry",
@@ -122,14 +128,6 @@ fn describe_kind(kind_id: Id, name: &str, description: &str) -> Fragment {
 }
 
 #[derive(Clone)]
-struct FieldEntry {
-    name: View<str>,
-    name_handle: Inline<Handle<UTF8String>>,
-    index: u64,
-    value: Id,
-}
-
-#[derive(Clone)]
 struct ArrayEntry {
     index: u64,
     value: Id,
@@ -140,7 +138,11 @@ enum Frame {
     Array(Vec<ArrayEntry>),
     /// `pending` is the name of the member whose value is being parsed.
     Object {
-        fields: Vec<FieldEntry>,
+        /// Entry ids of the members read so far. The object is their set,
+        /// so the order they arrive in never reaches its id.
+        entries: Vec<Id>,
+        /// Name handles seen in this object, to find a repeated name.
+        names: HashSet<RawInline>,
         pending: (ParsedString, Inline<Handle<UTF8String>>),
     },
 }
@@ -156,19 +158,25 @@ struct ImportState {
     pending: Vec<(Blob<UTF8String>, fn(EncodeError) -> JsonImportError)>,
     /// The first surrogate a complete string left unpaired.
     unpaired: Option<u16>,
+    /// The first member name repeated within one object.
+    duplicate: Option<String>,
 }
 
-/// Lossless JSON importer that preserves ordering and encodes explicit entry nodes.
+/// Lossless JSON importer that encodes explicit node and entry entities.
 ///
 /// This importer encodes JSON values as an explicit node/entry graph (a JSON AST),
 /// using content-addressed ids so identical subtrees deduplicate across imports.
+/// Arrays keep their element order; an object is the set of its members, so
+/// `{"a":1,"b":2}` and `{"b":2,"a":1}` import to the same root and facts.
 ///
 /// Parsing is iterative, so deeply nested input cannot overflow the call
 /// stack; nesting beyond [`with_max_depth`](Self::with_max_depth) (default
 /// [`DEFAULT_MAX_DEPTH`]) is refused with [`JsonImportError::DepthExceeded`].
 /// A `\uXXXX` surrogate that is not half of a pair is refused with
-/// [`JsonImportError::LoneSurrogate`], once the document is known to be
-/// syntactically complete. A refused document puts nothing into the store.
+/// [`JsonImportError::LoneSurrogate`], and a name repeated within one object
+/// with [`JsonImportError::DuplicateKey`], once the document is known to be
+/// syntactically complete (a lone surrogate is reported first). A refused
+/// document puts nothing into the store.
 pub struct JsonTreeImporter<'a, Store>
 where
     Store: BlobStore,
@@ -225,6 +233,7 @@ where
             stored: HashSet::new(),
             pending: Vec::new(),
             unpaired: None,
+            duplicate: None,
         };
         let mut bytes = blob.bytes.clone();
         self.skip_ws(&mut bytes);
@@ -235,6 +244,9 @@ where
         }
         if let Some(code_unit) = state.unpaired {
             return Err(JsonImportError::LoneSurrogate { code_unit });
+        }
+        if let Some(key) = state.duplicate {
+            return Err(JsonImportError::DuplicateKey { key });
         }
         for (blob, on_error) in state.pending {
             self.store
@@ -288,11 +300,12 @@ where
                         }
                     } else if bytes.peek_token() == Some(b'}') {
                         bytes.pop_front();
-                        self.finish_object(&[], state)
+                        self.finish_object(Vec::new(), state)
                     } else {
                         let pending = self.parse_member_name(bytes, state)?;
                         stack.push(Frame::Object {
-                            fields: Vec::new(),
+                            entries: Vec::new(),
+                            names: HashSet::new(),
                             pending,
                         });
                         continue;
@@ -318,15 +331,19 @@ where
                             _ => return Err(JsonImportError::Syntax("unexpected token".into())),
                         }
                     }
-                    Frame::Object { fields, pending } => {
-                        let index = fields.len() as u64;
-                        let (name, name_handle) = pending.clone();
-                        fields.push(FieldEntry {
-                            name,
-                            name_handle,
-                            index,
-                            value,
-                        });
+                    Frame::Object {
+                        entries,
+                        names,
+                        pending,
+                    } => {
+                        let (name, name_handle) = &*pending;
+                        if names.insert(name_handle.raw) {
+                            entries.push(self.finish_entry(*name_handle, value, state));
+                        } else if state.duplicate.is_none() {
+                            // Refused once the document is known to be
+                            // well-formed, like an unpaired surrogate.
+                            state.duplicate = Some(name.as_ref().to_owned());
+                        }
                         match bytes.pop_front() {
                             Some(b',') => {
                                 self.skip_ws(bytes);
@@ -344,7 +361,7 @@ where
                 }
                 value = match stack.pop().expect("the frame just inspected") {
                     Frame::Array(entries) => self.finish_array(&entries, state),
-                    Frame::Object { fields, .. } => self.finish_object(&fields, state),
+                    Frame::Object { entries, .. } => self.finish_object(entries, state),
                 };
             }
         }
@@ -454,24 +471,51 @@ where
         handle
     }
 
-    fn finish_object(&self, fields: &[FieldEntry], state: &mut ImportState) -> Id {
-        let object_id = self.hash_object(fields);
-        state.data += entity! { ExclusiveId::force_ref(&object_id) @
-            kind: kind_object,
-        };
+    /// Adds the entry for one object member: the intrinsic entity of its
+    /// kind, name and value, shared by every object with that member.
+    fn finish_entry(
+        &self,
+        name: Inline<Handle<UTF8String>>,
+        value: Id,
+        state: &mut ImportState,
+    ) -> Id {
+        self.intrinsic(
+            vec![
+                IntrinsicEntityRow::new(kind.id(), GenId::inline_from(&kind_field).raw),
+                IntrinsicEntityRow::new(field_name.id(), name.raw),
+                IntrinsicEntityRow::new(field_value.id(), GenId::inline_from(&value).raw),
+            ],
+            state,
+        )
+    }
 
-        for field in fields {
-            let entry_id = self.hash_field_entry(&object_id, field);
-            state.data += entity! { ExclusiveId::force_ref(&entry_id) @
-                kind: kind_field,
-                field_parent: object_id,
-                field_name: field.name_handle,
-                field_index: field.index,
-                field_value: field.value,
-            };
+    /// Adds an object: the intrinsic entity of its kind and its set of
+    /// entries, the same Merkle node `entity! { kind: kind_object,
+    /// object_field*: entries }` builds.
+    fn finish_object(&self, entries: Vec<Id>, state: &mut ImportState) -> Id {
+        let mut rows = Vec::with_capacity(entries.len() + 1);
+        rows.push(IntrinsicEntityRow::new(
+            kind.id(),
+            GenId::inline_from(&kind_object).raw,
+        ));
+        for entry in entries {
+            rows.push(IntrinsicEntityRow::new(
+                object_field.id(),
+                GenId::inline_from(&entry).raw,
+            ));
         }
+        self.intrinsic(rows, state)
+    }
 
-        object_id
+    /// Canonicalises `rows` into one content-derived entity, under the
+    /// salt when there is one, and adds its facts.
+    fn intrinsic(&self, rows: Vec<IntrinsicEntityRow>, state: &mut ImportState) -> Id {
+        let (id, facts) = match self.id_salt.as_ref() {
+            Some(salt) => build_namespaced_intrinsic_entity(rows, salt),
+            None => build_intrinsic_entity(rows),
+        };
+        state.data += facts;
+        id
     }
 
     fn finish_array(&self, entries: &[ArrayEntry], state: &mut ImportState) -> Id {
@@ -493,18 +537,6 @@ where
         array_id
     }
 
-    fn hash_object(&self, fields: &[FieldEntry]) -> Id {
-        let mut hasher = self.seeded_hasher();
-        hash_chunk(&mut hasher, b"object");
-        for field in fields {
-            let index_bytes = field.index.to_be_bytes();
-            hash_chunk(&mut hasher, field.name.as_ref().as_bytes());
-            hash_chunk(&mut hasher, &index_bytes);
-            hash_chunk(&mut hasher, field.value.as_ref());
-        }
-        self.finish_hash(hasher)
-    }
-
     fn hash_array(&self, entries: &[ArrayEntry]) -> Id {
         let mut hasher = self.seeded_hasher();
         hash_chunk(&mut hasher, b"array");
@@ -513,17 +545,6 @@ where
             hash_chunk(&mut hasher, &index_bytes);
             hash_chunk(&mut hasher, entry.value.as_ref());
         }
-        self.finish_hash(hasher)
-    }
-
-    fn hash_field_entry(&self, parent: &Id, entry: &FieldEntry) -> Id {
-        let mut hasher = self.seeded_hasher();
-        hash_chunk(&mut hasher, b"field");
-        let index_bytes = entry.index.to_be_bytes();
-        hash_chunk(&mut hasher, parent.as_ref());
-        hash_chunk(&mut hasher, entry.name.as_ref().as_bytes());
-        hash_chunk(&mut hasher, &index_bytes);
-        hash_chunk(&mut hasher, entry.value.as_ref());
         self.finish_hash(hasher)
     }
 
@@ -1045,7 +1066,9 @@ mod tests {
 
     /// Root id, BLAKE3 of the ordered facts, and fact count, recorded from
     /// the importer at triblespace e77f8e67 with `id_salt = None`. Archive
-    /// identity depends on these never changing.
+    /// identity depends on these never changing. The rows holding an object
+    /// were re-recorded on 2026-11-04, when objects became sets of
+    /// name/value entries; scalar and object-free array rows did not change.
     const GOLDEN: &[(&str, &str, &str, usize)] = &[
         (
             "null",
@@ -1115,8 +1138,8 @@ mod tests {
         ),
         (
             "{}",
-            "2F5563B933F5852111DDA9ADDFB38F8F",
-            "678e8ac742b64e83bf1d80b0ec55318b8b4656ba634ebf2e4d4091fe1f026a0d",
+            "A2272F5AEE841D9018749552F835011C",
+            "6b926a7e5c38c44c26062f3f3e80fb5c8f7b37e06473e7ca7bc8040fd33fee95",
             1,
         ),
         (
@@ -1127,15 +1150,22 @@ mod tests {
         ),
         (
             r#"{"a": [1, 2, {"b": null}], "c": "\u00e9", "": {}}"#,
-            "0F9C4626E50FA6772864FF447B9E7655",
-            "c9fd3d64e8a9a97278059226fef246df3b64ae946375cc0a39d1368a2c429de8",
-            43,
+            "91C7638854F2894BDDFCE9F7A2512068",
+            "98a0b215850721a44b376f164b1dab1020c05b878f8590903ad9f9538466bc02",
+            39,
+        ),
+        // Replaces `{"k": 1, "k": 2, "j": "k"}`, now refused as a duplicate.
+        (
+            r#"{"j": "k", "k": 1}"#,
+            "2A98E6521893CEA728AE71B6ABD4A117",
+            "551c89260ccae83867cb574fc6e9c6101451fa90283099fcb2fff49e35d24a49",
+            13,
         ),
         (
-            r#"{"k": 1, "k": 2, "j": "k"}"#,
-            "D4BA1587A68D409D378B9BD1D2748A18",
-            "0db516a3bb746434833096d56c3fcb9c760e0a25a4027ebe9f2f6758c634e5e2",
-            22,
+            r#"{"k": 1, "j": "k"}"#,
+            "2A98E6521893CEA728AE71B6ABD4A117",
+            "551c89260ccae83867cb574fc6e9c6101451fa90283099fcb2fff49e35d24a49",
+            13,
         ),
     ];
 
