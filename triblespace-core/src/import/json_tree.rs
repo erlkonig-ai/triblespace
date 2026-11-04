@@ -133,6 +133,60 @@ struct ArrayEntry {
     value: Id,
 }
 
+/// A caller-supplied array cannot be constructed from these fragments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrayError {
+    /// The child at this position exports zero or multiple roots.
+    ChildNotRooted { index: u64 },
+    /// An element's position does not fit the importer's array coordinate.
+    IndexOverflow,
+}
+
+impl std::fmt::Display for ArrayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ChildNotRooted { index } => {
+                write!(
+                    f,
+                    "array child at index {index} must export exactly one root"
+                )
+            }
+            Self::IndexOverflow => write!(f, "array index exceeds u64"),
+        }
+    }
+}
+
+impl std::error::Error for ArrayError {}
+
+/// Constructs the canonical, unsalted array of ordered rooted children.
+///
+/// This uses the same array identity and entry facts as [`JsonTreeImporter`].
+/// Child ids are used as supplied, including arbitrary native entity ids;
+/// their facts are not interpreted or validated as JSON. Order and repeated
+/// children are preserved. All child facts, metafacts and blobs are carried
+/// into the result, which exports only the array root and describes its schema.
+/// An empty iterator produces the same array as importing `[]`.
+///
+/// A child must export exactly one root. This is a construction contract for
+/// the supplied fragment's interface, not a cardinality constraint on records.
+pub fn array(children: impl IntoIterator<Item = Fragment>) -> Result<Fragment, ArrayError> {
+    let mut fragment = Fragment::empty();
+    // Operation-local ordered coordinates; no retained catalogue or lookup.
+    let mut entries = Vec::new();
+    for child in children {
+        let index = u64::try_from(entries.len()).map_err(|_| ArrayError::IndexOverflow)?;
+        let value = child.root().ok_or(ArrayError::ChildNotRooted { index })?;
+        entries.push(ArrayEntry { index, value });
+        let (_, facts, metafacts, blobs) = child.into_parts();
+        fragment += Fragment::from_parts(facts, metafacts, blobs);
+    }
+    let root = finish_array(&entries, None, fragment.facts_mut());
+    let (_, facts, metafacts, blobs) = fragment.into_parts();
+    let mut fragment = Fragment::rooted_from_parts(root, facts, metafacts, blobs);
+    fragment.describe_with(build_json_tree_metadata());
+    Ok(fragment)
+}
+
 /// An array or object whose closing bracket has not been read yet.
 enum Frame {
     Array(Vec<ArrayEntry>),
@@ -519,43 +573,7 @@ where
     }
 
     fn finish_array(&self, entries: &[ArrayEntry], state: &mut ImportState) -> Id {
-        let array_id = self.hash_array(entries);
-        state.data += entity! { ExclusiveId::force_ref(&array_id) @
-            kind: kind_array,
-        };
-
-        for entry in entries {
-            let entry_id = self.hash_array_entry(&array_id, entry);
-            state.data += entity! { ExclusiveId::force_ref(&entry_id) @
-                kind: kind_array_entry,
-                array_parent: array_id,
-                array_index: entry.index,
-                array_value: entry.value,
-            };
-        }
-
-        array_id
-    }
-
-    fn hash_array(&self, entries: &[ArrayEntry]) -> Id {
-        let mut hasher = self.seeded_hasher();
-        hash_chunk(&mut hasher, b"array");
-        for entry in entries {
-            let index_bytes = entry.index.to_be_bytes();
-            hash_chunk(&mut hasher, &index_bytes);
-            hash_chunk(&mut hasher, entry.value.as_ref());
-        }
-        self.finish_hash(hasher)
-    }
-
-    fn hash_array_entry(&self, parent: &Id, entry: &ArrayEntry) -> Id {
-        let mut hasher = self.seeded_hasher();
-        hash_chunk(&mut hasher, b"array_entry");
-        let index_bytes = entry.index.to_be_bytes();
-        hash_chunk(&mut hasher, parent.as_ref());
-        hash_chunk(&mut hasher, &index_bytes);
-        hash_chunk(&mut hasher, entry.value.as_ref());
-        self.finish_hash(hasher)
+        finish_array(entries, self.id_salt, &mut state.data)
     }
 
     fn hash_tagged(&self, tag: &[u8], parts: &[&[u8]]) -> Id {
@@ -568,11 +586,7 @@ where
     }
 
     fn seeded_hasher(&self) -> Blake3 {
-        let mut hasher = Blake3::new();
-        if let Some(salt) = self.id_salt {
-            hasher.update(salt.as_ref());
-        }
-        hasher
+        seeded_hasher(self.id_salt)
     }
 
     fn finish_hash(&self, hasher: Blake3) -> Id {
@@ -602,6 +616,52 @@ where
     fn parse_number(&self, bytes: &mut Bytes) -> Result<Bytes, JsonImportError> {
         parse_number_common(bytes)
     }
+}
+
+fn finish_array(entries: &[ArrayEntry], salt: Option<[u8; 32]>, data: &mut TribleSet) -> Id {
+    let array_id = hash_array(entries, salt);
+    *data += entity! { ExclusiveId::force_ref(&array_id) @
+        kind: kind_array,
+    };
+    for entry in entries {
+        let entry_id = hash_array_entry(&array_id, entry, salt);
+        *data += entity! { ExclusiveId::force_ref(&entry_id) @
+            kind: kind_array_entry,
+            array_parent: array_id,
+            array_index: entry.index,
+            array_value: entry.value,
+        };
+    }
+    array_id
+}
+
+fn hash_array(entries: &[ArrayEntry], salt: Option<[u8; 32]>) -> Id {
+    let mut hasher = seeded_hasher(salt);
+    hash_chunk(&mut hasher, b"array");
+    for entry in entries {
+        let index_bytes = entry.index.to_be_bytes();
+        hash_chunk(&mut hasher, &index_bytes);
+        hash_chunk(&mut hasher, entry.value.as_ref());
+    }
+    id_from_digest(hasher.finalize().as_ref())
+}
+
+fn hash_array_entry(parent: &Id, entry: &ArrayEntry, salt: Option<[u8; 32]>) -> Id {
+    let mut hasher = seeded_hasher(salt);
+    hash_chunk(&mut hasher, b"array_entry");
+    let index_bytes = entry.index.to_be_bytes();
+    hash_chunk(&mut hasher, parent.as_ref());
+    hash_chunk(&mut hasher, &index_bytes);
+    hash_chunk(&mut hasher, entry.value.as_ref());
+    id_from_digest(hasher.finalize().as_ref())
+}
+
+fn seeded_hasher(salt: Option<[u8; 32]>) -> Blake3 {
+    let mut hasher = Blake3::new();
+    if let Some(salt) = salt {
+        hasher.update(salt.as_ref());
+    }
+    hasher
 }
 
 fn hash_chunk(hasher: &mut Blake3, bytes: &[u8]) {
@@ -636,6 +696,117 @@ mod tests {
     use crate::macros::{entity, find, pattern};
     use crate::repo::{BlobStoreGet, BlobStorePut, SnapshotSource};
     use crate::trible::Fragment;
+
+    #[test]
+    fn array_constructor_matches_importer_empty_nested_and_repeated() {
+        for (children, document) in [
+            (vec![], "[]"),
+            (vec!["1", "1", r#""1""#], r#"[1,1,"1"]"#),
+            (
+                vec!["[true,null]", r#"{"a":"x"}"#],
+                r#"[[true,null],{"a":"x"}]"#,
+            ),
+        ] {
+            let constructed = super::array(children.into_iter().map(scalar)).unwrap();
+            let imported = import(document).unwrap();
+            assert_eq!(constructed, imported, "{document}");
+        }
+        let inner = super::array([scalar("true"), scalar("null")]).unwrap();
+        let outer = super::array([inner.clone(), inner]).unwrap();
+        assert_eq!(outer, import("[[true,null],[true,null]]").unwrap());
+    }
+
+    #[test]
+    fn array_constructor_preserves_native_ids_order_and_duplicates() {
+        let a = crate::id::fucid();
+        let b = crate::id::fucid();
+        let first = entity! { &a @ crate::metadata::name: "native a" };
+        let second = entity! { &b @ crate::metadata::name: "native b" };
+        let a_id = first.root().unwrap();
+        let b_id = second.root().unwrap();
+        let array = super::array([first.clone(), second.clone(), first.clone()]).unwrap();
+        let root = array.root().unwrap();
+        let mut entries = find!(
+            (index: ethnum::U256, value: Id),
+            pattern!(array.facts(), [{
+                _?entry @ super::array_parent: root,
+                super::array_index: ?index,
+                super::array_value: ?value,
+            }])
+        )
+        .collect::<Vec<_>>();
+        entries.sort_by_key(|(index, _)| *index);
+        assert_eq!(
+            entries,
+            vec![
+                (0_u64.into(), a_id),
+                (1_u64.into(), b_id),
+                (2_u64.into(), a_id)
+            ]
+        );
+        let forward = super::array([first.clone(), second.clone()]).unwrap();
+        let reverse = super::array([second, first]).unwrap();
+        assert_ne!(forward.root(), reverse.root());
+        assert_ne!(array.root(), forward.root());
+    }
+
+    #[test]
+    fn array_constructor_preserves_all_child_channels_and_only_exports_array() {
+        let id = crate::id::fucid();
+        let mut child = entity! { &id @ crate::metadata::name: "child payload" };
+        child.describe_with(entity! { crate::metadata::description: "child description" });
+        // Ownership includes carried bytes even when no child fact names them.
+        let extra = child.put::<UTF8String, _>("carried extra");
+        let original = child.clone();
+        let result = super::array([child]).unwrap();
+        assert_eq!(
+            result.exports().collect::<Vec<_>>(),
+            vec![result.root().unwrap()]
+        );
+        assert_ne!(result.root(), original.root());
+
+        let mut facts = original.facts().clone();
+        facts += result.facts().clone();
+        assert_eq!(&facts, result.facts());
+        let mut metafacts = original.metafacts().clone();
+        metafacts += result.metafacts().clone();
+        assert_eq!(&metafacts, result.metafacts());
+        let mut blobs = original.blobs().clone();
+        blobs.union(result.blobs().clone());
+        assert_eq!(&blobs, result.blobs());
+
+        let snapshot = result.blobs().clone().snapshot().unwrap();
+        for (handle, expected) in [
+            ("child payload".to_blob().get_handle(), "child payload"),
+            (
+                "child description".to_blob().get_handle(),
+                "child description",
+            ),
+            (extra, "carried extra"),
+        ] {
+            let text: View<str> = snapshot.get(handle).unwrap();
+            assert_eq!(text.as_ref(), expected);
+        }
+    }
+
+    #[test]
+    fn array_constructor_rejects_only_unrooted_child_interfaces() {
+        let a = crate::id::fucid().release();
+        let b = crate::id::fucid().release();
+        let valid = Fragment::rooted(a, crate::trible::TribleSet::new());
+        // Native roots need no JSON facts; repeated exports are a set.
+        assert!(super::array([valid.clone()]).is_ok());
+        assert!(super::array([Fragment::new([a, a], crate::trible::TribleSet::new())]).is_ok());
+        for invalid in [
+            Fragment::empty(),
+            Fragment::new([a, b], crate::trible::TribleSet::new()),
+        ] {
+            assert_eq!(
+                super::array([valid.clone(), invalid]).unwrap_err(),
+                super::ArrayError::ChildNotRooted { index: 1 }
+            );
+        }
+    }
 
     #[test]
     fn lossless_ids_are_content_based() {

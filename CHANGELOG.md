@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `import::json_tree::array` composes ordered, rooted fragments using the
+  importer's existing unsalted array identity. It preserves repeated children,
+  their original ids, facts, metafacts and blobs, and exports only the array
+  root. Unrooted or multi-root caller fragments and overflowing indices are
+  construction errors; child facts are not validated as JSON records.
+
 - `AcquiringReader` optionally shares call-owned cancellation and an absolute
   deadline across synchronous and asynchronous exact reads. Interrupted reads
   preserve a typed error distinct from missing bytes, and backend errors retain
