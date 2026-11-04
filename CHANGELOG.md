@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `AcquiringReadControl::without_deadline` preserves shared sticky cancellation
+  while removing only the returned clone's acquisition deadline, for receipt
+  work after a complete prepared result. Existing readers retain their deadline.
+
 - `import::json_tree::array` composes ordered, rooted fragments using the
   importer's existing unsalted array identity. It preserves repeated children,
   their original ids, facts, metafacts and blobs, and exports only the array

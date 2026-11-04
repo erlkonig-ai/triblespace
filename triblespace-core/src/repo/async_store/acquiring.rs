@@ -80,6 +80,18 @@ impl AcquiringReadControl {
         self.deadline
     }
 
+    /// Removes this clone's acquisition deadline while sharing cancellation.
+    ///
+    /// Use after a complete result is prepared when subsequent receipt work
+    /// must remain cancellable but is no longer bounded by selection's deadline.
+    /// Existing clones keep their deadlines; cancellation is never reset.
+    pub fn without_deadline(&self) -> Self {
+        Self {
+            deadline: None,
+            ..self.clone()
+        }
+    }
+
     /// Cancellation wins when both interruption conditions are already true.
     pub fn check(&self) -> Result<(), AcquiringReadInterrupted> {
         if self.abort.is_aborted() {

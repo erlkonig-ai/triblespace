@@ -92,6 +92,37 @@ fn interruption(mut error: &(dyn Error + 'static)) -> Option<AcquiringReadInterr
 }
 
 #[test]
+fn deadline_free_clone_preserves_sticky_cancellation() {
+    for cancel_original in [true, false] {
+        let deadline = Instant::now() - Duration::from_secs(1);
+        let original = AcquiringReadControl::new(Some(deadline));
+        assert_eq!(
+            original.check(),
+            Err(AcquiringReadInterrupted::DeadlineExceeded)
+        );
+        let receipt = original.without_deadline();
+        assert_eq!(original.deadline(), Some(deadline));
+        assert_eq!(receipt.deadline(), None);
+        assert_eq!(receipt.check(), Ok(()));
+        assert_eq!(
+            original.check(),
+            Err(AcquiringReadInterrupted::DeadlineExceeded)
+        );
+        if cancel_original {
+            original.cancel();
+        } else {
+            receipt.cancel();
+        }
+        assert_eq!(original.check(), Err(AcquiringReadInterrupted::Cancelled));
+        assert_eq!(receipt.check(), Err(AcquiringReadInterrupted::Cancelled));
+        assert_eq!(
+            original.without_deadline().check(),
+            Err(AcquiringReadInterrupted::Cancelled)
+        );
+    }
+}
+
+#[test]
 fn cancelled_or_expired_before_get_does_not_poll() {
     let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
     for expected in [
