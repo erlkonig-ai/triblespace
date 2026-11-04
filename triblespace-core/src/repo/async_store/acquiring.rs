@@ -134,19 +134,21 @@ where
         return future.await.map_err(ReadFailure::new);
     };
     control.check().map_err(ReadFailure::new)?;
-    match futures::future::select(Box::pin(future), Box::pin(control.interrupted())).await {
-        Either::Left((result, _)) => {
-            let value = result.map_err(ReadFailure::new)?;
-            // A completed poll may have done synchronous work past the deadline.
-            // Reject its result, without claiming to undo any cache insertion.
-            control.check().map_err(ReadFailure::new)?;
-            Ok(value)
-        }
-        Either::Right((interrupted, pending_get)) => {
-            drop(pending_get);
-            Err(ReadFailure::new(interrupted))
-        }
-    }
+    let result =
+        match futures::future::select(Box::pin(future), Box::pin(control.interrupted())).await {
+            Either::Left((result, _)) => {
+                let value = result.map_err(ReadFailure::new)?;
+                // A completed poll may have done synchronous work past the deadline.
+                // Reject its result, without claiming to undo any cache insertion.
+                control.check().map_err(ReadFailure::new)?;
+                Ok(value)
+            }
+            Either::Right((interrupted, pending_get)) => {
+                drop(pending_get);
+                Err(ReadFailure::new(interrupted))
+            }
+        };
+    result
 }
 
 /// A synchronous command-boundary reader with exact-byte acquisition, but

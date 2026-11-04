@@ -268,7 +268,7 @@ fn cancellation_waits_for_synchronous_poll_then_rejects_its_result() {
     let (done, completed) = mpsc::channel();
     let worker = std::thread::spawn(move || {
         let result = runtime.block_on(controlled_get(
-            async {
+            async move {
                 entered.send(()).unwrap();
                 resume.recv_timeout(Duration::from_secs(3)).unwrap();
                 Ok::<_, std::io::Error>(42)
