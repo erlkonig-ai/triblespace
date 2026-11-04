@@ -25,6 +25,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::Hash;
 
 use anybytes::View;
 use ethnum::U256;
@@ -38,9 +39,12 @@ use triblespace_core::prelude::*;
 use triblespace_core::repo::BlobStoreGet;
 use triblespace_core::trible::{Fragment, TribleSet};
 
-/// The name of a grammatical category, demanded by a parent constituent and
-/// supplied by constructions.
-pub type Category = &'static str;
+/// A grammatical category, demanded by a parent constituent and supplied by
+/// constructions. Any value works: a name, or a compiler's (path, context)
+/// pair, so that context a parent decides travels down in the category.
+pub trait Category: Clone + Eq + Hash + fmt::Debug {}
+
+impl<T: Clone + Eq + Hash + fmt::Debug> Category for T {}
 
 type Name = Inline<Handle<UTF8String>>;
 
@@ -78,31 +82,34 @@ pub enum Step {
     Index(usize),
     /// Every array entry.
     Each,
+    /// Every object member, whatever its name: an object whose member
+    /// names are ids rather than a fixed vocabulary.
+    EachField,
 }
 
 /// What a constituent does with the members it claims.
-#[derive(Clone, Copy, Debug)]
-pub enum Role {
+#[derive(Clone, Debug)]
+pub enum Role<C> {
     /// The member's whole subtree is consumed and bound.
     Value,
     /// The member must be covered by a construction of this category.
-    Child(Category),
+    Child(C),
     /// The member is consumed and emits nothing, for the stated reason.
     Drop(&'static str),
 }
 
 /// One constituent of a construction.
 #[derive(Clone, Debug)]
-pub struct Constituent {
+pub struct Constituent<C> {
     pub step: Step,
-    pub role: Role,
+    pub role: Role<C>,
     /// A `Field` or `Index` step claims nothing when the member is absent.
-    /// `Each` is always optional.
+    /// `Each` and `EachField` are always optional.
     pub optional: bool,
 }
 
-impl Constituent {
-    pub fn new(step: Step, role: Role) -> Self {
+impl<C> Constituent<C> {
+    pub fn new(step: Step, role: Role<C>) -> Self {
         Constituent {
             step,
             role,
@@ -110,7 +117,7 @@ impl Constituent {
         }
     }
 
-    pub fn optional(step: Step, role: Role) -> Self {
+    pub fn optional(step: Step, role: Role<C>) -> Self {
         Constituent {
             step,
             role,
@@ -123,11 +130,11 @@ type Anchor = Box<dyn Fn(&TribleSet, Id) -> bool + Send + Sync>;
 type Emit = Box<dyn Fn(&Instance) -> Fragment + Send + Sync>;
 
 /// A construction: category, anchor, constituents and emit.
-pub struct Construction {
+pub struct Construction<C> {
     pub name: &'static str,
-    pub category: Category,
+    pub category: C,
     pub anchor: Anchor,
-    pub constituents: Vec<Constituent>,
+    pub constituents: Vec<Constituent<C>>,
     /// Builds the construction's image from an instance. The returned
     /// fragment must have exactly one root: the parent refers to it.
     pub emit: Emit,
@@ -182,9 +189,9 @@ struct Member {
 
 /// Why a unit has no single cover, located by path.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Finding {
+pub struct Finding<C> {
     pub path: String,
-    pub category: Category,
+    pub category: C,
     pub problem: Problem,
 }
 
@@ -211,16 +218,16 @@ pub enum Problem {
     Unrooted { construction: &'static str },
 }
 
-impl fmt::Display for Finding {
+impl<C: fmt::Debug> fmt::Display for Finding<C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} as {}: {:?}", self.path, self.category, self.problem)
+        write!(f, "{} as {:?}: {:?}", self.path, self.category, self.problem)
     }
 }
 
 /// A grammar whose constructions passed the static checks.
-pub struct Grammar {
-    constructions: Vec<Construction>,
-    by_category: HashMap<Category, Vec<usize>>,
+pub struct Grammar<C> {
+    constructions: Vec<Construction<C>>,
+    by_category: HashMap<C, Vec<usize>>,
     field_names: HashMap<&'static str, Name>,
 }
 
@@ -230,14 +237,15 @@ pub enum GrammarError {
     Overlap { construction: &'static str },
 }
 
-impl Grammar {
-    pub fn new(constructions: Vec<Construction>) -> Result<Self, GrammarError> {
-        let mut by_category: HashMap<Category, Vec<usize>> = HashMap::new();
+impl<C: Category> Grammar<C> {
+    pub fn new(constructions: Vec<Construction<C>>) -> Result<Self, GrammarError> {
+        let mut by_category: HashMap<C, Vec<usize>> = HashMap::new();
         let mut field_names = HashMap::new();
         for (i, c) in constructions.iter().enumerate() {
             let mut fields = HashSet::new();
             let mut indices = HashSet::new();
             let mut each = false;
+            let mut each_field = false;
             for con in &c.constituents {
                 let fresh = match con.step {
                     Step::Field(name) => {
@@ -247,14 +255,15 @@ impl Grammar {
                     }
                     Step::Index(index) => indices.insert(index),
                     Step::Each => !std::mem::replace(&mut each, true),
+                    Step::EachField => !std::mem::replace(&mut each_field, true),
                 };
-                if !fresh || (each && !indices.is_empty()) {
+                if !fresh || (each && !indices.is_empty()) || (each_field && !fields.is_empty()) {
                     return Err(GrammarError::Overlap {
                         construction: c.name,
                     });
                 }
             }
-            by_category.entry(c.category).or_default().push(i);
+            by_category.entry(c.category.clone()).or_default().push(i);
         }
         Ok(Grammar {
             constructions,
@@ -264,7 +273,7 @@ impl Grammar {
     }
 
     /// The number of covers of `root` as `category`, without emitting.
-    pub fn count(&self, facts: &TribleSet, root: Id, category: Category) -> Count {
+    pub fn count(&self, facts: &TribleSet, root: Id, category: &C) -> Count {
         Run::new(self, facts).count(root, category)
     }
 
@@ -275,8 +284,8 @@ impl Grammar {
         facts: &TribleSet,
         blobs: &B,
         root: Id,
-        category: Category,
-    ) -> Result<Fragment, Vec<Finding>> {
+        category: &C,
+    ) -> Result<Fragment, Vec<Finding<C>>> {
         let mut run = Run::new(self, facts);
         if run.count(root, category) == Count::One {
             let mut image = Fragment::empty();
@@ -285,7 +294,7 @@ impl Grammar {
                 Err(problem) => {
                     return Err(vec![Finding {
                         path: String::from("/"),
-                        category,
+                        category: category.clone(),
                         problem,
                     }])
                 }
@@ -303,16 +312,16 @@ enum Fit {
     Unclaimed(Vec<PathStep>),
 }
 
-struct Run<'g, 'u> {
-    grammar: &'g Grammar,
+struct Run<'g, 'u, C> {
+    grammar: &'g Grammar<C>,
     facts: &'u TribleSet,
-    counts: HashMap<(Id, Category), Count>,
-    open: HashSet<(Id, Category)>,
-    emitted: HashMap<(Id, Category), Id>,
+    counts: HashMap<(Id, C), Count>,
+    open: HashSet<(Id, C)>,
+    emitted: HashMap<(Id, C), Id>,
 }
 
-impl<'g, 'u> Run<'g, 'u> {
-    fn new(grammar: &'g Grammar, facts: &'u TribleSet) -> Self {
+impl<'g, 'u, C: Category> Run<'g, 'u, C> {
+    fn new(grammar: &'g Grammar<C>, facts: &'u TribleSet) -> Self {
         Run {
             grammar,
             facts,
@@ -359,11 +368,12 @@ impl<'g, 'u> Run<'g, 'u> {
             (Step::Field(name), PathStep::Field(handle)) => self.grammar.field_names[name] == *handle,
             (Step::Index(i), PathStep::Index(index)) => U256::from(*i as u64) == *index,
             (Step::Each, PathStep::Index(_)) => true,
+            (Step::EachField, PathStep::Field(_)) => true,
             _ => false,
         }
     }
 
-    fn fit(&self, c: &Construction, members: &[Member]) -> Fit {
+    fn fit(&self, c: &Construction<C>, members: &[Member]) -> Fit {
         let mut parts = vec![Vec::new(); c.constituents.len()];
         let mut claimed = vec![false; members.len()];
         for (k, con) in c.constituents.iter().enumerate() {
@@ -377,7 +387,7 @@ impl<'g, 'u> Run<'g, 'u> {
                     claimed[m] = true;
                 }
             }
-            let optional = con.optional || matches!(con.step, Step::Each);
+            let optional = con.optional || matches!(con.step, Step::Each | Step::EachField);
             if parts[k].is_empty() && !optional {
                 return Fit::Missing(k);
             }
@@ -396,7 +406,7 @@ impl<'g, 'u> Run<'g, 'u> {
     }
 
     /// The instance count of construction `c` at `e`, when it applies.
-    fn instance(&mut self, c: &Construction, e: Id, members: &[Member]) -> Option<(Count, Vec<Vec<Part>>)> {
+    fn instance(&mut self, c: &Construction<C>, e: Id, members: &[Member]) -> Option<(Count, Vec<Vec<Part>>)> {
         if !(c.anchor)(self.facts, e) {
             return None;
         }
@@ -405,7 +415,7 @@ impl<'g, 'u> Run<'g, 'u> {
         };
         let mut n = Count::One;
         for (k, con) in c.constituents.iter().enumerate() {
-            if let Role::Child(category) = con.role {
+            if let Role::Child(category) = &con.role {
                 for part in &parts[k] {
                     n = n.mul(self.count(part.value, category));
                 }
@@ -414,11 +424,11 @@ impl<'g, 'u> Run<'g, 'u> {
         Some((n, parts))
     }
 
-    fn count(&mut self, e: Id, category: Category) -> Count {
-        if let Some(n) = self.counts.get(&(e, category)) {
+    fn count(&mut self, e: Id, category: &C) -> Count {
+        if let Some(n) = self.counts.get(&(e, category.clone())) {
             return *n;
         }
-        if !self.open.insert((e, category)) {
+        if !self.open.insert((e, category.clone())) {
             return Count::Zero;
         }
         let grammar = self.grammar;
@@ -429,15 +439,15 @@ impl<'g, 'u> Run<'g, 'u> {
                 total = total.add(n);
             }
         }
-        self.open.remove(&(e, category));
-        self.counts.insert((e, category), total);
+        self.open.remove(&(e, category.clone()));
+        self.counts.insert((e, category.clone()), total);
         total
     }
 
     /// Emits the single cover of `e` as `category` into `image`. Only called
     /// where the count is `One`, so exactly one instance has count `One`.
-    fn emit(&mut self, e: Id, category: Category, image: &mut Fragment) -> Result<Id, Problem> {
-        if let Some(root) = self.emitted.get(&(e, category)) {
+    fn emit(&mut self, e: Id, category: &C, image: &mut Fragment) -> Result<Id, Problem> {
+        if let Some(root) = self.emitted.get(&(e, category.clone())) {
             return Ok(*root);
         }
         let grammar = self.grammar;
@@ -452,7 +462,7 @@ impl<'g, 'u> Run<'g, 'u> {
         }
         let (c, mut parts) = chosen.expect("a count of One has exactly one instance of count One");
         for (k, con) in c.constituents.iter().enumerate() {
-            if let Role::Child(child) = con.role {
+            if let Role::Child(child) = &con.role {
                 for part in &mut parts[k] {
                     part.child = Some(self.emit(part.value, child, image)?);
                 }
@@ -467,21 +477,21 @@ impl<'g, 'u> Run<'g, 'u> {
             .root()
             .ok_or(Problem::Unrooted { construction: c.name })?;
         *image += fragment;
-        self.emitted.insert((e, category), root);
+        self.emitted.insert((e, category.clone()), root);
         Ok(root)
     }
 
     fn diagnose<B: BlobStoreGet>(
         &mut self,
         e: Id,
-        category: Category,
+        category: &C,
         path: &mut Vec<PathStep>,
         blobs: &B,
-        findings: &mut Vec<Finding>,
+        findings: &mut Vec<Finding<C>>,
     ) {
         let here = |problem: Problem, path: &[PathStep]| Finding {
             path: render_path(path, blobs),
-            category,
+            category: category.clone(),
             problem,
         };
         let target = self.count(e, category);
@@ -507,7 +517,7 @@ impl<'g, 'u> Run<'g, 'u> {
                 return;
             }
         }
-        self.open.insert((e, category));
+        self.open.insert((e, category.clone()));
         for c in candidates {
             match self.fit(c, &members) {
                 Fit::Missing(k) => findings.push(here(
@@ -526,13 +536,13 @@ impl<'g, 'u> Run<'g, 'u> {
                 )),
                 Fit::Applies(parts) => {
                     for (k, con) in c.constituents.iter().enumerate() {
-                        let Role::Child(child) = con.role else { continue };
+                        let Role::Child(child) = &con.role else { continue };
                         for part in &parts[k] {
-                            if self.open.contains(&(part.value, child)) {
+                            if self.open.contains(&(part.value, child.clone())) {
                                 path.push(part.step);
                                 findings.push(Finding {
                                     path: render_path(path, blobs),
-                                    category: child,
+                                    category: child.clone(),
                                     problem: Problem::Cycle,
                                 });
                                 path.pop();
@@ -548,7 +558,7 @@ impl<'g, 'u> Run<'g, 'u> {
                 }
             }
         }
-        self.open.remove(&(e, category));
+        self.open.remove(&(e, category.clone()));
     }
 }
 
