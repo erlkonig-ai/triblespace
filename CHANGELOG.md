@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Typed tensor construction and parsing reject overflowing logical counts and
+  payload extents instead of panicking or accepting wrapped geometry. Empty
+  axes remain empty in any order, rank-zero tensors remain scalars, and NVFP4
+  retains its partial-block/global-scale layout. The encoding and zero-copy
+  view are unchanged. `TensorElement::payload_len` now returns `Option<usize>`;
+  implementors must check their format-specific calculation, and callers must
+  handle an unrepresentable extent. `TensorError::ExtentOverflow` reports
+  invalid extents on the constructor and parser paths.
+
 - `import::json`: `JsonObjectImporter` refuses a member name repeated
   within one object with `JsonImportError::DuplicateKey { key }`, as
   `JsonTreeImporter` does, with the same precedence (syntax and lone-surrogate

@@ -88,9 +88,11 @@ pub trait TensorElement: MetaDescribe + 'static {
     /// Payload bytes for `elems` logical elements, INCLUDING any scale planes
     /// the format defines. A format that is more than its elements accounts for
     /// itself here rather than making every caller remember.
-    fn payload_len(elems: usize) -> usize {
-        elems.saturating_mul(Self::BITS).div_ceil(8)
-    }
+    ///
+    /// Returns `None` when the exact length cannot be represented by `usize`.
+    /// Implementors must check their complete format-specific calculation;
+    /// wrapping or saturation cannot establish a valid payload extent.
+    fn payload_len(elems: usize) -> Option<usize>;
 }
 
 /// A tensor of `T` with `RANK` dimensions.
@@ -131,6 +133,8 @@ pub enum TensorError {
     LengthMismatch { expected: usize, found: usize },
     /// A rank the fixed header cannot hold.
     RankTooLarge { rank: usize },
+    /// Logical element count or complete byte extent is not representable.
+    ExtentOverflow,
 }
 
 impl core::fmt::Display for TensorError {
@@ -151,6 +155,9 @@ impl core::fmt::Display for TensorError {
                     "rank {rank} exceeds the {MAX_RANK} a fixed header can hold"
                 )
             }
+            TensorError::ExtentOverflow => {
+                write!(f, "tensor element count or byte extent overflows")
+            }
         }
     }
 }
@@ -161,6 +168,7 @@ impl core::error::Error for TensorError {}
 #[derive(Debug)]
 pub struct TensorView {
     dims: Vec<u64>,
+    elems: usize,
     payload: Bytes,
 }
 
@@ -172,13 +180,33 @@ impl TensorView {
 
     /// Logical element count.
     pub fn elems(&self) -> usize {
-        self.dims.iter().product::<u64>() as usize
+        self.elems
     }
 
     /// Payload bytes, including any scale planes the element format defines.
     pub fn payload(&self) -> &Bytes {
         &self.payload
     }
+}
+
+/// Validate geometry before either constructing or exposing a typed view.
+fn tensor_extent<T: TensorElement>(dims: &[u64]) -> Result<(usize, usize), TensorError> {
+    // An empty axis makes the whole tensor empty regardless of axis order.
+    // Do this first: a preceding product may otherwise overflow before zero.
+    // The empty product (rank zero) remains one scalar element.
+    let elems = if dims.contains(&0) {
+        0
+    } else {
+        dims.iter()
+            .try_fold(1u64, |n, &dim| n.checked_mul(dim))
+            .ok_or(TensorError::ExtentOverflow)?
+    };
+    let elems = usize::try_from(elems).map_err(|_| TensorError::ExtentOverflow)?;
+    let expected = T::payload_len(elems).ok_or(TensorError::ExtentOverflow)?;
+    TENSOR_HEADER_LEN
+        .checked_add(expected)
+        .ok_or(TensorError::ExtentOverflow)?;
+    Ok((elems, expected))
 }
 
 /// Build a tensor blob from logical dims and a payload.
@@ -193,8 +221,7 @@ pub fn tensor_blob<T: TensorElement, const RANK: usize>(
     if RANK > MAX_RANK {
         return Err(TensorError::RankTooLarge { rank: RANK });
     }
-    let elems: u64 = dims.iter().product();
-    let expected = T::payload_len(elems as usize);
+    let (_, expected) = tensor_extent::<T>(&dims)?;
     if payload.len() != expected {
         return Err(TensorError::LengthMismatch {
             expected,
@@ -234,8 +261,7 @@ impl<T: TensorElement, const RANK: usize> TryFromBlob<Tensor<T, RANK>> for Tenso
                 bytes[at..at + 8].try_into().expect("8 bytes"),
             ));
         }
-        let elems: u64 = dims.iter().product();
-        let expected = T::payload_len(elems as usize);
+        let (elems, expected) = tensor_extent::<T>(&dims)?;
         let payload = bytes.slice(TENSOR_HEADER_LEN..);
         if payload.len() != expected {
             return Err(TensorError::LengthMismatch {
@@ -243,7 +269,11 @@ impl<T: TensorElement, const RANK: usize> TryFromBlob<Tensor<T, RANK>> for Tenso
                 found: payload.len(),
             });
         }
-        Ok(TensorView { dims, payload })
+        Ok(TensorView {
+            dims,
+            elems,
+            payload,
+        })
     }
 }
 
@@ -271,6 +301,11 @@ pub mod elements {
 
             impl TensorElement for $marker {
                 const BITS: usize = $bits;
+
+                fn payload_len(elems: usize) -> Option<usize> {
+                    // Every dense format declared below uses whole bytes.
+                    elems.checked_mul(Self::BITS / 8)
+                }
             }
         };
     }
@@ -339,10 +374,10 @@ pub mod elements {
     impl TensorElement for NVFP4 {
         const BITS: usize = 4;
 
-        fn payload_len(elems: usize) -> usize {
+        fn payload_len(elems: usize) -> Option<usize> {
             let packed = elems.div_ceil(2);
             let blocks = elems.div_ceil(NVFP4_BLOCK);
-            packed + blocks + 4
+            packed.checked_add(blocks)?.checked_add(4)
         }
     }
 }
@@ -404,13 +439,13 @@ mod tests {
     fn nvfp4_payload_accounts_for_its_own_scales() {
         assert_eq!(
             NVFP4::payload_len(16),
-            8 + 1 + 4,
+            Some(8 + 1 + 4),
             "8 packed + 1 block scale + global"
         );
-        assert_eq!(NVFP4::payload_len(32), 16 + 2 + 4);
+        assert_eq!(NVFP4::payload_len(32), Some(16 + 2 + 4));
         assert_eq!(
             F32::payload_len(32),
-            128,
+            Some(128),
             "a dense format is just its elements"
         );
     }
@@ -443,12 +478,12 @@ mod tests {
         );
         assert_eq!(
             NVFP4::payload_len(elems),
-            packed + block_scales + 4,
+            Some(packed + block_scales + 4),
             "one expert carries one global scale"
         );
         let blob = tensor_blob::<NVFP4, 2>(
             [rows as u64, cols as u64],
-            payload(NVFP4::payload_len(elems)),
+            payload(NVFP4::payload_len(elems).expect("bounded expert extent")),
         )
         .expect("well formed");
         let view: TensorView = blob.try_from_blob().expect("decodes");
@@ -557,5 +592,134 @@ mod shape_check_reach {
             <TensorView as TryFromBlob<Tensor<F32, 2>>>::try_from_blob(as_rank2).expect("passes");
         assert_eq!(view.dims(), &[3, 4]);
         assert_eq!(view.elems(), 12, "same elements, same order");
+    }
+}
+
+#[cfg(test)]
+mod extent_tests {
+    use super::elements::{BF16, F32, F64, NVFP4, U8};
+    use super::*;
+
+    // Deliberately bypass the fallible constructor to exercise the reader on
+    // malformed wire bytes. All callers use at most a few payload bytes.
+    fn raw_blob<T: TensorElement, const RANK: usize>(
+        dims: [u64; RANK],
+        payload_len: usize,
+    ) -> Blob<Tensor<T, RANK>> {
+        let mut bytes = vec![0u8; TENSOR_HEADER_LEN + payload_len];
+        for (i, dim) in dims.iter().enumerate() {
+            bytes[i * 8..i * 8 + 8].copy_from_slice(&dim.to_le_bytes());
+        }
+        Blob::new(Bytes::from_source(bytes))
+    }
+
+    // These two tests use only the pre-fix public API. On the old code the
+    // product panics with overflow checks, or wraps to zero and accepts the
+    // empty payload without overflow checks. Both are failures of this test.
+    #[test]
+    fn constructor_rejects_overflowing_logical_extent() {
+        assert!(
+            tensor_blob::<BF16, 3>([1u64 << 63, 2, 1], Bytes::from_source(Vec::<u8>::new()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parser_rejects_overflowing_logical_extent() {
+        let blob = raw_blob::<BF16, 3>([1u64 << 63, 2, 1], 0);
+        assert!(TensorView::try_from_blob(blob).is_err());
+    }
+
+    #[test]
+    fn zero_extent_is_independent_of_dimension_order() {
+        for dims in [
+            [u64::MAX, u64::MAX, 0],
+            [u64::MAX, 0, u64::MAX],
+            [0, u64::MAX, u64::MAX],
+        ] {
+            let blob = tensor_blob::<BF16, 3>(dims, Bytes::from_source(Vec::<u8>::new())).unwrap();
+            let view = TensorView::try_from_blob(blob).unwrap();
+            assert_eq!(view.dims(), &dims);
+            assert_eq!(view.elems(), 0);
+            assert!(view.payload().is_empty());
+            assert!(TensorView::try_from_blob(raw_blob::<BF16, 3>(dims, 1)).is_err());
+        }
+    }
+
+    #[test]
+    fn rank_zero_is_one_scalar_element() {
+        let dense = tensor_blob::<F32, 0>([], Bytes::from_source(vec![0u8; 4])).unwrap();
+        let dense = TensorView::try_from_blob(dense).unwrap();
+        assert!(dense.dims().is_empty());
+        assert_eq!(dense.elems(), 1);
+        assert_eq!(dense.payload().len(), 4);
+        assert!(TensorView::try_from_blob(raw_blob::<F32, 0>([], 0)).is_err());
+        let packed = tensor_blob::<NVFP4, 0>([], Bytes::from_source(vec![0u8; 6])).unwrap();
+        let packed = TensorView::try_from_blob(packed).unwrap();
+        assert_eq!(packed.elems(), 1);
+        assert_eq!(packed.payload().len(), 6);
+    }
+
+    #[test]
+    fn dense_payload_overflow_is_rejected_before_length_comparison() {
+        let elems = usize::MAX / 8 + 1;
+        assert_eq!(F64::payload_len(elems), None);
+        assert_eq!(F64::payload_len(elems - 1), Some((elems - 1) * 8));
+        let error = tensor_blob::<F64, 1>([elems as u64], Bytes::from_source(Vec::<u8>::new()))
+            .unwrap_err();
+        assert_eq!(error, TensorError::ExtentOverflow);
+        let error = TensorView::try_from_blob(raw_blob::<F64, 1>([elems as u64], 0)).unwrap_err();
+        assert_eq!(error, TensorError::ExtentOverflow);
+    }
+
+    #[test]
+    fn header_plus_payload_extent_must_fit() {
+        assert_eq!(U8::payload_len(usize::MAX), Some(usize::MAX));
+        let error = tensor_blob::<U8, 1>([usize::MAX as u64], Bytes::from_source(Vec::<u8>::new()))
+            .unwrap_err();
+        assert_eq!(error, TensorError::ExtentOverflow);
+        let error =
+            TensorView::try_from_blob(raw_blob::<U8, 1>([usize::MAX as u64], 0)).unwrap_err();
+        assert_eq!(error, TensorError::ExtentOverflow);
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn logical_count_must_fit_usize() {
+        let dims = [u64::from(u32::MAX) + 1];
+        let error = tensor_blob::<BF16, 1>(dims, Bytes::from_source(Vec::<u8>::new())).unwrap_err();
+        assert_eq!(error, TensorError::ExtentOverflow);
+        let error = TensorView::try_from_blob(raw_blob::<BF16, 1>(dims, 0)).unwrap_err();
+        assert_eq!(error, TensorError::ExtentOverflow);
+    }
+
+    #[test]
+    fn packed_payloads_keep_partial_blocks_and_empty_global_scale() {
+        for (elems, expected) in [(0, 4), (1, 6), (15, 13), (16, 13), (17, 15), (32, 22)] {
+            assert_eq!(NVFP4::payload_len(elems), Some(expected));
+            let blob =
+                tensor_blob::<NVFP4, 1>([elems as u64], Bytes::from_source(vec![0u8; expected]))
+                    .unwrap();
+            let view = TensorView::try_from_blob(blob).unwrap();
+            assert_eq!(view.elems(), elems);
+            assert_eq!(view.payload().len(), expected);
+            assert!(
+                TensorView::try_from_blob(raw_blob::<NVFP4, 1>([elems as u64], expected + 1))
+                    .is_err()
+            );
+        }
+        // Its packed extent fits even when an intermediate "elems * 4" would
+        // overflow. Do not reject a representable packed result for that.
+        let expected = usize::MAX.div_ceil(2) + usize::MAX.div_ceil(16) + 4;
+        assert_eq!(NVFP4::payload_len(usize::MAX), Some(expected));
+    }
+
+    #[test]
+    fn typed_view_keeps_the_original_payload_backing() {
+        let blob = raw_blob::<BF16, 2>([2, 3], 12);
+        let ptr = blob.bytes[TENSOR_HEADER_LEN..].as_ptr();
+        let view = TensorView::try_from_blob(blob).unwrap();
+        assert_eq!(view.payload().as_ptr(), ptr);
+        assert_eq!(view.elems(), 6);
     }
 }
