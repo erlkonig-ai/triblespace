@@ -1,0 +1,16 @@
+[package]
+name = "triblespace-cxg"
+version = "0.47.0"
+authors = ["Jan Bramkamp <crest@rlwinm.de>", "⚫️ <jp@bultmann.eu>", "Vanja Sophie Cangalovic <vanja@bultmann.eu>"]
+edition = "2021"
+rust-version = "1.89"
+description = "Construction grammar over TribleSpace JSON trees."
+homepage = "https://trible.space"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/triblespace/triblespace-rs"
+publish = false
+
+[dependencies]
+triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-features = false }
+anybytes = { version = "0.20.3", path = "../../anybytes" }
+ethnum = "1.5.0"

@@ -26,6 +26,7 @@ members = [
     "triblespace-macros",
     "triblespace-macros-common",
     "triblespace-net",
+    "triblespace-cxg",
     "triblespace-paths",
     "triblespace-search",
     "trible",
