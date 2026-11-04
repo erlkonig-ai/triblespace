@@ -8,7 +8,9 @@ use triblespace_core::inline::Inline;
 use triblespace_core::macros::{attributes, entity};
 use triblespace_core::prelude::*;
 use triblespace_core::trible::{Fragment, TribleSet};
-use triblespace_cxg::{Constituent, Construction, Count, Grammar, Problem, Role, Step};
+use std::sync::Arc;
+
+use triblespace_cxg::{Anchor, Category, Constituent, Construction, Count, Grammar, Problem, Role, Step};
 
 type Name = Inline<Handle<UTF8String>>;
 
@@ -55,10 +57,10 @@ fn string_of(facts: &TribleSet, node: Id) -> Option<Name> {
 
 /// An object anchor: the object has a field `type` whose value is the
 /// string `kind`.
-fn typed(kind: &'static str) -> Box<dyn Fn(&TribleSet, Id) -> bool + Send + Sync> {
+fn typed<C: 'static>(kind: &'static str) -> Anchor<C> {
     let type_name = handle("type");
     let wanted = handle(kind);
-    Box::new(move |facts, e| {
+    Box::new(move |facts, e, _| {
         exists!(pattern!(facts, [
             { e @ json_tree::object_field: _?field },
             { _?field @ json_tree::field_name: type_name, json_tree::field_value: _?value },
@@ -67,8 +69,8 @@ fn typed(kind: &'static str) -> Box<dyn Fn(&TribleSet, Id) -> bool + Send + Sync
     })
 }
 
-fn kind_is(kind: Id) -> Box<dyn Fn(&TribleSet, Id) -> bool + Send + Sync> {
-    Box::new(move |facts, e| exists!(pattern!(facts, [{ e @ json_tree::kind: kind }])))
+fn kind_is<C: 'static>(kind: Id) -> Anchor<C> {
+    Box::new(move |facts, e, _| exists!(pattern!(facts, [{ e @ json_tree::kind: kind }])))
 }
 
 fn string() -> Construction<&'static str> {
@@ -408,4 +410,154 @@ fn an_id_keyed_object_is_covered_member_by_member() {
     let mut c = text_message();
     c.constituents.push(Constituent::new(Step::EachField, Role::Value));
     assert!(Grammar::new(vec![c]).is_err(), "EachField overlaps a named field");
+}
+
+/// A compiler's category: a family (the path) and the context its parent
+/// decided, here whether the enclosing record's thinking is summarized.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Cat {
+    path: &'static str,
+    summarized: bool,
+}
+
+impl Category for Cat {
+    type Family = &'static str;
+    fn family(&self) -> &'static str {
+        self.path
+    }
+}
+
+fn context_grammar(with_own: bool) -> Grammar<Cat> {
+    let model_name = handle("model");
+    let summarized_prefix = "claude-4";
+    let record = Construction::<Cat> {
+        name: "record",
+        category: "record",
+        anchor: kind_is(json_tree::kind_object),
+        constituents: vec![
+            Constituent::new(Step::Field("model"), Role::Drop("read by the content's category")),
+            Constituent::new(
+                Step::Field("thinking"),
+                Role::Within(Arc::new(move |facts: &TribleSet, e: Id, _: &Cat| {
+                    let model = find!(
+                        (h: Name),
+                        pattern!(facts, [
+                            { e @ json_tree::object_field: _?field },
+                            { _?field @ json_tree::field_name: model_name, json_tree::field_value: _?value },
+                            { _?value @ json_tree::string: ?h },
+                        ])
+                    )
+                    .map(|(h,)| h)
+                    .next();
+                    Cat {
+                        path: "thinking",
+                        summarized: model == Some(handle(summarized_prefix)),
+                    }
+                })),
+            ),
+        ],
+        emit: Box::new(|inst| {
+            let thinking = inst.children(1).next().expect("thinking");
+            entity! { _ @ out::body: thinking }
+        }),
+    };
+    let summary = Construction::<Cat> {
+        name: "summary",
+        category: "thinking",
+        anchor: Box::new(|facts, e, cat: &Cat| {
+            cat.summarized && exists!(pattern!(facts, [{ e @ json_tree::kind: json_tree::kind_string }]))
+        }),
+        constituents: vec![],
+        emit: Box::new(|inst| {
+            let h = string_of(inst.facts, inst.anchor).expect("text");
+            entity! { _ @ out::tool: h }
+        }),
+    };
+    let own = Construction::<Cat> {
+        name: "own_thinking",
+        category: "thinking",
+        anchor: Box::new(|facts, e, cat: &Cat| {
+            !cat.summarized && exists!(pattern!(facts, [{ e @ json_tree::kind: json_tree::kind_string }]))
+        }),
+        constituents: vec![],
+        emit: Box::new(|inst| {
+            let h = string_of(inst.facts, inst.anchor).expect("text");
+            entity! { _ @ out::said: h }
+        }),
+    };
+    let records = Construction::<Cat> {
+        name: "records",
+        category: "records",
+        anchor: kind_is(json_tree::kind_array),
+        constituents: vec![Constituent::new(
+            Step::Each,
+            Role::Child(Cat {
+                path: "record",
+                summarized: false,
+            }),
+        )],
+        emit: Box::new(|inst| {
+            let items: Vec<Id> = inst.children(0).collect();
+            entity! { _ @ out::item*: items }
+        }),
+    };
+    let mut cs = vec![records, record, summary];
+    if with_own {
+        cs.push(own);
+    }
+    Grammar::new(cs).expect("grammar")
+}
+
+#[test]
+fn a_parent_passes_context_down_in_the_category() {
+    let g = context_grammar(true);
+    let start = Cat {
+        path: "record",
+        summarized: false,
+    };
+
+    // The same thinking string, under two records whose model differs, is
+    // classified by the context the record passed down.
+    let u = unit(r#"{"model":"claude-4","thinking":"hmm"}"#);
+    let image = g.cover(u.fragment.facts(), &u.blobs, u.root, &start).expect("one cover");
+    assert!(said(&image).is_empty());
+    assert_eq!(
+        find!((h: Name), pattern!(image.facts(), [{ _?e @ out::tool: ?h }])).count(),
+        1,
+        "a summarized record's thinking is a summary"
+    );
+    let u = unit(r#"{"model":"claude-3","thinking":"hmm"}"#);
+    let image = g.cover(u.fragment.facts(), &u.blobs, u.root, &start).expect("one cover");
+    assert_eq!(said(&image), vec![handle("hmm")], "otherwise it is her own");
+}
+
+#[test]
+fn one_shared_subtree_under_two_contexts_in_one_unit_is_counted_and_emitted_per_context() {
+    // Sol, 2026-11-04: the full computed category must be the memo key, or a
+    // subtree shared under two record conditions mixes. Both visit orders.
+    for json in [
+        r#"[{"model":"claude-4","thinking":"hmm"},{"model":"claude-3","thinking":"hmm"}]"#,
+        r#"[{"model":"claude-3","thinking":"hmm"},{"model":"claude-4","thinking":"hmm"}]"#,
+    ] {
+        let g = context_grammar(true);
+        let u = unit(json);
+        let start = Cat {
+            path: "records",
+            summarized: false,
+        };
+        let image = g.cover(u.fragment.facts(), &u.blobs, u.root, &start).expect("one cover");
+        assert_eq!(said(&image), vec![handle("hmm")], "{json}: her own, once");
+        assert_eq!(
+            find!((h: Name), pattern!(image.facts(), [{ _?e @ out::tool: ?h }])).count(),
+            1,
+            "{json}: the summary, once"
+        );
+        // Without a construction for her own thinking, the unsummarized
+        // context has no cover, whichever context the walk reaches first.
+        let findings = context_grammar(false)
+            .cover(u.fragment.facts(), &u.blobs, u.root, &start)
+            .expect_err("one context has no construction");
+        assert_eq!(findings.len(), 1, "{json}: {findings:?}");
+        assert_eq!(findings[0].problem, Problem::NoConstruction, "{json}");
+    }
 }

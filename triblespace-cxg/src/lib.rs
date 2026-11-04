@@ -26,6 +26,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
+use std::sync::Arc;
 
 use anybytes::View;
 use ethnum::U256;
@@ -40,11 +41,22 @@ use triblespace_core::repo::BlobStoreGet;
 use triblespace_core::trible::{Fragment, TribleSet};
 
 /// A grammatical category, demanded by a parent constituent and supplied by
-/// constructions. Any value works: a name, or a compiler's (path, context)
-/// pair, so that context a parent decides travels down in the category.
-pub trait Category: Clone + Eq + Hash + fmt::Debug {}
+/// constructions. A category may carry context its parent decided (a
+/// compiler's record conditions, say), and constructions are found by its
+/// [`Category::family`], so one construction serves every context of its
+/// family and reads the context through its anchor.
+pub trait Category: Clone + Eq + Hash + fmt::Debug {
+    type Family: Clone + Eq + Hash + fmt::Debug;
+    fn family(&self) -> Self::Family;
+}
 
-impl<T: Clone + Eq + Hash + fmt::Debug> Category for T {}
+/// A plain name is its own family.
+impl Category for &'static str {
+    type Family = &'static str;
+    fn family(&self) -> &'static str {
+        self
+    }
+}
 
 type Name = Inline<Handle<UTF8String>>;
 
@@ -87,15 +99,44 @@ pub enum Step {
     EachField,
 }
 
+/// A child category computed from the anchor's entity and the category the
+/// anchor was asked for: how context a parent decides reaches its children.
+pub type Within<C> = Arc<dyn Fn(&TribleSet, Id, &C) -> C + Send + Sync>;
+
 /// What a constituent does with the members it claims.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum Role<C> {
     /// The member's whole subtree is consumed and bound.
     Value,
     /// The member must be covered by a construction of this category.
     Child(C),
+    /// The member must be covered by a construction of the category this
+    /// computes.
+    Within(Within<C>),
     /// The member is consumed and emits nothing, for the stated reason.
     Drop(&'static str),
+}
+
+impl<C: fmt::Debug> fmt::Debug for Role<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Role::Value => write!(f, "Value"),
+            Role::Child(c) => write!(f, "Child({c:?})"),
+            Role::Within(_) => write!(f, "Within(..)"),
+            Role::Drop(reason) => write!(f, "Drop({reason:?})"),
+        }
+    }
+}
+
+impl<C: Clone> Role<C> {
+    /// The category a child must be covered as, when this role has one.
+    fn child(&self, facts: &TribleSet, anchor: Id, category: &C) -> Option<C> {
+        match self {
+            Role::Child(c) => Some(c.clone()),
+            Role::Within(f) => Some(f(facts, anchor, category)),
+            Role::Value | Role::Drop(_) => None,
+        }
+    }
 }
 
 /// One constituent of a construction.
@@ -126,24 +167,28 @@ impl<C> Constituent<C> {
     }
 }
 
-type Anchor = Box<dyn Fn(&TribleSet, Id) -> bool + Send + Sync>;
-type Emit = Box<dyn Fn(&Instance) -> Fragment + Send + Sync>;
+/// A query over the anchor occurrence's entity, given the category it is
+/// asked for.
+pub type Anchor<C> = Box<dyn Fn(&TribleSet, Id, &C) -> bool + Send + Sync>;
+pub type Emit<C> = Box<dyn Fn(&Instance<C>) -> Fragment + Send + Sync>;
 
-/// A construction: category, anchor, constituents and emit.
-pub struct Construction<C> {
+/// A construction: family, anchor, constituents and emit.
+pub struct Construction<C: Category> {
     pub name: &'static str,
-    pub category: C,
-    pub anchor: Anchor,
+    pub category: C::Family,
+    pub anchor: Anchor<C>,
     pub constituents: Vec<Constituent<C>>,
     /// Builds the construction's image from an instance. The returned
     /// fragment must have exactly one root: the parent refers to it.
-    pub emit: Emit,
+    pub emit: Emit<C>,
 }
 
 /// An accepted construction instance, as handed to its emit.
-pub struct Instance<'a> {
+pub struct Instance<'a, C> {
     pub facts: &'a TribleSet,
     pub anchor: Id,
+    /// The category the instance covers, with whatever context it carries.
+    pub category: &'a C,
     parts: &'a [Vec<Part>],
 }
 
@@ -154,7 +199,7 @@ struct Part {
     child: Option<Id>,
 }
 
-impl Instance<'_> {
+impl<C> Instance<'_, C> {
     /// The value entities claimed by constituent `k`, in member order.
     pub fn values(&self, k: usize) -> impl Iterator<Item = Id> + '_ {
         self.parts[k].iter().map(|p| p.value)
@@ -225,9 +270,9 @@ impl<C: fmt::Debug> fmt::Display for Finding<C> {
 }
 
 /// A grammar whose constructions passed the static checks.
-pub struct Grammar<C> {
+pub struct Grammar<C: Category> {
     constructions: Vec<Construction<C>>,
-    by_category: HashMap<C, Vec<usize>>,
+    by_category: HashMap<C::Family, Vec<usize>>,
     field_names: HashMap<&'static str, Name>,
 }
 
@@ -239,7 +284,7 @@ pub enum GrammarError {
 
 impl<C: Category> Grammar<C> {
     pub fn new(constructions: Vec<Construction<C>>) -> Result<Self, GrammarError> {
-        let mut by_category: HashMap<C, Vec<usize>> = HashMap::new();
+        let mut by_category: HashMap<C::Family, Vec<usize>> = HashMap::new();
         let mut field_names = HashMap::new();
         for (i, c) in constructions.iter().enumerate() {
             let mut fields = HashSet::new();
@@ -312,7 +357,7 @@ enum Fit {
     Unclaimed(Vec<PathStep>),
 }
 
-struct Run<'g, 'u, C> {
+struct Run<'g, 'u, C: Category> {
     grammar: &'g Grammar<C>,
     facts: &'u TribleSet,
     counts: HashMap<(Id, C), Count>,
@@ -406,8 +451,14 @@ impl<'g, 'u, C: Category> Run<'g, 'u, C> {
     }
 
     /// The instance count of construction `c` at `e`, when it applies.
-    fn instance(&mut self, c: &Construction<C>, e: Id, members: &[Member]) -> Option<(Count, Vec<Vec<Part>>)> {
-        if !(c.anchor)(self.facts, e) {
+    fn instance(
+        &mut self,
+        c: &Construction<C>,
+        e: Id,
+        category: &C,
+        members: &[Member],
+    ) -> Option<(Count, Vec<Vec<Part>>)> {
+        if !(c.anchor)(self.facts, e, category) {
             return None;
         }
         let Fit::Applies(parts) = self.fit(c, members) else {
@@ -415,9 +466,9 @@ impl<'g, 'u, C: Category> Run<'g, 'u, C> {
         };
         let mut n = Count::One;
         for (k, con) in c.constituents.iter().enumerate() {
-            if let Role::Child(category) = &con.role {
+            if let Some(child) = con.role.child(self.facts, e, category) {
                 for part in &parts[k] {
-                    n = n.mul(self.count(part.value, category));
+                    n = n.mul(self.count(part.value, &child));
                 }
             }
         }
@@ -434,8 +485,8 @@ impl<'g, 'u, C: Category> Run<'g, 'u, C> {
         let grammar = self.grammar;
         let members = self.members(e);
         let mut total = Count::Zero;
-        for &i in grammar.by_category.get(category).into_iter().flatten() {
-            if let Some((n, _)) = self.instance(&grammar.constructions[i], e, &members) {
+        for &i in grammar.by_category.get(&category.family()).into_iter().flatten() {
+            if let Some((n, _)) = self.instance(&grammar.constructions[i], e, category, &members) {
                 total = total.add(n);
             }
         }
@@ -453,24 +504,25 @@ impl<'g, 'u, C: Category> Run<'g, 'u, C> {
         let grammar = self.grammar;
         let members = self.members(e);
         let mut chosen = None;
-        for &i in grammar.by_category.get(category).into_iter().flatten() {
+        for &i in grammar.by_category.get(&category.family()).into_iter().flatten() {
             let c = &grammar.constructions[i];
-            if let Some((Count::One, parts)) = self.instance(c, e, &members) {
+            if let Some((Count::One, parts)) = self.instance(c, e, category, &members) {
                 chosen = Some((c, parts));
                 break;
             }
         }
         let (c, mut parts) = chosen.expect("a count of One has exactly one instance of count One");
         for (k, con) in c.constituents.iter().enumerate() {
-            if let Role::Child(child) = &con.role {
+            if let Some(child) = con.role.child(self.facts, e, category) {
                 for part in &mut parts[k] {
-                    part.child = Some(self.emit(part.value, child, image)?);
+                    part.child = Some(self.emit(part.value, &child, image)?);
                 }
             }
         }
         let fragment = (c.emit)(&Instance {
             facts: self.facts,
             anchor: e,
+            category,
             parts: &parts,
         });
         let root = fragment
@@ -498,9 +550,9 @@ impl<'g, 'u, C: Category> Run<'g, 'u, C> {
         let grammar = self.grammar;
         let members = self.members(e);
         let mut candidates = Vec::new();
-        for &i in grammar.by_category.get(category).into_iter().flatten() {
+        for &i in grammar.by_category.get(&category.family()).into_iter().flatten() {
             let c = &grammar.constructions[i];
-            if (c.anchor)(self.facts, e) {
+            if (c.anchor)(self.facts, e, category) {
                 candidates.push(c);
             }
         }
@@ -510,7 +562,7 @@ impl<'g, 'u, C: Category> Run<'g, 'u, C> {
         }
         if target == Count::Many {
             // Only the constructions that do cover explain an ambiguity.
-            candidates.retain(|c| matches!(self.instance(c, e, &members), Some((n, _)) if n != Count::Zero));
+            candidates.retain(|c| matches!(self.instance(c, e, category, &members), Some((n, _)) if n != Count::Zero));
             if candidates.len() > 1 {
                 let constructions = candidates.iter().map(|c| c.name).collect();
                 findings.push(here(Problem::Ambiguous { constructions }, path));
@@ -536,7 +588,9 @@ impl<'g, 'u, C: Category> Run<'g, 'u, C> {
                 )),
                 Fit::Applies(parts) => {
                     for (k, con) in c.constituents.iter().enumerate() {
-                        let Role::Child(child) = &con.role else { continue };
+                        let Some(child) = con.role.child(self.facts, e, category) else {
+                            continue;
+                        };
                         for part in &parts[k] {
                             if self.open.contains(&(part.value, child.clone())) {
                                 path.push(part.step);
@@ -548,9 +602,9 @@ impl<'g, 'u, C: Category> Run<'g, 'u, C> {
                                 path.pop();
                                 continue;
                             }
-                            if self.count(part.value, child) != Count::One {
+                            if self.count(part.value, &child) != Count::One {
                                 path.push(part.step);
-                                self.diagnose(part.value, child, path, blobs, findings);
+                                self.diagnose(part.value, &child, path, blobs, findings);
                                 path.pop();
                             }
                         }
