@@ -10,7 +10,7 @@ use triblespace_core::prelude::*;
 use triblespace_core::trible::{Fragment, TribleSet};
 use std::sync::Arc;
 
-use triblespace_cxg::{Anchor, Category, Constituent, Construction, Count, Grammar, Problem, Role, Step, Unit};
+use triblespace_cxg::{Anchor, Category, Constituent, Construction, Count, Grammar, Problem, PathStep, Role, Step, Unit};
 
 type Name = Inline<Handle<UTF8String>>;
 
@@ -445,7 +445,7 @@ fn context_grammar(with_own: bool) -> Grammar<Cat> {
             Constituent::new(Step::Field("model"), Role::Drop("read by the content's category")),
             Constituent::new(
                 Step::Field("thinking"),
-                Role::Within(Arc::new(move |unit: &Unit, e: Id, _: &Cat| {
+                Role::Within(Arc::new(move |unit: &Unit, e: Id, _: &Cat, _: &PathStep| {
                     let facts = unit.facts;
                     let model = find!(
                         (h: Name),

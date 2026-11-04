@@ -132,9 +132,10 @@ pub enum Step {
     EachField,
 }
 
-/// A child category computed from the anchor's entity and the category the
-/// anchor was asked for: how context a parent decides reaches its children.
-pub type Within<C> = Arc<dyn Fn(&Unit, Id, &C) -> C + Send + Sync>;
+/// A child category computed from the anchor's entity, the category the
+/// anchor was asked for and the member's step: how context a parent decides
+/// reaches its children, and how a member's name chooses its category.
+pub type Within<C> = Arc<dyn Fn(&Unit, Id, &C, &PathStep) -> C + Send + Sync>;
 
 /// What a constituent does with the members it claims.
 #[derive(Clone)]
@@ -163,10 +164,10 @@ impl<C: fmt::Debug> fmt::Debug for Role<C> {
 
 impl<C: Clone> Role<C> {
     /// The category a child must be covered as, when this role has one.
-    fn child(&self, unit: &Unit, anchor: Id, category: &C) -> Option<C> {
+    fn child(&self, unit: &Unit, anchor: Id, category: &C, step: &PathStep) -> Option<C> {
         match self {
             Role::Child(c) => Some(c.clone()),
-            Role::Within(f) => Some(f(unit, anchor, category)),
+            Role::Within(f) => Some(f(unit, anchor, category, step)),
             Role::Value | Role::Drop(_) => None,
         }
     }
@@ -493,8 +494,8 @@ impl<'g, 'u, C: Category> Run<'g, 'u, C> {
         };
         let mut n = Count::One;
         for (k, con) in c.constituents.iter().enumerate() {
-            if let Some(child) = con.role.child(&self.unit, e, category) {
-                for part in &parts[k] {
+            for part in &parts[k] {
+                if let Some(child) = con.role.child(&self.unit, e, category, &part.step) {
                     n = n.mul(self.count(part.value, &child));
                 }
             }
@@ -540,8 +541,8 @@ impl<'g, 'u, C: Category> Run<'g, 'u, C> {
         }
         let (c, mut parts) = chosen.expect("a count of One has exactly one instance of count One");
         for (k, con) in c.constituents.iter().enumerate() {
-            if let Some(child) = con.role.child(&self.unit, e, category) {
-                for part in &mut parts[k] {
+            for part in &mut parts[k] {
+                if let Some(child) = con.role.child(&self.unit, e, category, &part.step) {
                     part.child = Some(self.emit(part.value, &child, image)?);
                 }
             }
@@ -615,10 +616,11 @@ impl<'g, 'u, C: Category> Run<'g, 'u, C> {
                 )),
                 Fit::Applies(parts) => {
                     for (k, con) in c.constituents.iter().enumerate() {
-                        let Some(child) = con.role.child(&self.unit, e, category) else {
-                            continue;
-                        };
                         for part in &parts[k] {
+                            let Some(child) = con.role.child(&self.unit, e, category, &part.step)
+                            else {
+                                continue;
+                            };
                             if self.open.contains(&(part.value, child.clone())) {
                                 path.push(part.step);
                                 findings.push(Finding {
