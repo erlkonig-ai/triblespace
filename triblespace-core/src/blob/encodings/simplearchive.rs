@@ -279,8 +279,9 @@ impl CanonicalTribles {
     /// reported as such; each run then checks the row rule on its own rows
     /// and proves its own interior ordering. Ordering is transitive, so
     /// together this is exactly the check [`Self::validate`] performs, and
-    /// the errors are the same kinds in the same precedence: an ordering
-    /// error is reported only once no row anywhere breaks the row rule.
+    /// the error is the one it reports, whatever the pool size: an ordering
+    /// error is reported only once no row anywhere breaks the row rule, and
+    /// then the first offence by position.
     #[cfg(feature = "parallel")]
     pub fn par_validate_map<T, F>(
         bytes: Bytes,
@@ -310,10 +311,15 @@ impl CanonicalTribles {
             // others, so an ordering error has not seen every row. The row
             // rule takes precedence, so it is checked over the rest before
             // the ordering error is reported. This is the error path only.
-            Err(ordering) => {
+            //
+            // Seams and runs are also checked out of position order, so the
+            // ordering error met first need not be the first by position.
+            // Report the one the serial check reports.
+            Err(_) => {
                 rows.par_chunks(run_len)
                     .try_for_each(|run| row_rule(run).map(|_| ()))?;
-                return Err(ordering);
+                return Err(first_offence(&rows)
+                    .expect("a seam or a run found an ordering offence"));
             }
         };
 
@@ -435,6 +441,21 @@ fn check_seams(rows: &[AlignedRow], run_len: usize) -> Result<(), UnarchiveError
         }
     }
     Ok(())
+}
+
+/// The first ordering offence by position, as [`check_increasing`] would
+/// report it. Only the parallel error path uses this.
+#[cfg(feature = "parallel")]
+fn first_offence(rows: &[AlignedRow]) -> Option<UnarchiveError> {
+    rows.windows(2).find_map(|pair| {
+        if pair[0].0 == pair[1].0 {
+            Some(UnarchiveError::BadCanonicalizationRedundancy)
+        } else if pair[0].0 > pair[1].0 {
+            Some(UnarchiveError::BadCanonicalizationOrdering)
+        } else {
+            None
+        }
+    })
 }
 
 /// One pass proving `rows` strictly increasing in byte order, calling `visit`
@@ -723,6 +744,39 @@ mod tests {
                 TribleSet::try_from_blob(Blob::new(bytes)).unwrap_err(),
                 expected
             );
+        }
+    }
+
+    /// The parallel validator reports the offence the sequential one does,
+    /// the first by position, whatever the pool size: its runs and seams are
+    /// checked out of position order, so the error it meets first need not
+    /// be that one.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn par_validate_reports_the_first_offence_for_any_pool_size() {
+        let (a, b, c) = (fixture_row(0), fixture_row(1), fixture_row(2));
+        let cases = [
+            vec![a, a],
+            vec![a, b, b],
+            vec![b, a],
+            vec![a, c, b],
+            vec![b, b, a],
+            vec![a, c, c, b],
+            vec![c, a, b, b],
+        ];
+        for threads in 1..=4 {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            for rows in &cases {
+                let bytes = Bytes::from(rows.clone());
+                let expected = CanonicalTribles::validate(bytes.clone()).unwrap_err();
+                let got = pool
+                    .install(|| CanonicalTribles::par_validate_map(bytes.clone(), |_| ()))
+                    .unwrap_err();
+                assert_eq!(got, expected, "{threads} threads, {} rows", rows.len());
+            }
         }
     }
 
@@ -1192,15 +1246,14 @@ mod tests {
                 invalid_and_descending.swap(chunk_size - 1, chunk_size);
                 assert_public_error(invalid_and_descending, UnarchiveError::BadTrible);
 
-                // Among ordering errors, the seams are still checked first: a
-                // seam duplicate wins over an inversion inside the first run.
+                // Among ordering errors the first by position wins, as in the
+                // serial check: an inversion inside the first run comes before
+                // a duplicate at a later seam. (The parallel path used to
+                // report the seam, so its answer depended on the pool size.)
                 let mut inside_and_seam = (0..len).map(fixture_row).collect::<Vec<_>>();
                 inside_and_seam.swap(0, 1);
                 inside_and_seam[chunk_size] = inside_and_seam[chunk_size - 1];
-                assert_public_error(
-                    inside_and_seam,
-                    UnarchiveError::BadCanonicalizationRedundancy,
-                );
+                assert_public_error(inside_and_seam, UnarchiveError::BadCanonicalizationOrdering);
 
                 let malformed = Blob::new(Bytes::from(vec![0u8; 63]));
                 assert_eq!(
