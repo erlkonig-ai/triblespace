@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `import::json`: `JsonObjectImporter` refuses a member name repeated
+  within one object with `JsonImportError::DuplicateKey { key }`, as
+  `JsonTreeImporter` does, with the same precedence (syntax and lone-surrogate
+  errors are reported first) and the same guarantee that a refused document
+  puts nothing and leaves the attribute cache as it was. Names compare after
+  escapes are decoded. Repeated values inside an array still collapse.
+
 - `import::json_tree`: an object is the set of its members, so member order
   no longer reaches any id: `{"a":1,"b":2}` and `{"b":2,"a":1}` import to the
   same root and facts. Each member entry is the intrinsic entity of

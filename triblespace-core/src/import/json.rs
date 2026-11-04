@@ -73,8 +73,8 @@ pub enum JsonImportError {
     },
     /// One object names the same member twice (compared after escapes are
     /// decoded, so `"a"` and `"\u0061"` are the same name). JSON leaves the
-    /// meaning of such an object to the reader, so the lossless importer
-    /// refuses it rather than keeping or merging either value.
+    /// meaning of such an object to the reader, so both importers refuse it
+    /// rather than keeping or merging either value.
     DuplicateKey {
         /// The repeated member name, decoded.
         key: String,
@@ -180,6 +180,10 @@ pub const DEFAULT_MAX_DEPTH: usize = 128;
 /// Parsing is iterative, so deeply nested input cannot overflow the call
 /// stack; nesting beyond [`with_max_depth`](Self::with_max_depth) (default
 /// [`DEFAULT_MAX_DEPTH`]) is refused with [`JsonImportError::DepthExceeded`].
+/// A name repeated within one object is refused with
+/// [`JsonImportError::DuplicateKey`], once the document is known to be
+/// syntactically complete (a lone surrogate is reported first), as
+/// [`JsonTreeImporter`](crate::import::json_tree::JsonTreeImporter) does.
 /// A refused document puts nothing into the store and leaves the attribute
 /// cache as it was.
 ///
@@ -221,6 +225,8 @@ struct ObjectImport {
     undo: Vec<CacheEntry>,
     /// The first surrogate a complete string left unpaired.
     unpaired: Option<u16>,
+    /// The first member name repeated within one object.
+    duplicate: Option<String>,
 }
 
 impl ObjectImport {
@@ -242,6 +248,8 @@ impl ObjectImport {
 struct OpenObject {
     pairs: Vec<(Id, RawInline)>,
     field: ParsedString,
+    /// Every member name read so far, `field` included.
+    names: HashSet<ParsedString>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -391,6 +399,9 @@ where
         if let Some(code_unit) = import.unpaired {
             return Err(JsonImportError::LoneSurrogate { code_unit });
         }
+        if let Some(key) = import.duplicate.take() {
+            return Err(JsonImportError::DuplicateKey { key });
+        }
         Ok(roots)
     }
 
@@ -463,6 +474,7 @@ where
                             let field = self.parse_member_name(bytes, import)?;
                             objects.push(OpenObject {
                                 pairs: Vec::new(),
+                                names: HashSet::from([field.clone()]),
                                 field,
                             });
                             open.push(Container::Object);
@@ -516,7 +528,13 @@ where
                     (Container::Object, Some(b',')) => {
                         self.skip_ws(bytes);
                         let field = self.parse_member_name(bytes, import)?;
-                        objects.last_mut().expect("open object").field = field;
+                        let object = objects.last_mut().expect("open object");
+                        if !object.names.insert(field.clone()) && import.duplicate.is_none() {
+                            // Refused once the document is known to be
+                            // well-formed, like an unpaired surrogate.
+                            import.duplicate = Some(field.as_ref().to_owned());
+                        }
+                        object.field = field;
                         break;
                     }
                     (Container::Array, Some(b']')) => {
@@ -998,6 +1016,7 @@ mod tests {
             r#"{"f": "v", "g": {"h": [true, "w", 1e999]}}"#.to_owned(),
             r#"{"f": "v", "t": ["w"]"#.to_owned(),
             format!(r#"{{"f": "v", "d": {}}}"#, arrays_in_object(200)),
+            r#"{"f": "v", "g": {"h": [true, "w"], "h": 1}}"#.to_owned(),
         ];
         for doc in &bad {
             assert!(importer.import_str(doc).is_err(), "{doc} must be refused");
@@ -1082,6 +1101,77 @@ mod tests {
                 Err(JsonImportError::PrimitiveRoot) => {}
                 other => panic!("{doc:?}: expected PrimitiveRoot, got {other:?}"),
             }
+        }
+    }
+
+    fn import_object(doc: &str) -> Result<Fragment, JsonImportError> {
+        JsonObjectImporter::<_>::new(&mut MemoryBlobStore::new(), None).import_str(doc)
+    }
+
+    fn expect_duplicate_key(doc: &str, key: &str) {
+        match import_object(doc) {
+            Err(JsonImportError::DuplicateKey { key: got }) => assert_eq!(got, key, "{doc}"),
+            other => panic!("{doc}: expected DuplicateKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_importer_refuses_a_duplicate_member_name_with_the_key() {
+        for (doc, key) in [
+            (r#"{"k":1,"k":2}"#, "k"),
+            (r#"{"k":1,"k":1}"#, "k"),
+            (r#"{"k":1,"j":2,"k":3}"#, "k"),
+            (r#"{"a":1,"\u0061":2}"#, "a"),
+            (r#"{"":1,"":2}"#, ""),
+            (r#"{"\ud83d\ude00":1,"\uD83D\uDE00":2}"#, "\u{1F600}"),
+            (r#"{"k":[1],"k":[2]}"#, "k"),
+        ] {
+            expect_duplicate_key(doc, key);
+        }
+    }
+
+    #[test]
+    fn object_importer_refuses_a_nested_duplicate_member_name() {
+        for (doc, key) in [
+            (r#"{"a":{"k":1,"j":0,"k":2}}"#, "k"),
+            (r#"{"x":[{"k":null,"k":null}]}"#, "k"),
+            (r#"[{"k":1},{"k":2,"k":3}]"#, "k"),
+            (r#"{"o":{"p":{"q":[],"q":{}}},"z":0}"#, "q"),
+        ] {
+            expect_duplicate_key(doc, key);
+        }
+    }
+
+    #[test]
+    fn object_importer_accepts_the_same_name_in_different_objects() {
+        for doc in [
+            r#"[{"k":1},{"k":2}]"#,
+            r#"{"k":{"k":1}}"#,
+            r#"{"k":1,"K":2}"#,
+            r#"{"k":[{"k":{"k":null}}]}"#,
+            r#"{"k":[{"j":1},{"j":2}]}"#,
+        ] {
+            import_object(doc).unwrap_or_else(|e| panic!("{doc}: {e}"));
+        }
+    }
+
+    /// A syntax error anywhere, or an unpaired surrogate, takes precedence
+    /// over a duplicate member name, as in the tree importer.
+    #[test]
+    fn object_importer_reports_syntax_and_surrogates_before_duplicate_keys() {
+        for doc in [
+            r#"{"k":1,"k":2"#,
+            r#"{"k":1,"k":2} x"#,
+            r#"[{"k":1,"k":2},]"#,
+        ] {
+            match import_object(doc) {
+                Err(JsonImportError::Syntax(_)) => {}
+                other => panic!("{doc}: expected a syntax error, got {other:?}"),
+            }
+        }
+        match import_object(r#"{"k":1,"k":"\ud800"}"#) {
+            Err(JsonImportError::LoneSurrogate { code_unit }) => assert_eq!(code_unit, 0xD800),
+            other => panic!("expected LoneSurrogate, got {other:?}"),
         }
     }
 }
