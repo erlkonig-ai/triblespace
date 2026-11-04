@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `AcquiringReader` optionally shares call-owned cancellation and an absolute
+  deadline across synchronous and asynchronous exact reads. Interrupted reads
+  preserve a typed error distinct from missing bytes, and backend errors retain
+  their source chains. Frozen observations are unchanged. Control is cooperative:
+  synchronous work is not preempted, and blocking callers must join their tasks.
+
 - Typed tensor construction and parsing reject overflowing logical counts and
   payload extents instead of panicking or accepting wrapped geometry. Empty
   axes remain empty in any order, rank-zero tensors remain scalars, and NVFP4

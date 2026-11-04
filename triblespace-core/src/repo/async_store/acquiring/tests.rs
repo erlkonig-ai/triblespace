@@ -135,7 +135,7 @@ fn acquiring_residual_keeps_fixed_support_and_passive_reads_do_not_fetch() {
     source.commit(root, &host(), facts(21).into()).unwrap();
     frozen.source = source.snapshot().unwrap(); // a provider can know newer records
     let requests = frozen.requested.clone();
-    let reader = reader(frozen);
+    let reader = reader(frozen).with_control(AcquiringReadControl::new(None));
     let selected = reader.attached(attached).unwrap();
     assert_eq!(selected.residual().len(), 1);
     assert!(succinctarchive_union::read_attached(&selected)

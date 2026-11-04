@@ -38,7 +38,7 @@ use std::future::Future;
 #[cfg(feature = "object-store")]
 mod acquiring;
 #[cfg(feature = "object-store")]
-pub use acquiring::AcquiringReader;
+pub use acquiring::{AcquiringReadControl, AcquiringReadInterrupted, AcquiringReader};
 
 use anybytes::Bytes;
 
