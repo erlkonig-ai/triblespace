@@ -80,11 +80,23 @@ impl<B: BlobStoreGet> Texts for B {
 pub struct Unit<'u> {
     pub facts: &'u TribleSet,
     texts: &'u dyn Texts,
+    run: u64,
 }
+
+static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl<'u> Unit<'u> {
     pub fn new(facts: &'u TribleSet, texts: &'u dyn Texts) -> Self {
-        Unit { facts, texts }
+        let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Unit { facts, texts, run }
+    }
+
+    /// A number no other [`Unit::new`] in this process returns. A cache an
+    /// anchor keeps must be scoped to it: a reading of one unit, absences
+    /// above all, says nothing about another, which may hold more facts
+    /// about the same ids.
+    pub fn run(&self) -> u64 {
+        self.run
     }
 
     /// The text of a string handle, when the unit's blobs hold it.

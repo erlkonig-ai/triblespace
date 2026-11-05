@@ -573,3 +573,12 @@ fn one_shared_subtree_under_two_contexts_in_one_unit_is_counted_and_emitted_per_
         assert_eq!(findings[0].problem, Problem::NoConstruction, "{json}");
     }
 }
+
+#[test]
+fn every_unit_has_its_own_run() {
+    let a = unit("[]");
+    let b = unit("[]");
+    assert_ne!(a.view().run(), b.view().run());
+    let view = a.view();
+    assert_eq!(view.run(), view.run(), "a copy keeps its run");
+}
