@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Experimental `reactive::Environment` executes native positive match/emit
+  rules, composes consequences, resumes under a firing budget and exposes
+  concurrent revisions through the existing observation DAG register.
+  Selection is explicit; output identity comes from native content cores.
+  Scheduling and firing memoization are in-memory only.
+
 - `AcquiringReadControl::without_deadline` preserves shared sticky cancellation
   while removing only the returned clone's acquisition deadline, for receipt
   work after a complete prepared result. Existing readers retain their deadline.
