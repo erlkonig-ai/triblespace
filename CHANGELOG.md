@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reactive reheader tests cover branch-specific copies, original-node recall and event convergence.
 - Reactive call-candidate tests enumerate matching calls on each result's
   predecessor line, keeping importer selection policy outside the positive rules.
+- Reactive pending-claim tests thread waiting bundles through record states,
+  preserve delivery witnesses by placement and converge equal node/claim
+  occurrences. Final leftovers remain data for an external importer reading.
 
 - `AcquiringReadControl::without_deadline` preserves shared sticky cancellation
   while removing only the returned clone's acquisition deadline, for receipt
