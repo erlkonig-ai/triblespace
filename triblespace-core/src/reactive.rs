@@ -20,10 +20,14 @@
 //! [`Environment`] is a continuing, additive, in-memory environment, not a daemon.
 //! Extend its facts with observations or rule revisions, select revisions, then
 //! advance/resume. Each firing emits facts that can activate another rule.
-//! Matching uses the native query engine. Only the current rule's constraints,
-//! complete bindings already fired, and a fair rule cursor are execution state.
-//! No catalog replaces the authoritative fact set. This first implementation
-//! re-queries selected rules instead of maintaining a semi-naive delta index.
+//! Matching uses the native incremental query constraints beneath `pattern_changes!`.
+//! A newly selected revision seeds from all current facts. Subsequent batches
+//! match additions since that revision's exhausted snapshot, with a delta witness
+//! in any input clause. Each finite batch owns its native query cursor; its
+//! snapshot becomes the frontier only after exhaustion. Emitted or externally
+//! added facts are included in the next batch, even across budget pauses.
+//! Snapshots, constraints, complete bindings already fired and the fair rule
+//! cursor are disposable execution state, never an authoritative domain catalog.
 //!
 //! Output-only terms are constructed from their `core` clauses using the same
 //! native producer as `entity!`. Identity contains only those attribute/value
@@ -50,6 +54,7 @@ use crate::metadata;
 use crate::prelude::*;
 use crate::query::equalityconstraint::EqualityConstraint;
 use crate::query::register::{resolve, ObservationOrder};
+use crate::query::unionconstraint::UnionConstraint;
 use crate::query::{Constraint, Query};
 use crate::trible::{build_intrinsic_entity, Fragment, IntrinsicEntityRow, Trible, TribleSet};
 
@@ -133,6 +138,27 @@ pub struct Environment {
     selected: Vec<Id>,
     fired: BTreeSet<(Id, Vec<(Id, RawInline)>)>,
     cursor: usize,
+    executions: BTreeMap<Id, Execution>,
+    #[cfg(test)]
+    enumerated: usize,
+}
+
+type Binding = Vec<(Id, RawInline)>;
+
+#[derive(Default)]
+struct Execution {
+    frontier: Option<TribleSet>,
+    batch: Option<Batch>,
+}
+
+struct Batch {
+    snapshot: TribleSet,
+    query: Box<dyn Iterator<Item = Binding>>,
+    pending: Option<Binding>,
+    slots: BTreeMap<Id, usize>,
+    bound: BTreeSet<Id>,
+    cores: BTreeMap<Id, Vec<(Id, Id)>>,
+    templates: Vec<(Id, Id, Id)>,
 }
 
 impl Environment {
@@ -152,12 +178,17 @@ impl Environment {
 
     /// Explicit execution reading. Multiple IDs deliberately compose rules;
     /// no implicit latest/head choice is performed. Old consequences survive.
+    /// Still-selected revisions retain their query cursors. Deselecting drops
+    /// that revision's cursor/frontier; reselecting seeds again, while the
+    /// environment's complete-binding memo suppresses already completed firings.
     pub fn select(&mut self, revisions: impl IntoIterator<Item = Id>) {
         self.selected = revisions
             .into_iter()
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+        self.executions
+            .retain(|revision, _| self.selected.contains(revision));
         self.cursor = 0;
     }
 
@@ -205,11 +236,55 @@ impl Environment {
         })
     }
 
-    fn next_firing(&self, revision: Id) -> Result<Option<Firing>, Error> {
+    fn next_firing(&mut self, revision: Id) -> Result<Option<Firing>, Error> {
+        let execution = self.executions.entry(revision).or_default();
+        loop {
+            if execution.batch.is_none() {
+                let changed = execution
+                    .frontier
+                    .as_ref()
+                    .map(|previous| self.facts.difference(previous));
+                if changed.as_ref().is_some_and(TribleSet::is_empty) {
+                    return Ok(None);
+                }
+                execution.batch = Some(Batch::new(revision, self.facts.clone(), changed.as_ref())?);
+            }
+            let batch = execution.batch.as_mut().expect("batch prepared");
+            loop {
+                let Some(binding) = batch.pending.take().or_else(|| {
+                    let binding = batch.query.next();
+                    #[cfg(test)]
+                    if binding.is_some() {
+                        self.enumerated += 1;
+                    }
+                    binding
+                }) else {
+                    break;
+                };
+                if self.fired.contains(&(revision, binding.clone())) {
+                    continue;
+                }
+                match batch.fire(revision, &binding) {
+                    Ok(firing) => return Ok(Some(firing)),
+                    Err(error) => {
+                        // A failed output is not consumed, even though Query::next
+                        // has moved. Retry reports it again without partial output.
+                        batch.pending = Some(binding);
+                        return Err(error);
+                    }
+                }
+            }
+            execution.frontier = Some(execution.batch.take().expect("exhausted batch").snapshot);
+        }
+    }
+}
+
+impl Batch {
+    fn new(revision: Id, snapshot: TribleSet, changed: Option<&TribleSet>) -> Result<Self, Error> {
         let r: Inline<GenId> = revision.to_inline();
         let mut supported = false;
         for operation in find!(operation: Id,
-            self.facts.pattern(r, schema::operation.id().to_inline(), operation))
+            snapshot.pattern(r, schema::operation.id().to_inline(), operation))
         {
             if operation != schema::POSITIVE {
                 return Err(Error::UnsupportedOperation {
@@ -230,14 +305,14 @@ impl Environment {
         let mut templates = Vec::new();
         let mut cores = BTreeMap::<Id, Vec<(Id, Id)>>::new();
         for relation in [schema::matches.id(), schema::emits.id(), schema::core.id()] {
-            for clause in find!(clause: Id, self.facts.pattern(r, relation.to_inline(), clause)) {
+            for clause in find!(clause: Id, snapshot.pattern(r, relation.to_inline(), clause)) {
                 let c: Inline<GenId> = clause.to_inline();
                 let mut decoded = false;
                 for (subject, predicate, object) in find!((subject: Id, predicate: Id, object: Id),
                 and!(
-                    self.facts.pattern(c, schema::subject.id().to_inline(), subject),
-                    self.facts.pattern(c, schema::predicate.id().to_inline(), predicate),
-                    self.facts.pattern(c, schema::object.id().to_inline(), object)
+                    snapshot.pattern(c, schema::subject.id().to_inline(), subject),
+                    snapshot.pattern(c, schema::predicate.id().to_inline(), predicate),
+                    snapshot.pattern(c, schema::object.id().to_inline(), object)
                 )) {
                     decoded = true;
                     for term in [subject, object] {
@@ -263,6 +338,7 @@ impl Environment {
         if slot_count > 128 {
             return Err(Error::VariableLimit(revision));
         }
+        let mut inputs = Vec::new();
         for (subject, predicate, object) in body {
             let s = slots[&subject];
             let mut o = slots[&object];
@@ -277,111 +353,214 @@ impl Environment {
                 slot_count += 1;
                 constraints.push(Box::new(EqualityConstraint::new(s, o)));
             }
-            constraints.push(Box::new(self.facts.pattern(
-                Variable::<GenId>::new(s),
-                predicate.to_inline(),
-                Variable::<UnknownInline>::new(o),
-            )));
+            inputs.push((s, predicate, o));
         }
         for (&term, &slot) in &slots {
             let t: Inline<GenId> = term.to_inline();
             if exists!(temp!(
                 (value),
-                self.facts
-                    .pattern::<UnknownInline>(t, schema::literal.id().to_inline(), value)
+                snapshot.pattern::<UnknownInline>(t, schema::literal.id().to_inline(), value)
             )) {
                 bound.insert(term);
-                constraints.push(Box::new(self.facts.pattern(
+                constraints.push(Box::new(snapshot.pattern(
                     t,
                     schema::literal.id().to_inline(),
                     Variable::<UnknownInline>::new(slot),
                 )));
             }
         }
-        let constraint = IntersectionConstraint::new(constraints);
-        let query = Query::new(constraint, |binding| {
-            Some(
-                bound
-                    .iter()
-                    .map(|term| {
-                        (
-                            *term,
-                            *binding.get(slots[term]).expect("bound by constraint"),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .with_frontier_width(1);
-        for binding in query {
-            if self.fired.contains(&(revision, binding.clone())) {
-                continue;
-            }
-            let binding: BTreeMap<_, _> = binding.into_iter().collect();
-            let mut values = binding.clone();
-            let mut constructed = BTreeMap::new();
-            let mut emitted = TribleSet::new();
-            for term in cores.keys() {
-                if bound.contains(term) {
-                    return Err(Error::BoundCore {
-                        revision,
-                        term: *term,
-                    });
-                }
-            }
-            let mut remaining: BTreeSet<_> = slots
-                .keys()
-                .filter(|term| !bound.contains(*term))
-                .copied()
+        // This is the dynamic-clause lowering used by pattern_changes!: one
+        // native conjunction per delta position, combined by native union.
+        // Equality helpers and immutable literal constraints sit outside it.
+        // Union deduplicates identical complete bindings across delta branches.
+        if !inputs.is_empty() {
+            let positions: Vec<_> = match changed {
+                Some(_) => (0..inputs.len()).map(Some).collect(),
+                None => vec![None],
+            };
+            let variants: Vec<_> = positions
+                .into_iter()
+                .map(|position| {
+                    let clauses: Vec<Box<dyn Constraint<'static>>> = inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(index, &(s, predicate, o))| {
+                            let source = if position == Some(index) {
+                                changed.expect("delta position")
+                            } else {
+                                &snapshot
+                            };
+                            Box::new(source.pattern(
+                                Variable::<GenId>::new(s),
+                                predicate.to_inline(),
+                                Variable::<UnknownInline>::new(o),
+                            )) as Box<dyn Constraint<'static>>
+                        })
+                        .collect();
+                    IntersectionConstraint::new(clauses)
+                })
                 .collect();
-            while !remaining.is_empty() {
-                let before = remaining.len();
-                for term in remaining.clone() {
-                    let Some(fields) = cores.get(&term) else {
-                        continue;
-                    };
-                    if fields.iter().all(|(_, object)| values.contains_key(object)) {
-                        let rows = fields
-                            .iter()
-                            .map(|(attribute, object)| {
-                                IntrinsicEntityRow::new(*attribute, values[object])
-                            })
-                            .collect();
-                        let (root, facts) = build_intrinsic_entity(rows);
-                        emitted += facts;
-                        let root_value: Inline<GenId> = root.to_inline();
-                        values.insert(term, root_value.raw);
-                        constructed.insert(term, root);
-                        remaining.remove(&term);
-                    }
-                }
-                if before == remaining.len() {
-                    return Err(Error::UnresolvedTerms {
-                        revision,
-                        terms: remaining,
-                    });
-                }
-            }
-            let value = |term: Id| -> RawInline { values[&term] };
-            for &(subject, predicate, object) in &templates {
-                let raw = Inline::<GenId>::new(value(subject));
-                let subject_id = Id::try_from_inline(&raw).map_err(|_| Error::InvalidSubject {
-                    revision,
-                    term: subject,
-                })?;
-                emitted.insert(&Trible::force(
-                    &subject_id,
-                    &predicate,
-                    &Inline::<UnknownInline>::new(value(object)),
-                ));
-            }
-            return Ok(Some(Firing {
-                revision,
-                binding,
-                constructed,
-                emitted: emitted.into(),
-            }));
+            constraints.push(Box::new(UnionConstraint::new(variants)));
         }
-        Ok(None)
+        let projection: Vec<_> = bound.iter().map(|term| (*term, slots[term])).collect();
+        let query: Box<dyn Iterator<Item = Binding>> = if changed.is_some() && inputs.is_empty() {
+            // Empty-body/literal-only rules depend solely on the immutable
+            // program. There is no data delta position after the initial seed.
+            Box::new(std::iter::empty())
+        } else {
+            Box::new(
+                Query::new(IntersectionConstraint::new(constraints), move |binding| {
+                    Some(
+                        projection
+                            .iter()
+                            .map(|&(term, slot)| {
+                                (term, *binding.get(slot).expect("bound by constraint"))
+                            })
+                            .collect::<Binding>(),
+                    )
+                })
+                .with_frontier_width(1),
+            )
+        };
+        Ok(Self {
+            snapshot,
+            query,
+            pending: None,
+            slots,
+            bound,
+            cores,
+            templates,
+        })
+    }
+
+    fn fire(&self, revision: Id, binding: &Binding) -> Result<Firing, Error> {
+        let Self {
+            slots,
+            bound,
+            cores,
+            templates,
+            ..
+        } = self;
+        let binding: BTreeMap<_, _> = binding.iter().copied().collect();
+        let mut values = binding.clone();
+        let mut constructed = BTreeMap::new();
+        let mut emitted = TribleSet::new();
+        for term in cores.keys() {
+            if bound.contains(term) {
+                return Err(Error::BoundCore {
+                    revision,
+                    term: *term,
+                });
+            }
+        }
+        let mut remaining: BTreeSet<_> = slots
+            .keys()
+            .filter(|term| !bound.contains(*term))
+            .copied()
+            .collect();
+        while !remaining.is_empty() {
+            let before = remaining.len();
+            for term in remaining.clone() {
+                let Some(fields) = cores.get(&term) else {
+                    continue;
+                };
+                if fields.iter().all(|(_, object)| values.contains_key(object)) {
+                    let rows = fields
+                        .iter()
+                        .map(|(attribute, object)| {
+                            IntrinsicEntityRow::new(*attribute, values[object])
+                        })
+                        .collect();
+                    let (root, facts) = build_intrinsic_entity(rows);
+                    emitted += facts;
+                    let root_value: Inline<GenId> = root.to_inline();
+                    values.insert(term, root_value.raw);
+                    constructed.insert(term, root);
+                    remaining.remove(&term);
+                }
+            }
+            if before == remaining.len() {
+                return Err(Error::UnresolvedTerms {
+                    revision,
+                    terms: remaining,
+                });
+            }
+        }
+        let value = |term: Id| -> RawInline { values[&term] };
+        for &(subject, predicate, object) in templates {
+            let raw = Inline::<GenId>::new(value(subject));
+            let subject_id = Id::try_from_inline(&raw).map_err(|_| Error::InvalidSubject {
+                revision,
+                term: subject,
+            })?;
+            emitted.insert(&Trible::force(
+                &subject_id,
+                &predicate,
+                &Inline::<UnknownInline>::new(value(object)),
+            ));
+        }
+        Ok(Firing {
+            revision,
+            binding,
+            constructed,
+            emitted: emitted.into(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod delta_tests {
+    use super::*;
+
+    #[test]
+    fn environment_enumerates_only_new_bindings_and_resumes_its_query() {
+        fn edge(facts: &mut TribleSet, e: Id, a: Id, v: Id) {
+            let v: Inline<GenId> = v.to_inline();
+            facts.insert(&Trible::force(&e, &a, &v));
+        }
+        let [revision, clause, subject, object, input] = std::array::from_fn(|_| *genid());
+        let mut facts = TribleSet::new();
+        edge(
+            &mut facts,
+            revision,
+            schema::operation.id(),
+            schema::POSITIVE,
+        );
+        edge(&mut facts, revision, schema::matches.id(), clause);
+        edge(&mut facts, clause, schema::subject.id(), subject);
+        edge(&mut facts, clause, schema::predicate.id(), input);
+        edge(&mut facts, clause, schema::object.id(), object);
+        for _ in 0..100 {
+            edge(&mut facts, *genid(), input, *genid());
+        }
+        let mut env = Environment::new();
+        env.extend(&facts);
+        env.select([revision]);
+        assert_eq!(env.advance(101).unwrap().progress, Progress::Quiescent);
+        assert_eq!(env.enumerated, 100);
+        for _ in 0..3 {
+            edge(&mut facts, *genid(), input, *genid());
+        }
+        env.extend(&facts);
+        for count in 101..=103 {
+            assert_eq!(env.advance(1).unwrap().firings.len(), 1);
+            assert_eq!(
+                env.enumerated, count,
+                "no old rows and no repeated prefix on resume"
+            );
+            assert_eq!(
+                env.executions[&revision].frontier.as_ref().unwrap().len(),
+                105,
+                "frontier cannot pass unconsumed bindings"
+            );
+        }
+        assert_eq!(env.advance(1).unwrap().progress, Progress::Quiescent);
+        assert_eq!(env.executions[&revision].frontier.as_ref().unwrap(), &facts);
+        env.extend(&facts);
+        assert_eq!(env.advance(1).unwrap().progress, Progress::Quiescent);
+        assert_eq!(
+            env.enumerated, 103,
+            "duplicate-only extension does no query work"
+        );
     }
 }

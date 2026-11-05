@@ -12,7 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   concurrent revisions through the existing observation DAG register.
   Selection is explicit; output identity comes from native content cores.
   Scheduling and firing memoization are in-memory only.
+- Reactive matching now uses native delta union/intersection constraints, per-rule
+  exhausted snapshots and resumable query cursors; newly selected revisions seed
+  existing facts, and later batches consume additions in any joined clause.
 - Reactive reheader tests cover branch-specific copies, original-node recall and event convergence.
+- Reactive call-candidate tests enumerate matching calls on each result's
+  predecessor line, keeping importer selection policy outside the positive rules.
 
 - `AcquiringReadControl::without_deadline` preserves shared sticky cancellation
   while removing only the returned clone's acquisition deadline, for receipt
