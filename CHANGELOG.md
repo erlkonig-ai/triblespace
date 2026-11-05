@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Reactive rules can state exact UTF-8 containment over already-bound terms,
+  read through an explicit blob capability. Fallible native bound-row evaluation
+  retains the failed row for retry without consuming the delta frontier; it
+  does not prune partial query search or interpret unreadable content as false.
+
 - Experimental `reactive::Environment` executes native positive match/emit
   rules, composes consequences, resumes under a firing budget and exposes
   concurrent revisions through the existing observation DAG register.

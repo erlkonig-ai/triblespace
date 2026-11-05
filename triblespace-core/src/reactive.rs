@@ -41,16 +41,29 @@
 //! converge on the same core; the in-memory firing memo only avoids repeated work.
 //! [`Firing`] exposes complete bindings and constructed roots for inspection.
 //!
+//! A revision may also link `constraints` with `operation: STRING_CONTAINS`
+//! and `container`/`needle` terms. Both must already be bound by matches or
+//! literals to UTF-8 blob handles. Evaluation reads through the explicit
+//! [`Environment::advance_with_reader`] capability and uses exact
+//! case-sensitive `str::contains`, without normalization. Both strings must
+//! be readable even for an empty needle. These pure predicates stream complete
+//! native bindings before projection; they do not prune partial query search.
+//! Missing/corrupt/undecodable bytes return an error and retain the exact row
+//! and batch frontier for retry, including with a newer reader snapshot.
+//!
 //! Positive rules can diverge. The budget bounds *firings*, not query search,
 //! memory, or wall time. Exhaustion returns [`Progress::Pending`] even if the
 //! next call would prove quiescence. No global cycle/closure check is imposed.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::convert::Infallible;
 
 use crate::id::Id;
 use crate::inline::encodings::{genid::GenId, UnknownInline};
 use crate::inline::{Inline, IntoInline, RawInline, TryFromInline};
 use crate::metadata;
+use crate::prelude::blobencodings::UTF8String;
+use crate::prelude::inlineencodings::Handle;
 use crate::prelude::*;
 use crate::query::equalityconstraint::EqualityConstraint;
 use crate::query::register::{resolve, ObservationOrder};
@@ -77,9 +90,17 @@ pub mod schema {
         /// Alternative native inline constants for a term. Encoding is supplied
         /// by each matched/emitted attribute, rather than coerced to a string.
         "39606138DDA5D4CB3F275B3A029AD6B0" as pub literal: UnknownInline;
+        /// Revision's pure bound-content constraints.
+        "71748F0D860D04E1935C7D04CB4491B2" as pub constraints: GenId;
+        /// String-containing term, already bound by matches or literals.
+        "BD2EE2B6256C34B0463AEF42A1A2D127" as pub container: GenId;
+        /// String sought within the container, already bound by matches or literals.
+        "C4DD00AC00156749CE1F8C23E1B4EBEC" as pub needle: GenId;
         /// Explicit evaluator operation; unknown selected operations are errors.
         "411026B46A23661F442A9469E8F4D3D2" as pub operation: GenId;
     }
+    /// Exact case-sensitive UTF-8 `str::contains`, without normalization.
+    pub const STRING_CONTAINS: Id = crate::id_hex!("8EF54F3AA52E28F3D9CBCAB4D3C177E9");
     /// The positive conjunction / fact-emission operation.
     pub const POSITIVE: Id = crate::id_hex!("92BE7FE5E9579770A96E8C67316434EA");
 }
@@ -93,6 +114,22 @@ pub enum Error {
     UnsupportedOperation { revision: Id, operation: Id },
     /// A linked clause has no complete typed subject/predicate/object tuple.
     IncompleteClause { revision: Id, clause: Id },
+    /// A content constraint has no complete typed operation/argument tuple.
+    IncompleteConstraint { revision: Id, constraint: Id },
+    /// A selected content constraint names an unsupported operation.
+    UnsupportedConstraint {
+        revision: Id,
+        constraint: Id,
+        operation: Id,
+    },
+    /// Content arguments must be bound by positive matches or literal facts.
+    UnboundContentTerm {
+        revision: Id,
+        constraint: Id,
+        term: Id,
+    },
+    /// A content reading was reached without an explicit blob reader.
+    MissingContentReader { revision: Id, constraint: Id },
     /// This native query engine supports at most 128 variable slots.
     VariableLimit(Id),
     /// Output terms have no ready core (missing fields or cyclic construction).
@@ -101,6 +138,54 @@ pub enum Error {
     BoundCore { revision: Id, term: Id },
     /// An output subject binding is not a native entity id.
     InvalidSubject { revision: Id, term: Id },
+}
+
+/// Failure while advancing with an explicit blob reader. Backend errors retain
+/// their concrete type and source chain (including `repo::MissingBlob`). No
+/// unavailable, corrupt or undecodable content is interpreted as predicate false.
+#[derive(Debug)]
+pub enum ReadAdvanceError<E> {
+    Program(Error),
+    Content {
+        revision: Id,
+        constraint: Id,
+        term: Id,
+        handle: Inline<Handle<UTF8String>>,
+        source: E,
+    },
+}
+
+impl<E> From<Error> for ReadAdvanceError<E> {
+    fn from(error: Error) -> Self {
+        Self::Program(error)
+    }
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for ReadAdvanceError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Program(error) => write!(f, "selected rule error: {error:?}"),
+            Self::Content {
+                revision,
+                constraint,
+                term,
+                source,
+                ..
+            } => write!(
+                f,
+                "rule {revision:?} constraint {constraint:?} term {term:?}: {source}"
+            ),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for ReadAdvanceError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Program(_) => None,
+            Self::Content { source, .. } => Some(source),
+        }
+    }
 }
 
 /// One actual firing, including all binding alternatives separately.
@@ -144,6 +229,18 @@ pub struct Environment {
 }
 
 type Binding = Vec<(Id, RawInline)>;
+type NativeQuery = Query<
+    IntersectionConstraint<Box<dyn Constraint<'static>>>,
+    Box<dyn Fn(&crate::query::Binding<'_>) -> Option<Binding>>,
+    Binding,
+>;
+type StringReader<'a, E> = dyn Fn(Inline<Handle<UTF8String>>) -> Result<View<str>, E> + 'a;
+
+struct ContentConstraint {
+    id: Id,
+    container: Id,
+    needle: Id,
+}
 
 #[derive(Default)]
 struct Execution {
@@ -153,7 +250,8 @@ struct Execution {
 
 struct Batch {
     snapshot: TribleSet,
-    query: Box<dyn Iterator<Item = Binding>>,
+    query: Option<NativeQuery>,
+    content: Vec<ContentConstraint>,
     pending: Option<Binding>,
     slots: BTreeMap<Id, usize>,
     bound: BTreeSet<Id>,
@@ -206,13 +304,38 @@ impl Environment {
     /// Errors leave earlier completed firings committed and available in facts;
     /// retry never repeats those firings within this environment.
     pub fn advance(&mut self, budget: usize) -> Result<Advance, Error> {
+        match self.advance_reading::<Infallible>(budget, None) {
+            Ok(result) => Ok(result),
+            Err(ReadAdvanceError::Program(error)) => Err(error),
+            Err(ReadAdvanceError::Content { source, .. }) => match source {},
+        }
+    }
+
+    /// Advance using an explicit synchronous blob capability. The reader is
+    /// borrowed only for this call; a later call may supply a newer snapshot
+    /// to retry unavailable content. Successful reads must obey BlobStoreGet's
+    /// content-identity contract. No ambient blob store or content cache is used.
+    pub fn advance_with_reader<R: BlobStoreGet>(
+        &mut self,
+        budget: usize,
+        reader: &R,
+    ) -> Result<Advance, ReadAdvanceError<R::GetError<<View<str> as TryFromBlob<UTF8String>>::Error>>>
+    {
+        self.advance_reading(budget, Some(&|handle| reader.get(handle)))
+    }
+
+    fn advance_reading<E>(
+        &mut self,
+        budget: usize,
+        reader: Option<&StringReader<'_, E>>,
+    ) -> Result<Advance, ReadAdvanceError<E>> {
         let mut firings = Vec::new();
         while firings.len() < budget {
             let mut next = None;
             for _ in 0..self.selected.len() {
                 let revision = self.selected[self.cursor];
                 self.cursor = (self.cursor + 1) % self.selected.len();
-                if let Some(firing) = self.next_firing(revision)? {
+                if let Some(firing) = self.next_firing(revision, reader)? {
                     next = Some(firing);
                     break;
                 }
@@ -236,7 +359,11 @@ impl Environment {
         })
     }
 
-    fn next_firing(&mut self, revision: Id) -> Result<Option<Firing>, Error> {
+    fn next_firing<E>(
+        &mut self,
+        revision: Id,
+        reader: Option<&StringReader<'_, E>>,
+    ) -> Result<Option<Firing>, ReadAdvanceError<E>> {
         let execution = self.executions.entry(revision).or_default();
         loop {
             if execution.batch.is_none() {
@@ -251,14 +378,61 @@ impl Environment {
             }
             let batch = execution.batch.as_mut().expect("batch prepared");
             loop {
-                let Some(binding) = batch.pending.take().or_else(|| {
-                    let binding = batch.query.next();
-                    #[cfg(test)]
-                    if binding.is_some() {
-                        self.enumerated += 1;
-                    }
-                    binding
-                }) else {
+                let binding = if let Some(binding) = batch.pending.take() {
+                    Some(binding)
+                } else if let Some(query) = batch.query.as_mut() {
+                    query.try_next_where(|binding| -> Result<bool, ReadAdvanceError<E>> {
+                        if batch.content.is_empty() {
+                            return Ok(true);
+                        }
+                        let complete: Binding = batch
+                            .bound
+                            .iter()
+                            .map(|term| {
+                                (
+                                    *term,
+                                    *binding.get(batch.slots[term]).expect("bound by constraint"),
+                                )
+                            })
+                            .collect();
+                        // A completed firing does not need its content again,
+                        // even if this delta rediscovers it after blob eviction.
+                        if self.fired.contains(&(revision, complete)) {
+                            return Ok(false);
+                        }
+                        for content in &batch.content {
+                            let reader = reader.ok_or(Error::MissingContentReader {
+                                revision,
+                                constraint: content.id,
+                            })?;
+                            let read = |term| {
+                                let handle = Inline::<Handle<UTF8String>>::new(
+                                    *binding.get(batch.slots[&term]).expect("checked bound term"),
+                                );
+                                reader(handle).map_err(|source| ReadAdvanceError::Content {
+                                    revision,
+                                    constraint: content.id,
+                                    term,
+                                    handle,
+                                    source,
+                                })
+                            };
+                            let container = read(content.container)?;
+                            let needle = read(content.needle)?;
+                            if !container.contains(&*needle) {
+                                return Ok(false);
+                            }
+                        }
+                        Ok(true)
+                    })?
+                } else {
+                    None
+                };
+                #[cfg(test)]
+                if binding.is_some() {
+                    self.enumerated += 1;
+                }
+                let Some(binding) = binding else {
                     break;
                 };
                 if self.fired.contains(&(revision, binding.clone())) {
@@ -270,7 +444,7 @@ impl Environment {
                         // A failed output is not consumed, even though Query::next
                         // has moved. Retry reports it again without partial output.
                         batch.pending = Some(binding);
-                        return Err(error);
+                        return Err(error.into());
                     }
                 }
             }
@@ -332,6 +506,43 @@ impl Batch {
                 }
             }
         }
+        let mut content = Vec::new();
+        for constraint in find!(c: Id,
+            snapshot.pattern(r, schema::constraints.id().to_inline(), c))
+        {
+            let c: Inline<GenId> = constraint.to_inline();
+            let mut decoded = false;
+            for (operation, container, needle) in find!((operation: Id, container: Id, needle: Id),
+            and!(
+                snapshot.pattern(c, schema::operation.id().to_inline(), operation),
+                snapshot.pattern(c, schema::container.id().to_inline(), container),
+                snapshot.pattern(c, schema::needle.id().to_inline(), needle)
+            )) {
+                decoded = true;
+                if operation != schema::STRING_CONTAINS {
+                    return Err(Error::UnsupportedConstraint {
+                        revision,
+                        constraint,
+                        operation,
+                    });
+                }
+                for term in [container, needle] {
+                    let n = slots.len();
+                    slots.entry(term).or_insert(n);
+                }
+                content.push(ContentConstraint {
+                    id: constraint,
+                    container,
+                    needle,
+                });
+            }
+            if !decoded {
+                return Err(Error::IncompleteConstraint {
+                    revision,
+                    constraint,
+                });
+            }
+        }
         let mut constraints: Vec<Box<dyn Constraint<'static>>> = Vec::new();
         let mut bound = BTreeSet::new();
         let mut slot_count = slots.len();
@@ -369,6 +580,17 @@ impl Batch {
                 )));
             }
         }
+        for constraint in &content {
+            for term in [constraint.container, constraint.needle] {
+                if !bound.contains(&term) {
+                    return Err(Error::UnboundContentTerm {
+                        revision,
+                        constraint: constraint.id,
+                        term,
+                    });
+                }
+            }
+        }
         // This is the dynamic-clause lowering used by pattern_changes!: one
         // native conjunction per delta position, combined by native union.
         // Equality helpers and immutable literal constraints sit outside it.
@@ -403,28 +625,33 @@ impl Batch {
             constraints.push(Box::new(UnionConstraint::new(variants)));
         }
         let projection: Vec<_> = bound.iter().map(|term| (*term, slots[term])).collect();
-        let query: Box<dyn Iterator<Item = Binding>> = if changed.is_some() && inputs.is_empty() {
+        let query: Option<NativeQuery> = if changed.is_some() && inputs.is_empty() {
             // Empty-body/literal-only rules depend solely on the immutable
             // program. There is no data delta position after the initial seed.
-            Box::new(std::iter::empty())
+            None
         } else {
-            Box::new(
-                Query::new(IntersectionConstraint::new(constraints), move |binding| {
-                    Some(
-                        projection
-                            .iter()
-                            .map(|&(term, slot)| {
-                                (term, *binding.get(slot).expect("bound by constraint"))
-                            })
-                            .collect::<Binding>(),
-                    )
-                })
+            Some(
+                Query::new(
+                    IntersectionConstraint::new(constraints),
+                    Box::new(move |binding: &crate::query::Binding<'_>| {
+                        Some(
+                            projection
+                                .iter()
+                                .map(|&(term, slot)| {
+                                    (term, *binding.get(slot).expect("bound by constraint"))
+                                })
+                                .collect::<Binding>(),
+                        )
+                    })
+                        as Box<dyn Fn(&crate::query::Binding<'_>) -> Option<Binding>>,
+                )
                 .with_frontier_width(1),
             )
         };
         Ok(Self {
             snapshot,
             query,
+            content,
             pending: None,
             slots,
             bound,

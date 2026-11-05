@@ -2122,37 +2122,43 @@ enum Search {
     Done,
 }
 
-impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Iterator for Query<C, P, R> {
-    type Item = R;
-
-    fn next(&mut self) -> Option<Self::Item> {
+impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> {
+    /// Evaluate a fallible predicate on each complete native binding before
+    /// projection. This streams bound rows; it does not prune partial search
+    /// like a [`Constraint`]. The predicate must be a pure reading of the
+    /// binding: `false` consumes that row, while an error leaves exactly that
+    /// row pending for the next call (including with a replacement reader).
+    /// Earlier rejected rows and projections returning `None` stay consumed.
+    ///
+    /// Use the same predicate semantics on every resume. Calling ordinary
+    /// `next` instead deliberately resumes without this additional predicate.
+    pub fn try_next_where<E>(
+        &mut self,
+        mut predicate: impl FnMut(&Binding<'_>) -> Result<bool, E>,
+    ) -> Result<Option<R>, E> {
         loop {
             match self.mode {
                 Search::Plan => self.plan(),
                 Search::NextGroup => self.next_group(),
                 Search::NextChunk => self.next_chunk(),
                 Search::Emit => {
-                    // One row per complete binding, in frontier order, no
-                    // dedup — bag semantics are a property of the rows, not
-                    // of how many at a time the engine happened to build.
+                    let emit = self.depths[self.depth].emit;
                     let frontier = self.frontier();
-                    let rows = frontier.len();
-                    let mut emit = self.depths[self.depth].emit;
-                    let mut result = None;
-                    while emit < rows {
+                    if emit < frontier.len() {
                         let binding = frontier.row(emit);
-                        emit += 1;
-                        if let Some(row) = (self.postprocessing)(&binding) {
-                            result = Some(row);
-                            break;
+                        // Do not advance on Err. Commit each successful verdict
+                        // separately so a later error cannot replay the prefix.
+                        let result = if predicate(&binding)? {
+                            (self.postprocessing)(&binding)
+                        } else {
+                            None
+                        };
+                        self.depths[self.depth].emit = emit + 1;
+                        if result.is_some() {
+                            return Ok(result);
                         }
+                        continue;
                     }
-                    self.depths[self.depth].emit = emit;
-                    if result.is_some() {
-                        return result;
-                    }
-                    // The batch is spent; hand control back to the level
-                    // that produced it for its next chunk.
                     if self.depth == 0 {
                         self.mode = Search::Done;
                     } else {
@@ -2160,8 +2166,19 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Iterator for Qu
                         self.mode = Search::NextChunk;
                     }
                 }
-                Search::Done => return None,
+                Search::Done => return Ok(None),
             }
+        }
+    }
+}
+
+impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Iterator for Query<C, P, R> {
+    type Item = R;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.try_next_where(|_| Ok::<_, std::convert::Infallible>(true)) {
+            Ok(row) => row,
+            Err(never) => match never {},
         }
     }
 }
