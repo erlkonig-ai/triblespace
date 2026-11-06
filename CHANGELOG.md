@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `reactive::text` parses explicit rule shorthand directly into native facts and
+  UTF-8 literal blobs, and writes readable aliases with an exact raw-fact fallback.
+  Finite fact sets round-trip even with unknown, partial or multivalued graphs;
+  parsing does not select, execute or implicitly revise a program.
+
 - `reactive::collection::CollectionEnvironment` adopts complete native root
   snapshots, resolves explicit execution readings through the existing DAG
   register, and publishes additive consequences with writer admission and an

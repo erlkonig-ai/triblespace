@@ -241,3 +241,74 @@ fact in commit A with a fever fact in commit B can produce an alert from
 `A union B` although neither separate member produces it. Thus its ordinary
 output union is not the foundation-local homomorphism required by DERIVE.
 The adapter instead publishes computed conclusions as authored COMMIT facts.
+
+
+## Author native rules as text
+
+`reactive::text::parse(Bytes)` returns a `Fragment` containing exactly the
+asserted content facts, plus blobs explicitly authored with `utf8`. It adds no
+exports, schema metafacts, operation defaults, collection readings or execution.
+The runnable example mints IDs in its caller, then binds them once in a header:
+`alias patient = id"<32 hex digits>";`. Use actual attribute IDs (`attribute.id()`),
+not the anchor literals used to define their encodings.
+
+The body is ordinary native clause and term entities expressed more compactly:
+
+```text
+{{#include ../../triblespace-core/examples/reactive_text.rs:reactive_text_rule}}
+```
+
+This synthetic matching example joins a ward observation and a note from
+separate commits, checks exact case-sensitive UTF-8 containment, and publishes
+one alert core with descriptive annotations. Two independently authored
+revisions and two notes converge on the same core. It demonstrates matching,
+not clinical guidance. Run it with:
+
+```text
+cargo run -p triblespace-core --no-default-features --example reactive_text
+```
+
+Each `matches`, `core` or `emits` statement asserts a revision-to-clause link
+and the clause's explicit subject, predicate and object term IDs. `operation
+POSITIVE` asserts only that operation; `literal ?term VALUE` asserts only the
+term's literal value. `constraint @id STRING_CONTAINS(?container, ?needle)`
+asserts the constraint link, operation and its two term references. Empty rule
+blocks assert nothing. Repeating any statement unions facts, including literal
+alternatives; the parser imposes no schema cardinality rules.
+
+Aliases match `[A-Za-z_][A-Za-z_0-9]*` and must be declared before use. `@name`
+and `?name` share a namespace; `?` is a visual term marker. Multiple spellings
+for one ID are legal, but rebinding a spelling to a different ID is an error.
+`id"<32 hex digits>"` can replace any alias reference. Changing an alias's
+spelling changes no facts and persists no label; author `metadata::name` facts
+explicitly when labels should survive independently of this projection.
+
+Every statement ends with `;` (a rule block ends with `}`). Whitespace and
+`//` line comments are ignored. Four explicit value constructors are available:
+
+| Constructor | Meaning |
+| --- | --- |
+| `raw32"<64 hex digits>"` | Exactly those 32 bytes, for any encoding or malformed value. |
+| `genid(@id)` | Native zero-prefixed 16-byte ID encoding. |
+| `handle<UTF8String>"<64 hex digits>"` | A complete handle, without requiring its blob. |
+| `utf8("text")` | JSON-escaped UTF-8 text, stored in the returned fragment's blob store. |
+
+`fact @entity @attribute VALUE;` is the universal form, including unknown
+operations. Syntax errors return a `TextError` with zero-based byte offset and
+one-based line/byte column; no partial fragment is returned. Native evaluator
+diagnostics remain separate from text syntax.
+
+`reactive::text::write(&facts, &mut output)` uses deterministic local aliases
+and conservative readable clause/constraint shorthand. A field with several
+values, malformed bytes or missing data remains raw; every uncovered input fact
+is emitted. Unknown annotations and shared IDs survive. The guarantee is
+`parse(write(F)).facts() == F` for any supplied finite `TribleSet F`. Literal
+encodings are never guessed, and writing needs no blob reader. Existing blob
+bodies, exports, metafacts, comments and alias spelling are outside this
+fact-set contract; this is not a Fragment or pile archive.
+
+Text import does not edit published revisions in place. Semantic changes need
+an explicitly fresh revision and fresh changed semantic nodes, with deliberate
+sharing of unchanged nodes and explicit `metadata::supersedes` links. Automatic
+fork/remapping and editing unknown graphs are outside this API. Superseding a
+revision does not change a collection's selection reading.

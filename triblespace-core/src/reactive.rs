@@ -75,6 +75,10 @@ use crate::trible::{build_intrinsic_entity, Fragment, IntrinsicEntityRow, Trible
 #[path = "reactive/collection.rs"]
 pub mod collection;
 
+/// Exact fact-set text projection and explicit native rule authoring.
+#[path = "reactive/text.rs"]
+pub mod text;
+
 /// Native rule vocabulary. Anchors were minted with `trible genid` on 2026-11-05.
 pub mod schema {
     use super::*;
