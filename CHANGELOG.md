@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- The `reactive_live` example loads saved rule documents into one continuing
+  in-memory environment, makes execution readings and their predecessors
+  explicit, and demonstrates predicate edits, retained conclusions and fork
+  resolution without a watcher or automatic graph cloning.
+
 - `reactive::text` parses explicit rule shorthand directly into native facts and
   UTF-8 literal blobs, and writes readable aliases with an exact raw-fact fallback.
   Finite fact sets round-trip even with unknown, partial or multivalued graphs;

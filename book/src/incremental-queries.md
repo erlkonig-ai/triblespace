@@ -312,3 +312,84 @@ an explicitly fresh revision and fresh changed semantic nodes, with deliberate
 sharing of unchanged nodes and explicit `metadata::supersedes` links. Automatic
 fork/remapping and editing unknown graphs are outside this API. Superseding a
 revision does not change a collection's selection reading.
+
+## Try a saved edit in one continuing environment
+
+`reactive_live` is a small synchronous command driver. Its `MemoryRepo`, signing
+key and one `CollectionEnvironment` live until EOF or `quit`. **Only the source
+files survive process exit**; this example does not persist readings, results or
+execution progress. A new initialization mints a distinct set of example entity
+and program IDs; it reuses the canonical `metadata::name` and
+`metadata::description` attributes. It requires a new directory and refuses to
+overwrite an existing one.
+
+```text
+cargo run -p triblespace-core --no-default-features --example reactive_live -- --init live-demo
+cargo run -p triblespace-core --no-default-features --example reactive_live
+```
+
+The initializer authors two independent fresh rule templates, `v1.rules` and
+`v2.rules`, plus `initial.facts` and `later.facts`. Both templates initially match
+names containing `red` and copy those names to descriptions. This is a neutral
+label-matching example. Templates contain explicit revision, term, clause and
+constraint IDs: the initializer does not clone any published graph.
+
+In the running driver, enter:
+
+```text
+load live-demo/v1.rules
+load live-demo/initial.facts
+select V1 after -
+step
+show
+```
+
+Replace `V1` with the revision ID printed by `load`. `select` prints the new
+**reading ID**; keep it as `R1`. `show` prints that reading, its selection and a
+query-based demo projection of ordinary `metadata::description` facts. Initially
+only `red lantern` appears, although both red and blue input names were loaded.
+`load` parses the complete saved document before committing anything; syntax
+errors leave the collection unchanged. Loading does not select or execute rules.
+
+Keep the driver running. In another editor, open **the fresh `v2.rules`**, change
+`literal ?needle utf8("red");` to `literal ?needle utf8("blue");`, and save it.
+Leave the published `v1.rules` unchanged. Then enter:
+
+```text
+load live-demo/v2.rules
+select V2 after R1
+step
+show
+load live-demo/later.facts
+step
+show
+```
+
+Substitute the second revision ID for `V2`, and the first reading ID for `R1`.
+The new revision seeds the already-held inputs, so `blue lantern` now appears.
+`red lantern` remains an ordinary consequence of the old revision. Later input
+adds `blue comet`, but **not `red comet`**: the retired rule no longer fires.
+A semantic edit after a revision has been loaded requires explicitly fresh
+revision/changed-node IDs again; reloading changed facts under published IDs
+would add alternatives, not replace the old values. There is no automatic edit
+or remapping operation here.
+
+`after` always takes **reading IDs, not rule revision IDs**. Selection lists and
+predecessor lists are comma-separated; `-` means empty. Save the reading from
+the second selection as `R2`. To demonstrate a fork, issue both
+`select V1 after R2` and `select V2 after R2`, retaining their printed reading IDs
+as `LEFT` and `RIGHT`. `step` refuses this unresolved fork and publishes no new
+consequences. Resolve it deliberately with
+`select V1 after LEFT,RIGHT`; the next `step` can produce `red comet`. A selection
+of `V1,V2` would instead compose both revisions. Nothing picks the last loaded
+revision, chooses a winner, or silently merges all known reading heads.
+
+To retire all execution, use `select - after MERGED`, where `MERGED` is the
+reading just printed by the explicit resolution. Historical descriptions remain.
+`step [BUDGET]` performs one bounded advance (default 16 firings) and publishes
+successful facts even when a later evaluation fails. Repeat it for pending work;
+the budget bounds firings, not query search time. Publication failure retains
+the exact batch; a subsequent `step` retries it before observing new control
+facts. `show` observes without executing and refuses observation while publication
+is pending. The driver is deliberately an example, not a daemon or an external
+effect runner.
