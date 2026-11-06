@@ -169,3 +169,75 @@ facts and query the explicit DAG. Do not infer a winner from insertion order.
   continuation after successful consumption.
 - A result may recur in a later invocation when the later delta provides a new
   witness.
+
+## Additive rules over a durable fact collection
+
+`reactive::collection::CollectionEnvironment` connects the experimental native
+rule language to one root `Collection<SimpleArchive>`. Observations, immutable
+program revisions, execution readings, and published consequences are all
+ordinary facts. The adapter has no notification owner, transport, or external
+effect worker. An application supplies immutable snapshots, a content reader,
+and a writer explicitly.
+
+An immutable reading states `reading_of: environment_anchor` and repeated
+`selects` edges naming the exact rule revisions to execute. Readings use
+`metadata::supersedes` for their observation DAG. `observe(snapshot)` queries
+that snapshot's facts with the existing register and returns `Empty`, `Sole`,
+or `Fork`. A fork does not choose a winner or combine the programs. A Sole
+reading with no selected revisions explicitly retires execution. Publishing a
+new rule revision alone does not select it or replace an explicitly selected
+older revision. Resolve a reading fork by publishing a new reading that
+supersedes the observed branches and states its intended selection.
+
+```rust,ignore
+{{#include ../../triblespace-core/examples/reactive_collection.rs:reactive_collection_run}}
+```
+
+Run the complete example with
+`cargo run -p triblespace-core --no-default-features --example reactive_collection`.
+It uses an in-memory store; a durable store implements the same publication
+boundary. `publish` checks writer admission, inserts a native COMMIT, then calls
+`flush`. Either failure retains the exact fragment and the attempted signer for
+retry. The batch blocks observation and further advancement until settled, so a
+new reading cannot silently displace unfinished publication. An inserted record
+visible in a snapshot after a flush error does not prove durability. There is
+no rollback or exactly-once external effect guarantee.
+
+`advance` retains successful new facts even if a later binding fails; therefore
+call `publish` after either evaluation outcome. Report both errors when both
+operations fail. Its budget bounds firings only, not search time, memory, or
+termination. A missing content blob remains a retryable error. Content arrival
+can unblock evaluation without any new fact or change in root support; a later
+explicit reader can retry that binding.
+
+Observation requires a complete view of the root's known admitted foundations.
+Missing bytes fail instead of quietly presenting a smaller input. The support
+cursor names logical foundations, not the physical cover: a resident merge can
+replace its input shards without changing the interpretation. The adapter reads
+the current cover and unions its native facts directly. Shrinking support
+requires explicit reopening, and never erases the existing adapter's held
+facts. Observation failures disable advancement until another observation
+succeeds. These native snapshots and query cursors are disposable continuation
+state, not a second database of domain objects.
+
+Retirement leaves every published consequence available to later rules. If R1
+produced `b` from `a`, retiring R1 and selecting R2 (`b` implies `c`) can produce
+`c`. This is a history of accepted conclusions, not the current output of R2
+over raw `{a}`. A fresh counterfactual interpretation needs an explicitly chosen
+input frame excluding earlier conclusions. Output entity cores remain free of
+reading IDs and provenance salts. The adapter exposes its observed support and
+selected reading for inspection; it does not persist a proof graph.
+
+After reopening a store, construct a new adapter and observe its complete
+durable frame. Committed conclusions seed recomputation. Bindings may fire
+again; already held consequences add no new publication batch. The memo and
+support cursor are not durable receipts. If the reading changed before restart,
+uncommitted work from an old reading is not guaranteed to complete. Reopening
+also cannot certify continuity with admission or retention evidence no longer
+held by that store.
+
+General rules do not implement `CollectionDerivation`. A rule joining a ward
+fact in commit A with a fever fact in commit B can produce an alert from
+`A union B` although neither separate member produces it. Thus its ordinary
+output union is not the foundation-local homomorphism required by DERIVE.
+The adapter instead publishes computed conclusions as authored COMMIT facts.

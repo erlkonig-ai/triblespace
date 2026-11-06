@@ -71,6 +71,10 @@ use crate::query::unionconstraint::UnionConstraint;
 use crate::query::{Constraint, Query};
 use crate::trible::{build_intrinsic_entity, Fragment, IntrinsicEntityRow, Trible, TribleSet};
 
+/// Explicit snapshot observation and durable publication of additive rules.
+#[path = "reactive/collection.rs"]
+pub mod collection;
+
 /// Native rule vocabulary. Anchors were minted with `trible genid` on 2026-11-05.
 pub mod schema {
     use super::*;

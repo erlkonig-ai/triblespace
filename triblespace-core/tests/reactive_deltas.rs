@@ -1,7 +1,7 @@
 // Compile the exact production source with its private cfg(test) counter.
 // This keeps the lean integration closure independent of unrelated library
 // unit modules that require optional proptest, without adding a public metric.
-pub use triblespace_core::{id, id_hex, inline, macros, metadata, prelude, query, trible};
+pub use triblespace_core::{collection, id, id_hex, inline, macros, metadata, prelude, query, repo, trible};
 #[path = "../src/reactive.rs"]
 #[allow(dead_code)]
 mod native_under_test;

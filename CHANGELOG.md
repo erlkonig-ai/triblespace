@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `reactive::collection::CollectionEnvironment` adopts complete native root
+  snapshots, resolves explicit execution readings through the existing DAG
+  register, and publishes additive consequences with writer admission and an
+  explicit durability flush. Partial evaluation errors preserve successful
+  new facts; uncertain publication retains the exact batch for retry.
+  Retirement retains historical conclusions, and restart recomputes from
+  durable facts without persisting firing memos or promising exactly-once effects.
+
 - Reactive rules can state exact UTF-8 containment over already-bound terms,
   read through an explicit blob capability. Fallible native bound-row evaluation
   retains the failed row for retry without consuming the delta frontier; it
