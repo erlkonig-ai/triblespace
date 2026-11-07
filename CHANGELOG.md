@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Compile value formatters in private directories and atomically publish only
+  successful Wasm outputs without overwriting a competing cache winner. Failed
+  and losing attempts remove their temporary source and output files; cache
+  keys and source-path identity remain unchanged.
+
 - The `reactive_live` example loads saved rule documents into one continuing
   in-memory environment, makes execution readings and their predecessors
   explicit, and demonstrates predicate edits, retained conclusions and fork
