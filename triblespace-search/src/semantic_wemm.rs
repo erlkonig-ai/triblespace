@@ -4,9 +4,10 @@
 //! the caller first binds a genuine frozen model pile through Mary's unsafe
 //! native loader, then lends the resulting OWNED runtime to this thread with
 //! [`with_wemm_runtime`]. A generic `StoreRead` is never treated as CUDA alias
-//! provenance. The collection argument is caller-established frozen-store
-//! provenance; the native facade itself proves only its actual selected root,
-//! validated assets and device. READ/WRITE admission remains the store's job.
+//! provenance. The native facade proves its actual selected root, validated
+//! assets and device; which collection carried the model is the store's
+//! business and is not part of an index's identity. READ/WRITE admission
+//! remains the store's job.
 //!
 //! The mapping is total on content bytes, through the SAME model for text
 //! and images. A PNG/JPEG the fixed preparation decodes is one row. UTF-8
@@ -29,7 +30,7 @@ use anybytes::{Bytes, View};
 use triblespace_core::blob::encodings::{rawbytes::RawBytes, simplearchive::SimpleArchive};
 use triblespace_core::blob::{Blob, BlobEncoding, TryFromBlob};
 use triblespace_core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
-use triblespace_core::collection::{CollectionHandle, CollectionOperationError, DeriveMapping};
+use triblespace_core::collection::{CollectionOperationError, DeriveMapping};
 use triblespace_core::id::{id_hex, ExclusiveId, Id};
 use triblespace_core::inline::encodings::{genid::GenId, hash::Handle, iu256::U256BE};
 use triblespace_core::inline::{Inline, IntoInline, TryFromInline};
@@ -44,7 +45,7 @@ use triblespace_core::trible::{Fragment, TribleSet};
 use crate::content_text::{looks_like_html, pdf_text, strip_html};
 use crate::nvfp4::{nvfp4_dimension, NvFp4CosineIndex, NvFp4CosineSet, ReconstructedCosines};
 pub use crate::semantic_attributes::{semantic_compute, semantic_content_attribute};
-pub use mary::format::attrs::{model_collection, model_root};
+pub use mary::format::attrs::model_root;
 
 /// Minted with `trible genid`, 2026-10-06. It replaces
 /// `C2218047C697B76F657619C33B0B560D` (2026-10-01), which read only what fits
@@ -65,13 +66,13 @@ pub const WINDOW_IDS: usize = 248;
 /// descriptor.
 pub const DEFAULT_WINDOW_CAP: u64 = 16;
 
+// The asset attributes `wemm_config` (C1FEADBAD086C8A7EC00C1080D7E2F13),
+// `wemm_tokenizer_json` (438EE4FAA8F9465B38DD8CCAD595D3DE) and
+// `wemm_chat_template` (6850FB2F899C4EA04257547C9C5D63BC), minted 2026-10-01,
+// named side-file blobs beside a member-only root. The complete model root
+// covers all three since 2026-11-07, so descriptors no longer carry them; an
+// older descriptor that does is still bound, and they are ignored.
 attributes! {
-    /// Configuration asset. Anchor minted by `trible genid`, 2026-10-01.
-    "C1FEADBAD086C8A7EC00C1080D7E2F13" as pub wemm_config: Handle<RawBytes>;
-    /// Exact tokenizer JSON. Anchor minted by `trible genid`, 2026-10-01.
-    "438EE4FAA8F9465B38DD8CCAD595D3DE" as pub wemm_tokenizer_json: Handle<RawBytes>;
-    /// Exact chat template. Anchor minted by `trible genid`, 2026-10-01.
-    "6850FB2F899C4EA04257547C9C5D63BC" as pub wemm_chat_template: Handle<RawBytes>;
     /// Kernel AND input profile. Anchor minted by `trible genid`, 2026-10-01.
     "B3CC3C4ED14B1F099A3D47FCC876E51C" as pub wemm_kernel_profile: GenId;
     /// The most windows, and so rows, one content value maps to. Anchor
@@ -79,38 +80,43 @@ attributes! {
     "B999AF3E65C457A9DFD54EBA05C211B7" as pub wemm_window_cap: U256BE;
 }
 
-/// Semantic inputs, not the physical archives carrying the selected model.
+/// What an embedding IS a function of, and nothing else: the model and the
+/// way it is run. Content-only, so the same model gives the same index
+/// identity on every machine and in every collection that carries it.
+///
+/// - `model_root` is the COMPLETE model root
+///   (`mary::ingest::build_model_root_with`), whose content-derived id
+///   covers the weights, the tokenizer, the configuration and the chat
+///   template. A changed tokenizer or template changes the token ids a text
+///   becomes, and so the vectors; that is why they are in the root and why
+///   the root alone suffices here. Which collection, pile or archive carried
+///   the model is provenance, not identity, and is not stated.
+/// - `kernel_profile` stays. The profile names the native BF16 GB10 kernels
+///   together with the input semantics (framing, the B1 at most 256 IDs
+///   bound, the 256-patch white-pad image preparation). Every one of those
+///   changes the vector for the same model and content: another kernel
+///   accumulates the BF16 GEMMs in another order and lands on other bits,
+///   which quantize to other NVFP4 rows, and another preparation feeds the
+///   model other pixels. Rows from two profiles in one index would be scored
+///   against each other as if they were comparable. So the profile is part
+///   of what the embedding is, and an index under another profile is another
+///   index ([`GB10_NATIVE_BF16_PROFILE`]).
+///
 /// Unknown kernel profiles remain readable/carryable but cannot compute here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WemmIdentity {
-    pub model_collection: CollectionHandle,
     pub model_root: Id,
-    pub config: Inline<Handle<RawBytes>>,
-    pub tokenizer_json: Inline<Handle<RawBytes>>,
-    pub chat_template: Inline<Handle<RawBytes>>,
     pub kernel_profile: Id,
 }
 
 impl WemmIdentity {
-    fn require_loaded_selection(
-        &self,
-        root: Id,
-        config: Inline<Handle<RawBytes>>,
-        tokenizer_json: Inline<Handle<RawBytes>>,
-        chat_template: Inline<Handle<RawBytes>>,
-    ) -> Result<(), CollectionOperationError> {
+    fn require_loaded_selection(&self, root: Id) -> Result<(), CollectionOperationError> {
         if self.kernel_profile != GB10_NATIVE_BF16_PROFILE {
             return Err(fatal("unsupported WeMM kernel/input profile"));
         }
-        if (
-            self.model_root,
-            self.config,
-            self.tokenizer_json,
-            self.chat_template,
-        ) != (root, config, tokenizer_json, chat_template)
-        {
+        if self.model_root != root {
             return Err(fatal(
-                "WeMM runtime's actual root/assets do not match the descriptor",
+                "WeMM runtime's actual root does not match the descriptor",
             ));
         }
         Ok(())
@@ -263,7 +269,7 @@ impl MetaDescribe for Recipe {
     fn describe() -> Fragment {
         entity! { ExclusiveId::force_ref(&WEMM_CONTENT_WINDOWS_TO_NVFP4) @
             metadata::name: "wemm-content-windows-to-nvfp4",
-            metadata::description: "Content handles under selected attributes embedded by one pinned native WeMM model as canonical 4096-dimensional two-stage NVFP4 set rows keyed by the content handle. A complete PNG/JPEG the fixed preparation decodes is one row. UTF-8 text, reduced to its text when it sniffs as HTML, and a PDF text layer are cut by the pinned tokenizer into windows of at most 248 framed IDs, greedily whole lines, a line too long alone between words, a word too long alone between characters; each of the first window-cap windows is one row. Any other content is no row. Root and exact assets, GB10 compute, kernel/input profile and window cap are descriptor identity; physical model archives are not.",
+            metadata::description: "Content handles under selected attributes embedded by one pinned native WeMM model as canonical 4096-dimensional two-stage NVFP4 set rows keyed by the content handle. A complete PNG/JPEG the fixed preparation decodes is one row. UTF-8 text, reduced to its text when it sniffs as HTML, and a PDF text layer are cut by the pinned tokenizer into windows of at most 248 framed IDs, greedily whole lines, a line too long alone between words, a word too long alone between characters; each of the first window-cap windows is one row. Any other content is no row. The complete model root (weights, tokenizer, configuration and chat template), GB10 compute, kernel/input profile and window cap are descriptor identity; the collection and physical archives carrying the model are not.",
             metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
@@ -286,11 +292,7 @@ where
             nvfp4_dimension: DIMENSION as u64,
             semantic_compute: COMPUTE_CLASS,
             semantic_content_attribute*: self.content_attributes(),
-            model_collection: self.identity.model_collection,
             model_root: self.identity.model_root,
-            wemm_config: self.identity.config,
-            wemm_tokenizer_json: self.identity.tokenizer_json,
-            wemm_chat_template: self.identity.chat_template,
             wemm_kernel_profile: self.identity.kernel_profile,
             wemm_window_cap: self.window_cap,
         }
@@ -321,11 +323,7 @@ where
         Self::new(
             selected,
             WemmIdentity {
-                model_collection: Inline::new(argument(facts, model_collection.id())?),
                 model_root: id_argument(facts, model_root.id())?,
-                config: Inline::new(argument(facts, wemm_config.id())?),
-                tokenizer_json: Inline::new(argument(facts, wemm_tokenizer_json.id())?),
-                chat_template: Inline::new(argument(facts, wemm_chat_template.id())?),
                 kernel_profile: id_argument(facts, wemm_kernel_profile.id())?,
             },
             u64::try_from_inline(&Inline::<U256BE>::new(argument(
@@ -497,30 +495,25 @@ pub struct WemmRuntime {
 }
 
 impl WemmRuntime {
-    /// The caller establishes that `identity.model_collection` is the admitted
-    /// collection whose FROZEN facts supplied the selected model. NativeWemm
-    /// does not claim collection membership or grant authorization. Its loader's
-    /// immutable backing/preceding-page lifetime premise remains in force until
-    /// CUDA teardown, even after this runtime/lease is dropped.
+    /// The caller establishes that the admitted collection's FROZEN facts
+    /// supplied the selected model. NativeWemm does not claim collection
+    /// membership or grant authorization. Its loader's immutable
+    /// backing/preceding-page lifetime premise remains in force until CUDA
+    /// teardown, even after this runtime/lease is dropped.
     ///
-    /// The actual native root, validated asset bytes and actual selected device
-    /// are checked here; they cannot be relabelled by a separate device argument.
+    /// The actual native root and actual selected device are checked here;
+    /// they cannot be relabelled by a separate device argument. The root
+    /// carries its tokenizer, configuration and template in its identity.
     ///
-    /// `codec` cuts text into windows. `InputCodec::from_assets` admits only
-    /// the pinned tokenizer and template, so it is the one `native` frames with.
+    /// `codec` cuts text into windows. It must be the codec of the same
+    /// assets `native` was bound with (`Assets::codec`).
     #[cfg(feature = "semantic-wemm-cuda")]
     pub fn from_native(
         identity: WemmIdentity,
         native: mary::models::qwen3_5::native::NativeWemm,
         codec: mary::models::qwen3_5::input_codec::InputCodec,
     ) -> Result<Self, CollectionOperationError> {
-        let assets = native.asset_handles();
-        identity.require_loaded_selection(
-            native.model_root(),
-            assets.config,
-            assets.tokenizer_json,
-            assets.chat_template,
-        )?;
+        identity.require_loaded_selection(native.model_root())?;
         let (name, major, minor) = native.device_identity().map_err(fatal)?;
         require_gb10(&name, major, minor)?;
         let device = native.device().clone();
@@ -745,18 +738,14 @@ mod tests {
     use crate::schemas::Embedding;
     use triblespace_core::blob::IntoBlob;
     use triblespace_core::collection::{
-        AdmissionPolicy, Collection, CollectionPolicy, CollectionStoreExt,
+        AdmissionPolicy, Collection, CollectionHandle, CollectionPolicy, CollectionStoreExt,
     };
     use triblespace_core::repo::{memoryrepo::MemoryRepo, SnapshotSource};
     use triblespace_core::trible::Trible;
 
     fn identity() -> WemmIdentity {
         WemmIdentity {
-            model_collection: Inline::new([1; 32]),
             model_root: Id::new([2; 16]).unwrap(),
-            config: Inline::new([3; 32]),
-            tokenizer_json: Inline::new([4; 32]),
-            chat_template: Inline::new([5; 32]),
             kernel_profile: GB10_NATIVE_BF16_PROFILE,
         }
     }
@@ -831,17 +820,175 @@ mod tests {
         assert!(!unknown.computable_here());
     }
 
+    /// A stand-in complete model put into `repo` (the weights a named leaf,
+    /// a tokenizer, a configuration and a template), built the way importers
+    /// build roots.
+    fn complete_root(
+        repo: &mut MemoryRepo,
+        weight: &str,
+        vocab_b: &str,
+        hidden: i64,
+        template: &str,
+    ) -> Fragment {
+        use triblespace_core::blob::encodings::utf8string::UTF8String;
+        use triblespace_core::repo::BlobStorePut;
+        let tokenizer = format!(
+            r###"{{"version": "1.0", "added_tokens": [], "normalizer": null,
+            "pre_tokenizer": {{"type": "BertPreTokenizer"}}, "post_processor": null, "decoder": null,
+            "model": {{"type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##",
+            "max_input_chars_per_word": 100, "vocab": {{"[UNK]": 0, "a": 1, "{vocab_b}": 2}}}}}}"###
+        );
+        let mut facts = TribleSet::new();
+        let path = repo.put::<UTF8String, _>("w".to_owned()).unwrap();
+        let kind = repo.put::<UTF8String, _>(weight.to_owned()).unwrap();
+        let leaf = entity! { _ @ mary::format::attrs::kind: kind };
+        let leaf_id = leaf.root().unwrap();
+        facts += leaf.into_facts();
+        let module = entity! { _ @
+            mary::format::attrs::safetensor_path: path,
+            mary::format::attrs::weight: leaf_id,
+        };
+        let members = vec![module.root().unwrap()];
+        facts += module.into_facts();
+        let tok = mary::tokenizer::save_tokenizer_json(tokenizer.as_bytes(), "t", repo).unwrap();
+        let tokenizer = tok.root();
+        facts += tok.into_facts();
+        // A stand-in configuration node: the root's core links its id.
+        let config = entity! { _ @ metadata::name: format!("hidden_size {hidden}") };
+        let config_id = config.root().unwrap();
+        facts += config.into_facts();
+        let chat_template = repo.put::<UTF8String, _>(template.to_owned()).unwrap();
+        mary::ingest::build_model_root_with(
+            repo,
+            "org/wemm",
+            "native",
+            members,
+            facts,
+            &[],
+            mary::ingest::RootParts {
+                tokenizer,
+                config: Some(config_id),
+                chat_template: Some(chat_template),
+            },
+        )
+        .unwrap()
+    }
+
+    /// Publish `fragment` into a fresh `models` collection under its own
+    /// signer, and select the model root back from that collection.
+    fn published_root(
+        seed: u8,
+        build: impl FnOnce(&mut MemoryRepo) -> Fragment,
+    ) -> (CollectionHandle, Id) {
+        let mut repo = MemoryRepo::default();
+        let fragment = build(&mut repo);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(key.verifying_key()),
+            AdmissionPolicy::direct(key.verifying_key()),
+        );
+        let collection = repo.collection("models", policy).unwrap();
+        repo.commit(collection, &key, fragment).unwrap();
+        let store = repo.snapshot().unwrap();
+        let model =
+            mary::model_collection::snapshot_model_collection_for(&store, collection).unwrap();
+        let root = mary::selection::select_model_root(
+            model.facts(),
+            &store,
+            mary::selection::ModelSelector::Only,
+        )
+        .unwrap();
+        (collection.handle(), root)
+    }
+
+    fn index_of(root: Id) -> Fragment {
+        WemmIndex::<Embedding>::new(
+            [metadata::name.id()],
+            WemmIdentity {
+                model_root: root,
+                kernel_profile: GB10_NATIVE_BF16_PROFILE,
+            },
+            DEFAULT_WINDOW_CAP,
+        )
+        .unwrap()
+        .fragment()
+    }
+
+    #[test]
+    fn the_index_identity_is_the_model_content_not_the_collection_carrying_it() {
+        let base = |repo: &mut MemoryRepo| complete_root(repo, "weights", "b", 8, "{{ m }}");
+        let (first_collection, first) = published_root(0x31, base);
+        let (second_collection, second) = published_root(0x32, base);
+        assert_ne!(first_collection, second_collection, "two collections");
+        assert_eq!(first, second, "one model");
+        assert_eq!(index_of(first), index_of(second), "one index identity");
+        for (what, build) in [
+            (
+                "weights",
+                Box::new(|repo: &mut MemoryRepo| complete_root(repo, "other", "b", 8, "{{ m }}"))
+                    as Box<dyn FnOnce(&mut MemoryRepo) -> Fragment>,
+            ),
+            (
+                "tokenizer",
+                Box::new(|repo: &mut MemoryRepo| complete_root(repo, "weights", "c", 8, "{{ m }}")),
+            ),
+            (
+                "config",
+                Box::new(|repo: &mut MemoryRepo| complete_root(repo, "weights", "b", 9, "{{ m }}")),
+            ),
+            (
+                "template",
+                Box::new(|repo: &mut MemoryRepo| {
+                    complete_root(repo, "weights", "b", 8, "{{ m }} ")
+                }),
+            ),
+        ] {
+            let (_, changed) = published_root(0x31, build);
+            assert_ne!(changed, first, "a changed {what} is another model");
+            assert_ne!(
+                index_of(changed),
+                index_of(first),
+                "a changed {what} is another index"
+            );
+        }
+    }
+
+    /// A descriptor written before the identity became content-only states
+    /// the carrying collection and three asset handles. They are facts this
+    /// mapping no longer models, so binding ignores them (open world).
+    #[test]
+    fn a_descriptor_with_retired_asset_arguments_still_binds() {
+        let index = mapping();
+        let (_, descriptor) = descriptor(&index);
+        let mapping_id = triblespace_core::collection::descriptor::mapping(descriptor.facts())
+            .unwrap()
+            .unwrap();
+        let mut older = descriptor.clone();
+        for retired in [
+            mary::format::attrs::model_collection.id(),
+            id_hex!("C1FEADBAD086C8A7EC00C1080D7E2F13"),
+            id_hex!("438EE4FAA8F9465B38DD8CCAD595D3DE"),
+            id_hex!("6850FB2F899C4EA04257547C9C5D63BC"),
+        ] {
+            older.facts_mut().insert(&Trible::force(
+                &mapping_id,
+                &retired,
+                &Inline::<Handle<RawBytes>>::new([7; 32]),
+            ));
+        }
+        assert_eq!(
+            WemmIndex::<Embedding>::bind(&Fragment::empty(), &older).unwrap(),
+            index
+        );
+    }
+
     #[test]
     fn each_semantic_pin_changes_identity_but_neither_packaging_nor_order_is_a_pin() {
         let index = mapping();
         let original = identity();
-        let mut alternatives = [original; 6];
-        alternatives[0].model_collection = Inline::new([7; 32]);
-        alternatives[1].model_root = Id::new([7; 16]).unwrap();
-        alternatives[2].config = Inline::new([7; 32]);
-        alternatives[3].tokenizer_json = Inline::new([7; 32]);
-        alternatives[4].chat_template = Inline::new([7; 32]);
-        alternatives[5].kernel_profile = Id::new([7; 16]).unwrap();
+        let mut alternatives = [original; 2];
+        alternatives[0].model_root = Id::new([7; 16]).unwrap();
+        alternatives[1].kernel_profile = Id::new([7; 16]).unwrap();
         for identity in alternatives {
             assert_ne!(identity, original);
             assert_ne!(
@@ -864,10 +1011,6 @@ mod tests {
         );
         assert_eq!(model_root.id(), mary::format::attrs::model_root.id());
         assert_eq!(
-            model_collection.id(),
-            mary::format::attrs::model_collection.id()
-        );
-        assert_eq!(
             semantic_content_attribute.id(),
             crate::semantic_attributes::semantic_content_attribute.id()
         );
@@ -876,56 +1019,13 @@ mod tests {
     #[test]
     fn loaded_selection_cannot_be_relabelled_and_hardware_is_not_an_architecture_guess() {
         let id = identity();
+        assert!(id.require_loaded_selection(id.model_root).is_ok());
         assert!(id
-            .require_loaded_selection(
-                id.model_root,
-                id.config,
-                id.tokenizer_json,
-                id.chat_template
-            )
-            .is_ok());
-        assert!(id
-            .require_loaded_selection(
-                Id::new([9; 16]).unwrap(),
-                id.config,
-                id.tokenizer_json,
-                id.chat_template
-            )
-            .is_err());
-        assert!(id
-            .require_loaded_selection(
-                id.model_root,
-                Inline::new([9; 32]),
-                id.tokenizer_json,
-                id.chat_template
-            )
-            .is_err());
-        assert!(id
-            .require_loaded_selection(
-                id.model_root,
-                id.config,
-                Inline::new([9; 32]),
-                id.chat_template
-            )
-            .is_err());
-        assert!(id
-            .require_loaded_selection(
-                id.model_root,
-                id.config,
-                id.tokenizer_json,
-                Inline::new([9; 32])
-            )
+            .require_loaded_selection(Id::new([9; 16]).unwrap())
             .is_err());
         let mut other = id;
         other.kernel_profile = Id::new([9; 16]).unwrap();
-        assert!(other
-            .require_loaded_selection(
-                id.model_root,
-                id.config,
-                id.tokenizer_json,
-                id.chat_template
-            )
-            .is_err());
+        assert!(other.require_loaded_selection(id.model_root).is_err());
         assert!(require_gb10("NVIDIA GB10", 12, 1).is_ok());
         for (name, major, minor) in [
             ("NVIDIA GB10", 12, 0),
@@ -1187,7 +1287,7 @@ mod tests {
     /// WEMM_GATE_OVERSIZE_PNG (an image wider than 4096 pixels).
     #[cfg(feature = "semantic-wemm-cuda")]
     #[test]
-    #[ignore = "requires a reserved GB10 and the immutable WeMM model pile"]
+    #[ignore = "requires a reserved GB10 and a pile holding the complete WeMM root"]
     fn native_windows_rows_per_handle_and_maximum_scoring() {
         use mary::models::qwen3_5::input_codec::InputCodec;
         use mary::models::qwen3_5::native::{Assets, NativeWemm};
@@ -1197,17 +1297,17 @@ mod tests {
         use triblespace_core::repo::BlobStorePut;
 
         let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("set {name}"));
-        let assets = std::path::PathBuf::from(var("WEMM_ASSETS"));
-        let asset = |name: &str| std::fs::read(assets.join(name)).unwrap();
-        let (config, tokenizer, template) = (
-            asset("config.json"),
-            asset("tokenizer.json"),
-            asset("chat_template.jinja"),
-        );
+        // WEMM_PILE: a pile whose `models` collection (WEMM_MODELS, 64 hex
+        // digits) holds the complete root WEMM_ROOT. Never written here.
+        let path = std::path::PathBuf::from(var("WEMM_PILE"));
+        let store = mary::persist::read_model_pile_snapshot_read_only(&path).unwrap();
+        let handle = mary::model_collection::parse_collection_handle(&var("WEMM_MODELS")).unwrap();
+        let collection = mary::model_collection::open_model_collection(&store, handle).unwrap();
         let model =
-            mary::persist::read_model_pile_read_only(std::path::Path::new(&var("WEMM_PILE")))
-                .unwrap();
+            mary::model_collection::snapshot_model_collection_for(&store, collection).unwrap();
         let root = Id::from_hex(&var("WEMM_ROOT")).unwrap();
+        let assets = Assets::from_model_root(model.facts(), model.store(), root).unwrap();
+        let codec: InputCodec = assets.codec().clone();
         let mut aliases =
             mary::nn::cuda_bf16_alias::CudaBf16Aliases::new(Default::default(), 759).unwrap();
         let started = Instant::now();
@@ -1215,33 +1315,22 @@ mod tests {
         // process exits.
         let native = unsafe {
             NativeWemm::from_frozen(
-                &model.facts,
-                &model.store,
+                model.facts(),
+                model.store(),
                 root,
-                Assets::from_bytes(&config, &tokenizer, &template).unwrap(),
+                assets,
                 &mut aliases,
                 |_, _, _, _| Ok(()),
             )
         }
         .unwrap();
         eprintln!("bind_ms={}", started.elapsed().as_millis());
-        let pinned = native.asset_handles();
         let identity = WemmIdentity {
-            model_collection: model.collection.handle(),
             model_root: root,
-            config: pinned.config,
-            tokenizer_json: pinned.tokenizer_json,
-            chat_template: pinned.chat_template,
             kernel_profile: GB10_NATIVE_BF16_PROFILE,
         };
-        let codec = InputCodec::from_assets(&tokenizer, &template).unwrap();
         let runtime = Rc::new(RefCell::new(
-            WemmRuntime::from_native(
-                identity,
-                native,
-                InputCodec::from_assets(&tokenizer, &template).unwrap(),
-            )
-            .unwrap(),
+            WemmRuntime::from_native(identity, native, codec.clone()).unwrap(),
         ));
 
         let fits = |window: &str| {
