@@ -1207,7 +1207,6 @@ mod tests {
         let model =
             mary::persist::read_model_pile_read_only(std::path::Path::new(&var("WEMM_PILE")))
                 .unwrap();
-        assert_eq!(model.collections.len(), 1, "one dedicated model collection");
         let root = Id::from_hex(&var("WEMM_ROOT")).unwrap();
         let mut aliases =
             mary::nn::cuda_bf16_alias::CudaBf16Aliases::new(Default::default(), 759).unwrap();
@@ -1228,7 +1227,7 @@ mod tests {
         eprintln!("bind_ms={}", started.elapsed().as_millis());
         let pinned = native.asset_handles();
         let identity = WemmIdentity {
-            model_collection: model.collections[0].collection.handle(),
+            model_collection: model.collection.handle(),
             model_root: root,
             config: pinned.config,
             tokenizer_json: pinned.tokenizer_json,

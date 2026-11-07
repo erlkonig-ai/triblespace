@@ -878,7 +878,7 @@ mod tests {
         let policy =
             CollectionPolicy::new(AdmissionPolicy::direct(root), AdmissionPolicy::direct(root));
         let ambient = store
-            .collection(mary::model_collection::mary_model_graph_name(), policy)
+            .collection(mary::model_collection::model_collection_name(), policy)
             .unwrap();
         store
             .commit(
