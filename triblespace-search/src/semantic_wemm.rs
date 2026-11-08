@@ -53,9 +53,21 @@ pub use mary::format::attrs::model_root;
 /// never maintained outside scratch piles, and nothing reads it.
 pub const WEMM_CONTENT_WINDOWS_TO_NVFP4: Id = id_hex!("3D288D450426ABD3FFF0D2C05887C09D");
 /// Minted with `trible genid`, 2026-10-01. Native BF16 GB10 kernels, pinned
-/// assets/framing, B1 <=256 IDs and complete PNG/JPEG white-pad preparation.
-/// A change to these semantics or canonical output bytes needs another profile.
+/// assets/framing, windows of <=256 IDs and complete PNG/JPEG white-pad
+/// preparation. Since 2026-11-08 windows run as right-padded batches of up
+/// to [`WINDOW_BATCH`], each pooled at its own last token; every row is
+/// bit-identical to its one-window forward (mary c2e280a), so the profile is
+/// unchanged. A change to these semantics or canonical output bytes needs
+/// another profile.
 pub const GB10_NATIVE_BF16_PROFILE: Id = id_hex!("56AA6AA44ECDFF68B91CA45E39BC9EB6");
+/// Most text windows in one forward. Chosen on a GB10 (2026-11-08): a
+/// steady 248-ID scan (on a build with the DeltaNet unroll) gave per window
+/// 155 ms at 1, 127 at 2, 125 at 4, 142 at 8, 248 at 16, and the CubeCL pool
+/// held 639 MiB up to 4 and 2585 MiB from 8; without the unroll a 303-window
+/// corpus took 173.5 ms per window at 1 and 153.2 at 4. Above 4 the K=12288
+/// down projection slows per row. Each window's row is bit-identical at every
+/// batch size.
+pub const WINDOW_BATCH: usize = 4;
 pub const DIMENSION: usize = 4096;
 pub const COMPUTE_CLASS: &str = "gb10";
 /// The most framed token IDs one text window takes: eight under the profile's
@@ -92,8 +104,9 @@ attributes! {
 ///   the root alone suffices here. Which collection, pile or archive carried
 ///   the model is provenance, not identity, and is not stated.
 /// - `kernel_profile` stays. The profile names the native BF16 GB10 kernels
-///   together with the input semantics (framing, the B1 at most 256 IDs
-///   bound, the 256-patch white-pad image preparation). Every one of those
+///   together with the input semantics (framing, at most 256 IDs per
+///   window in right-padded batches, the 256-patch white-pad image
+///   preparation). Every one of those
 ///   changes the vector for the same model and content: another kernel
 ///   accumulates the BF16 GEMMs in another order and lands on other bits,
 ///   which quantize to other NVFP4 rows, and another preparation feeds the
@@ -368,12 +381,23 @@ where
             // Per-call output only. A failed forward drops this vector; no
             // partial target blob is returned or published by the mapping.
             let mut rows = Vec::new();
+            let mut texts = Vec::new();
             for raw in values.iter_ordered() {
                 let bytes = content_bytes(reader, Inline::new(*raw))?;
-                if let Some(input) = classify(bytes.as_ref()) {
-                    let embedded = runtime.encode_content(input, self.window_cap)?;
-                    rows.extend(embedded.into_iter().map(|row| (*raw, row)));
+                match classify(bytes.as_ref()) {
+                    Some(Input::Text(text)) => texts.push((*raw, text.into_owned())),
+                    Some(Input::Image(image)) => rows.extend(
+                        runtime.encode_image(image)?.into_iter().map(|row| (*raw, row))),
+                    None => {}
                 }
+            }
+            // Every text window of this foundation, WINDOW_BATCH per forward.
+            let windows: Vec<(&[u8; 32], &str)> = texts.iter()
+                .flat_map(|(raw, text)| runtime.windows(text, self.window_cap).into_iter().map(move |w| (raw, w)))
+                .collect();
+            for chunk in windows.chunks(WINDOW_BATCH) {
+                let embedded = runtime.encode_windows(&chunk.iter().map(|(_, w)| *w).collect::<Vec<_>>())?;
+                rows.extend(chunk.iter().zip(embedded).map(|((raw, _), row)| (**raw, row)));
             }
             NvFp4CosineSet::from_quantized_rows_4096(rows).map_err(|e| fatal(e.to_string()))
         })
@@ -540,47 +564,60 @@ impl WemmRuntime {
             && identity.kernel_profile == GB10_NATIVE_BF16_PROFILE
     }
 
-    /// One row per window of a text, the first `cap` of them, or one row for
-    /// an image the fixed preparation decodes. An image it cannot decode
-    /// (damaged, or wider or taller than 4096 pixels) is no row.
-    fn encode_content(
+    /// The first `cap` windows of `text`, cut by the pinned tokenizer.
+    fn windows<'t>(&self, text: &'t str, cap: u64) -> Vec<&'t str> {
+        #[cfg(feature = "semantic-wemm-cuda")]
+        {
+            let codec = &self.codec;
+            return windows(text, cap, |window| {
+                codec.text(window).is_ok_and(|ids| ids.as_slice().len() <= WINDOW_IDS)
+            });
+        }
+        #[cfg(not(feature = "semantic-wemm-cuda"))]
+        {
+            let _ = (text, cap);
+            Vec::new()
+        }
+    }
+
+    /// One row per window, all of them through one batched forward.
+    fn encode_windows(
         &mut self,
-        input: Input<'_>,
-        cap: u64,
+        windows: &[&str],
     ) -> Result<Vec<mary::nn::nvfp4_cosine::QuantizedRow>, CollectionOperationError> {
         #[cfg(feature = "semantic-wemm-cuda")]
         {
-            use mary::models::qwen3_5::image_prepare::DecodedRgba;
-            let mut embeddings = Vec::new();
-            match input {
-                Input::Image(bytes) => {
-                    if DecodedRgba::decode(bytes).is_ok() {
-                        embeddings.push(self.native.embed_image(bytes, None).map_err(fatal)?);
-                    }
-                }
-                Input::Text(text) => {
-                    let codec = &self.codec;
-                    for window in windows(&text, cap, |window| {
-                        codec
-                            .text(window)
-                            .is_ok_and(|ids| ids.as_slice().len() <= WINDOW_IDS)
-                    }) {
-                        embeddings.push(self.native.embed_text(window).map_err(fatal)?);
-                    }
-                }
-            }
+            let embeddings = self.native.embed_texts(windows).map_err(fatal)?;
             return embeddings
                 .iter()
-                .map(|embedding| {
-                    self.encoder
-                        .encode(embedding)
-                        .map_err(|e| fatal(e.to_string()))
-                })
+                .map(|e| self.encoder.encode(e).map_err(|e| fatal(e.to_string())))
                 .collect();
         }
         #[cfg(not(feature = "semantic-wemm-cuda"))]
         {
-            let _ = (input, cap);
+            let _ = windows;
+            Err(fatal("native WeMM CUDA runtime is not compiled"))
+        }
+    }
+
+    /// One row for an image the fixed preparation decodes; an image it cannot
+    /// decode (damaged, or wider or taller than 4096 pixels) is no row.
+    fn encode_image(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<Vec<mary::nn::nvfp4_cosine::QuantizedRow>, CollectionOperationError> {
+        #[cfg(feature = "semantic-wemm-cuda")]
+        {
+            use mary::models::qwen3_5::image_prepare::DecodedRgba;
+            if DecodedRgba::decode(bytes).is_err() {
+                return Ok(Vec::new());
+            }
+            let embedding = self.native.embed_image(bytes, None).map_err(fatal)?;
+            return Ok(vec![self.encoder.encode(&embedding).map_err(|e| fatal(e.to_string()))?]);
+        }
+        #[cfg(not(feature = "semantic-wemm-cuda"))]
+        {
+            let _ = bytes;
             Err(fatal("native WeMM CUDA runtime is not compiled"))
         }
     }
