@@ -1224,6 +1224,25 @@ fn derive_order(key: &VerifyingKey, foundation: CollectionData) -> [u8; 32] {
     *hash.finalize().as_bytes()
 }
 
+/// Where a foundation of `length` payload bytes comes in a pass: smaller
+/// payloads first, by the power of two their length falls under, and in the
+/// key's own order ([`derive_order`]) within each such class. A payload that
+/// is not here (`None`) comes last.
+///
+/// One bulk commit can take hours to map, and in a hash order everything
+/// after it waits that long. By size, the small foundations a pass owes are
+/// done first, and the large ones still come in the key's own order, so two
+/// hosts deriving at once still mostly meet different foundations. Only the
+/// order changes: each foundation's image is the same whenever it is mapped.
+fn schedule(
+    key: &VerifyingKey,
+    foundation: CollectionData,
+    length: Option<u64>,
+) -> (u32, [u8; 32]) {
+    let class = length.map_or(u32::MAX, |length| u64::BITS - length.leading_zeros());
+    (class, derive_order(key, foundation))
+}
+
 /// Publish a leaf, `DERIVE(target, L(F), f(F))` with an empty image
 /// included, for every source foundation `F` this pass owes one.
 ///
@@ -1256,9 +1275,10 @@ fn derive_order(key: &VerifyingKey, foundation: CollectionData) -> [u8; 32] {
 /// arrives later, both are here, both are joined, and nothing further is
 /// derived.
 ///
-/// Foundations are derived own first, each group in the key's own order
-/// ([`derive_order`]), and a foundation whose leaf another writer published
-/// while the pass ran is skipped ([`derive_leaf`]).
+/// Foundations are derived own first, each group smallest payload first and
+/// in the key's own order within a size class ([`schedule`]), and a
+/// foundation whose leaf another writer published while the pass ran is
+/// skipped ([`derive_leaf`]).
 ///
 /// Nothing is derived on a host that cannot compute the mapping
 /// ([`DeriveMapping::computable_here`]): its leaves arrive by replication,
@@ -1364,9 +1384,23 @@ where
             readable.insert(&Entry::new(raw));
         }
     }
+    let scheduled = |entries: Vec<(CollectionData, SourceLocator, _)>| {
+        let mut keyed = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let length = snapshot
+                .metadata(Handle::<UnknownBlob>::from_hash(entry.0))
+                .map_err(|error| {
+                    CollectionRealizationError::storage("inspect a source foundation", error)
+                })?
+                .map(|metadata| metadata.length);
+            keyed.push((schedule(&key, entry.0, length), entry));
+        }
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok::<_, CollectionRealizationError>(keyed.into_iter().map(|(_, entry)| entry).collect::<Vec<_>>())
+    };
+    let own = scheduled(own)?;
+    let foreign = scheduled(foreign)?;
     drop(snapshot);
-    own.sort_by_cached_key(|(foundation, _, _)| derive_order(&key, *foundation));
-    foreign.sort_by_cached_key(|(foundation, _, _)| derive_order(&key, *foundation));
     // A foundation with a leaf whose output reads here is done, whoever
     // signed the leaf. One whose leaves' outputs do not read here -- absent,
     // or damaged -- waits for them to be asked for, and is owed a leaf only
@@ -1717,6 +1751,41 @@ mod tests {
     use super::*;
     use crate::collection::coverage::AdmitEveryRecord;
     use crate::collection::{empty_metadata_handle, CollectionCommit};
+
+    /// Smaller size classes come first and an unknown length last; within
+    /// one class the key's own order decides, so two keys still walk a class
+    /// in different orders.
+    #[test]
+    fn schedule_orders_by_size_class_then_by_the_key() {
+        let keys = [41u8, 42].map(|k| SigningKey::from_bytes(&[k; 32]).verifying_key());
+        let lengths = [Some(64), Some(100), Some(20_797_056), None];
+        let foundations: Vec<(CollectionData, Option<u64>)> = (0..64u8)
+            .map(|i| (Inline::new([i; 32]), lengths[usize::from(i % 4)]))
+            .collect();
+        let order = |key: &VerifyingKey| {
+            let mut sorted = foundations.clone();
+            sorted.sort_by_key(|(foundation, length)| schedule(key, *foundation, *length));
+            sorted
+        };
+        let [left, right] = keys.each_ref().map(order);
+        let class = |length: Option<u64>| length.map_or(u32::MAX, |l| 64 - l.leading_zeros());
+        for sorted in [&left, &right] {
+            assert!(sorted.windows(2).all(|w| class(w[0].1) <= class(w[1].1)));
+            // 64 and 100 bytes are one class (7 bits): 32 foundations, then
+            // the 16 large ones, then the 16 not here.
+            assert_eq!(sorted[..32].iter().filter(|(_, l)| l.is_some_and(|l| l < 128)).count(), 32);
+            assert!(sorted[32..48].iter().all(|(_, l)| *l == Some(20_797_056)));
+            assert!(sorted[48..].iter().all(|(_, l)| l.is_none()));
+        }
+        for (key, sorted) in keys.iter().zip([&left, &right]) {
+            for group in sorted.chunk_by(|a, b| class(a.1) == class(b.1)) {
+                assert!(group
+                    .windows(2)
+                    .all(|w| derive_order(key, w[0].0) < derive_order(key, w[1].0)));
+            }
+        }
+        assert_ne!(left, right, "two keys walk a class in different orders");
+    }
 
     #[test]
     fn a_published_witness_requires_its_exact_driven_inputs_and_result() {

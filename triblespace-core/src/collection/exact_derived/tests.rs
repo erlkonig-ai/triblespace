@@ -5336,6 +5336,55 @@ mod lattice_v2 {
         assert_eq!(mixed[..3].iter().copied().collect::<BTreeSet<_>>(), own);
     }
 
+    /// A pass derives smaller payloads first: a large foundation the key's
+    /// own order puts early still waits for the small ones, and the key's
+    /// order decides within one size class. Only the order changes: every
+    /// foundation is mapped once and gets its leaf.
+    #[test]
+    fn smaller_foundations_are_derived_before_larger_ones() {
+        reset_mapping_calls();
+        let (mut store, root, first, _) = collections_as(&key(41));
+        let small: Vec<CollectionData> = (0..12)
+            .map(|entity| own_commit(&mut store, root, 41, entity))
+            .collect();
+        let large = (100..200u8)
+            .map(|entity| {
+                let mut facts = TribleSet::new();
+                for value in 1..=32 {
+                    facts.insert(&row(entity, value));
+                }
+                facts.to_blob()
+            })
+            .min_by_key(|blob| derive_rank(41, data(blob)))
+            .unwrap();
+        let large = publish_root(&mut store, root, &large, 41).data();
+        assert!(
+            small
+                .iter()
+                .any(|small| derive_rank(41, *small) > derive_rank(41, large)),
+            "the key's own order alone would derive the large one before a small one"
+        );
+
+        block_on(store.maintain(first, &key(41))).unwrap();
+        let mapped = FIRST_MAP_LOG.with_borrow(|log| log.clone());
+        let mut by_rank = small.clone();
+        by_rank.sort_by_key(|small| derive_rank(41, *small));
+        by_rank.push(large);
+        assert_eq!(mapped, by_rank);
+        let leaves: BTreeSet<SourceLocator> = leaves_by(&mut store, first, 41)
+            .iter()
+            .map(|leaf| leaf.input())
+            .collect();
+        assert_eq!(
+            leaves,
+            small
+                .iter()
+                .chain([&large])
+                .map(|foundation| SourceLocator::of(foundation.raw))
+                .collect()
+        );
+    }
+
     /// The order a pass by `signer` derives `foundation` in, computed as
     /// maintenance computes it, so a test can place one foundation after
     /// others in it.
