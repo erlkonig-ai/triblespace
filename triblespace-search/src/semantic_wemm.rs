@@ -400,9 +400,24 @@ where
                 .zip(&cuts)
                 .flat_map(|((raw, _), cut)| cut.iter().map(move |w| (raw, *w)))
                 .collect();
-            for chunk in windows.chunks(WINDOW_BATCH) {
+            // A large foundation embeds for hours with nothing published until
+            // the end, so its progress is logged once a minute; small ones say
+            // nothing.
+            let started = std::time::Instant::now();
+            let mut reported = started;
+            for (done, chunk) in windows.chunks(WINDOW_BATCH).enumerate() {
                 let embedded = runtime.encode_windows(&chunk.iter().map(|(_, w)| *w).collect::<Vec<_>>())?;
                 rows.extend(chunk.iter().zip(embedded).map(|((raw, _), row)| (**raw, row)));
+                if reported.elapsed() >= PROGRESS_EVERY {
+                    reported = std::time::Instant::now();
+                    let finished = ((done + 1) * WINDOW_BATCH).min(windows.len());
+                    let elapsed = started.elapsed().as_secs_f64();
+                    eprintln!(
+                        "wemm: embedded {finished}/{} windows in {elapsed:.0} s, {:.0} s left at this rate",
+                        windows.len(),
+                        elapsed * (windows.len() - finished) as f64 / finished as f64,
+                    );
+                }
             }
             NvFp4CosineSet::from_quantized_rows_4096(rows).map_err(|e| fatal(e.to_string()))
         })
@@ -563,6 +578,10 @@ const CUT_THREADS: usize = 8;
 /// slow derivation says which content it spent the time on.
 #[cfg(feature = "semantic-wemm-cuda")]
 const SLOW_CUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often a foundation's embedding logs its progress on stderr.
+#[cfg(feature = "semantic-wemm-cuda")]
+const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// [`cut_windows`] of every text, in the texts' order, on up to
 /// [`CUT_THREADS`] threads. Each text is cut whole on one thread by the same
