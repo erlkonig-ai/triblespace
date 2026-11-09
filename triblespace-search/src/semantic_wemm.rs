@@ -392,8 +392,13 @@ where
                 }
             }
             // Every text window of this foundation, WINDOW_BATCH per forward.
-            let windows: Vec<(&[u8; 32], &str)> = texts.iter()
-                .flat_map(|(raw, text)| runtime.windows(text, self.window_cap).into_iter().map(move |w| (raw, w)))
+            // The texts are cut in parallel, all before the first forward;
+            // the windows and batches are the sequential ones, in order.
+            let cuts = runtime.cut_all(&texts, self.window_cap);
+            let windows: Vec<(&[u8; 32], &str)> = texts
+                .iter()
+                .zip(&cuts)
+                .flat_map(|((raw, _), cut)| cut.iter().map(move |w| (raw, *w)))
                 .collect();
             for chunk in windows.chunks(WINDOW_BATCH) {
                 let embedded = runtime.encode_windows(&chunk.iter().map(|(_, w)| *w).collect::<Vec<_>>())?;
@@ -550,6 +555,51 @@ fn cut_windows<'t>(
     (cut, probes)
 }
 
+/// The threads [`cut_all`] cuts on.
+#[cfg(feature = "semantic-wemm-cuda")]
+const CUT_THREADS: usize = 8;
+
+/// [`cut_windows`] of every text, in the texts' order, on up to
+/// [`CUT_THREADS`] threads. Each text is cut whole on one thread by the same
+/// pure function, and its windows land at its own index, so the result is
+/// the sequential one; only the wall time changes.
+#[cfg(feature = "semantic-wemm-cuda")]
+fn cut_all<'t>(
+    codec: &mary::models::qwen3_5::input_codec::InputCodec,
+    texts: &'t [([u8; 32], String)],
+    cap: u64,
+) -> Vec<Vec<&'t str>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let mut cuts = vec![Vec::new(); texts.len()];
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..CUT_THREADS.min(texts.len()))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let at = next.fetch_add(1, Ordering::Relaxed);
+                        let Some((_, text)) = texts.get(at) else {
+                            break done;
+                        };
+                        let (cut, _) = cut_windows(codec, text, cap);
+                        done.push((at, cut));
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            let done = worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            for (at, cut) in done {
+                cuts[at] = cut;
+            }
+        }
+    });
+    cuts
+}
+
 /// An owned selected native session, never an ambient model loader. Without
 /// `semantic-wemm-cuda` this type has no public constructor; descriptors and
 /// joins still work and nonempty compute explicitly reports unavailable.
@@ -611,16 +661,17 @@ impl WemmRuntime {
             && identity.kernel_profile == GB10_NATIVE_BF16_PROFILE
     }
 
-    /// The first `cap` windows of `text`, cut by the pinned tokenizer.
-    fn windows<'t>(&self, text: &'t str, cap: u64) -> Vec<&'t str> {
+    /// The first `cap` windows of each text, cut by the pinned tokenizer,
+    /// in the texts' order ([`cut_all`]).
+    fn cut_all<'t>(&self, texts: &'t [([u8; 32], String)], cap: u64) -> Vec<Vec<&'t str>> {
         #[cfg(feature = "semantic-wemm-cuda")]
         {
-            return cut_windows(&self.codec, text, cap).0;
+            return cut_all(&self.codec, texts, cap);
         }
         #[cfg(not(feature = "semantic-wemm-cuda"))]
         {
-            let _ = (text, cap);
-            Vec::new()
+            let _ = cap;
+            texts.iter().map(|_| Vec::new()).collect()
         }
     }
 
@@ -1499,6 +1550,61 @@ mod tests {
             "total contents={} windows={windows_total} {}",
             paths.len(),
             totals.join(" ")
+        );
+    }
+
+    /// [`cut_all`] against [`cut_windows`] text by text on real content,
+    /// CPU only: the same windows per text and so the same batches of
+    /// [`WINDOW_BATCH`] windows, in the same order, for the forward. All
+    /// sample texts form one foundation here. Prints both wall times.
+    #[cfg(feature = "semantic-wemm-cuda")]
+    #[test]
+    #[ignore = "requires WEMM_CHECKPOINT_DIR and WEMM_SAMPLE_DIR; CPU only"]
+    fn parallel_cut_hands_the_forward_the_sequential_batches() {
+        let codec = checkpoint_codec();
+        let dir = std::env::var("WEMM_SAMPLE_DIR").expect("set WEMM_SAMPLE_DIR");
+        let mut paths: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        paths.sort();
+        let mut texts = Vec::new();
+        for path in &paths {
+            let bytes = std::fs::read(path).unwrap();
+            if let Some(Input::Text(text)) = classify(&bytes) {
+                let raw = *blake3::hash(&bytes).as_bytes();
+                texts.push((raw, text.into_owned()));
+            }
+        }
+        assert!(texts.len() > CUT_THREADS);
+        let batches = |cuts: &[Vec<&str>]| -> Vec<Vec<([u8; 32], String)>> {
+            let windows: Vec<(&[u8; 32], &str)> = texts
+                .iter()
+                .zip(cuts)
+                .flat_map(|((raw, _), cut)| cut.iter().map(move |w| (raw, *w)))
+                .collect();
+            windows
+                .chunks(WINDOW_BATCH)
+                .map(|chunk| chunk.iter().map(|(r, w)| (**r, w.to_string())).collect())
+                .collect()
+        };
+        let started = std::time::Instant::now();
+        let sequential: Vec<Vec<&str>> = texts
+            .iter()
+            .map(|(_, text)| cut_windows(&codec, text, DEFAULT_WINDOW_CAP).0)
+            .collect();
+        let sequential_s = started.elapsed().as_secs_f64();
+        let started = std::time::Instant::now();
+        let parallel = cut_all(&codec, &texts, DEFAULT_WINDOW_CAP);
+        let parallel_s = started.elapsed().as_secs_f64();
+        assert_eq!(sequential, parallel);
+        let (sequential, parallel) = (batches(&sequential), batches(&parallel));
+        assert_eq!(sequential, parallel);
+        eprintln!(
+            "parallel texts={} batches={} windows={} threads={CUT_THREADS} sequential_s={sequential_s:.3} parallel_s={parallel_s:.3} identical=yes",
+            texts.len(),
+            parallel.len(),
+            parallel.iter().map(Vec::len).sum::<usize>()
         );
     }
 
