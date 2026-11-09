@@ -503,6 +503,19 @@ fn windows<'t>(text: &'t str, cap: u64, mut fits: impl FnMut(&str) -> bool) -> V
     windows
 }
 
+/// Whether `window` frames to at most [`WINDOW_IDS`] IDs. A probe the codec
+/// can prove too long without tokenizing (`surely_exceeds`) gets the same
+/// false it would have computed: the greedy cut's first probe of a window is
+/// the whole rest of a one-line text, up to 1 MiB, and that tokenization
+/// was most of the cost of cutting HTML.
+#[cfg(feature = "semantic-wemm-cuda")]
+fn window_fits(codec: &mary::models::qwen3_5::input_codec::InputCodec, window: &str) -> bool {
+    !codec.surely_exceeds(window, WINDOW_IDS)
+        && codec
+            .text(window)
+            .is_ok_and(|ids| ids.as_slice().len() <= WINDOW_IDS)
+}
+
 /// An owned selected native session, never an ambient model loader. Without
 /// `semantic-wemm-cuda` this type has no public constructor; descriptors and
 /// joins still work and nonempty compute explicitly reports unavailable.
@@ -569,9 +582,7 @@ impl WemmRuntime {
         #[cfg(feature = "semantic-wemm-cuda")]
         {
             let codec = &self.codec;
-            return windows(text, cap, |window| {
-                codec.text(window).is_ok_and(|ids| ids.as_slice().len() <= WINDOW_IDS)
-            });
+            return windows(text, cap, |window| window_fits(codec, window));
         }
         #[cfg(not(feature = "semantic-wemm-cuda"))]
         {
@@ -1316,6 +1327,77 @@ mod tests {
         assert_eq!(slot.run(owned, || 42).unwrap(), 42);
     }
 
+    /// Old against new cutting on real content, CPU only, byte for byte:
+    /// every window of every sample under the plain tokenizer probe and under
+    /// [`window_fits`] (which refuses provably long probes untokenized).
+    /// Prints per content the bytes,
+    /// what it classified as, its windows, and the cutting time of each
+    /// (wall, one thread, release). WEMM_CHECKPOINT_DIR holds the pinned
+    /// `tokenizer.json` and `chat_template.jinja`; WEMM_SAMPLE_DIR holds
+    /// content files, read in name order.
+    #[cfg(feature = "semantic-wemm-cuda")]
+    #[test]
+    #[ignore = "requires WEMM_CHECKPOINT_DIR and WEMM_SAMPLE_DIR; CPU only"]
+    fn length_refusal_cuts_the_same_windows_on_real_content() {
+        use mary::models::qwen3_5::input_codec::InputCodec;
+        use std::time::Instant;
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("set {name}"));
+        let assets = std::path::PathBuf::from(var("WEMM_CHECKPOINT_DIR"));
+        let codec = InputCodec::from_assets(
+            &std::fs::read(assets.join("tokenizer.json")).unwrap(),
+            &std::fs::read(assets.join("chat_template.jinja")).unwrap(),
+        )
+        .unwrap();
+        let old = |w: &str| {
+            codec
+                .text(w)
+                .is_ok_and(|ids| ids.as_slice().len() <= WINDOW_IDS)
+        };
+        let mut paths: Vec<_> = std::fs::read_dir(var("WEMM_SAMPLE_DIR"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        paths.sort();
+        assert!(!paths.is_empty());
+        let (mut old_total, mut new_total, mut windows_total) = (0.0, 0.0, 0);
+        for path in &paths {
+            let bytes = std::fs::read(path).unwrap();
+            let name = path.file_name().unwrap().to_string_lossy();
+            let started = Instant::now();
+            let input = classify(&bytes);
+            let classify_s = started.elapsed().as_secs_f64();
+            let (kind, text_len, cut) = match &input {
+                Some(Input::Text(text)) => {
+                    let started = Instant::now();
+                    let before = windows(text, DEFAULT_WINDOW_CAP, old);
+                    let old_s = started.elapsed().as_secs_f64();
+                    let started = Instant::now();
+                    let after = windows(text, DEFAULT_WINDOW_CAP, |w| window_fits(&codec, w));
+                    let new_s = started.elapsed().as_secs_f64();
+                    assert_eq!(before, after, "{name}");
+                    old_total += old_s;
+                    new_total += new_s;
+                    windows_total += after.len();
+                    (
+                        "text",
+                        text.len(),
+                        format!("windows={} old_s={old_s:.3} new_s={new_s:.3}", after.len()),
+                    )
+                }
+                Some(Input::Image(_)) => ("image", 0, String::new()),
+                None => ("none", 0, String::new()),
+            };
+            eprintln!(
+                "content {name} bytes={} kind={kind} text_bytes={text_len} classify_s={classify_s:.3} {cut}",
+                bytes.len()
+            );
+        }
+        eprintln!(
+            "total contents={} windows={windows_total} cut_old_s={old_total:.3} cut_new_s={new_total:.3}",
+            paths.len()
+        );
+    }
+
     /// The real model on a scratch in-memory store: rows per content handle,
     /// and a query only the long text's later window matches scoring that
     /// handle highest. Prints bind, per-item and query latency. The runner
@@ -1370,11 +1452,7 @@ mod tests {
             WemmRuntime::from_native(identity, native, codec.clone()).unwrap(),
         ));
 
-        let fits = |window: &str| {
-            codec
-                .text(window)
-                .is_ok_and(|ids| ids.as_slice().len() <= WINDOW_IDS)
-        };
+        let fits = |window: &str| window_fits(&codec, window);
         let filler: String = (0..40)
             .map(|i| format!("Entry {i}: the lighthouse keeper trimmed the lamp wick, wound the clockwork that turns the lens and logged each passing ship.\n"))
             .collect();
