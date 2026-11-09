@@ -641,6 +641,8 @@ fn cut_all<'t>(
 /// joins still work and nonempty compute explicitly reports unavailable.
 pub struct WemmRuntime {
     identity: WemmIdentity,
+    /// Model forwards this runtime has started, every kind counted.
+    forwards: u64,
     #[cfg(feature = "semantic-wemm-cuda")]
     native: mary::models::qwen3_5::native::NativeWemm,
     #[cfg(feature = "semantic-wemm-cuda")]
@@ -680,6 +682,7 @@ impl WemmRuntime {
             .map_err(|e| fatal(e.to_string()))?;
         Ok(Self {
             identity,
+            forwards: 0,
             native,
             codec,
             encoder,
@@ -689,6 +692,43 @@ impl WemmRuntime {
 
     pub fn identity(&self) -> WemmIdentity {
         self.identity
+    }
+
+    /// How many model forwards this runtime has started: text batches,
+    /// images, queries and probes alike. The first forward is number 0.
+    pub fn forwards(&self) -> u64 {
+        self.forwards
+    }
+
+    /// One batched text forward of `texts`, in the given order, for a
+    /// caller's self-check. Returns the framed token IDs of each text, this
+    /// forward's number ([`Self::forwards`] before it ran), and the raw BF16
+    /// bytes of each text's embedding, concatenated in order (8192 bytes per
+    /// text). Nothing is encoded, published or cached.
+    #[cfg(feature = "semantic-wemm-cuda")]
+    pub fn probe_texts(&mut self, texts: &[&str]) -> Result<ProbeOutput, CollectionOperationError> {
+        let ids = texts
+            .iter()
+            .map(|text| self.codec.text(text).map(|ids| ids.as_slice().to_vec()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| fatal(format!("WeMM probe text preparation: {e}")))?;
+        let forward = self.forwards;
+        self.forwards += 1;
+        let embeddings = self.native.embed_texts(texts).map_err(fatal)?;
+        let mut raw = Vec::with_capacity(texts.len() * DIMENSION * 2);
+        for embedding in &embeddings {
+            let bytes = embedding.meta.shape().as_slice().iter().product::<usize>() * 2;
+            let read = embedding
+                .client
+                .read_one(embedding.handle.clone())
+                .map_err(|e| fatal(format!("WeMM probe readback: {e:?}")))?;
+            let read: &[u8] = &read;
+            raw.extend_from_slice(
+                read.get(..bytes)
+                    .ok_or_else(|| fatal("WeMM probe readback is shorter than its tensor"))?,
+            );
+        }
+        Ok(ProbeOutput { ids, forward, raw })
     }
 
     fn matches(&self, identity: &WemmIdentity) -> bool {
@@ -718,6 +758,7 @@ impl WemmRuntime {
     ) -> Result<Vec<mary::nn::nvfp4_cosine::QuantizedRow>, CollectionOperationError> {
         #[cfg(feature = "semantic-wemm-cuda")]
         {
+            self.forwards += 1;
             let embeddings = self.native.embed_texts(windows).map_err(fatal)?;
             return embeddings
                 .iter()
@@ -743,6 +784,7 @@ impl WemmRuntime {
             if DecodedRgba::decode(bytes).is_err() {
                 return Ok(Vec::new());
             }
+            self.forwards += 1;
             let embedding = self.native.embed_image(bytes, None).map_err(fatal)?;
             return Ok(vec![self.encoder.encode(&embedding).map_err(|e| fatal(e.to_string()))?]);
         }
@@ -765,6 +807,7 @@ impl WemmRuntime {
     {
         #[cfg(feature = "semantic-wemm-cuda")]
         {
+            self.forwards += 1;
             let embedding = self.native.embed_text(text).map_err(fatal)?;
             let query = self
                 .scorer
@@ -796,6 +839,7 @@ impl WemmRuntime {
             if !matches!(classify(encoded), Some(Input::Image(_))) {
                 return Err(fatal("image query is not PNG/JPEG"));
             }
+            self.forwards += 1;
             let embedding = self.native.embed_image(encoded, None).map_err(fatal)?;
             let query = self
                 .scorer
@@ -811,6 +855,17 @@ impl WemmRuntime {
             Err(fatal("native WeMM CUDA runtime is not compiled"))
         }
     }
+}
+
+/// What [`WemmRuntime::probe_texts`] observed.
+#[derive(Clone, Debug)]
+pub struct ProbeOutput {
+    /// The framed token IDs of each probe text, in order.
+    pub ids: Vec<Vec<u32>>,
+    /// This forward's number in its runtime; the first forward is 0.
+    pub forward: u64,
+    /// Each text's BF16 embedding bytes, concatenated in order.
+    pub raw: Vec<u8>,
 }
 
 fn require_gb10(name: &str, major: i32, minor: i32) -> Result<(), CollectionOperationError> {
