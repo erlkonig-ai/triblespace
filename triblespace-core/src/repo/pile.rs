@@ -35,6 +35,8 @@ use std::path::Path;
 use std::ptr::slice_from_raw_parts;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use zerocopy::Immutable;
@@ -84,6 +86,9 @@ mod append_visibility_tests;
 mod prefix_tests;
 mod record_kind;
 mod record_index;
+mod turnstile;
+#[cfg(test)]
+mod turnstile_tests;
 use record_index::CollectionRecordIndex;
 pub use record_kind::{described_kinds, description_blobs, RecordKind, KIND_PILE_RECORD};
 
@@ -331,6 +336,22 @@ fn block_post_pad(data_len: usize) -> usize {
 /// duration of the large append. The margin keeps us comfortably below
 /// any platform's single-call ceiling.
 const ATOMIC_WRITE_LIMIT: usize = 1 << 30;
+
+/// How long a shared replay holds the shared file lock before it releases it
+/// and queues again behind any waiting writer, so a writer waits behind a long
+/// replay (a fresh open of a large pile) for about this instead of the whole
+/// replay.
+///
+/// It is a soft threshold, not a bound. The clock is read only after every
+/// [`SHARED_REPLAY_STRIDE`] records, and a record is never split. A stride of
+/// records that are slow to apply holds the lock past it by as long as they
+/// take: opaque and retired-proof frames are BLAKE3-hashed whole, and
+/// collection records are indexed. Small blob records apply in under a
+/// microsecond each, so for them the overrun is small.
+const SHARED_REPLAY_SLICE: Duration = Duration::from_millis(5);
+
+/// Records a shared replay applies between clock reads.
+const SHARED_REPLAY_STRIDE: u32 = 256;
 
 /// Payloads at least this large may use BLAKE3's Rayon join strategy when the
 /// current pool has more than one worker. Smaller payloads stay on the serial
@@ -3033,6 +3054,10 @@ pub struct PileFile {
     applied_length: usize,
     /// The fixed prefix a [`Self::open_prefix`] handle is bounded to.
     prefix: Option<usize>,
+    /// Whether this descriptor takes part in the writer-preference
+    /// turnstile (see the `turnstile` module). Fairness only: correctness
+    /// never depends on it.
+    turnstile: bool,
 }
 
 /// Arrivals in one applied batch that can change a parked coverage decision.
@@ -3995,6 +4020,7 @@ impl PileFile {
             .len(mapped_size)
             .map_raw_read_only(&file)?;
         let mmap = Arc::new(mmap);
+        let turnstile = turnstile::supported(&file);
 
         Ok(Self {
             file,
@@ -4014,6 +4040,7 @@ impl PileFile {
             wants: PATCH::<WANT_REQUEST_BYTES_LEN, IdentitySchema>::new(),
             applied_length: 0,
             prefix,
+            turnstile,
         })
     }
 
@@ -4043,8 +4070,14 @@ impl PileFile {
     /// which takes an exclusive lock before truncating. A parse failure is
     /// rechecked once under an exclusive lock with a fresh file length: shared
     /// writers may expose an incomplete record during a single append syscall.
+    ///
+    /// Where the platform supports the writer-preference turnstile (Linux,
+    /// local filesystems), the shared lock is taken behind any writer already
+    /// waiting for the exclusive one, and a long replay releases and retakes
+    /// it at record boundaries every few milliseconds, so overlapping readers
+    /// cannot keep a writer out.
     pub fn refresh(&mut self) -> Result<(), ReadError> {
-        self.file.lock_shared()?;
+        self.lock_shared()?;
         let res = self.refresh_shared_locked();
         let unlock_res = self.file.unlock();
         res?;
@@ -4082,7 +4115,28 @@ impl PileFile {
                 "a pile handle bounded to a fixed prefix never writes or takes the exclusive lock",
             ));
         }
-        self.file.lock()
+        // Holding the turnstile while waiting stops new shared holders from
+        // arriving in front of this writer; it waits only for those already
+        // holding the shared lock. Nothing holds the pile lock while waiting
+        // for the turnstile, and the turnstile is only ever held across this
+        // one acquisition, so the order turnstile-then-pile cannot cycle.
+        let entered = self.turnstile && turnstile::enter(&self.file, true);
+        let locked = self.file.lock();
+        if entered {
+            turnstile::leave(&self.file);
+        }
+        locked
+    }
+
+    /// The shared file lock every replay and atomic append takes, entered
+    /// behind any writer already waiting for the exclusive lock.
+    fn lock_shared(&self) -> std::io::Result<()> {
+        let entered = self.turnstile && turnstile::enter(&self.file, false);
+        let locked = self.file.lock_shared();
+        if entered {
+            turnstile::leave(&self.file);
+        }
+        locked
     }
 
     /// Applies one record from a file-length snapshot already covered by the
@@ -4248,7 +4302,7 @@ impl PileFile {
     /// with an exclusive lock and replay once more. The caller must unlock on
     /// every return path; successful recovery retains the stronger lock.
     fn refresh_shared_locked(&mut self) -> Result<(), ReadError> {
-        match self.refresh_locked() {
+        match self.replay_observed(self.turnstile) {
             // A bounded handle never rechecks: its replay bound is the fixed
             // prefix, not a fresh length an in-flight append could move, and
             // the recheck would take the exclusive lock.
@@ -4270,17 +4324,69 @@ impl PileFile {
     }
 
     fn refresh_locked(&mut self) -> Result<(), ReadError> {
+        self.replay_observed(false)
+    }
+
+    /// Replays the observed prefix with the pile lock already held.
+    ///
+    /// With `yield_shared` (the caller holds the SHARED lock), the lock is
+    /// released and retaken behind any waiting writer every
+    /// [`SHARED_REPLAY_SLICE`], always at a record boundary. That is safe
+    /// because of what the shared lock actually protects during replay:
+    ///
+    /// - Amputation, the only path that shrinks the file, needs the exclusive
+    ///   lock and truncates at the first malformed record, never below a
+    ///   record this replay has applied (replay is a deterministic parse of
+    ///   append-only bytes). So in a release only bytes at or past
+    ///   `applied_length` can disappear. The bound is re-observed after every
+    ///   reacquire and only ever lowered, so no byte past end of file is read.
+    /// - Appends land at end of file. Without an amputation in a release,
+    ///   that is at or past the bound, so the bytes replayed are those of the
+    ///   first observation. After an amputation, appends may refill bytes
+    ///   below the bound; replay reads them after the reacquire, under the
+    ///   shared lock, as a fresh refresh would. An exclusive (multi-syscall)
+    ///   append has completed before the shared lock is retaken.
+    /// - The old bound can then fall inside a refilled record. Replay sees
+    ///   that record as incomplete, exactly as it sees an atomic append in
+    ///   flight without yielding, and `refresh_shared_locked` resolves both
+    ///   the same way: an exclusive recheck at a fresh length.
+    ///   `turnstile_tests::amputation_gap_during_a_yield` drives this schedule.
+    fn replay_observed(&mut self, yield_shared: bool) -> Result<(), ReadError> {
         // A fixed bound avoids a metadata syscall per record. Under a shared
         // lock this can end inside an in-flight append; refresh_shared_locked
         // confirms a parse failure after excluding all participating writers.
         // Later appends are intentionally left for the next refresh.
-        let file_len = self.observed_file_len()?;
+        let mut file_len = self.observed_file_len()?;
         if file_len < self.applied_length {
             std::process::abort();
         }
         self.ensure_mapped(file_len)?;
+        let mut held_since = Instant::now();
+        let mut stride = 0u32;
         loop {
             match self.apply_next_bounded(file_len) {
+                Ok(Some(_)) if yield_shared => {
+                    stride += 1;
+                    let due = stride >= SHARED_REPLAY_STRIDE && {
+                        stride = 0;
+                        held_since.elapsed() >= SHARED_REPLAY_SLICE
+                    };
+                    #[cfg(test)]
+                    let due = turnstile_tests::yield_due(self.applied_length).unwrap_or(due);
+                    if !due {
+                        continue;
+                    }
+                    self.file.unlock()?;
+                    #[cfg(test)]
+                    turnstile_tests::while_released();
+                    self.lock_shared()?;
+                    let observed = self.observed_file_len()?;
+                    if observed < self.applied_length {
+                        std::process::abort();
+                    }
+                    file_len = file_len.min(observed);
+                    held_since = Instant::now();
+                }
                 Ok(Some(_)) => {}
                 Ok(None) => return Ok(()),
                 Err(ReadError::CorruptPile { valid_length }) if self.prefix.is_some() => {
@@ -5280,7 +5386,7 @@ impl PileFile {
         let use_atomic = record_size <= ATOMIC_WRITE_LIMIT;
 
         if use_atomic {
-            self.file.lock_shared()?;
+            self.lock_shared()?;
         } else {
             // Oversized record: exclude other writers for the duration of
             // the multi-syscall append. Shared readers ([`refresh`]) block

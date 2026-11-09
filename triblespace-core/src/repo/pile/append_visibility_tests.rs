@@ -12,7 +12,7 @@ use std::time::Duration;
 type Hook = Option<Box<dyn FnOnce()>>;
 
 thread_local! {
-    static BEFORE_EXCLUSIVE_RECHECK: RefCell<Hook> = RefCell::new(None);
+    pub(super) static BEFORE_EXCLUSIVE_RECHECK: RefCell<Hook> = RefCell::new(None);
     static BEFORE_BLOB_READBACK: RefCell<Hook> = RefCell::new(None);
 }
 
@@ -30,7 +30,7 @@ pub(super) fn before_blob_readback() {
     }
 }
 
-fn blob_frame(payload: &[u8]) -> (Inline<Handle<UnknownBlob>>, Vec<u8>) {
+pub(super) fn blob_frame(payload: &[u8]) -> (Inline<Handle<UnknownBlob>>, Vec<u8>) {
     let blob = Blob::<UnknownBlob>::new(Bytes::from_source(payload.to_vec()));
     let handle = blob.get_handle();
     let blocks = envelope_blocks_for_payload(payload.len()).unwrap();
