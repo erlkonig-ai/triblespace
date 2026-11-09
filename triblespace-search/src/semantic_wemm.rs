@@ -468,8 +468,23 @@ fn classify(bytes: &[u8]) -> Option<Input<'_>> {
 /// whole lines that `fits`; a line that does not fit alone is cut between
 /// words, and a word that does not fit alone between characters. Whitespace
 /// between windows belongs to neither.
+///
+/// `same(shorter, longer)`, for `longer` starting with `shorter`, may be true
+/// only where `fits(longer) == fits(shorter)` (for the real cut,
+/// `InputCodec::same_text`). The cut then skips the probes it makes
+/// redundant and is exactly the cut without it: a probe is skipped only
+/// when it extends `rest[..end]`, which has already fit (`end` moves only on
+/// a fit, and a later unit's pass starts at 0), so the skipped probe would
+/// have said true too. That turns a run of blank lines, which the template
+/// trims from the probe's end, from one full tokenization per line into
+/// none.
 #[cfg_attr(not(feature = "semantic-wemm-cuda"), allow(dead_code))]
-fn windows<'t>(text: &'t str, cap: u64, mut fits: impl FnMut(&str) -> bool) -> Vec<&'t str> {
+fn windows<'t>(
+    text: &'t str,
+    cap: u64,
+    mut fits: impl FnMut(&str) -> bool,
+    same: impl Fn(&str, &str) -> bool,
+) -> Vec<&'t str> {
     let units: [fn(&str) -> usize; 3] = [
         |s| s.find('\n').map_or(s.len(), |at| at + 1),
         |s| {
@@ -485,7 +500,8 @@ fn windows<'t>(text: &'t str, cap: u64, mut fits: impl FnMut(&str) -> bool) -> V
         for unit in units {
             while end < rest.len() {
                 let next = end + unit(&rest[end..]);
-                if !fits(&rest[..next]) {
+                let known = end > 0 && same(&rest[..end], &rest[..next]);
+                if !known && !fits(&rest[..next]) {
                     break;
                 }
                 end = next;
@@ -514,6 +530,24 @@ fn window_fits(codec: &mary::models::qwen3_5::input_codec::InputCodec, window: &
         && codec
             .text(window)
             .is_ok_and(|ids| ids.as_slice().len() <= WINDOW_IDS)
+}
+
+/// The real cut: [`windows`] under [`window_fits`], skipping the probes
+/// `InputCodec::same_text` answers, and how many probes it did run.
+#[cfg(feature = "semantic-wemm-cuda")]
+fn cut_windows<'t>(
+    codec: &mary::models::qwen3_5::input_codec::InputCodec,
+    text: &'t str,
+    cap: u64,
+) -> (Vec<&'t str>, usize) {
+    use mary::models::qwen3_5::input_codec::InputCodec;
+    let mut probes = 0;
+    let fits = |window: &str| {
+        probes += 1;
+        window_fits(codec, window)
+    };
+    let cut = windows(text, cap, fits, InputCodec::same_text);
+    (cut, probes)
 }
 
 /// An owned selected native session, never an ambient model loader. Without
@@ -581,8 +615,7 @@ impl WemmRuntime {
     fn windows<'t>(&self, text: &'t str, cap: u64) -> Vec<&'t str> {
         #[cfg(feature = "semantic-wemm-cuda")]
         {
-            let codec = &self.codec;
-            return windows(text, cap, |window| window_fits(codec, window));
+            return cut_windows(&self.codec, text, cap).0;
         }
         #[cfg(not(feature = "semantic-wemm-cuda"))]
         {
@@ -1282,23 +1315,46 @@ mod tests {
 
     #[test]
     fn windows_pack_whole_lines_then_words_then_characters_up_to_the_cap() {
+        let never = |_: &str, _: &str| false;
         let four_words = |window: &str| window.split_whitespace().count() <= 4;
         assert_eq!(
             windows(
                 "one two\nthree four\nfive six seven\neight\n",
                 16,
-                four_words
+                four_words,
+                never
             ),
             ["one two\nthree four", "five six seven\neight"]
         );
         let ten_bytes = |window: &str| window.trim().len() <= 10;
         let text = "  ab cd\nefghijkl mn opq\nrstuvwxyz\u{e4}BCDEFG\n";
         let all = ["ab cd", "efghijkl", "mn opq", "rstuvwxyz", "\u{e4}BCDEFG"];
-        assert_eq!(windows(text, 16, ten_bytes), all);
-        assert_eq!(windows(text, 2, ten_bytes), all[..2]);
-        assert!(windows(text, 0, ten_bytes).is_empty());
-        assert!(windows(" \n\t", 16, ten_bytes).is_empty());
-        assert_eq!(windows("ab", 16, |_| false), ["a", "b"]);
+        assert_eq!(windows(text, 16, ten_bytes, never), all);
+        assert_eq!(windows(text, 2, ten_bytes, never), all[..2]);
+        assert!(windows(text, 0, ten_bytes, never).is_empty());
+        assert!(windows(" \n\t", 16, ten_bytes, never).is_empty());
+        assert_eq!(windows("ab", 16, |_| false, never), ["a", "b"]);
+        // A `same` that is true where `ten_bytes` must agree (only trimmed
+        // whitespace added) cuts the same windows with fewer probes.
+        let spaced = |a: &str, b: &str| b[a.len()..].chars().all(char::is_whitespace);
+        let blank = format!("ab\n{}cd ef\n\n \ngh{}ij", "\n".repeat(50), " ".repeat(30));
+        let counted = |skip: bool| {
+            let mut probes = 0;
+            let cut = windows(
+                &blank,
+                16,
+                |w| {
+                    probes += 1;
+                    ten_bytes(w)
+                },
+                |a, b| skip && spaced(a, b),
+            );
+            (cut, probes)
+        };
+        let (plain, skip) = (counted(false), counted(true));
+        assert_eq!(plain.0, ["ab", "cd ef", "gh", "ij"]);
+        assert_eq!(plain.0, skip.0);
+        assert!(skip.1 < plain.1, "{} < {}", skip.1, plain.1);
     }
 
     #[test]
@@ -1327,75 +1383,182 @@ mod tests {
         assert_eq!(slot.run(owned, || 42).unwrap(), 42);
     }
 
-    /// Old against new cutting on real content, CPU only, byte for byte:
-    /// every window of every sample under the plain tokenizer probe and under
-    /// [`window_fits`] (which refuses provably long probes untokenized).
-    /// Prints per content the bytes,
-    /// what it classified as, its windows, and the cutting time of each
-    /// (wall, one thread, release). WEMM_CHECKPOINT_DIR holds the pinned
-    /// `tokenizer.json` and `chat_template.jinja`; WEMM_SAMPLE_DIR holds
+    /// The checkpoint codec of WEMM_CHECKPOINT_DIR (the pinned
+    /// `tokenizer.json` and `chat_template.jinja`).
+    #[cfg(feature = "semantic-wemm-cuda")]
+    fn checkpoint_codec() -> mary::models::qwen3_5::input_codec::InputCodec {
+        let dir = std::env::var("WEMM_CHECKPOINT_DIR").expect("set WEMM_CHECKPOINT_DIR");
+        let assets = std::path::PathBuf::from(dir);
+        mary::models::qwen3_5::input_codec::InputCodec::from_assets(
+            &std::fs::read(assets.join("tokenizer.json")).unwrap(),
+            &std::fs::read(assets.join("chat_template.jinja")).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// One cut of `text` timed (wall, this thread) with its probe count:
+    /// `plain` probes the tokenizer only, `refusal` is [`window_fits`] with
+    /// nothing skipped (the cut before `same_text`), `cut` is [`cut_windows`].
+    #[cfg(feature = "semantic-wemm-cuda")]
+    fn timed_cut<'t>(
+        codec: &mary::models::qwen3_5::input_codec::InputCodec,
+        variant: &str,
+        text: &'t str,
+    ) -> (Vec<&'t str>, usize, f64) {
+        let started = std::time::Instant::now();
+        let mut probes = 0;
+        let (cut, probes) = match variant {
+            "plain" => {
+                let fits = |w: &str| {
+                    probes += 1;
+                    codec
+                        .text(w)
+                        .is_ok_and(|ids| ids.as_slice().len() <= WINDOW_IDS)
+                };
+                (
+                    windows(text, DEFAULT_WINDOW_CAP, fits, |_, _| false),
+                    probes,
+                )
+            }
+            "refusal" => {
+                let fits = |w: &str| {
+                    probes += 1;
+                    window_fits(codec, w)
+                };
+                (
+                    windows(text, DEFAULT_WINDOW_CAP, fits, |_, _| false),
+                    probes,
+                )
+            }
+            "cut" => cut_windows(codec, text, DEFAULT_WINDOW_CAP),
+            other => panic!("no cut {other}"),
+        };
+        (cut, probes, started.elapsed().as_secs_f64())
+    }
+
+    /// The cuts on real content, CPU only, byte for byte: every window of
+    /// every sample under each variant of [`timed_cut`] that WEMM_CUTS names
+    /// (default `plain,refusal,cut`), compared with the first. Prints per
+    /// content the bytes, what it classified as, its windows, and each cut's
+    /// probes and time (wall, one thread, release). WEMM_SAMPLE_DIR holds
     /// content files, read in name order.
     #[cfg(feature = "semantic-wemm-cuda")]
     #[test]
     #[ignore = "requires WEMM_CHECKPOINT_DIR and WEMM_SAMPLE_DIR; CPU only"]
-    fn length_refusal_cuts_the_same_windows_on_real_content() {
-        use mary::models::qwen3_5::input_codec::InputCodec;
-        use std::time::Instant;
-        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("set {name}"));
-        let assets = std::path::PathBuf::from(var("WEMM_CHECKPOINT_DIR"));
-        let codec = InputCodec::from_assets(
-            &std::fs::read(assets.join("tokenizer.json")).unwrap(),
-            &std::fs::read(assets.join("chat_template.jinja")).unwrap(),
-        )
-        .unwrap();
-        let old = |w: &str| {
-            codec
-                .text(w)
-                .is_ok_and(|ids| ids.as_slice().len() <= WINDOW_IDS)
-        };
-        let mut paths: Vec<_> = std::fs::read_dir(var("WEMM_SAMPLE_DIR"))
+    fn every_cut_gives_the_same_windows_on_real_content() {
+        let codec = checkpoint_codec();
+        let cuts = std::env::var("WEMM_CUTS").unwrap_or("plain,refusal,cut".into());
+        let cuts: Vec<&str> = cuts.split(',').collect();
+        let dir = std::env::var("WEMM_SAMPLE_DIR").expect("set WEMM_SAMPLE_DIR");
+        let mut paths: Vec<_> = std::fs::read_dir(dir)
             .unwrap()
             .map(|e| e.unwrap().path())
             .collect();
         paths.sort();
         assert!(!paths.is_empty());
-        let (mut old_total, mut new_total, mut windows_total) = (0.0, 0.0, 0);
+        let mut totals = vec![(0usize, 0.0f64); cuts.len()];
+        let mut windows_total = 0;
         for path in &paths {
             let bytes = std::fs::read(path).unwrap();
             let name = path.file_name().unwrap().to_string_lossy();
-            let started = Instant::now();
+            let started = std::time::Instant::now();
             let input = classify(&bytes);
             let classify_s = started.elapsed().as_secs_f64();
-            let (kind, text_len, cut) = match &input {
+            let (kind, text_len, report) = match &input {
                 Some(Input::Text(text)) => {
-                    let started = Instant::now();
-                    let before = windows(text, DEFAULT_WINDOW_CAP, old);
-                    let old_s = started.elapsed().as_secs_f64();
-                    let started = Instant::now();
-                    let after = windows(text, DEFAULT_WINDOW_CAP, |w| window_fits(&codec, w));
-                    let new_s = started.elapsed().as_secs_f64();
-                    assert_eq!(before, after, "{name}");
-                    old_total += old_s;
-                    new_total += new_s;
-                    windows_total += after.len();
-                    (
-                        "text",
-                        text.len(),
-                        format!("windows={} old_s={old_s:.3} new_s={new_s:.3}", after.len()),
-                    )
+                    let mut report = String::new();
+                    let mut first: Option<Vec<&str>> = None;
+                    for (variant, total) in cuts.iter().zip(&mut totals) {
+                        let (cut, probes, seconds) = timed_cut(&codec, variant, text);
+                        total.0 += probes;
+                        total.1 += seconds;
+                        report += &format!(" {variant}_probes={probes} {variant}_s={seconds:.3}");
+                        match &first {
+                            Some(first) => assert_eq!(first, &cut, "{name} {variant}"),
+                            None => first = Some(cut),
+                        }
+                    }
+                    let n = first.map_or(0, |cut| cut.len());
+                    windows_total += n;
+                    ("text", text.len(), format!(" windows={n}{report}"))
                 }
                 Some(Input::Image(_)) => ("image", 0, String::new()),
                 None => ("none", 0, String::new()),
             };
             eprintln!(
-                "content {name} bytes={} kind={kind} text_bytes={text_len} classify_s={classify_s:.3} {cut}",
+                "content {name} bytes={} kind={kind} text_bytes={text_len} classify_s={classify_s:.3}{report}",
                 bytes.len()
             );
         }
+        let totals: Vec<String> = cuts
+            .iter()
+            .zip(&totals)
+            .map(|(v, (probes, s))| format!("{v}_probes={probes} {v}_s={s:.3}"))
+            .collect();
         eprintln!(
-            "total contents={} windows={windows_total} cut_old_s={old_total:.3} cut_new_s={new_total:.3}",
-            paths.len()
+            "total contents={} windows={windows_total} {}",
+            paths.len(),
+            totals.join(" ")
         );
+    }
+
+    /// Synthetic blank runs, the shape `same_text` exists for: the cut with
+    /// nothing skipped against [`cut_windows`], byte for byte, each timed.
+    /// WEMM_BLANK_CASES picks cases by name (default all); WEMM_BLANK_OLD=0
+    /// times only the new cut.
+    #[cfg(feature = "semantic-wemm-cuda")]
+    #[test]
+    #[ignore = "requires WEMM_CHECKPOINT_DIR; CPU only; the old cut is quadratic here"]
+    fn blank_runs_cut_the_same_windows() {
+        use mary::models::qwen3_5::input_codec::MAX_TEXT_BYTES;
+        let codec = checkpoint_codec();
+        let prose = |from: usize, n: usize| -> String {
+            (from..from + n)
+                .map(|i| format!("Entry {i}: the lighthouse keeper trimmed the lamp wick, wound the clockwork that turns the lens and logged each passing ship.\n"))
+                .collect()
+        };
+        let words = |n: usize| -> String { (0..n).map(|i| format!("w{i}\n")).collect() };
+        let blank = |n: usize| "\n".repeat(n);
+        let cases: Vec<(&str, String)> = vec![
+            ("lines-10k", prose(0, 2) + &blank(10_000) + &prose(2, 200)),
+            ("lines-100k", prose(0, 2) + &blank(100_000) + &prose(2, 200)),
+            ("lines-300k", prose(0, 2) + &blank(300_000) + &prose(2, 200)),
+            ("lines-900k", prose(0, 2) + &blank(900_000) + &prose(2, 200)),
+            ("words-900k", prose(0, 2) + &blank(900_000) + &words(2000)),
+            (
+                "spaces-900k",
+                prose(0, 2) + &"   \n".repeat(225_000) + &prose(2, 200),
+            ),
+            (
+                "cross-1m",
+                "hello\n".to_string() + &blank(MAX_TEXT_BYTES) + &prose(0, 200),
+            ),
+        ];
+        let pick = std::env::var("WEMM_BLANK_CASES").ok();
+        let old = std::env::var("WEMM_BLANK_OLD").map_or(true, |v| v != "0");
+        let mut ran = 0;
+        for (name, text) in &cases {
+            if pick
+                .as_ref()
+                .is_some_and(|pick| !pick.split(',').any(|p| p == *name))
+            {
+                continue;
+            }
+            ran += 1;
+            let (cut, probes, seconds) = timed_cut(&codec, "cut", text);
+            let mut line = format!(
+                "blank {name} bytes={} windows={} cut_probes={probes} cut_s={seconds:.3}",
+                text.len(),
+                cut.len()
+            );
+            if old {
+                let (before, probes, seconds) = timed_cut(&codec, "refusal", text);
+                assert_eq!(before, cut, "{name}");
+                line += &format!(" refusal_probes={probes} refusal_s={seconds:.3} identical=yes");
+            }
+            eprintln!("{line}");
+        }
+        assert!(ran > 0, "no case selected");
     }
 
     /// The real model on a scratch in-memory store: rows per content handle,
@@ -1452,12 +1615,11 @@ mod tests {
             WemmRuntime::from_native(identity, native, codec.clone()).unwrap(),
         ));
 
-        let fits = |window: &str| window_fits(&codec, window);
         let filler: String = (0..40)
             .map(|i| format!("Entry {i}: the lighthouse keeper trimmed the lamp wick, wound the clockwork that turns the lens and logged each passing ship.\n"))
             .collect();
         let long = format!("{filler}Repotting an orchid: lift it from its old pot, cut away the rotten roots and set it in fresh coarse bark, never in garden soil.\nWater the orchid sparingly for a week afterwards and keep it out of direct sun while new roots grow.\n");
-        let long_windows = windows(&long, DEFAULT_WINDOW_CAP, fits);
+        let long_windows = cut_windows(&codec, &long, DEFAULT_WINDOW_CAP).0;
         assert!(long_windows.len() > 2);
         assert!(!long_windows[0].contains("orchid"));
         assert!(long_windows.last().unwrap().contains("orchid"));
@@ -1465,7 +1627,9 @@ mod tests {
             "The night train to Vienna leaves Leiden at nine in the evening.",
             "Each sleeper cabin holds two berths and a small washbasin.",
         ]);
-        let pdf_windows = windows(&pdf_text(&pdf), DEFAULT_WINDOW_CAP, fits).len();
+        let pdf_windows = cut_windows(&codec, &pdf_text(&pdf), DEFAULT_WINDOW_CAP)
+            .0
+            .len();
         let items: [(&str, Vec<u8>, usize); 6] = [
             (
                 "short",
