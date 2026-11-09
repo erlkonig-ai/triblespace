@@ -559,10 +559,16 @@ fn cut_windows<'t>(
 #[cfg(feature = "semantic-wemm-cuda")]
 const CUT_THREADS: usize = 8;
 
+/// A text whose cut takes longer is named on stderr when it finishes, so a
+/// slow derivation says which content it spent the time on.
+#[cfg(feature = "semantic-wemm-cuda")]
+const SLOW_CUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// [`cut_windows`] of every text, in the texts' order, on up to
 /// [`CUT_THREADS`] threads. Each text is cut whole on one thread by the same
 /// pure function, and its windows land at its own index, so the result is
-/// the sequential one; only the wall time changes.
+/// the sequential one; only the wall time changes. A cut slower than
+/// [`SLOW_CUT`] is logged.
 #[cfg(feature = "semantic-wemm-cuda")]
 fn cut_all<'t>(
     codec: &mary::models::qwen3_5::input_codec::InputCodec,
@@ -579,10 +585,21 @@ fn cut_all<'t>(
                     let mut done = Vec::new();
                     loop {
                         let at = next.fetch_add(1, Ordering::Relaxed);
-                        let Some((_, text)) = texts.get(at) else {
+                        let Some((raw, text)) = texts.get(at) else {
                             break done;
                         };
-                        let (cut, _) = cut_windows(codec, text, cap);
+                        let started = std::time::Instant::now();
+                        let (cut, probes) = cut_windows(codec, text, cap);
+                        let took = started.elapsed();
+                        if took > SLOW_CUT {
+                            eprintln!(
+                                "wemm: slow cut of {}… ({} text bytes) in {:.1} s: {} windows, {probes} probes",
+                                raw[..8].iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                                text.len(),
+                                took.as_secs_f64(),
+                                cut.len()
+                            );
+                        }
                         done.push((at, cut));
                     }
                 })
@@ -1609,9 +1626,10 @@ mod tests {
     }
 
     /// Synthetic blank runs, the shape `same_text` exists for: the cut with
-    /// nothing skipped against [`cut_windows`], byte for byte, each timed.
-    /// WEMM_BLANK_CASES picks cases by name (default all); WEMM_BLANK_OLD=0
-    /// times only the new cut.
+    /// nothing skipped against [`cut_windows`], byte for byte, each timed,
+    /// and then all selected cases through [`cut_all`] (where a cut slower
+    /// than [`SLOW_CUT`] logs its line). WEMM_BLANK_CASES picks cases by
+    /// name (default all); WEMM_BLANK_OLD=0 times only the new cut.
     #[cfg(feature = "semantic-wemm-cuda")]
     #[test]
     #[ignore = "requires WEMM_CHECKPOINT_DIR; CPU only; the old cut is quadratic here"]
@@ -1642,7 +1660,7 @@ mod tests {
         ];
         let pick = std::env::var("WEMM_BLANK_CASES").ok();
         let old = std::env::var("WEMM_BLANK_OLD").map_or(true, |v| v != "0");
-        let mut ran = 0;
+        let mut ran = Vec::new();
         for (name, text) in &cases {
             if pick
                 .as_ref()
@@ -1650,7 +1668,6 @@ mod tests {
             {
                 continue;
             }
-            ran += 1;
             let (cut, probes, seconds) = timed_cut(&codec, "cut", text);
             let mut line = format!(
                 "blank {name} bytes={} windows={} cut_probes={probes} cut_s={seconds:.3}",
@@ -1663,8 +1680,19 @@ mod tests {
                 line += &format!(" refusal_probes={probes} refusal_s={seconds:.3} identical=yes");
             }
             eprintln!("{line}");
+            ran.push((*blake3::hash(text.as_bytes()).as_bytes(), text.clone()));
         }
-        assert!(ran > 0, "no case selected");
+        assert!(!ran.is_empty(), "no case selected");
+        let started = std::time::Instant::now();
+        let parallel = cut_all(&codec, &ran, DEFAULT_WINDOW_CAP);
+        for ((_, text), cut) in ran.iter().zip(&parallel) {
+            assert_eq!(&cut_windows(&codec, text, DEFAULT_WINDOW_CAP).0, cut);
+        }
+        eprintln!(
+            "blank cut_all cases={} parallel_s={:.3} identical=yes",
+            ran.len(),
+            started.elapsed().as_secs_f64()
+        );
     }
 
     /// The real model on a scratch in-memory store: rows per content handle,
