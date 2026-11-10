@@ -219,20 +219,33 @@ struct Hydration<T> {
 
 impl<T: StoreRead> Hydration<T> {
     /// Derive every selected root from `snapshot` and read each one.
-    fn derive(snapshot: &T, collections: &[CollectionHandle]) -> Result<Self, T::RecordsError> {
+    ///
+    /// On a fresh process every read hashes its blob, which for a large pile
+    /// is minutes of work, so the derivation yields at least every
+    /// [`DERIVE_TURN`]: a caller's other branches (a daemon's stop signal)
+    /// are polled meanwhile. Dropped at a yield, it has read only an
+    /// immutable snapshot and leaves nothing behind.
+    async fn derive(
+        snapshot: &T,
+        collections: &[CollectionHandle],
+    ) -> Result<Self, T::RecordsError> {
         #[cfg(test)]
         tests::DERIVATIONS.with(|count| count.set(count.get() + 1));
+        let mut turn = crate::clock::mono_now();
         let mut roots = BTreeSet::new();
         // One indexed read per selection. COMMIT signatures are checked once,
         // before physical union.
         for &collection in collections {
             roots.extend(direct_roots(snapshot, collection)?);
+            yield_after_turn(&mut turn).await;
         }
-        let missing = roots
-            .iter()
-            .copied()
-            .filter(|&handle| !readable(snapshot, handle))
-            .collect();
+        let mut missing = BTreeSet::new();
+        for &handle in &roots {
+            if !readable(snapshot, handle) {
+                missing.insert(handle);
+            }
+            yield_after_turn(&mut turn).await;
+        }
         Ok(Self {
             snapshot: snapshot.clone(),
             roots,
@@ -243,7 +256,7 @@ impl<T: StoreRead> Hydration<T> {
     /// The same answer for `snapshot`, reading only what changed since
     /// `self.snapshot`: added selected records, the still-missing roots, and
     /// roots whose blobs left the view.
-    fn advance(
+    async fn advance(
         mut self,
         snapshot: &T,
         collections: &[CollectionHandle],
@@ -265,7 +278,7 @@ impl<T: StoreRead> Hydration<T> {
                 RecordViewChanges::Delta { added, removed } if removed.is_empty() => added,
                 // A removed record may have been the only one naming a root.
                 RecordViewChanges::Delta { .. } | RecordViewChanges::Rebuild => {
-                    return Self::derive(snapshot, collections);
+                    return Self::derive(snapshot, collections).await;
                 }
             };
             for view in views {
@@ -282,7 +295,7 @@ impl<T: StoreRead> Hydration<T> {
             // What was here before and is not now; empty for an append-only pile.
             for gone in self.snapshot.blobs_diff(snapshot) {
                 let Ok(gone) = gone else {
-                    return Self::derive(snapshot, collections);
+                    return Self::derive(snapshot, collections).await;
                 };
                 let handle = gone.handle.raw;
                 if self.roots.contains(&handle)
@@ -303,12 +316,26 @@ impl<T: StoreRead> Hydration<T> {
     }
 }
 
+/// How long a root derivation runs before it yields to its runtime.
+const DERIVE_TURN: Duration = Duration::from_millis(10);
+
+/// Yield once `turn` is [`DERIVE_TURN`] old, and start a new turn.
+async fn yield_after_turn(turn: &mut crate::clock::Mono) {
+    if crate::clock::mono_now().duration_since(*turn) >= DERIVE_TURN {
+        tokio::task::yield_now().await;
+        *turn = crate::clock::mono_now();
+    }
+}
+
 /// Whether `snapshot` hands out bytes for `handle`. A physical occurrence
 /// alone can be corrupt, so this is the validated read rather than
 /// `contains_blob`/`blob_info`.
 fn readable<R: BlobStoreGet>(snapshot: &R, handle: RawHash) -> bool {
     #[cfg(test)]
-    tests::READS.with(|count| count.set(count.get() + 1));
+    {
+        tests::READS.with(|count| count.set(count.get() + 1));
+        std::thread::sleep(tests::READ_DELAY.get());
+    }
     BlobStoreGet::get::<Bytes, UnknownBlob>(snapshot, Inline::new(handle)).is_ok()
 }
 
@@ -553,7 +580,7 @@ impl Reconciler {
             self.hydration = None;
             (true, 0, BTreeSet::new())
         } else {
-            match self.observe_roots(&*snapshot) {
+            match self.observe_roots(&*snapshot).await {
                 Ok((count, missing)) => (true, count, missing),
                 Err(error) => {
                     tracing::warn!(
@@ -677,7 +704,7 @@ impl Reconciler {
     /// The selected root count and the roots `snapshot` cannot read, advanced
     /// from the previous tick's [`Hydration`] when there is one for this store
     /// type and selection, and derived from scratch otherwise.
-    fn observe_roots<T: StoreRead>(
+    async fn observe_roots<T: StoreRead>(
         &mut self,
         snapshot: &T,
     ) -> Result<(usize, BTreeSet<RawHash>), T::RecordsError> {
@@ -688,8 +715,8 @@ impl Reconciler {
             .and_then(|memo| memo.downcast::<Hydration<T>>().ok());
         // Taken before the read: a failure leaves no memo behind.
         let hydration = match previous {
-            Some(previous) => previous.advance(snapshot, &collections)?,
-            None => Hydration::derive(snapshot, &collections)?,
+            Some(previous) => previous.advance(snapshot, &collections).await?,
+            None => Hydration::derive(snapshot, &collections).await?,
         };
         let observed = (hydration.roots.len(), hydration.missing.clone());
         self.hydration = Some(Box::new(hydration));
@@ -760,6 +787,10 @@ mod tests {
         pub(super) static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// From-scratch hydration derivations made on this thread.
         pub(super) static DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// Time each validated read takes on this thread, standing in for
+        /// hashing a large pile's roots on the first pass.
+        pub(super) static READ_DELAY: std::cell::Cell<Duration> =
+            const { std::cell::Cell::new(Duration::ZERO) };
     }
 
     /// Reset both counters, returning their previous `(reads, derivations)`.
@@ -1378,6 +1409,70 @@ mod tests {
         for &handle in &fixture.roots[1..] {
             assert_eq!(calls.iter().filter(|&&called| called == handle).count(), 1);
         }
+    }
+
+    /// The daemon's shape: one current-thread runtime, a stop raised from
+    /// another thread (as a signal is), and a first pass whose derivation
+    /// reads many roots. The stop must win long before the derivation would
+    /// end, and the next pass derives from scratch with the full answer.
+    #[test]
+    fn a_stop_during_the_first_derivation_is_answered_without_waiting_for_it() {
+        const ROOTS: u32 = 2_000;
+        const READ: Duration = Duration::from_millis(2);
+        let mut store = MemoryRepo::default();
+        let descriptor = put(&mut store, b"long first pass".to_vec());
+        let metadata = put(&mut store, Vec::new());
+        for ordinal in 0..ROOTS {
+            let data = put(
+                &mut store,
+                format!("first-pass root {ordinal}").into_bytes(),
+            );
+            raw_commit(&mut store, descriptor, data, metadata);
+        }
+        let (mut peer, fetches, _) = controlled_peer(store, BTreeMap::new(), BTreeSet::new());
+        peer.set_replication(ReplicationMode::Shallow, [Inline::new(descriptor)]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (raise, stop) = tokio::sync::oneshot::channel::<()>();
+        let raiser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            raise.send(()).unwrap();
+        });
+        READ_DELAY.set(READ);
+        take_counts();
+        let started = std::time::Instant::now();
+        let stopped = runtime.block_on(async {
+            tokio::select! {
+                biased;
+                _ = stop => true,
+                _ = peer.reconcile() => false,
+            }
+        });
+        let elapsed = started.elapsed();
+        READ_DELAY.set(Duration::ZERO);
+        raiser.join().unwrap();
+        let (reads, derivations) = take_counts();
+        // The whole derivation is ROOTS + 2 reads of READ each, about 4 s.
+        assert!(
+            stopped,
+            "the pass ended before the stop was seen, after {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the stop took {elapsed:?}, after {reads} of {} reads",
+            ROOTS + 2,
+        );
+        assert_eq!(derivations, 1);
+        assert!(reads < ROOTS as usize / 2, "{reads} reads before the stop");
+        // A stopped derivation leaves no memo: the next pass derives again
+        // and reaches the same answer as a reconciler that never stopped.
+        let stats = runtime.block_on(peer.reconcile());
+        assert_eq!(take_counts(), (ROOTS as usize + 2, 1));
+        assert_eq!(stats.replication.roots, ROOTS as usize + 2);
+        assert_eq!(stats.replication.pending, 0);
+        assert!(fetches.trace.lock().unwrap().calls.is_empty());
     }
 
     #[tokio::test]
@@ -2096,8 +2191,8 @@ mod tests {
 
     /// A blob that leaves the view returns its root to the missing set, even
     /// when no selected record changed.
-    #[test]
-    fn forgotten_root_blob_returns_to_missing() {
+    #[tokio::test]
+    async fn forgotten_root_blob_returns_to_missing() {
         let descriptor = Blob::<UnknownBlob>::new(Bytes::from_source(b"kept".to_vec()));
         let forgotten = Blob::<UnknownBlob>::new(Bytes::from_source(b"forgotten".to_vec()));
         let collection = descriptor.get_handle().raw;
@@ -2112,17 +2207,17 @@ mod tests {
         let held = held.snapshot().unwrap();
         let lost = lost.snapshot().unwrap();
         let selection = [Inline::new(collection)];
-        let hydration = Hydration::derive(&held, &selection).unwrap();
+        let hydration = Hydration::derive(&held, &selection).await.unwrap();
         assert_eq!(hydration.roots.len(), 2);
         assert!(hydration.missing.is_empty());
         take_counts();
-        let hydration = hydration.advance(&lost, &selection).unwrap();
+        let hydration = hydration.advance(&lost, &selection).await.unwrap();
         assert_eq!(take_counts().1, 0);
         assert_eq!(
             hydration.missing,
             BTreeSet::from([forgotten.get_handle().raw])
         );
-        let hydration = hydration.advance(&held, &selection).unwrap();
+        let hydration = hydration.advance(&held, &selection).await.unwrap();
         assert!(hydration.missing.is_empty());
         assert_eq!(take_counts().1, 0);
     }
