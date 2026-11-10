@@ -88,6 +88,41 @@ pub const GB10_NATIVE_BF16_PROFILE: Id = id_hex!("56AA6AA44ECDFF68B91CA45E39BC9E
 /// A change to any of these, or to the canonical output bytes, needs another
 /// profile.
 pub const GB10_NATIVE_W4A4_PROFILE: Id = id_hex!("4C72118226DB26A3DEE8D16BA9950406");
+/// Minted with `trible genid`, 2026-11-11. [`GB10_NATIVE_W4A4_PROFILE`]'s
+/// decoder, unchanged, with 83 of the vision tower's 110 linears run as
+/// NVFP4 weights on the W4A16 prompt lane (compass 6ff6d9be, arm (c)):
+///
+/// - Decoder: exactly as [`GB10_NATIVE_W4A4_PROFILE`]: the 248 projections
+///   from the root's own stored `Tensor<NVFP4, 2>` leaves, W4A4 with per-row
+///   activation scales on `mma.sync ... kind::mxf4nvf4.block_scale`.
+/// - Vision weights: every one of the 27 blocks' `attn.qkv` [3456, 1152],
+///   `attn.proj` [1152, 1152] and `mlp.linear_fc1` [4304, 1152], and the
+///   merger's `linear_fc1` [4608, 4608] and `linear_fc2` [4096, 4608]
+///   (`mary::models::qwen3_5::gdn_mixer::is_vision_nvfp4_linear`), from the
+///   root's own stored `Tensor<NVFP4, 2>` leaves (E2M1 codes, an E4M3 scale
+///   per 16, one f32 tensor scale), uploaded unchanged and never quantized
+///   at load, so the root names them by content as it names the decoder's.
+/// - Vision product: the W4A16 prompt lane (`Nvfp4::project`,
+///   `PromptLane::W4a16`): BF16 activations, the weights decoded in
+///   registers into the BF16 `mma.sync` m16n8k16, f32 accumulation and one
+///   BF16 cast; then a BF16 bias add (f32 add of the BF16 bias, a second
+///   BF16 cast). Every row is computed independently of the others.
+/// - BF16, on the BF16 profile's kernels: each block's `mlp.linear_fc2`
+///   [1152, 4304] (K 4304, which no NVFP4 step divides) on the serial BF16
+///   linear kernel, the patch convolution, the position table, norms,
+///   attention scores, softmax, rotary and GELU; and, as under
+///   [`GB10_NATIVE_W4A4_PROFILE`], the token table, decoder norms, conv,
+///   DeltaNet, attention scores and the last-token pooling.
+/// - Input preparation as under the BF16 profile: the same framing, windows
+///   of at most 256 IDs ([`WINDOW_IDS`] content IDs) in right-padded batches
+///   of up to [`WINDOW_BATCH`], the 256-patch white-pad image preparation,
+///   and the descriptor's window cap.
+///
+/// Text rows equal [`GB10_NATIVE_W4A4_PROFILE`]'s bit for bit (the vision
+/// precision is not on the text path), but this is another profile and so
+/// another index: nothing reuses rows across descriptors. A change to any of
+/// these, or to the canonical output bytes, needs another profile.
+pub const GB10_NATIVE_W4A4_VW4A16_PROFILE: Id = id_hex!("673F5BA327F6D89F52773B4EAA13537B");
 
 /// The kernel profiles this build computes. A descriptor may name any other
 /// profile id: it stays readable and carryable, and computes nowhere here.
@@ -97,15 +132,18 @@ pub enum WemmProfile {
     Bf16,
     /// [`GB10_NATIVE_W4A4_PROFILE`].
     W4a4,
+    /// [`GB10_NATIVE_W4A4_VW4A16_PROFILE`].
+    W4a4Vw4a16,
 }
 
 impl WemmProfile {
-    pub const ALL: [Self; 2] = [Self::Bf16, Self::W4a4];
+    pub const ALL: [Self; 3] = [Self::Bf16, Self::W4a4, Self::W4a4Vw4a16];
 
     pub fn id(self) -> Id {
         match self {
             Self::Bf16 => GB10_NATIVE_BF16_PROFILE,
             Self::W4a4 => GB10_NATIVE_W4A4_PROFILE,
+            Self::W4a4Vw4a16 => GB10_NATIVE_W4A4_VW4A16_PROFILE,
         }
     }
 
@@ -118,10 +156,11 @@ impl WemmProfile {
         match self {
             Self::Bf16 => "bf16",
             Self::W4a4 => "w4a4",
+            Self::W4a4Vw4a16 => "w4a4-vw4a16",
         }
     }
 
-    /// The profile `label` names (`bf16` or `w4a4`), exactly.
+    /// The profile `label` names (`bf16`, `w4a4` or `w4a4-vw4a16`), exactly.
     pub fn parse(label: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|profile| profile.label() == label)
     }
@@ -132,32 +171,57 @@ impl WemmProfile {
         use mary::models::qwen3_5::gdn_mixer::DecoderPrecision;
         match self {
             Self::Bf16 => DecoderPrecision::Bf16,
-            Self::W4a4 => DecoderPrecision::W4a4,
+            Self::W4a4 | Self::W4a4Vw4a16 => DecoderPrecision::W4a4,
         }
     }
 
-    /// The profile a model's decoder, as actually bound
-    /// (`NativeWemm::decoder_bound`), runs: BF16 projections are the BF16
-    /// profile, stored NVFP4 projections on W4A4 the W4A4 profile. Anything
-    /// else is no profile: projections quantized at load (the root would not
-    /// name the weights the kernels read), W4A16, or a mixed decoder.
+    /// The vision precision a model is bound with to run this profile
+    /// (`NativeWemm::from_frozen_with_vision`).
+    #[cfg(feature = "semantic-wemm-cuda")]
+    pub fn vision_precision(self) -> mary::models::qwen3_5::gdn_mixer::DecoderPrecision {
+        use mary::models::qwen3_5::gdn_mixer::DecoderPrecision;
+        match self {
+            Self::Bf16 | Self::W4a4 => DecoderPrecision::Bf16,
+            Self::W4a4Vw4a16 => DecoderPrecision::W4a16,
+        }
+    }
+
+    /// The profile a model, as actually bound, runs: its decoder
+    /// (`NativeWemm::decoder_bound`) AND its vision tower
+    /// (`NativeWemm::vision_bound`), both read, so that NVFP4 vision linears
+    /// are never labelled with a profile whose vision is BF16.
+    ///
+    /// - BF16 decoder, BF16 vision: the BF16 profile.
+    /// - Stored NVFP4 decoder on W4A4, BF16 vision: the W4A4 profile.
+    /// - Stored NVFP4 decoder on W4A4, the 83 vision linears stored NVFP4 on
+    ///   W4A16 (block fc2 BF16): the W4A4-VW4A16 profile.
+    ///
+    /// Anything else is no profile: weights quantized at load (the root would
+    /// not name the weights the kernels read), any other precision pairing,
+    /// a mixed decoder, or a vision tower in no profile shape.
     #[cfg(feature = "semantic-wemm-cuda")]
     pub fn of_bound(
-        bound: Option<mary::models::qwen3_5::gdn_mixer::BoundProjection>,
+        decoder: Option<mary::models::qwen3_5::gdn_mixer::BoundProjection>,
+        vision: Option<mary::models::qwen3_5::gdn_mixer::BoundProjection>,
     ) -> Result<Self, String> {
         use mary::models::qwen3_5::gdn_mixer::{BoundProjection, DecoderPrecision};
-        match bound {
-            Some(BoundProjection::Bf16) => Ok(Self::Bf16),
-            Some(BoundProjection::Nvfp4 {
-                precision: DecoderPrecision::W4a4,
-                stored: true,
-            }) => Ok(Self::W4a4),
-            Some(BoundProjection::Nvfp4 {
-                precision: DecoderPrecision::W4a4,
-                stored: false,
-            }) => Err("the decoder was quantized to NVFP4 at load; the W4A4 profile computes only from a root that stores its NVFP4 projections (models_import wemm), so that the root names the weights the kernels read".into()),
-            Some(other) => Err(format!("no WeMM kernel profile runs a decoder bound as {other:?}")),
-            None => Err("the decoder's projections are bound with mixed precisions, which no WeMM kernel profile runs".into()),
+        const W4A4_STORED: BoundProjection = BoundProjection::Nvfp4 {
+            precision: DecoderPrecision::W4a4,
+            stored: true,
+        };
+        const W4A16_STORED: BoundProjection = BoundProjection::Nvfp4 {
+            precision: DecoderPrecision::W4a16,
+            stored: true,
+        };
+        match (decoder, vision) {
+            (Some(BoundProjection::Bf16), Some(BoundProjection::Bf16)) => Ok(Self::Bf16),
+            (Some(W4A4_STORED), Some(BoundProjection::Bf16)) => Ok(Self::W4a4),
+            (Some(W4A4_STORED), Some(W4A16_STORED)) => Ok(Self::W4a4Vw4a16),
+            (Some(BoundProjection::Nvfp4 { stored: false, .. }), _) => Err("the decoder was quantized to NVFP4 at load; an NVFP4 profile computes only from a root that stores its NVFP4 projections (models_import wemm), so that the root names the weights the kernels read".into()),
+            (_, Some(BoundProjection::Nvfp4 { stored: false, .. })) => Err("the vision linears were quantized to NVFP4 at load; an NVFP4 vision profile computes only from a root that stores them as NVFP4 (models_import wemm --vision-nvfp4), so that the root names the weights the kernels read".into()),
+            (None, _) => Err("the decoder's projections are bound with mixed precisions, which no WeMM kernel profile runs".into()),
+            (_, None) => Err("the vision tower's linears are bound in a shape no WeMM kernel profile runs (vision_tower::vision_bound_of)".into()),
+            (Some(decoder), Some(vision)) => Err(format!("no WeMM kernel profile runs a decoder bound as {decoder:?} with vision linears bound as {vision:?}")),
         }
     }
 }
@@ -224,7 +288,8 @@ attributes! {
 ///   model other pixels. Rows from two profiles in one index would be scored
 ///   against each other as if they were comparable. So the profile is part
 ///   of what the embedding is, and an index under another profile is another
-///   index ([`GB10_NATIVE_BF16_PROFILE`], [`GB10_NATIVE_W4A4_PROFILE`]).
+///   index ([`GB10_NATIVE_BF16_PROFILE`], [`GB10_NATIVE_W4A4_PROFILE`],
+///   [`GB10_NATIVE_W4A4_VW4A16_PROFILE`]).
 ///   A runtime states the profile its model was actually bound with
 ///   ([`WemmRuntime::from_native`]), never one it was asked for.
 ///
@@ -798,7 +863,7 @@ impl WemmRuntime {
     ///
     /// The identity is READ from what was bound, never supplied: the actual
     /// root of `native`, the kernel profile of its decoder as actually bound
-    /// ([`WemmProfile::of_bound`]), and the model collection of `source`, the
+    /// and vision tower ([`WemmProfile::of_bound`]), and the model collection of `source`, the
     /// snapshot `native` was bound from ([`carrying_collection`], which also
     /// requires that collection to state the root). So a runtime cannot be
     /// relabelled with a profile, root or collection it did not bind. A
@@ -814,7 +879,8 @@ impl WemmRuntime {
         codec: mary::models::qwen3_5::input_codec::InputCodec,
         source: &mary::model_collection::ModelSnapshot<S>,
     ) -> Result<Self, CollectionOperationError> {
-        let profile = WemmProfile::of_bound(native.decoder_bound()).map_err(fatal)?;
+        let profile =
+            WemmProfile::of_bound(native.decoder_bound(), native.vision_bound()).map_err(fatal)?;
         let identity = WemmIdentity {
             model_collection: carrying_collection(source, native.model_root())?,
             model_root: native.model_root(),
@@ -1509,28 +1575,31 @@ mod tests {
         {
             use mary::models::qwen3_5::gdn_mixer::{BoundProjection, DecoderPrecision};
             let nvfp4 = |precision, stored| Some(BoundProjection::Nvfp4 { precision, stored });
+            let bf16 = Some(BoundProjection::Bf16);
+            assert_eq!(WemmProfile::of_bound(bf16, bf16), Ok(WemmProfile::Bf16));
             assert_eq!(
-                WemmProfile::of_bound(Some(BoundProjection::Bf16)),
-                Ok(WemmProfile::Bf16)
-            );
-            assert_eq!(
-                WemmProfile::of_bound(nvfp4(DecoderPrecision::W4a4, true)),
+                WemmProfile::of_bound(nvfp4(DecoderPrecision::W4a4, true), bf16),
                 Ok(WemmProfile::W4a4)
             );
-            let at_load = WemmProfile::of_bound(nvfp4(DecoderPrecision::W4a4, false)).unwrap_err();
+            let at_load =
+                WemmProfile::of_bound(nvfp4(DecoderPrecision::W4a4, false), bf16).unwrap_err();
             assert!(at_load.contains("quantized to NVFP4 at load"), "{at_load}");
             for refused in [
                 nvfp4(DecoderPrecision::W4a16, true),
                 nvfp4(DecoderPrecision::W4a16, false),
                 None,
             ] {
-                assert!(WemmProfile::of_bound(refused).is_err(), "{refused:?}");
+                assert!(WemmProfile::of_bound(refused, bf16).is_err(), "{refused:?}");
             }
-            assert_eq!(
-                WemmProfile::W4a4.precision(),
-                DecoderPrecision::W4a4
-            );
+            assert_eq!(WemmProfile::W4a4.precision(), DecoderPrecision::W4a4);
             assert_eq!(WemmProfile::Bf16.precision(), DecoderPrecision::Bf16);
+            assert_eq!(WemmProfile::W4a4Vw4a16.precision(), DecoderPrecision::W4a4);
+            assert_eq!(WemmProfile::Bf16.vision_precision(), DecoderPrecision::Bf16);
+            assert_eq!(WemmProfile::W4a4.vision_precision(), DecoderPrecision::Bf16);
+            assert_eq!(
+                WemmProfile::W4a4Vw4a16.vision_precision(),
+                DecoderPrecision::W4a16
+            );
         }
         assert!(require_gb10("NVIDIA GB10", 12, 1).is_ok());
         for (name, major, minor) in [
@@ -1818,6 +1887,48 @@ mod tests {
         assert!(drifted.is_empty(), "these descriptors changed: {drifted:?}");
     }
 
+    /// compass 6ff6d9be item 2: a model bound with NVFP4 vision linears is
+    /// never labelled with a profile whose vision is BF16 (4C72 or 56AA).
+    /// Before `of_bound` read the vision tower, a stored W4A4 decoder was
+    /// the W4A4 profile whatever the vision linears ran.
+    #[test]
+    fn nvfp4_vision_is_never_labelled_with_a_bf16_vision_profile() {
+        #[cfg(feature = "semantic-wemm-cuda")]
+        {
+            use mary::models::qwen3_5::gdn_mixer::{BoundProjection, DecoderPrecision};
+            let nvfp4 = |precision, stored| Some(BoundProjection::Nvfp4 { precision, stored });
+            let bf16 = Some(BoundProjection::Bf16);
+            let decoder = nvfp4(DecoderPrecision::W4a4, true);
+            assert_eq!(
+                WemmProfile::of_bound(decoder, nvfp4(DecoderPrecision::W4a16, true)),
+                Ok(WemmProfile::W4a4Vw4a16)
+            );
+            assert_eq!(
+                WemmProfile::W4a4Vw4a16.id(),
+                GB10_NATIVE_W4A4_VW4A16_PROFILE
+            );
+            for vision in [
+                nvfp4(DecoderPrecision::W4a16, false),
+                nvfp4(DecoderPrecision::W4a4, true),
+                nvfp4(DecoderPrecision::W4a4, false),
+                None,
+            ] {
+                for decoder in [decoder, bf16] {
+                    let labelled = WemmProfile::of_bound(decoder, vision);
+                    assert!(labelled.is_err(), "{decoder:?} {vision:?}: {labelled:?}");
+                }
+            }
+            // Stored NVFP4 vision under a BF16 decoder is no profile either.
+            assert!(
+                WemmProfile::of_bound(bf16, nvfp4(DecoderPrecision::W4a16, true)).is_err()
+            );
+            let at_load =
+                WemmProfile::of_bound(decoder, nvfp4(DecoderPrecision::W4a16, false))
+                    .unwrap_err();
+            assert!(at_load.contains("vision linears were quantized"), "{at_load}");
+        }
+    }
+
     #[test]
     fn the_w4a4_profile_is_its_own_index_and_round_trips() {
         assert_ne!(GB10_NATIVE_W4A4_PROFILE, GB10_NATIVE_BF16_PROFILE);
@@ -1826,7 +1937,18 @@ mod tests {
             assert_eq!(WemmProfile::parse(profile.label()), Some(profile));
         }
         assert_eq!(WemmProfile::of(Id::new([8; 16]).unwrap()), None);
-        for typo in ["W4A4", "w4a16", "", "bf16 "] {
+        assert_ne!(GB10_NATIVE_W4A4_VW4A16_PROFILE, GB10_NATIVE_W4A4_PROFILE);
+        assert_ne!(GB10_NATIVE_W4A4_VW4A16_PROFILE, GB10_NATIVE_BF16_PROFILE);
+        for typo in [
+            "W4A4",
+            "w4a16",
+            "",
+            "bf16 ",
+            "w4a4-vw4a4",
+            "W4A4-VW4A16",
+            "w4a4vw4a16",
+            "w4a4-vw4a16 ",
+        ] {
             assert_eq!(WemmProfile::parse(typo), None, "{typo:?}");
         }
         let bf16 = mapping();
