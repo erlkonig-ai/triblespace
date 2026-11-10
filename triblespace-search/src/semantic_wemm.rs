@@ -5,9 +5,10 @@
 //! native loader, then lends the resulting OWNED runtime to this thread with
 //! [`with_wemm_runtime`]. A generic `StoreRead` is never treated as CUDA alias
 //! provenance. The native facade proves its actual selected root, validated
-//! assets and device; which collection carried the model is the store's
-//! business and is not part of an index's identity. READ/WRITE admission
-//! remains the store's job.
+//! assets and device, and the runtime records the model collection the root
+//! was resolved from ([`WemmRuntime::from_native`]): an index names the
+//! collection that carries its model, so it describes fully where that model
+//! lives. READ/WRITE admission remains the store's job.
 //!
 //! The mapping is total on content bytes, through the SAME model for text
 //! and images. A PNG/JPEG the fixed preparation decodes is one row. UTF-8
@@ -30,7 +31,7 @@ use anybytes::{Bytes, View};
 use triblespace_core::blob::encodings::{rawbytes::RawBytes, simplearchive::SimpleArchive};
 use triblespace_core::blob::{Blob, BlobEncoding, TryFromBlob};
 use triblespace_core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
-use triblespace_core::collection::{CollectionOperationError, DeriveMapping};
+use triblespace_core::collection::{CollectionHandle, CollectionOperationError, DeriveMapping};
 use triblespace_core::id::{id_hex, ExclusiveId, Id};
 use triblespace_core::inline::encodings::{genid::GenId, hash::Handle, iu256::U256BE};
 use triblespace_core::inline::{Inline, IntoInline, TryFromInline};
@@ -45,7 +46,7 @@ use triblespace_core::trible::{Fragment, TribleSet};
 use crate::content_text::{looks_like_html, pdf_text, strip_html};
 use crate::nvfp4::{nvfp4_dimension, NvFp4CosineIndex, NvFp4CosineSet, ReconstructedCosines};
 pub use crate::semantic_attributes::{semantic_compute, semantic_content_attribute};
-pub use mary::format::attrs::model_root;
+pub use mary::format::attrs::{model_collection, model_root};
 
 /// Minted with `trible genid`, 2026-10-06. It replaces
 /// `C2218047C697B76F657619C33B0B560D` (2026-10-01), which read only what fits
@@ -192,17 +193,27 @@ attributes! {
     "B999AF3E65C457A9DFD54EBA05C211B7" as pub wemm_window_cap: U256BE;
 }
 
-/// What an embedding IS a function of, and nothing else: the model and the
-/// way it is run. Content-only, so the same model gives the same index
-/// identity on every machine and in every collection that carries it.
+/// Which model an index embeds with, where that model lives, and how it is
+/// run. The same model in the same collection gives the same index identity
+/// on every machine.
 ///
+/// - `model_collection` is the exact descriptor handle of the model
+///   collection the root was resolved from. A root id alone is not findable:
+///   it is contextualised by the collection that states it, and an index
+///   that did not name the collection would leave every reader to assume
+///   one. A collection is identified by its full descriptor, so it carries
+///   no annotations, and naming it here makes the model's location
+///   immutable: moving a model to another collection is a big change, and
+///   it propagates, deliberately, as new indexes (JP, 2026-11-10). The
+///   runtime states the collection it actually bound from
+///   ([`WemmRuntime::from_native`]); it is never searched for.
 /// - `model_root` is the COMPLETE model root
 ///   (`mary::ingest::build_model_root_with`), whose content-derived id
 ///   covers the weights, the tokenizer, the configuration and the chat
 ///   template. A changed tokenizer or template changes the token ids a text
 ///   becomes, and so the vectors; that is why they are in the root and why
-///   the root alone suffices here. Which collection, pile or archive carried
-///   the model is provenance, not identity, and is not stated.
+///   the root names the model. The physical archives and pile carrying it
+///   are not stated.
 /// - `kernel_profile` stays. The profile names the native GB10 kernels
 ///   together with the input semantics (framing, at most 256 IDs per
 ///   window in right-padded batches, the 256-patch white-pad image
@@ -220,10 +231,44 @@ attributes! {
 /// Unknown kernel profiles remain readable/carryable but cannot compute here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WemmIdentity {
+    pub model_collection: CollectionHandle,
     pub model_root: Id,
     pub kernel_profile: Id,
 }
 
+/// The model collection `source`'s facts were read from, which must state
+/// `root`: what a runtime bound from `source` records as its
+/// `model_collection`. Read from the snapshot, never configured or searched
+/// for. Refused for facts that were not read from one collection (an image
+/// or facts handed over directly name no collection), and for a collection
+/// that does not state `root`.
+pub fn carrying_collection<S>(
+    source: &mary::model_collection::ModelSnapshot<S>,
+    root: Id,
+) -> Result<CollectionHandle, CollectionOperationError> {
+    use triblespace_core::inline::encodings::UnknownInline;
+    let cover = source.cover().ok_or_else(|| {
+        fatal("the WeMM model's facts were not read from a model collection, so no collection carries it")
+    })?;
+    let stated = find!((attribute: Id, value: Inline<UnknownInline>),
+        source.facts().pattern::<UnknownInline>(root.to_inline(), attribute, value)
+    )
+    .next()
+    .is_some();
+    if !stated {
+        return Err(fatal(format!(
+            "model collection {} does not state the WeMM model root {root:X}",
+            collection_hex(cover.collection().handle())
+        )));
+    }
+    Ok(cover.collection().handle())
+}
+
+/// A collection descriptor handle as the 64 hex digits
+/// `TRIBLESPACE_COLLECTION_*` and `trible pile collection` use.
+pub fn collection_hex(handle: CollectionHandle) -> String {
+    handle.raw.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 /// Retained descriptor selection is a PATCH set, with no cached source rows.
 pub struct WemmIndex<E: BlobEncoding> {
@@ -371,7 +416,7 @@ impl MetaDescribe for Recipe {
     fn describe() -> Fragment {
         entity! { ExclusiveId::force_ref(&WEMM_CONTENT_WINDOWS_TO_NVFP4) @
             metadata::name: "wemm-content-windows-to-nvfp4",
-            metadata::description: "Content handles under selected attributes embedded by one pinned native WeMM model as canonical 4096-dimensional two-stage NVFP4 set rows keyed by the content handle. A complete PNG/JPEG the fixed preparation decodes is one row. UTF-8 text, reduced to its text when it sniffs as HTML, and a PDF text layer are cut by the pinned tokenizer into windows of at most 248 framed IDs, greedily whole lines, a line too long alone between words, a word too long alone between characters; each of the first window-cap windows is one row. Any other content is no row. The complete model root (weights, tokenizer, configuration and chat template), GB10 compute, kernel/input profile and window cap are descriptor identity; the collection and physical archives carrying the model are not.",
+            metadata::description: "Content handles under selected attributes embedded by one pinned native WeMM model as canonical 4096-dimensional two-stage NVFP4 set rows keyed by the content handle. A complete PNG/JPEG the fixed preparation decodes is one row. UTF-8 text, reduced to its text when it sniffs as HTML, and a PDF text layer are cut by the pinned tokenizer into windows of at most 248 framed IDs, greedily whole lines, a line too long alone between words, a word too long alone between characters; each of the first window-cap windows is one row. Any other content is no row. The model collection carrying the model (its exact descriptor handle), the complete model root it states (weights, tokenizer, configuration and chat template), GB10 compute, kernel/input profile and window cap are descriptor identity, so the same model in another collection is another index; the pile and physical archives carrying the model are not.",
             metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
         }
     }
@@ -394,6 +439,7 @@ where
             nvfp4_dimension: DIMENSION as u64,
             semantic_compute: COMPUTE_CLASS,
             semantic_content_attribute*: self.content_attributes(),
+            model_collection: self.identity.model_collection,
             model_root: self.identity.model_root,
             wemm_kernel_profile: self.identity.kernel_profile,
             wemm_window_cap: self.window_cap,
@@ -425,6 +471,7 @@ where
         Self::new(
             selected,
             WemmIdentity {
+                model_collection: Inline::new(argument(facts, model_collection.id())?),
                 model_root: id_argument(facts, model_root.id())?,
                 kernel_profile: id_argument(facts, wemm_kernel_profile.id())?,
             },
@@ -749,22 +796,27 @@ impl WemmRuntime {
     /// backing/preceding-page lifetime premise remains in force until CUDA
     /// teardown, even after this runtime/lease is dropped.
     ///
-    /// The identity is READ from `native`, never supplied: its actual root,
-    /// and the kernel profile of its decoder as actually bound
-    /// ([`WemmProfile::of_bound`]), so a runtime cannot be relabelled with a
-    /// profile or root it does not run. A decoder no profile runs is refused.
-    /// The device is checked here too. The root carries its tokenizer,
-    /// configuration and template in its identity.
+    /// The identity is READ from what was bound, never supplied: the actual
+    /// root of `native`, the kernel profile of its decoder as actually bound
+    /// ([`WemmProfile::of_bound`]), and the model collection of `source`, the
+    /// snapshot `native` was bound from ([`carrying_collection`], which also
+    /// requires that collection to state the root). So a runtime cannot be
+    /// relabelled with a profile, root or collection it did not bind. A
+    /// decoder no profile runs is refused. The device is checked here too.
+    /// The root carries its tokenizer, configuration and template in its
+    /// identity.
     ///
     /// `codec` cuts text into windows. It must be the codec of the same
     /// assets `native` was bound with (`Assets::codec`).
     #[cfg(feature = "semantic-wemm-cuda")]
-    pub fn from_native(
+    pub fn from_native<S>(
         native: mary::models::qwen3_5::native::NativeWemm,
         codec: mary::models::qwen3_5::input_codec::InputCodec,
+        source: &mary::model_collection::ModelSnapshot<S>,
     ) -> Result<Self, CollectionOperationError> {
         let profile = WemmProfile::of_bound(native.decoder_bound()).map_err(fatal)?;
         let identity = WemmIdentity {
+            model_collection: carrying_collection(source, native.model_root())?,
             model_root: native.model_root(),
             kernel_profile: profile.id(),
         };
@@ -1044,7 +1096,7 @@ fn with_matching_runtime<R>(
         .map_err(|_| fatal("native WeMM runtime is already in use"))?;
     if !runtime.matches(identity) {
         return Err(fatal(
-            "scoped WeMM runtime identity/profile does not match this mapping",
+            "scoped WeMM runtime identity (model collection, root, profile) does not match this mapping",
         ));
     }
     body(&mut runtime)
@@ -1063,6 +1115,7 @@ mod tests {
 
     fn identity() -> WemmIdentity {
         WemmIdentity {
+            model_collection: Inline::new([1; 32]),
             model_root: Id::new([2; 16]).unwrap(),
             kernel_profile: GB10_NATIVE_BF16_PROFILE,
         }
@@ -1193,11 +1246,14 @@ mod tests {
     }
 
     /// Publish `fragment` into a fresh `models` collection under its own
-    /// signer, and select the model root back from that collection.
-    fn published_root(
+    /// signer, and freeze that collection the way a bind does.
+    fn published_model(
         seed: u8,
         build: impl FnOnce(&mut MemoryRepo) -> Fragment,
-    ) -> (CollectionHandle, Id) {
+    ) -> (
+        mary::model_collection::ModelSnapshot<impl StoreRead>,
+        CollectionHandle,
+    ) {
         let mut repo = MemoryRepo::default();
         let fragment = build(&mut repo);
         let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
@@ -1210,19 +1266,29 @@ mod tests {
         let store = repo.snapshot().unwrap();
         let model =
             mary::model_collection::snapshot_model_collection_for(&store, collection).unwrap();
+        (model, collection.handle())
+    }
+
+    /// [`published_model`], and the model root selected back from it.
+    fn published_root(
+        seed: u8,
+        build: impl FnOnce(&mut MemoryRepo) -> Fragment,
+    ) -> (CollectionHandle, Id) {
+        let (model, collection) = published_model(seed, build);
         let root = mary::selection::select_model_root(
             model.facts(),
-            &store,
+            model.store(),
             mary::selection::ModelSelector::Only,
         )
         .unwrap();
-        (collection.handle(), root)
+        (collection, root)
     }
 
-    fn index_of(root: Id) -> Fragment {
+    fn index_of(collection: CollectionHandle, root: Id) -> Fragment {
         WemmIndex::<Embedding>::new(
             [metadata::name.id()],
             WemmIdentity {
+                model_collection: collection,
                 model_root: root,
                 kernel_profile: GB10_NATIVE_BF16_PROFILE,
             },
@@ -1232,14 +1298,27 @@ mod tests {
         .fragment()
     }
 
+    /// JP, 2026-11-10: the index names the collection carrying its model.
+    /// One model in two collections is one root and two indexes; the same
+    /// model in the same collection is one index.
     #[test]
-    fn the_index_identity_is_the_model_content_not_the_collection_carrying_it() {
+    fn one_model_in_two_collections_is_two_indexes() {
         let base = |repo: &mut MemoryRepo| complete_root(repo, "weights", "b", 8, "{{ m }}");
         let (first_collection, first) = published_root(0x31, base);
         let (second_collection, second) = published_root(0x32, base);
+        let (again_collection, again) = published_root(0x31, base);
         assert_ne!(first_collection, second_collection, "two collections");
         assert_eq!(first, second, "one model");
-        assert_eq!(index_of(first), index_of(second), "one index identity");
+        assert_ne!(
+            index_of(first_collection, first),
+            index_of(second_collection, second),
+            "moving the model to another collection is another index"
+        );
+        assert_eq!(
+            index_of(first_collection, first),
+            index_of(again_collection, again),
+            "the same model in the same collection is the same index"
+        );
         for (what, build) in [
             (
                 "weights",
@@ -1261,18 +1340,108 @@ mod tests {
                 }),
             ),
         ] {
-            let (_, changed) = published_root(0x31, build);
+            let (collection, changed) = published_root(0x31, build);
+            assert_eq!(collection, first_collection, "one collection");
             assert_ne!(changed, first, "a changed {what} is another model");
             assert_ne!(
-                index_of(changed),
-                index_of(first),
+                index_of(collection, changed),
+                index_of(first_collection, first),
                 "a changed {what} is another index"
             );
         }
     }
 
+    /// The collection a runtime records is the one its model's facts were
+    /// read from, and only when that collection states the root: facts with
+    /// no collection, and a collection without the root, are refused.
+    #[test]
+    fn the_carrying_collection_is_read_from_the_snapshot_that_states_the_root() {
+        let (model, collection) = published_model(0x41, |repo| {
+            complete_root(repo, "weights", "b", 8, "{{ m }}")
+        });
+        let root = mary::selection::select_model_root(
+            model.facts(),
+            model.store(),
+            mary::selection::ModelSelector::Only,
+        )
+        .unwrap();
+        assert_eq!(carrying_collection(&model, root).unwrap(), collection);
+        let elsewhere = Id::new([0x42; 16]).unwrap();
+        let error = carrying_collection(&model, elsewhere)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("does not state") && error.contains(&collection_hex(collection)),
+            "{error}"
+        );
+        let (facts, support, store) = model.into_parts();
+        let loose = mary::model_collection::ModelSnapshot::new(facts, support, store);
+        let error = carrying_collection(&loose, root).unwrap_err().to_string();
+        assert!(
+            error.contains("not read from a model collection"),
+            "{error}"
+        );
+    }
+
+    /// The descriptor states the collection, and it round-trips: a
+    /// descriptor binds back to the identity it was written from, collection
+    /// included, and the same index under another collection is another
+    /// descriptor, binding to another identity, which a runtime of the first
+    /// does not compute or score (`matches` compares the whole identity).
+    #[test]
+    fn the_collection_round_trips_and_another_collection_is_another_descriptor() {
+        let index = mapping();
+        let (_, described) = descriptor(&index);
+        let bound = WemmIndex::<Embedding>::bind(&Fragment::empty(), &described).unwrap();
+        assert_eq!(bound, index);
+        assert_eq!(bound.identity().model_collection, Inline::new([1; 32]));
+        let moved = WemmIndex::<Embedding>::new(
+            index.content_attributes(),
+            WemmIdentity {
+                model_collection: Inline::new([3; 32]),
+                ..identity()
+            },
+            DEFAULT_WINDOW_CAP,
+        )
+        .unwrap();
+        assert_ne!(moved.fragment(), index.fragment());
+        let (_, moved_described) = descriptor(&moved);
+        let moved_bound =
+            WemmIndex::<Embedding>::bind(&Fragment::empty(), &moved_described).unwrap();
+        assert_eq!(moved_bound, moved);
+        assert_ne!(moved_bound.identity(), bound.identity());
+        // Mary's model reference attribute (CC07F0AFB3DCFD254A54A883E86E2617),
+        // which Nomic's semantic index names its collection with too.
+        assert_eq!(
+            model_collection.id(),
+            mary::format::attrs::model_collection.id()
+        );
+    }
+
+    /// A descriptor from before the collection was identity names only the
+    /// root: it is another index, and binding it is refused rather than
+    /// completed with an assumed collection.
+    #[test]
+    fn a_descriptor_without_the_collection_does_not_bind() {
+        let (_, described) = descriptor(&mapping());
+        let mut older = TribleSet::new();
+        for fact in described.facts().iter() {
+            if fact.a() != &model_collection.id() {
+                older.insert(fact);
+            }
+        }
+        assert!(older.len() < described.facts().len());
+        let error = WemmIndex::<Embedding>::bind(&Fragment::empty(), &Fragment::from(older))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("{:X}", model_collection.id())),
+            "{error}"
+        );
+    }
+
     /// A descriptor written before the identity became content-only states
-    /// the carrying collection and three asset handles. They are facts this
+    /// three asset handles beside the collection. They are facts this
     /// mapping no longer models, so binding ignores them (open world).
     #[test]
     fn a_descriptor_with_retired_asset_arguments_still_binds() {
@@ -1283,7 +1452,6 @@ mod tests {
             .unwrap();
         let mut older = descriptor.clone();
         for retired in [
-            mary::format::attrs::model_collection.id(),
             id_hex!("C1FEADBAD086C8A7EC00C1080D7E2F13"),
             id_hex!("438EE4FAA8F9465B38DD8CCAD595D3DE"),
             id_hex!("6850FB2F899C4EA04257547C9C5D63BC"),
@@ -1304,9 +1472,10 @@ mod tests {
     fn each_semantic_pin_changes_identity_but_neither_packaging_nor_order_is_a_pin() {
         let index = mapping();
         let original = identity();
-        let mut alternatives = [original; 2];
+        let mut alternatives = [original; 3];
         alternatives[0].model_root = Id::new([7; 16]).unwrap();
         alternatives[1].kernel_profile = Id::new([7; 16]).unwrap();
+        alternatives[2].model_collection = Inline::new([7; 32]);
         for identity in alternatives {
             assert_ne!(identity, original);
             assert_ne!(
@@ -1557,34 +1726,71 @@ mod tests {
         );
     }
 
-    /// The BF16 profile's descriptor bytes, pinned. Recorded at main
-    /// 5766da2d (receipts phase2/receipts-g0b), before a second profile
-    /// existed: adding one must leave every BF16 index exactly the
-    /// collection it was, so the live rows stay found.
+    /// The live models collection on sky (TRIBLESPACE_COLLECTION_MODELS).
+    const LIVE_MODELS: &str = "a03d075c3cc31e5644b80dda054d0d59ec5b6c898cae1305143de055b0fb75e7";
+
+    /// Every WeMM index identity changed once, on 2026-11-10, when the model
+    /// collection became part of it, so every index is derived again. Both
+    /// sides are pinned (mapping root, mapping facts, descriptor facts): the
+    /// content-only bytes, recorded at main 5766da2d (receipts
+    /// phase2/receipts-g0b) and unchanged through eb4d50c1, must never come
+    /// back, and the bytes with the collection must not drift. `None` for an
+    /// identity that had no content-only index.
     #[test]
-    fn the_bf16_descriptor_is_byte_unchanged() {
-        let live = WemmIdentity {
-            model_root: id_hex!("85B6ACD39E6CB93EE8BA31FDEF6C4F4F"),
-            kernel_profile: GB10_NATIVE_BF16_PROFILE,
+    fn the_descriptor_bytes_changed_once_with_the_collection_and_are_pinned() {
+        let live = |root: Id, profile: WemmProfile| WemmIdentity {
+            model_collection: mary::model_collection::parse_collection_handle(LIVE_MODELS).unwrap(),
+            model_root: root,
+            kernel_profile: profile.id(),
         };
-        for (what, index, pinned) in [
+        let live_index = |identity| {
+            WemmIndex::<Embedding>::new([metadata::name.id()], identity, DEFAULT_WINDOW_CAP)
+                .unwrap()
+        };
+        let mut drifted = Vec::new();
+        for (what, index, content_only, pinned) in [
             (
                 "fixture",
                 mapping(),
-                [
+                Some([
                     "48A8C2BF5EC73B77D4DC3E53DAADD645",
                     "2d724e5ed68c402a013742febe3e6cd930a113f6dfcfad79a34fa968ee0856b6",
                     "b61f95b0cedbb1dd870b8200d7eef0911a1b0f3c68774076b55e8a3a131ca5c1",
+                ]),
+                [
+                    "50CDBD00FE1EB99B27DB72126838948E",
+                    "2f577db634fd939314aa5862860f3abc04b7fa20431fed8c7473e433ab61da45",
+                    "cd84567b75d340613fed79e1b68d0f376dd411327ac90406a1d9308eac1f4d2a",
                 ],
             ),
             (
-                "live root",
-                WemmIndex::<Embedding>::new([metadata::name.id()], live, DEFAULT_WINDOW_CAP)
-                    .unwrap(),
-                [
+                "live bf16",
+                live_index(live(
+                    id_hex!("85B6ACD39E6CB93EE8BA31FDEF6C4F4F"),
+                    WemmProfile::Bf16,
+                )),
+                Some([
                     "B6FF27B6030C6BB1DC8B7CC558CF5ED2",
                     "aa2db65b5e35af412ba2deabc4fd429b33f6b76ad47a0e8c46a0bd330e083da2",
                     "8b64d5521782973db7a0eda60d0faaa482333f40381d14d9c3b7b71bc8ead0fd",
+                ]),
+                [
+                    "2951116B8439AE6EEAE5AAC2E0D367BF",
+                    "c4f4c834b551233c0760c9803f1b7f6626a4d773cf17f0f02464be8574434520",
+                    "b072477b7b893e350aff66fa1f455cf6f88848311841c1812cd5e9e7f0bc4dcb",
+                ],
+            ),
+            (
+                "live w4a4",
+                live_index(live(
+                    id_hex!("E1A7DFB9D59FD338DB1C89F96E9672E1"),
+                    WemmProfile::W4a4,
+                )),
+                None,
+                [
+                    "BC7335F9EBA17ADDA88309A05486860E",
+                    "1512b6f62010189888cc97648ef213e65b296f36396852ae155a42aba2601e27",
+                    "6ffb9d0edad572bb65048b10d9aca17df4b8b671946232d36887b70cb18f8478",
                 ],
             ),
         ] {
@@ -1600,8 +1806,16 @@ mod tests {
                 hex(described.facts()),
             ];
             eprintln!("golden {what} {observed:?}");
-            assert_eq!(observed, pinned, "the {what} BF16 descriptor changed");
+            if let Some(content_only) = content_only {
+                for (now, before) in observed.iter().zip(content_only) {
+                    assert_ne!(now, before, "the {what} descriptor is the content-only one");
+                }
+            }
+            if observed != pinned {
+                drifted.push(what);
+            }
         }
+        assert!(drifted.is_empty(), "these descriptors changed: {drifted:?}");
     }
 
     #[test]
@@ -2017,10 +2231,11 @@ mod tests {
         .unwrap();
         eprintln!("bind_ms={}", started.elapsed().as_millis());
         let identity = WemmIdentity {
+            model_collection: handle,
             model_root: root,
             kernel_profile: GB10_NATIVE_BF16_PROFILE,
         };
-        let runtime = WemmRuntime::from_native(native, codec.clone()).unwrap();
+        let runtime = WemmRuntime::from_native(native, codec.clone(), &model).unwrap();
         assert_eq!(runtime.identity(), identity, "the bound model's own identity");
         let runtime = Rc::new(RefCell::new(runtime));
 

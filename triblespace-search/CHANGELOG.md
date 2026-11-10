@@ -6,6 +6,25 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+- The WeMM descriptor names the model collection again: `WemmIdentity` is
+  `(model_collection, model_root, kernel_profile)`, and the mapping states
+  `model_collection` (Mary's model reference attribute
+  `CC07F0AFB3DCFD254A54A883E86E2617`, the one Nomic's semantic index already
+  uses; no attribute is minted) beside `model_root`, `wemm_kernel_profile`
+  and the window cap. A root id is only findable in the collection that
+  states it, and a collection is identified by its full descriptor, so it
+  cannot be annotated: naming it in the index makes the model's location
+  immutable, and moving a model to another collection deliberately gives new
+  indexes (JP, 2026-11-10). This reverses 2026-11-07, which left the
+  collection out of identity. **It changes every WeMM index identity**,
+  BF16 and W4A4 alike: every WeMM index is derived again, once. A descriptor
+  without the collection no longer binds; the three retired asset arguments
+  are still ignored. `WemmRuntime::from_native(native, codec, source)` reads
+  the collection from `source`, the `ModelSnapshot` the model was bound from
+  (`carrying_collection`, which refuses facts not read from a collection and
+  a collection that does not state the root), never from configuration; a
+  runtime computes and scores only mappings of its whole identity.
+
 - `TextAttributeToBm25` keys its documents on the text payloads, not the
   entities: every distinct `Handle<UTF8String>` a node holds under the
   attribute is one document, read from the node's rows in place. A text's

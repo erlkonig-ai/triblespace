@@ -125,10 +125,11 @@ fn copied_and_aliased_weights_print_comparable_outputs() {
     }
     .unwrap();
     let identity = WemmIdentity {
+        model_collection: handle,
         model_root: root,
         kernel_profile: GB10_NATIVE_BF16_PROFILE,
     };
-    let mut runtime = WemmRuntime::from_native(native, codec).unwrap();
+    let mut runtime = WemmRuntime::from_native(native, codec, &model).unwrap();
     assert_eq!(runtime.identity(), identity, "the bound model's own identity");
     let stats = aliases.stats();
     eprintln!(
@@ -354,10 +355,12 @@ fn weight_memory_ownership_at_fixed_points() {
     }
     .unwrap();
     let identity = WemmIdentity {
+        // The macro's handle is hygienic; this is the collection it opened.
+        model_collection: model.cover().unwrap().collection().handle(),
         model_root: root,
         kernel_profile: GB10_NATIVE_BF16_PROFILE,
     };
-    let mut runtime = WemmRuntime::from_native(native, codec).unwrap();
+    let mut runtime = WemmRuntime::from_native(native, codec, &model).unwrap();
     assert_eq!(runtime.identity(), identity, "the bound model's own identity");
     let bind_s = started.elapsed().as_secs_f64();
     // The model's client: re-binding an already registered leaf is a lookup
