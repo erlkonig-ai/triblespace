@@ -60,6 +60,106 @@ pub const WEMM_CONTENT_WINDOWS_TO_NVFP4: Id = id_hex!("3D288D450426ABD3FFF0D2C05
 /// unchanged. A change to these semantics or canonical output bytes needs
 /// another profile.
 pub const GB10_NATIVE_BF16_PROFILE: Id = id_hex!("56AA6AA44ECDFF68B91CA45E39BC9EB6");
+/// Minted with `trible genid`, 2026-11-10. Native GB10 kernels with WeMM's
+/// 248 decoder linear projections (every layer's GDN qkv/z/a/b/out,
+/// attention q/k/v/o and MLP gate/up/down) run as NVFP4 W4A4 on the FP4
+/// tensor cores, and everything else exactly as [`GB10_NATIVE_BF16_PROFILE`]:
+///
+/// - Weights: the model root's OWN stored `Tensor<NVFP4, 2>` leaves (E2M1
+///   codes, an E4M3 scale per 16, one f32 tensor scale), uploaded unchanged.
+///   Never quantized at load: the root then names the exact weight bytes the
+///   kernels read, so the root's content id carries the quantization, and a
+///   BF16 root cannot be bound under this profile.
+/// - Activations: quantized on the device per row, one f32 second-level
+///   scale per activation row (`amax_row / (6 * 448)`, NaN for a row holding
+///   a NaN), then E2M1 per 16 with E4M3 block scales.
+/// - Product: `mma.sync ... kind::mxf4nvf4.block_scale.scale_vec::4X`
+///   (m16n8k64), f32 accumulation, an epilogue that multiplies the row scale
+///   by the weight's tensor scale before one BF16 cast. Every row is
+///   computed independently of the others.
+/// - BF16, as under the BF16 profile: the vision tower, the token table,
+///   norms, conv, DeltaNet, attention scores and the last-token pooling.
+/// - Input preparation as under the BF16 profile: the same framing, windows
+///   of at most 256 IDs ([`WINDOW_IDS`] content IDs) in right-padded batches
+///   of up to [`WINDOW_BATCH`], the 256-patch white-pad image preparation,
+///   and the descriptor's window cap.
+///
+/// A change to any of these, or to the canonical output bytes, needs another
+/// profile.
+pub const GB10_NATIVE_W4A4_PROFILE: Id = id_hex!("4C72118226DB26A3DEE8D16BA9950406");
+
+/// The kernel profiles this build computes. A descriptor may name any other
+/// profile id: it stays readable and carryable, and computes nowhere here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WemmProfile {
+    /// [`GB10_NATIVE_BF16_PROFILE`].
+    Bf16,
+    /// [`GB10_NATIVE_W4A4_PROFILE`].
+    W4a4,
+}
+
+impl WemmProfile {
+    pub const ALL: [Self; 2] = [Self::Bf16, Self::W4a4];
+
+    pub fn id(self) -> Id {
+        match self {
+            Self::Bf16 => GB10_NATIVE_BF16_PROFILE,
+            Self::W4a4 => GB10_NATIVE_W4A4_PROFILE,
+        }
+    }
+
+    /// The profile `id` names, or `None` for one this build does not compute.
+    pub fn of(id: Id) -> Option<Self> {
+        Self::ALL.into_iter().find(|profile| profile.id() == id)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::W4a4 => "w4a4",
+        }
+    }
+
+    /// The profile `label` names (`bf16` or `w4a4`), exactly.
+    pub fn parse(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|profile| profile.label() == label)
+    }
+
+    /// The decoder precision a model is bound with to run this profile.
+    #[cfg(feature = "semantic-wemm-cuda")]
+    pub fn precision(self) -> mary::models::qwen3_5::gdn_mixer::DecoderPrecision {
+        use mary::models::qwen3_5::gdn_mixer::DecoderPrecision;
+        match self {
+            Self::Bf16 => DecoderPrecision::Bf16,
+            Self::W4a4 => DecoderPrecision::W4a4,
+        }
+    }
+
+    /// The profile a model's decoder, as actually bound
+    /// (`NativeWemm::decoder_bound`), runs: BF16 projections are the BF16
+    /// profile, stored NVFP4 projections on W4A4 the W4A4 profile. Anything
+    /// else is no profile: projections quantized at load (the root would not
+    /// name the weights the kernels read), W4A16, or a mixed decoder.
+    #[cfg(feature = "semantic-wemm-cuda")]
+    pub fn of_bound(
+        bound: Option<mary::models::qwen3_5::gdn_mixer::BoundProjection>,
+    ) -> Result<Self, String> {
+        use mary::models::qwen3_5::gdn_mixer::{BoundProjection, DecoderPrecision};
+        match bound {
+            Some(BoundProjection::Bf16) => Ok(Self::Bf16),
+            Some(BoundProjection::Nvfp4 {
+                precision: DecoderPrecision::W4a4,
+                stored: true,
+            }) => Ok(Self::W4a4),
+            Some(BoundProjection::Nvfp4 {
+                precision: DecoderPrecision::W4a4,
+                stored: false,
+            }) => Err("the decoder was quantized to NVFP4 at load; the W4A4 profile computes only from a root that stores its NVFP4 projections (models_import wemm), so that the root names the weights the kernels read".into()),
+            Some(other) => Err(format!("no WeMM kernel profile runs a decoder bound as {other:?}")),
+            None => Err("the decoder's projections are bound with mixed precisions, which no WeMM kernel profile runs".into()),
+        }
+    }
+}
 /// Most text windows in one forward. Chosen on a GB10 (2026-11-08): a
 /// steady 248-ID scan (on a build with the DeltaNet unroll) gave per window
 /// 155 ms at 1, 127 at 2, 125 at 4, 142 at 8, 248 at 16, and the CubeCL pool
@@ -103,7 +203,7 @@ attributes! {
 ///   becomes, and so the vectors; that is why they are in the root and why
 ///   the root alone suffices here. Which collection, pile or archive carried
 ///   the model is provenance, not identity, and is not stated.
-/// - `kernel_profile` stays. The profile names the native BF16 GB10 kernels
+/// - `kernel_profile` stays. The profile names the native GB10 kernels
 ///   together with the input semantics (framing, at most 256 IDs per
 ///   window in right-padded batches, the 256-patch white-pad image
 ///   preparation). Every one of those
@@ -113,7 +213,9 @@ attributes! {
 ///   model other pixels. Rows from two profiles in one index would be scored
 ///   against each other as if they were comparable. So the profile is part
 ///   of what the embedding is, and an index under another profile is another
-///   index ([`GB10_NATIVE_BF16_PROFILE`]).
+///   index ([`GB10_NATIVE_BF16_PROFILE`], [`GB10_NATIVE_W4A4_PROFILE`]).
+///   A runtime states the profile its model was actually bound with
+///   ([`WemmRuntime::from_native`]), never one it was asked for.
 ///
 /// Unknown kernel profiles remain readable/carryable but cannot compute here.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,19 +224,6 @@ pub struct WemmIdentity {
     pub kernel_profile: Id,
 }
 
-impl WemmIdentity {
-    fn require_loaded_selection(&self, root: Id) -> Result<(), CollectionOperationError> {
-        if self.kernel_profile != GB10_NATIVE_BF16_PROFILE {
-            return Err(fatal("unsupported WeMM kernel/input profile"));
-        }
-        if self.model_root != root {
-            return Err(fatal(
-                "WeMM runtime's actual root does not match the descriptor",
-            ));
-        }
-        Ok(())
-    }
-}
 
 /// Retained descriptor selection is a PATCH set, with no cached source rows.
 pub struct WemmIndex<E: BlobEncoding> {
@@ -660,19 +749,25 @@ impl WemmRuntime {
     /// backing/preceding-page lifetime premise remains in force until CUDA
     /// teardown, even after this runtime/lease is dropped.
     ///
-    /// The actual native root and actual selected device are checked here;
-    /// they cannot be relabelled by a separate device argument. The root
-    /// carries its tokenizer, configuration and template in its identity.
+    /// The identity is READ from `native`, never supplied: its actual root,
+    /// and the kernel profile of its decoder as actually bound
+    /// ([`WemmProfile::of_bound`]), so a runtime cannot be relabelled with a
+    /// profile or root it does not run. A decoder no profile runs is refused.
+    /// The device is checked here too. The root carries its tokenizer,
+    /// configuration and template in its identity.
     ///
     /// `codec` cuts text into windows. It must be the codec of the same
     /// assets `native` was bound with (`Assets::codec`).
     #[cfg(feature = "semantic-wemm-cuda")]
     pub fn from_native(
-        identity: WemmIdentity,
         native: mary::models::qwen3_5::native::NativeWemm,
         codec: mary::models::qwen3_5::input_codec::InputCodec,
     ) -> Result<Self, CollectionOperationError> {
-        identity.require_loaded_selection(native.model_root())?;
+        let profile = WemmProfile::of_bound(native.decoder_bound()).map_err(fatal)?;
+        let identity = WemmIdentity {
+            model_root: native.model_root(),
+            kernel_profile: profile.id(),
+        };
         let (name, major, minor) = native.device_identity().map_err(fatal)?;
         require_gb10(&name, major, minor)?;
         let device = native.device().clone();
@@ -734,7 +829,7 @@ impl WemmRuntime {
     fn matches(&self, identity: &WemmIdentity) -> bool {
         cfg!(feature = "semantic-wemm-cuda")
             && self.identity == *identity
-            && identity.kernel_profile == GB10_NATIVE_BF16_PROFILE
+            && WemmProfile::of(identity.kernel_profile).is_some()
     }
 
     /// The first `cap` windows of each text, cut by the pinned tokenizer,
@@ -1240,15 +1335,34 @@ mod tests {
     }
 
     #[test]
-    fn loaded_selection_cannot_be_relabelled_and_hardware_is_not_an_architecture_guess() {
-        let id = identity();
-        assert!(id.require_loaded_selection(id.model_root).is_ok());
-        assert!(id
-            .require_loaded_selection(Id::new([9; 16]).unwrap())
-            .is_err());
-        let mut other = id;
-        other.kernel_profile = Id::new([9; 16]).unwrap();
-        assert!(other.require_loaded_selection(id.model_root).is_err());
+    fn the_profile_is_read_from_the_bound_decoder_and_hardware_is_not_an_architecture_guess() {
+        #[cfg(feature = "semantic-wemm-cuda")]
+        {
+            use mary::models::qwen3_5::gdn_mixer::{BoundProjection, DecoderPrecision};
+            let nvfp4 = |precision, stored| Some(BoundProjection::Nvfp4 { precision, stored });
+            assert_eq!(
+                WemmProfile::of_bound(Some(BoundProjection::Bf16)),
+                Ok(WemmProfile::Bf16)
+            );
+            assert_eq!(
+                WemmProfile::of_bound(nvfp4(DecoderPrecision::W4a4, true)),
+                Ok(WemmProfile::W4a4)
+            );
+            let at_load = WemmProfile::of_bound(nvfp4(DecoderPrecision::W4a4, false)).unwrap_err();
+            assert!(at_load.contains("quantized to NVFP4 at load"), "{at_load}");
+            for refused in [
+                nvfp4(DecoderPrecision::W4a16, true),
+                nvfp4(DecoderPrecision::W4a16, false),
+                None,
+            ] {
+                assert!(WemmProfile::of_bound(refused).is_err(), "{refused:?}");
+            }
+            assert_eq!(
+                WemmProfile::W4a4.precision(),
+                DecoderPrecision::W4a4
+            );
+            assert_eq!(WemmProfile::Bf16.precision(), DecoderPrecision::Bf16);
+        }
         assert!(require_gb10("NVIDIA GB10", 12, 1).is_ok());
         for (name, major, minor) in [
             ("NVIDIA GB10", 12, 0),
@@ -1441,6 +1555,93 @@ mod tests {
                 && layer.contains("Berths are narrow."),
             "{layer:?}"
         );
+    }
+
+    /// The BF16 profile's descriptor bytes, pinned. Recorded at main
+    /// 5766da2d (receipts phase2/receipts-g0b), before a second profile
+    /// existed: adding one must leave every BF16 index exactly the
+    /// collection it was, so the live rows stay found.
+    #[test]
+    fn the_bf16_descriptor_is_byte_unchanged() {
+        let live = WemmIdentity {
+            model_root: id_hex!("85B6ACD39E6CB93EE8BA31FDEF6C4F4F"),
+            kernel_profile: GB10_NATIVE_BF16_PROFILE,
+        };
+        for (what, index, pinned) in [
+            (
+                "fixture",
+                mapping(),
+                [
+                    "48A8C2BF5EC73B77D4DC3E53DAADD645",
+                    "2d724e5ed68c402a013742febe3e6cd930a113f6dfcfad79a34fa968ee0856b6",
+                    "b61f95b0cedbb1dd870b8200d7eef0911a1b0f3c68774076b55e8a3a131ca5c1",
+                ],
+            ),
+            (
+                "live root",
+                WemmIndex::<Embedding>::new([metadata::name.id()], live, DEFAULT_WINDOW_CAP)
+                    .unwrap(),
+                [
+                    "B6FF27B6030C6BB1DC8B7CC558CF5ED2",
+                    "aa2db65b5e35af412ba2deabc4fd429b33f6b76ad47a0e8c46a0bd330e083da2",
+                    "8b64d5521782973db7a0eda60d0faaa482333f40381d14d9c3b7b71bc8ead0fd",
+                ],
+            ),
+        ] {
+            let hex = |set: &TribleSet| {
+                let blob: Blob<SimpleArchive> = set.clone().to_blob();
+                blob.get_handle().raw.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            };
+            let fragment = index.fragment();
+            let (_, described) = descriptor(&index);
+            let observed = [
+                format!("{:X}", fragment.root().unwrap()),
+                hex(fragment.facts()),
+                hex(described.facts()),
+            ];
+            eprintln!("golden {what} {observed:?}");
+            assert_eq!(observed, pinned, "the {what} BF16 descriptor changed");
+        }
+    }
+
+    #[test]
+    fn the_w4a4_profile_is_its_own_index_and_round_trips() {
+        assert_ne!(GB10_NATIVE_W4A4_PROFILE, GB10_NATIVE_BF16_PROFILE);
+        for profile in WemmProfile::ALL {
+            assert_eq!(WemmProfile::of(profile.id()), Some(profile));
+            assert_eq!(WemmProfile::parse(profile.label()), Some(profile));
+        }
+        assert_eq!(WemmProfile::of(Id::new([8; 16]).unwrap()), None);
+        for typo in ["W4A4", "w4a16", "", "bf16 "] {
+            assert_eq!(WemmProfile::parse(typo), None, "{typo:?}");
+        }
+        let bf16 = mapping();
+        let w4a4 = WemmIndex::<Embedding>::new(
+            bf16.content_attributes(),
+            WemmIdentity {
+                kernel_profile: GB10_NATIVE_W4A4_PROFILE,
+                ..identity()
+            },
+            DEFAULT_WINDOW_CAP,
+        )
+        .unwrap();
+        assert_ne!(bf16.fragment(), w4a4.fragment());
+        let (_, described) = descriptor(&w4a4);
+        let bound = WemmIndex::<Embedding>::bind(&Fragment::empty(), &described).unwrap();
+        assert_eq!(bound, w4a4);
+        assert_eq!(bound.identity().kernel_profile, GB10_NATIVE_W4A4_PROFILE);
+        // Two profiles of one root and content are two collections.
+        let (mut store, _) = descriptor(&bf16);
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]).verifying_key();
+        let policy =
+            CollectionPolicy::new(AdmissionPolicy::direct(key), AdmissionPolicy::direct(key));
+        let source = store.collection("source", policy.clone()).unwrap();
+        let first: Collection<NvFp4CosineSet<Embedding>> =
+            store.derive_with(source, bf16.clone(), policy.clone()).unwrap();
+        let second: Collection<NvFp4CosineSet<Embedding>> =
+            store.derive_with(source, w4a4.clone(), policy).unwrap();
+        assert_ne!(first.handle(), second.handle());
+        assert!(!w4a4.computable_here(), "no runtime, no computation");
     }
 
     #[test]
@@ -1819,9 +2020,9 @@ mod tests {
             model_root: root,
             kernel_profile: GB10_NATIVE_BF16_PROFILE,
         };
-        let runtime = Rc::new(RefCell::new(
-            WemmRuntime::from_native(identity, native, codec.clone()).unwrap(),
-        ));
+        let runtime = WemmRuntime::from_native(native, codec.clone()).unwrap();
+        assert_eq!(runtime.identity(), identity, "the bound model's own identity");
+        let runtime = Rc::new(RefCell::new(runtime));
 
         let filler: String = (0..40)
             .map(|i| format!("Entry {i}: the lighthouse keeper trimmed the lamp wick, wound the clockwork that turns the lens and logged each passing ship.\n"))

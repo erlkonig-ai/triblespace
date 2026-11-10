@@ -128,7 +128,8 @@ fn copied_and_aliased_weights_print_comparable_outputs() {
         model_root: root,
         kernel_profile: GB10_NATIVE_BF16_PROFILE,
     };
-    let mut runtime = WemmRuntime::from_native(identity, native, codec).unwrap();
+    let mut runtime = WemmRuntime::from_native(native, codec).unwrap();
+    assert_eq!(runtime.identity(), identity, "the bound model's own identity");
     let stats = aliases.stats();
     eprintln!(
         "residence {residence:?} bind_s {:.2} registrations {} aliased_bytes {} copied_bytes {}",
@@ -356,7 +357,8 @@ fn weight_memory_ownership_at_fixed_points() {
         model_root: root,
         kernel_profile: GB10_NATIVE_BF16_PROFILE,
     };
-    let mut runtime = WemmRuntime::from_native(identity, native, codec).unwrap();
+    let mut runtime = WemmRuntime::from_native(native, codec).unwrap();
+    assert_eq!(runtime.identity(), identity, "the bound model's own identity");
     let bind_s = started.elapsed().as_secs_f64();
     // The model's client: re-binding an already registered leaf is a lookup
     // and returns a tensor on the same client; the registration count proves it.
