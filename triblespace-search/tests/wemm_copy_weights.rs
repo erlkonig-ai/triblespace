@@ -3,7 +3,7 @@
 //!
 //! Binds WeMM from a frozen model pile with the residence `WEMM_COPY_WEIGHTS`
 //! chooses (`1` copies to device memory, unset or `0` reads in place), then
-//! embeds one fixed batch `WEMM_REPS` times through
+//! embeds the nondet probe's batch `WEMM_REPS` times through
 //! [`WemmRuntime::probe_texts`] and prints the bind time, the device memory
 //! the process holds after bind, and the BLAKE3 hash of each forward's raw BF16
 //! output. With `WEMM_OUT` set, each distinct output is also written there.
@@ -11,7 +11,9 @@
 //! Env: `WEMM_PILE` (a model pile, opened read-only), `WEMM_MODELS` (its
 //! models collection, 64 hex digits), `WEMM_ROOT`, `WEMM_ASSETS` (a directory
 //! with the checkpoint's `config.json`, `tokenizer.json` and
-//! `chat_template.jinja`). Needs a GB10.
+//! `chat_template.jinja`), and optionally `WEMM_REF_FINAL` (four 16-hex
+//! final-row hashes, comma-separated; a forward whose rows differ prints
+//! EVENT). Needs a GB10.
 #![cfg(feature = "semantic-wemm-cuda")]
 
 use mary::models::qwen3_5::native::{Assets, NativeWemm};
@@ -19,13 +21,61 @@ use mary::nn::cuda_bf16_alias::{CudaBf16Aliases, WeightResidence};
 use triblespace_core::id::Id;
 use triblespace_search::semantic_wemm::{WemmIdentity, WemmRuntime, GB10_NATIVE_BF16_PROFILE};
 
-/// A fixed batch of four texts of different lengths, in this order.
-const BATCH: [&str; 4] = [
-    "The quick brown fox jumps over the lazy dog.",
-    "Tomato seedlings want full sun, deep watering and a stake once they reach knee height.",
-    "fn main() {\n    let numbers = vec![3, 1, 4, 1, 5, 9, 2, 6];\n    let total: i32 = numbers.iter().sum();\n    println!(\"{total}\");\n}",
-    "A lighthouse keeper kept a logbook of every ship that passed during the long winter: their names, the hour they were sighted, the direction of the wind, and whether the fog horn had to be sounded. Most entries were short, but on stormy nights the handwriting grew larger and the notes grew longer.",
-];
+/// The batch the per-layer nondeterminism probe (nondet-layer lane,
+/// 2026-11-09) repeated: one sentence and the first three windows of a
+/// filler text, each at most 248 tokens, in this order. Built exactly as
+/// that probe built it, so its `WEMM_REF_FINAL` hashes apply here.
+fn batch(codec: &mary::models::qwen3_5::input_codec::InputCodec) -> Vec<String> {
+    let filler: String = (0..40)
+        .map(|i| format!("Entry {i}: the lighthouse keeper trimmed the lamp wick and logged each passing ship.\n"))
+        .collect();
+    let sentence = "A bowl of tomato soup with fresh basil and garlic bread.";
+    let fits = |w: &str| codec.text(w).is_ok_and(|ids| ids.as_slice().len() <= 248);
+    let fw = windows(&filler, 16, fits);
+    [sentence, fw[0], fw[1], fw[2]].iter().map(|s| s.to_string()).collect()
+}
+
+/// The nondet probe's window cutter (a copy of the index's line, word,
+/// character cut), kept identical so the batch is identical.
+fn windows<'t>(text: &'t str, cap: u64, mut fits: impl FnMut(&str) -> bool) -> Vec<&'t str> {
+    let units: [fn(&str) -> usize; 3] = [
+        |s| s.find('\n').map_or(s.len(), |at| at + 1),
+        |s| {
+            let word = s.find(char::is_whitespace).unwrap_or(s.len());
+            s.len() - s[word..].trim_start().len()
+        },
+        |s| s.chars().next().map_or(0, char::len_utf8),
+    ];
+    let mut windows = Vec::new();
+    let mut rest = text.trim_start();
+    while !rest.is_empty() && (windows.len() as u64) < cap {
+        let mut end = 0;
+        for unit in units {
+            while end < rest.len() {
+                let next = end + unit(&rest[end..]);
+                if !fits(&rest[..next]) {
+                    break;
+                }
+                end = next;
+            }
+            if end > 0 {
+                break;
+            }
+        }
+        let end = end.max(units[2](rest));
+        windows.push(rest[..end].trim_end());
+        rest = rest[end..].trim_start();
+    }
+    windows
+}
+
+/// The nondet probe's final-row hash (std DefaultHasher over the row bytes).
+fn sip(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut s = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut s);
+    s.finish()
+}
 
 #[test]
 #[ignore = "needs a GB10 and a frozen WeMM model pile"]
@@ -52,6 +102,14 @@ fn copied_and_aliased_weights_print_comparable_outputs() {
     )
     .unwrap();
     let codec = assets.codec().clone();
+    let texts = batch(&codec);
+    let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let lens: Vec<usize> = texts.iter().map(|t| codec.text(t).unwrap().as_slice().len()).collect();
+    eprintln!("lens {lens:?}");
+    // WEMM_REF_FINAL: the nondet probe's four steady-state final-row hashes.
+    let reference: Option<Vec<u64>> = std::env::var("WEMM_REF_FINAL")
+        .ok()
+        .map(|s| s.split(',').map(|h| u64::from_str_radix(h, 16).unwrap()).collect());
 
     let started = std::time::Instant::now();
     let mut aliases = CudaBf16Aliases::new(Default::default(), 759)
@@ -94,22 +152,28 @@ fn copied_and_aliased_weights_print_comparable_outputs() {
 
     let out = std::env::var("WEMM_OUT").ok().map(std::path::PathBuf::from);
     let mut seen = Vec::new();
+    let mut events = 0usize;
     for rep in 0..reps {
         let t = std::time::Instant::now();
-        let probe = runtime.probe_texts(&BATCH).unwrap();
+        let probe = runtime.probe_texts(&texts).unwrap();
         assert_eq!(probe.forward, rep as u64);
-        assert_eq!(probe.raw.len(), BATCH.len() * 4096 * 2);
-        assert_eq!(probe.ids.len(), BATCH.len());
+        assert_eq!(probe.raw.len(), texts.len() * 4096 * 2);
+        assert_eq!(probe.ids.len(), texts.len());
         let digest = blake3::hash(&probe.raw).to_hex().to_string();
         let rows: Vec<String> = probe
             .raw
             .chunks(4096 * 2)
             .map(|row| blake3::hash(row).to_hex()[..16].to_owned())
             .collect();
+        let finals: Vec<u64> = probe.raw.chunks(4096 * 2).map(sip).collect();
+        let event = reference.as_ref().is_some_and(|r| r != &finals);
+        events += usize::from(event);
         eprintln!(
-            "forward {rep} ms {} raw_blake3 {digest} rows {}",
+            "forward {rep} ms {} raw_blake3 {digest} rows {} finals {} {}",
             t.elapsed().as_millis(),
-            rows.join(",")
+            rows.join(","),
+            finals.iter().map(|f| format!("{f:016x}")).collect::<Vec<_>>().join(","),
+            if reference.is_none() { "noref" } else if event { "EVENT" } else { "ok" }
         );
         if !seen.contains(&digest) {
             if let Some(out) = &out {
@@ -121,4 +185,5 @@ fn copied_and_aliased_weights_print_comparable_outputs() {
     }
     assert_eq!(runtime.forwards(), reps as u64);
     eprintln!("distinct_outputs {}", seen.len());
+    eprintln!("summary residence {residence:?} forwards {reps} events {events}");
 }
