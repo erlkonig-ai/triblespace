@@ -10,7 +10,7 @@ use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use anybytes::Bytes;
@@ -215,11 +215,17 @@ impl<S> DerefMut for StoreGuard<'_, S> {
 /// publishes what it took here before it lets the mutex go. A reader that
 /// needs only the latest observation reads it here without the mutex; a
 /// blob it does not find may be newer, and the reader then produces.
+///
+/// Closing the cell empties it for good: a producer that publishes after
+/// the close is refused, whichever mutex it holds.
 struct Latest<T> {
     cell: tokio::sync::watch::Sender<Option<(u64, T)>>,
     /// Snapshots taken so far, counted under the store mutex: the order in
     /// which the mutex let producers advance the store.
     taken: AtomicU64,
+    /// Set by [`close`](Self::close). Read and written only inside the
+    /// cell's lock, so a publish sees either the open cell or the closed one.
+    closed: AtomicBool,
 }
 
 impl<T: Clone> Latest<T> {
@@ -227,6 +233,7 @@ impl<T: Clone> Latest<T> {
         Self {
             cell: tokio::sync::watch::channel(None).0,
             taken: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -243,11 +250,13 @@ impl<T: Clone> Latest<T> {
     }
 
     /// Install the snapshot taken `order`th, unless a later one is already
-    /// installed: the cell only moves forward.
+    /// installed or the cell is closed: the cell only moves forward.
     fn publish(&self, order: u64, snapshot: T) {
         let mut retired = None;
         self.cell.send_if_modified(|latest| {
-            if latest.as_ref().is_some_and(|(newest, _)| *newest >= order) {
+            if self.closed.load(Ordering::Relaxed)
+                || latest.as_ref().is_some_and(|(newest, _)| *newest >= order)
+            {
                 return false;
             }
             retired = latest.replace((order, snapshot));
@@ -264,10 +273,16 @@ impl<T: Clone> Latest<T> {
             .map(|(_, snapshot)| snapshot.clone())
     }
 
-    /// Forget the latest snapshot: readers retained past a close must not
-    /// read what was written after them.
-    fn clear(&self) {
-        drop(self.cell.send_replace(None));
+    /// Forget the latest snapshot and refuse every later publish: readers
+    /// retained past a close must not read what was written after them, and
+    /// the cell must not keep a store snapshot alive for them.
+    fn close(&self) {
+        let mut retired = None;
+        self.cell.send_modify(|latest| {
+            self.closed.store(true, Ordering::Relaxed);
+            retired = latest.take();
+        });
+        drop(retired);
     }
 }
 
@@ -985,13 +1000,20 @@ where
         StoreGuard(self.store.lock().expect("store mutex"))
     }
 
-    /// Withdraw the published observation and explicitly stop/join the native
-    /// host. Call off UI/runtime threads, after cancelling outstanding local
-    /// acquisition futures. Retained readers cannot restart a closed host.
+    /// Host shutdown: withdraw the published observation and explicitly
+    /// stop/join the native host. Call off UI/runtime threads, after
+    /// cancelling outstanding local acquisition futures. Retained readers
+    /// cannot restart a closed host.
+    ///
+    /// The peer keeps its backend: [`store`](Self::store), writes and
+    /// snapshots still work, and a retained reader still reads newer local
+    /// blobs through the store mutex. Only the lock-free latest snapshot is
+    /// closed, so no reader, writer or landing publishes into it again.
+    /// [`into_store`](Self::into_store) is the consuming close.
     pub fn shutdown_and_join(&mut self) -> anyhow::Result<()> {
         self.serving
             .withdraw(&mut self.serving.publication.lock().expect("publication mutex"));
-        self.serving.latest.clear();
+        self.serving.latest.close();
         let started = {
             let mut host = self.host.lock().expect("host mutex");
             host.state = HostState::Closed;
@@ -1003,22 +1025,27 @@ where
         }
     }
 
-    /// Withdraw serving snapshots and release host ownership before returning
-    /// the local backend. This does not itself flush or close the backend.
+    /// Consuming close: withdraw serving snapshots and release host
+    /// ownership before returning the local backend. This does not itself
+    /// flush or close the backend ([`StorageClose::close`] does both).
+    ///
+    /// Unlike [`shutdown_and_join`](Self::shutdown_and_join), the backend
+    /// leaves the peer: a retained reader reads only what it captured, and
+    /// a read beyond that errors as closed.
     pub fn into_store(self) -> S {
         self.serving
             .withdraw(&mut self.serving.publication.lock().expect("publication mutex"));
+        self.serving.latest.close();
         {
             let mut host = self.host.lock().expect("host mutex");
             host.state = HostState::Closed;
             host.started = None;
         }
-        let mut guard = self.store.lock().expect("store mutex");
-        let store = guard.take().expect("a live Peer owns its backend");
-        // Cleared under the mutex, after which no producer can publish.
-        self.serving.latest.clear();
-        drop(guard);
-        store
+        self.store
+            .lock()
+            .expect("store mutex")
+            .take()
+            .expect("a live Peer owns its backend")
     }
 
     /// Freeze the backend without changing the host's serving observation.
@@ -2128,6 +2155,52 @@ mod tests {
         let error =
             futures::executor::block_on(frozen.get::<Bytes, UnknownBlob>(handle)).unwrap_err();
         assert!(error.to_string().contains("closed"), "{error}");
+    }
+
+    /// Host shutdown closes the latest snapshot for good. The backend stays
+    /// with the peer and still reads, but no landing, reader, snapshot or
+    /// refresh after the shutdown publishes into the cell again.
+    #[test]
+    fn shutdown_closes_the_latest_snapshot_to_every_producer() {
+        let key = SigningKey::from_bytes(&[79; 32]);
+        let (sender, receiver, _wiring) =
+            host::wire(crate::identity::iroh_secret(&key).public().into());
+        let mut peer = Peer::with_wiring(MemoryRepo::default(), sender, receiver);
+        let frozen = peer.snapshot().unwrap();
+        peer.refresh();
+        let latest = peer.serving.latest.clone();
+        assert!(latest.get().is_some());
+
+        peer.shutdown_and_join().unwrap();
+        assert!(
+            latest.get().is_none(),
+            "shutdown emptied the latest snapshot"
+        );
+
+        let lander = Lander(Arc::downgrade(&peer.serving));
+        let landed = Blob::<UnknownBlob>::new(Bytes::from_source(b"landed later".to_vec()));
+        let landed_handle = landed.get_handle();
+        lander.land(vec![NetEvent::Blob(landed)]);
+        assert!(latest.get().is_none(), "a landing after shutdown published");
+
+        let bytes = Bytes::from_source(b"written after shutdown".to_vec());
+        let written = peer.put::<UnknownBlob, _>(bytes.clone()).unwrap();
+        let read = futures::executor::block_on(frozen.get::<Bytes, UnknownBlob>(written));
+        assert_eq!(read.unwrap(), bytes, "the backend still reads");
+        assert!(
+            latest.get().is_none(),
+            "a reader's advance after shutdown published"
+        );
+
+        let after = peer.snapshot().unwrap();
+        assert!(after.contains_blob(landed_handle).unwrap());
+        peer.refresh();
+        assert!(
+            latest.get().is_none(),
+            "a snapshot or refresh after shutdown published"
+        );
+        drop((frozen, after));
+        peer.close().unwrap();
     }
 
     #[test]
