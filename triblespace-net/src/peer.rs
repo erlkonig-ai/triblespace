@@ -602,8 +602,8 @@ where
     /// Continue hydration from `hydration`, an answer already advanced over
     /// earlier snapshots of this peer's store -- typically a climb over the
     /// pile before the peer was assembled
-    /// ([`crate::reconcile::climb`]) -- instead of from empty. Call it after
-    /// [`Self::set_replication`], which discards any answer held. The next
+    /// ([`crate::reconcile::climb`]) -- instead of from empty. It replaces
+    /// any answer held. The next
     /// [`Self::reconcile`] advances it to that pass's snapshot, and anything
     /// that is not an append since (another store, a changed selection)
     /// resets it there, so adopting a stale answer costs a reread, never a

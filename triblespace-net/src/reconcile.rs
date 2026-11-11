@@ -187,9 +187,11 @@ pub struct Reconciler {
     root_round: ExactRound,
     next_service: ServiceTurn,
     /// A [`Hydration`] over the snapshot type of the store last ticked. It is
-    /// type-erased only so the reconciler stays independent of its store; a
-    /// different store type, a selection change, or a failed observation
-    /// discards it, and the next tick advances a new one from empty.
+    /// type-erased only so the reconciler stays independent of its store. A
+    /// selection change keeps it: the next advance reads a newly selected
+    /// collection whole, and a collection leaving the selection resets it. A
+    /// different store type, Demand mode, or a failed observation discards
+    /// it, and the next tick advances a new one from empty.
     hydration: Option<Box<dyn Any + Send + Sync>>,
 }
 
@@ -611,7 +613,8 @@ impl Reconciler {
         }
         self.root_round = ExactRound::default();
         self.next_service = ServiceTurn::default();
-        self.hydration = None;
+        // The hydration memo stays: its next advance reads a collection that
+        // joined the selection whole, and one that left resets it.
         for state in self.states.values_mut() {
             state.root_since = None;
             state.first_root_attempt = false;
@@ -2353,7 +2356,7 @@ mod tests {
         );
         let stats = reconciler.tick(&mut peer).await;
         assert_eq!((stats.replication.roots, stats.replication.pending), (7, 1));
-        assert_eq!(take_counts().1, 1);
+        assert_eq!(take_counts(), (4, 0), "a grown selection advances");
 
         reconciler.set_replication(ReplicationMode::Demand, [Inline::new(first)]);
         let stats = reconciler.tick(&mut peer).await;
@@ -2361,6 +2364,76 @@ mod tests {
         assert_eq!(stats.pending_blobs, Some(0));
         assert!(reconciler.hydration.is_none());
         assert!(reconciler.states.is_empty());
+    }
+
+    /// A selection change keeps the reconciler's hydration memo: a
+    /// collection that joins is read whole by the next tick, and only one
+    /// that leaves resets it. Every answer equals a fresh advance over the
+    /// same snapshot.
+    #[tokio::test]
+    async fn a_selection_change_keeps_the_hydration_memo() {
+        fn memo_of<T: StoreRead + Send + Sync + 'static>(
+            reconciler: &Reconciler,
+            _: &T,
+        ) -> (BTreeSet<RawHash>, BTreeSet<RawHash>) {
+            let memo = reconciler
+                .hydration
+                .as_ref()
+                .expect("a memo after a Shallow tick")
+                .downcast_ref::<Hydration<T>>()
+                .expect("a memo over this store's snapshots");
+            (memo.roots.clone(), memo.missing.clone())
+        }
+        let mut store = MemoryRepo::default();
+        let a = put(&mut store, b"collection a descriptor".to_vec());
+        let b = put(&mut store, b"collection b descriptor".to_vec());
+        let metadata = put(&mut store, Vec::new());
+        for ordinal in 0..2 {
+            let data = put(&mut store, format!("a data {ordinal}").into_bytes());
+            raw_commit(&mut store, a, data, metadata);
+        }
+        raw_commit(&mut store, b, [0xdd; 32], metadata);
+        let (mut peer, _, _) = controlled_peer(store, BTreeMap::new(), BTreeSet::new());
+        let mut reconciler = Reconciler::new().with_fetch_budget(Duration::ZERO);
+        take_counts();
+        let mut from_empty = 0;
+        let mut resets = 0;
+        // (step, selection, (roots, pending), root lookups, cumulative
+        // advances from empty, cumulative resets)
+        for (step, selection, observed, reads, expected_from_empty, expected_resets) in [
+            ("[a]", vec![a], (4, 0), 4, 1, 0),
+            ("grown to [a, b]", vec![a, b], (6, 1), 2, 1, 0),
+            ("shrunk to [a]", vec![a], (4, 0), 4, 2, 1),
+        ] {
+            let collections: Vec<_> = selection.iter().map(|raw| Inline::new(*raw)).collect();
+            reconciler.set_replication(ReplicationMode::Shallow, collections.iter().copied());
+            let stats = reconciler.tick(&mut peer).await;
+            resets += RESETS.get();
+            let (lookups, advanced_from_empty) = take_counts();
+            from_empty += advanced_from_empty;
+            assert_eq!(
+                (from_empty, resets),
+                (expected_from_empty, expected_resets),
+                "advances from empty and resets after {step}"
+            );
+            assert_eq!(lookups, reads, "root lookups for {step}");
+            assert_eq!(
+                (stats.replication.roots, stats.replication.pending),
+                observed,
+                "{step}"
+            );
+            let snapshot = peer.snapshot().unwrap();
+            let fresh = Hydration::new()
+                .advance(&*snapshot, &collections)
+                .await
+                .unwrap();
+            assert_eq!(
+                memo_of(&reconciler, &*snapshot),
+                (fresh.roots.clone(), fresh.missing.clone()),
+                "the memo equals a fresh advance after {step}"
+            );
+            take_counts();
+        }
     }
 
     /// A blob that leaves the view returns its root to the missing set, even
