@@ -1563,10 +1563,18 @@ explicit rewrite/retention-policy choice.
 
 ### Held blobs and replication policy
 
-A collection replicated in full has a held set: a positive PATCH of resident
-handles, kept by the store itself (`triblespace_core::collection::held`) for
-the collections `Peer::set_replication` puts in `Full` mode. A host that
-replicates on demand or shallowly keeps none. Seeds are the blobs C's
+A collection replicated shallowly or in full has a held set: a positive PATCH
+of resident handles, kept by the store itself
+(`triblespace_core::collection::held`) for the collections
+`Peer::set_replication` selects in `Shallow` or `Full` mode. Building it reads
+every blob in the collection's closure, so it is also the scrub that finds a
+corrupt copy. Only `Full` publishes it: outside `Full` the serving snapshot
+reports it unknown, so no References exchange is admitted for it. A `Demand`
+selection, or an empty one, tracks nothing and starts no held-set thread.
+Tracking only grows: a collection tracked under an earlier `Shallow` or `Full`
+selection stays tracked after a move to `Demand`, but is no longer published.
+A mode change governs new admissions; References walks already admitted run to
+their end. Seeds are the blobs C's
 replicated records name -- the descriptor, each COMMIT's data and metadata
 archive, each DERIVE's output -- and the capability definitions named by the
 proofs C's authorization evidence keeps. That is the predicate the evidence
@@ -1634,8 +1642,8 @@ every selected collection:
 
 | Mode | Blob acquisition |
 |---|---|
-| `Demand` (default) | Explicit WANTs only. No held sets are kept, and peerings carry an unset full flag. |
-| `Shallow` | Also direct blob references of the named collections' foundations. |
+| `Demand` (default) | Explicit WANTs only. No new held sets are tracked (collections tracked earlier stay tracked but unpublished), and peerings carry an unset full flag. |
+| `Shallow` | Also direct blob references of the named collections' foundations. This side keeps held sets for them without publishing them. |
 | `Full` | Also everything a Full neighbour holds in each named collection, by its references pushes. This side keeps held sets for them and peers with the full flag set. |
 
 These reconciler modes are separate from the bounded metadata warmup of
