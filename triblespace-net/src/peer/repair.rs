@@ -42,11 +42,23 @@
 //!   in a snapshot, for the life of the store.
 //!
 //! A corrupt blob first read there is marked unknown in its job, and that job
-//! does not read it again. It and every ancestor stay out of that
-//! collection's held set until a reset or a reopen, even if a later job of
-//! another collection repairs the bytes on the held-set thread. Closing this
-//! needs a change in the core's held index (hand such a job to the driver
-//! rather than marking the blob unknown); it is not made here.
+//! does not read it again. Unknown is scoped to the job: a later job can
+//! retry it and its ancestors -- a new record naming them, or a peer's report
+//! of a handle the set does not hold -- and if the bytes were repaired
+//! meanwhile, they join then. A bare valid duplicate of the bytes alone starts
+//! no new job, so without such a trigger they stay out until the index resets
+//! or the store reopens. Closing this needs a change in the core's held index
+//! (hand such a job to the driver rather than marking the blob unknown); it
+//! is not made here.
+//!
+//! Bounds and lifetimes: the attempt memo records a handle before its fetch,
+//! so a failed attempt also counts, once per held-set thread, and a held-index
+//! reset does not clear it. The interactive fetch deadline bounds the network
+//! wait only, not the store mutex, the put or the read-back. After
+//! [`Peer::shutdown_and_join`] the store stays, so a repair already fetched can
+//! still land; it is not published to the latest cell, which is closed by then.
+//!
+//! [`Peer::shutdown_and_join`]: super::Peer::shutdown_and_join
 //!
 //! [`PeerSnapshot`]: super::PeerSnapshot
 //! [`Peer::set_replication`]: super::Peer::set_replication

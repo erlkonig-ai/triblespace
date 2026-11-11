@@ -740,9 +740,10 @@ where
     /// Known gap: only blobs this thread reads are repaired. A corrupt blob
     /// first read inside a snapshot -- a building collection's inline
     /// allowance, or the publication barrier that extends every built
-    /// collection -- is marked unknown in that job and not read again, so it
-    /// and its ancestors stay out of that collection's held set until a reset
-    /// or a reopen (see the module documentation of `peer/repair.rs`).
+    /// collection -- is marked unknown in that job and not read again. A later
+    /// job (a new record, a peer's report) can retry it once the bytes are
+    /// repaired; without one it stays out until a reset or a reopen (see the
+    /// module documentation of `peer/repair.rs`).
     fn held_repair(&self) -> impl FnMut(RawHash) -> Option<Bytes> + Send + 'static + use<S> {
         let serving = Arc::downgrade(&self.serving);
         let host = Arc::downgrade(&self.host);

@@ -41,8 +41,9 @@ fn open_pile(path: &PathBuf, host: Option<ed25519_dalek::VerifyingKey>) -> Resul
 ///
 /// Known gap: a corrupt blob that a snapshot reads first -- a building
 /// collection's inline allowance, or the publication barrier that extends a
-/// built collection -- is not repaired, and stays out of that collection's
-/// held set until a reset or a reopen (`triblespace-net`'s `peer/repair.rs`).
+/// built collection -- is not repaired there. It stays out of that
+/// collection's held set until a later job retries it (a new record, a
+/// peer's report) or the index resets (`triblespace-net`'s `peer/repair.rs`).
 type Custody = Covered<Repairing<PileFile>>;
 /// One observation of [`Custody`].
 type CustodySnapshot = <Custody as SnapshotSource>::Snapshot;
