@@ -221,10 +221,13 @@ impl<T: StoreRead> Hydration<T> {
     /// Derive every selected root from `snapshot` and read each one.
     ///
     /// On a fresh process every read hashes its blob, which for a large pile
-    /// is minutes of work, so the derivation yields at least every
-    /// [`DERIVE_TURN`]: a caller's other branches (a daemon's stop signal)
-    /// are polled meanwhile. Dropped at a yield, it has read only an
-    /// immutable snapshot and leaves nothing behind.
+    /// is minutes of work, so the derivation yields once a chunk of reads has
+    /// taken [`DERIVE_TURN`]. That is a threshold between reads, not a latency
+    /// bound: a single read, and the work before and after the derivation,
+    /// stay synchronous. A caller's other branches (a daemon's stop signal)
+    /// are polled at those yields. Dropped at a yield, it has read only an
+    /// immutable snapshot and published no partial state. Validation-cache
+    /// entries it completed are each whole and survive for later reads.
     async fn derive(
         snapshot: &T,
         collections: &[CollectionHandle],
