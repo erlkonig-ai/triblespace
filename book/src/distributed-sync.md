@@ -1661,10 +1661,16 @@ Cancellation drops owned network futures, leaving already landed bytes for
 the next refresh. Unstarted work is not falsely fulfilled, and failed exact
 requests retain bounded retry backoff.
 
-Missing work is derived from known required handles and the current readable
-snapshot, not a retained mirror of durable answers. A raw physical occurrence
-alone is insufficient: ordinary reads retain corruption detection and valid
-duplicate fallback. Explicit close remains the persistence boundary. None of
+Missing work is derived from known required handles and the current
+snapshot, not a retained mirror of durable answers. Selected direct roots are
+checked by presence: a root the snapshot's blob index holds counts as held, and
+hydration reads no payload. The handle in the index was computed when the bytes
+were written. So a root that is present but corrupt is not missing to
+hydration, and hydration does not fetch it. Validation stays at byte use.
+Ordinary reads keep corruption detection and valid-duplicate fallback. Exact
+WANTs, peer acquisition and Full References admission still check with a
+validated read, so they can still fetch a replacement for a corrupt copy.
+Explicit close remains the persistence boundary. None of
 these scheduling bounds is a measured throughput or end-to-end completion
 guarantee.
 
