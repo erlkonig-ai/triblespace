@@ -3540,6 +3540,14 @@ impl super::SnapshotSource for PileFile {
     }
 }
 
+impl super::SnapshotStep for PileFile {
+    /// [`Self::refresh_step`], then [`Self::snapshot_replayed`].
+    fn snapshot_step(&mut self, max_bytes: u64) -> Result<(Self::Snapshot, bool), ReadError> {
+        let reached_end = self.refresh_step(max_bytes)?;
+        Ok((self.snapshot_replayed(), reached_end))
+    }
+}
+
 /// Error returned when opening or refreshing a [`PileFile`].
 #[derive(Debug)]
 pub enum ReadError {

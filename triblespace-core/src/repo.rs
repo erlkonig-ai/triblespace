@@ -603,6 +603,23 @@ pub trait SnapshotSource {
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError>;
 }
 
+/// A store that can reobserve a bounded further prefix of itself: one step
+/// of a climb.
+///
+/// Each step hands out an ordinary snapshot, an append to the previous one,
+/// so a consumer that advances by snapshot difference reaches the same
+/// answer as from one [`SnapshotSource::snapshot`] of the end, without any
+/// one step replaying more than about `max_bytes`.
+pub trait SnapshotStep: SnapshotSource {
+    /// Reobserve at most about `max_bytes` more and freeze exactly that
+    /// prefix. The flag says whether this step reached the end the store
+    /// observed.
+    fn snapshot_step(
+        &mut self,
+        max_bytes: u64,
+    ) -> Result<(Self::Snapshot, bool), Self::SnapshotError>;
+}
+
 /// Immutable snapshot type produced by `S`.
 pub type SnapshotOf<S> = <S as SnapshotSource>::Snapshot;
 

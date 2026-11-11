@@ -8,11 +8,12 @@ use ed25519_dalek::SigningKey;
 use triblespace_core::collection::{descriptor, Collection, CollectionStoreExt};
 use triblespace_core::metadata;
 use triblespace_core::prelude::*;
-use triblespace_core::repo::pile::Pile;
 use triblespace_net::health::HealthSnapshot;
 use triblespace_net::health_record as h;
 use triblespace_net::reconcile::ReconcileStats;
 use triblespace_net::telemetry as t;
+
+use super::Custody;
 
 #[derive(clap::Args)]
 pub(crate) struct Options {
@@ -35,7 +36,7 @@ mod tests {
 
     fn fixture() -> (
         tempfile::TempDir,
-        Pile,
+        Custody,
         Collection<blobencodings::SimpleArchive>,
         SigningKey,
     ) {
@@ -43,7 +44,7 @@ mod tests {
         let path = directory.path().join("telemetry.pile");
         std::fs::File::create(&path).unwrap();
         let signer = SigningKey::from_bytes(&[8; 32]);
-        let mut pile = Pile::open(&path).unwrap();
+        let mut pile = super::super::open_custody(&path).unwrap();
         let collection = pile
             .collection(
                 "test telemetry",
@@ -110,7 +111,7 @@ mod tests {
         pile.close().unwrap();
         let path = directory.path().join("telemetry.pile");
         let before = std::fs::read(&path).unwrap();
-        let mut pile = Pile::open(&path).unwrap();
+        let mut pile = super::super::open_custody(&path).unwrap();
         assert!(Publisher::open(
             &mut pile,
             &signer,
@@ -496,7 +497,7 @@ pub(super) struct Publisher {
 
 impl Publisher {
     pub(super) fn open(
-        pile: &mut Pile,
+        pile: &mut Custody,
         signer: &SigningKey,
         options: Options,
     ) -> Result<Option<Self>> {
@@ -637,7 +638,7 @@ impl Publisher {
         Ok(facts)
     }
 
-    pub(super) fn publish(&self, pile: &mut Pile, health: &HealthSnapshot) -> Result<()> {
+    pub(super) fn publish(&self, pile: &mut Custody, health: &HealthSnapshot) -> Result<()> {
         let facts = self.sample(
             health,
             triblespace_core::clock::epoch_now(),

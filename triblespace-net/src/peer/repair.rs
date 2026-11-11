@@ -70,8 +70,8 @@ use triblespace_core::patch::{Entry, IdentitySchema, PATCH};
 use triblespace_core::repo::{
     BlobChildren, BlobInfo, BlobMetadata, BlobStoreGet, BlobStoreKeep, BlobStoreList,
     BlobStoreMeta, BlobStorePut, CapabilityProofRead, CapabilityProofStore, PinSnapshot,
-    PinSnapshotSource, SnapshotSource, StorageClose, StorageFlush, StoreChanges, StoreDependencies,
-    StoreSnapshot, WantRead, WantRequest, WantStore,
+    PinSnapshotSource, SnapshotSource, SnapshotStep, StorageClose, StorageFlush, StoreChanges,
+    StoreDependencies, StoreSnapshot, WantRead, WantRequest, WantStore,
 };
 
 use crate::protocol::RawHash;
@@ -177,6 +177,17 @@ impl<S: SnapshotSource> SnapshotSource for Repairing<S> {
 
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
         self.0.snapshot().map(RepairingSnapshot)
+    }
+}
+
+/// A climb over a repairing store steps the inner store.
+impl<S: SnapshotStep> SnapshotStep for Repairing<S> {
+    fn snapshot_step(
+        &mut self,
+        max_bytes: u64,
+    ) -> Result<(Self::Snapshot, bool), Self::SnapshotError> {
+        let (snapshot, reached_end) = self.0.snapshot_step(max_bytes)?;
+        Ok((RepairingSnapshot(snapshot), reached_end))
     }
 }
 

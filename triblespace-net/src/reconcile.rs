@@ -17,6 +17,8 @@ use std::time::Duration;
 use anybytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use triblespace_core::blob::encodings::UnknownBlob;
+use triblespace_core::collection::covered::{Covered, CoveredSnapshot};
+use triblespace_core::collection::held::HeldSource;
 use triblespace_core::collection::{
     CollectionHandle, CollectionRecordSelector, CollectionStore, HeldRead, HeldStore,
     RecordViewChanges,
@@ -25,7 +27,8 @@ use triblespace_core::inline::Inline;
 use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
 use triblespace_core::repo::{
     BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, CapabilityProofStore, SnapshotSource,
-    StorageFlush, StoreChanges, StoreDependencies, StoreRead, WantRead, WantRequest, WantStore,
+    SnapshotStep, StorageFlush, StoreChanges, StoreDependencies, StoreRead, WantRead, WantRequest,
+    WantStore,
 };
 
 use crate::peer::{Peer, PeerSnapshot};
@@ -477,15 +480,20 @@ pub const CLIMB_STEP_BYTES: u64 = 1 << 30;
 ///
 /// Hand the result to [`Peer::adopt_hydration`](crate::peer::Peer::adopt_hydration)
 /// once the peer is assembled over the same `pile`.
-pub async fn climb<E>(
-    pile: &mut triblespace_core::repo::pile::Pile,
+///
+/// `pile` is any covered store that steps ([`SnapshotStep`]): a
+/// [`Pile`](triblespace_core::repo::pile::Pile), or custody's
+/// `Covered<Repairing<PileFile>>` ([`Repairing`](crate::peer::Repairing)).
+pub async fn climb<S, E>(
+    pile: &mut Covered<S>,
     step_bytes: u64,
-    mut selection: impl FnMut(
-        &triblespace_core::repo::pile::PileSnapshot,
-    ) -> Result<Vec<CollectionHandle>, E>,
-    mut on_step: impl FnMut(&Hydration<triblespace_core::repo::pile::PileSnapshot>, bool),
-) -> anyhow::Result<Hydration<triblespace_core::repo::pile::PileSnapshot>>
+    mut selection: impl FnMut(&CoveredSnapshot<S::Snapshot>) -> Result<Vec<CollectionHandle>, E>,
+    mut on_step: impl FnMut(&Hydration<CoveredSnapshot<S::Snapshot>>, bool),
+) -> anyhow::Result<Hydration<CoveredSnapshot<S::Snapshot>>>
 where
+    S: SnapshotStep,
+    S::Snapshot: HeldSource,
+    CoveredSnapshot<S::Snapshot>: StoreRead,
     E: Into<anyhow::Error>,
 {
     let mut hydration = Hydration::new();

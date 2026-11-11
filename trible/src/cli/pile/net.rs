@@ -4,24 +4,25 @@ mod dashboard;
 mod telemetry;
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 use clap::{Parser, ValueEnum};
 use ed25519_dalek::SigningKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::collection::covered::Covered;
 use triblespace_core::collection::selection::{
     config_facts, sync_collection, sync_selection, Selection,
 };
 use triblespace_core::collection::CollectionHandle;
 use triblespace_core::collection::{
-    AdmissionPolicy, Collection, CollectionPolicy, CollectionStoreExt,
+    AdmissionPolicy, Collection, CollectionPolicy, CollectionStore, CollectionStoreExt,
 };
-use triblespace_core::repo::pile::Pile;
+use triblespace_core::repo::pile::{Pile, PileFile};
 use triblespace_core::repo::SnapshotSource;
 use triblespace_net::health_record::{self, Recorder, DEFAULT_MAX_AGE, REPORT_EVERY};
-use triblespace_net::peer::{Peer, PeerConfig};
 use triblespace_net::patch_repair::PatchSummary;
+use triblespace_net::peer::{Peer, PeerConfig, Repairing};
 use triblespace_net::reconcile::ReplicationMode;
 
 /// Open the pile, as `host` when the command publishes or reads MERGEs or MAPs
@@ -29,6 +30,29 @@ use triblespace_net::reconcile::ReplicationMode;
 /// [`crate::cli::pile::open_refreshed`]).
 fn open_pile(path: &PathBuf, host: Option<ed25519_dalek::VerifyingKey>) -> Result<Pile> {
     crate::cli::pile::open_refreshed_with(path, host)
+}
+
+/// Custody's store, the one `sync` runs over: the pile read through
+/// [`Repairing`]. In Shallow and Full the peer's held-set thread then repairs
+/// a blob it reads whose bytes fail validation: it fetches a verified copy,
+/// lands it beside the corrupt one and reads it back, so the blob and what
+/// is above it join the held set. Every other read, and every read in
+/// Demand, where no held-set thread runs, is exactly a [`Pile`]'s.
+///
+/// Known gap: a corrupt blob that a snapshot reads first -- a building
+/// collection's inline allowance, or the publication barrier that extends a
+/// built collection -- is not repaired, and stays out of that collection's
+/// held set until a reset or a reopen (`triblespace-net`'s `peer/repair.rs`).
+type Custody = Covered<Repairing<PileFile>>;
+/// One observation of [`Custody`].
+type CustodySnapshot = <Custody as SnapshotSource>::Snapshot;
+
+/// Open custody's store at `path` with no host, without replaying it: sync
+/// never publishes or reads a MERGE, and replays by refresh or by a climb.
+fn open_custody(path: &Path) -> Result<Custody> {
+    PileFile::open(path)
+        .map(|file| Covered::new(Repairing::new(file)))
+        .map_err(|e| anyhow!("open pile {}: {e:?}", path.display()))
 }
 
 fn parse_collection(value: &str) -> Result<CollectionHandle> {
@@ -452,7 +476,7 @@ fn local_addresses(bound: &[std::net::SocketAddr]) -> BTreeSet<std::net::SocketA
 /// pile with the key reads them to reach the daemon first
 /// (`PeerConfig::daemon`).
 fn record_addresses(
-    pile: &mut Pile,
+    pile: &mut Custody,
     key: &SigningKey,
     addresses: &BTreeSet<std::net::SocketAddr>,
 ) -> Result<bool> {
@@ -474,7 +498,7 @@ fn record_addresses(
 /// The collections the configuration of the pile `authority` signs for
 /// selects for sync.
 fn selected_collections(
-    pile: &mut Pile,
+    pile: &mut Custody,
     authority: ed25519_dalek::VerifyingKey,
 ) -> Result<BTreeSet<CollectionHandle>> {
     selected_in(&pile.snapshot()?, authority)
@@ -482,7 +506,7 @@ fn selected_collections(
 
 /// [`selected_collections`] as of one snapshot.
 fn selected_in(
-    snapshot: &triblespace_core::repo::pile::PileSnapshot,
+    snapshot: &CustodySnapshot,
     authority: ed25519_dalek::VerifyingKey,
 ) -> Result<BTreeSet<CollectionHandle>> {
     use triblespace_core::macros::{find, pattern};
@@ -525,10 +549,14 @@ fn run_sync(
     // so the first pass reads the roots step by step and a stop is answered
     // between and within steps.
     let (mut pile, climbed) = if replication == ReplicationMode::Demand {
-        (open_pile(&pile_path, None)?, None)
+        let mut pile = open_custody(&pile_path)?;
+        if let Err(error) = pile.refresh() {
+            let _ = pile.close();
+            return Err(crate::cli::pile::pile_read_error(&pile_path, error));
+        }
+        (pile, None)
     } else {
-        let mut pile = Pile::open(&pile_path)
-            .map_err(|e| anyhow!("open pile {}: {e:?}", pile_path.display()))?;
+        let mut pile = open_custody(&pile_path)?;
         let authority = key.verifying_key();
         let climbed = runtime.block_on(async {
             tokio::select! {
@@ -917,11 +945,15 @@ fn completed_rounds<T: Copy + Ord>(
 /// The health collection reports go into: an explicit existing generation by
 /// handle, or the reporting key's own `swarm-health` generation (a direct
 /// policy on both sides, so the generation is a function of the key).
-fn open_health_collection(
-    pile: &mut Pile,
+fn open_health_collection<S>(
+    pile: &mut S,
     authority: ed25519_dalek::VerifyingKey,
     value: Option<&str>,
-) -> Result<Collection<SimpleArchive>> {
+) -> Result<Collection<SimpleArchive>>
+where
+    S: SnapshotSource + triblespace_core::repo::BlobStorePut + CollectionStore,
+    S::Snapshot: triblespace_core::repo::BlobStoreGet,
+{
     match value {
         Some(value) => {
             let handle = parse_collection(value)?;
@@ -1165,7 +1197,7 @@ mod tests {
         std::fs::File::create(&daemon_path).unwrap();
         let key = SigningKey::from_bytes(&[0x51; 32]);
         let mut daemon = Peer::new(
-            super::open_pile(&daemon_path, None).unwrap(),
+            super::open_custody(&daemon_path).unwrap(),
             key.clone(),
             PeerConfig {
                 daemon: None,
@@ -1207,6 +1239,168 @@ mod tests {
         assert_eq!(fetched, Some(payload));
         reader.into_store().close().unwrap();
         daemon.into_store().close().unwrap();
+    }
+
+    /// Sync's Shallow store repairs on the held-set thread. A pile whose
+    /// seed fails validation is opened and climbed as `run_sync` opens and
+    /// climbs it (`open_custody`, then `climb`), and the peer over it, as
+    /// `run_sync` assembles it, selects the seed's collection in Shallow. A
+    /// neighbour holds the valid bytes. The held-set thread fetches them,
+    /// lands them beside the corrupt copy, and the seed joins the held set
+    /// with the rest of its closure.
+    ///
+    /// The one difference from `run_sync`: sync names no daemon, so its
+    /// sources come from discovery, which this test cannot rely on; here the
+    /// peer names the neighbour as its daemon, through the addresses the
+    /// neighbour recorded in the pile.
+    #[test]
+    fn the_custody_store_repairs_a_corrupt_seed_on_the_held_thread() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::time::{Duration, Instant};
+
+        use anybytes::Bytes;
+        use ed25519_dalek::SigningKey;
+        use triblespace_core::blob::encodings::UnknownBlob;
+        use triblespace_core::blob::Blob;
+        use triblespace_core::collection::{CollectionCommit, CollectionRecord, HeldRead};
+        use triblespace_core::inline::Inline;
+        use triblespace_core::repo::pile::{PileRecordContent, PileRecords};
+        use triblespace_core::repo::{BlobStoreGet, BlobStorePut, StorageFlush};
+        use triblespace_net::peer::{Peer, PeerConfig};
+        use triblespace_net::reconcile::{climb, ReplicationMode, CLIMB_STEP_BYTES};
+
+        let blob = |bytes: Vec<u8>| Blob::<UnknownBlob>::new(Bytes::from_source(bytes));
+        // More than a snapshot reads of a building collection itself
+        // (16 MiB), so the held-set thread reads the seed.
+        let seed = blob(
+            b"custody seed "
+                .iter()
+                .copied()
+                .cycle()
+                .take((16 << 20) + 4096)
+                .collect(),
+        );
+        let metadata = blob(b"custody metadata".to_vec());
+        let descriptor = blob(b"custody descriptor".to_vec());
+        let collection = Inline::new(descriptor.get_handle().raw);
+        let copies = |path: &std::path::Path| {
+            PileRecords::open(path)
+                .unwrap()
+                .filter_map(|record| match record.unwrap().content {
+                    PileRecordContent::Blob {
+                        hash, data_offset, ..
+                    } if hash.raw == seed.get_handle().raw => Some(data_offset),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let loopback = || PeerConfig {
+            daemon: None,
+            provider_publication_budget: Some(0),
+            bind: Some("127.0.0.1:0".parse().unwrap()),
+        };
+
+        // The neighbour: the valid bytes, a commit naming them, and where it
+        // listens, recorded in its pile.
+        let directory = tempfile::tempdir().unwrap();
+        let neighbour_path = directory.path().join("neighbour.pile");
+        let custody_path = directory.path().join("custody.pile");
+        std::fs::File::create(&neighbour_path).unwrap();
+        let neighbour_key = SigningKey::from_bytes(&[0x61; 32]);
+        let mut neighbour = Peer::new(
+            super::open_custody(&neighbour_path).unwrap(),
+            neighbour_key.clone(),
+            loopback(),
+        )
+        .unwrap();
+        {
+            let mut store = neighbour.store();
+            for blob in [&descriptor, &seed, &metadata] {
+                store.put::<UnknownBlob, _>(blob.clone()).unwrap();
+            }
+            store
+                .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                    &neighbour_key,
+                    collection,
+                    Inline::new(seed.get_handle().raw),
+                    Inline::new(metadata.get_handle().raw),
+                )))
+                .unwrap();
+            let listening = super::local_addresses(&neighbour.bound_sockets());
+            assert!(super::record_addresses(&mut *store, &neighbour_key, &listening).unwrap());
+            store.flush().unwrap();
+        }
+        neighbour.refresh();
+
+        // Custody's pile: the neighbour's, with the seed changed in place
+        // after it was indexed, so it is listed and fails validation.
+        std::fs::copy(&neighbour_path, &custody_path).unwrap();
+        let [offset] = copies(&custody_path)[..] else {
+            panic!("one copy of the seed")
+        };
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&custody_path)
+            .unwrap();
+        writer.seek(SeekFrom::Start(offset as u64 + 40)).unwrap();
+        writer.write_all(&[0xa5]).unwrap();
+        drop(writer);
+
+        let mut custody = super::open_custody(&custody_path).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let climbed = runtime
+            .block_on(climb(
+                &mut custody,
+                CLIMB_STEP_BYTES,
+                |_| Ok::<_, std::convert::Infallible>(vec![collection]),
+                |_, _| {},
+            ))
+            .unwrap();
+        let mut peer = Peer::new(
+            custody,
+            SigningKey::from_bytes(&[0x62; 32]),
+            PeerConfig {
+                daemon: Some(neighbour_key.verifying_key()),
+                ..loopback()
+            },
+        )
+        .unwrap();
+        let before = peer.snapshot().unwrap();
+        assert!(
+            BlobStoreGet::get::<Bytes, UnknownBlob>(&*before, seed.get_handle()).is_err(),
+            "the damaged seed fails validation"
+        );
+        drop(before);
+
+        peer.set_replication(ReplicationMode::Shallow, [collection]);
+        peer.adopt_hydration(climbed);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let snapshot = loop {
+            let snapshot = peer.snapshot().unwrap();
+            if snapshot.held(collection).is_some() {
+                break snapshot;
+            }
+            assert!(Instant::now() < deadline, "held set not built in a minute");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let held = snapshot.held(collection).unwrap();
+        for blob in [&descriptor, &metadata, &seed] {
+            assert!(
+                held.has_prefix(&blob.get_handle().raw),
+                "the repaired seed's closure joins the held set"
+            );
+        }
+        let read: Bytes =
+            BlobStoreGet::get::<Bytes, UnknownBlob>(&*snapshot, seed.get_handle()).unwrap();
+        assert_eq!(read, seed.bytes);
+        assert_eq!(copies(&custody_path).len(), 2, "landed beside the corrupt copy");
+
+        drop(snapshot);
+        peer.into_store().close().unwrap();
+        neighbour.into_store().close().unwrap();
     }
 
     #[test]

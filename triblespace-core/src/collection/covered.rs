@@ -42,8 +42,8 @@ use crate::repo::async_store::AsyncBlobStoreAcquire;
 use crate::repo::{
     BlobChildren, BlobInfo, BlobMetadata, BlobStoreGet, BlobStoreKeep, BlobStoreList,
     BlobStoreMeta, BlobStorePut, CapabilityProofRead, CapabilityProofStore, PinSnapshot,
-    PinSnapshotSource, SnapshotSource, StorageClose, StorageFlush, StoreChanges, StoreDependencies, StoreSnapshot, WantRead,
-    WantRequest, WantStore,
+    PinSnapshotSource, SnapshotSource, SnapshotStep, StorageClose, StorageFlush, StoreChanges,
+    StoreDependencies, StoreSnapshot, WantRead, WantRequest, WantStore,
 };
 
 use super::coverage::{Coverage, CoverageIndex, StoreWriters};
@@ -389,9 +389,14 @@ impl<S: SnapshotSource + StorageClose> Covered<S> {
     }
 }
 
-impl Covered<crate::repo::pile::PileFile> {
-    /// One step of a climb: replay at most about `max_bytes` more of the pile
-    /// ([`PileFile::refresh_step`](crate::repo::pile::PileFile::refresh_step))
+impl<S> Covered<S>
+where
+    S: SnapshotStep,
+    S::Snapshot: HeldSource,
+{
+    /// One step of a climb: replay at most about `max_bytes` more of the
+    /// store ([`SnapshotStep`]; for a pile,
+    /// [`PileFile::refresh_step`](crate::repo::pile::PileFile::refresh_step))
     /// and hand out a snapshot of exactly that prefix, as
     /// [`SnapshotSource::snapshot`] would hand out the whole file. The flag
     /// says whether this step reached the end of the file it observed.
@@ -406,12 +411,13 @@ impl Covered<crate::repo::pile::PileFile> {
     pub fn snapshot_step(
         &mut self,
         max_bytes: u64,
-    ) -> Result<(crate::repo::pile::PileSnapshot, bool), crate::repo::pile::ReadError> {
-        let reached_end = self.inner.refresh_step(max_bytes)?;
-        let now = self.inner.snapshot_replayed();
+    ) -> Result<(CoveredSnapshot<S::Snapshot>, bool), S::SnapshotError> {
+        let (now, reached_end) = self.inner.snapshot_step(max_bytes)?;
         Ok((self.observe(now), reached_end))
     }
+}
 
+impl Covered<crate::repo::pile::PileFile> {
     /// Close a pile as the last act of a process that exits right after.
     ///
     /// The pile is flushed and its file closed exactly as by [`Self::close`],

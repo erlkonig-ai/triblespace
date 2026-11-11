@@ -1625,6 +1625,31 @@ snapshot that lost a blob its predecessor had resets the index, and every
 collection is recomputed as if newly tracked. Short-lived readers of the same
 pile track nothing.
 
+`pile net sync` repairs what its held-set thread reads. Its store is
+`Covered<Repairing<PileFile>>` (`triblespace_net::peer::Repairing`), and in
+`Shallow` or `Full` a read by the peer's held-set thread whose blob is resident
+but has no copy that validates fetches the blob by hash, waiting at most the
+interactive fetch deadline. The verified bytes land beside the corrupt copy
+under the store mutex and are read back from the snapshot that lands them, so
+the scan reads the pile's bytes, and the blob and what is above it join the
+held set. An absent blob is never fetched there, each handle is tried at most
+once per held-set thread, and no other thread repairs: a snapshot reads held
+sets with the store mutex held, and a landing there would take it again. In
+`Demand` no held-set thread runs and nothing changes; a Demand read repairs at
+the point of read, through the peer snapshot's reader.
+
+That repair has a known gap: only blobs the held-set thread reads are
+repaired, and it reads only what a building collection's first closure leaves
+after the snapshot's own share. A corrupt blob first read by a snapshot --
+within the inline allowance of a first closure (256 scans or 16 MiB, shared by
+every collection settling in that snapshot), or at the publication barrier,
+which computes every extension of a built collection for the life of the
+store -- is unknown in that job and is not read again. It and every ancestor
+stay out of that collection's held set until the index resets or the store is
+reopened, even when another collection's job later repairs the bytes. Closing
+this needs the held index to hand such a job to its driver instead of marking
+the blob unknown; it does not do that today.
+
 Two Full neighbours push each other their held sets like any other tree
 (*Walk streams*). Prefix prunes independently held overlap with matching
 commitments and completes with DONE/LANDED; cached RIBLT proves the held-set
