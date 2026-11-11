@@ -547,25 +547,33 @@ where
     /// Select optional payload replication, independently of collection READ
     /// admission or activation. The default remains explicit demand only.
     ///
-    /// In every mode the store keeps held sets for `collections` from the
-    /// next snapshot on. Only in Full are they published: this side's
+    /// In Shallow and Full the store keeps held sets for `collections` from
+    /// the next snapshot on. Only in Full are they published: this side's
     /// peerings for them say it replicates them in full, so that Full
-    /// neighbours compare and pull held sets (design 2.9). In other modes a
+    /// neighbours compare and pull held sets (design 2.9). In Shallow a
     /// held set stays unknown in the serving snapshot, so no references tree
     /// is exchanged and the peering's full flag is unset.
     ///
-    /// The first selection starts the peer's held-set thread: a collection's
-    /// first closure is computed there and published once whole (until then
-    /// its held set is unknown, and its references tree is not exchanged),
-    /// and neither landing nor this call waits for it. The thread ends once
-    /// the store is gone.
+    /// A Demand selection tracks nothing: Demand reads go through the
+    /// snapshot's reader, which validates a copy and fetches a replacement
+    /// for a corrupt one, so Demand repairs at the point of read. Demand is
+    /// also the default of every short-lived sync, which should not hash
+    /// whole closures. (Tracking only grows, so collections an earlier
+    /// Shallow or Full selection tracked stay tracked.)
+    ///
+    /// The first non-empty Shallow or Full selection starts the peer's
+    /// held-set thread: a collection's first closure is computed there and
+    /// published once whole (until then its held set is unknown, and its
+    /// references tree is not exchanged), and neither landing nor this call
+    /// waits for it. The thread ends once the store is gone.
     pub fn set_replication(
         &mut self,
         mode: ReplicationMode,
         collections: impl IntoIterator<Item = CollectionHandle>,
     ) {
         let collections: Vec<_> = collections.into_iter().collect();
-        if !self.held_driven {
+        let held = mode != ReplicationMode::Demand && !collections.is_empty();
+        if held && !self.held_driven {
             // `None`: another driver builds this store's sets now. Only a
             // started thread marks this peer driven, so a later selection
             // asks again once that driver is gone or a failed spawn can be
@@ -585,7 +593,9 @@ where
                 }
             }
         }
-        self.store().track_held(collections.iter().copied());
+        if held {
+            self.store().track_held(collections.iter().copied());
+        }
         let mut full = ActiveCollections::new();
         if mode == ReplicationMode::Full {
             for collection in &collections {
@@ -1402,13 +1412,13 @@ mod tests {
         }
     }
 
-    /// Held sets are tracked in every mode and built on the held-set
+    /// Held sets are tracked outside Demand and built on the held-set
     /// thread, but published only for a collection replicated in full:
     /// Shallow leaves the serving snapshot's set unknown although the store
     /// built it, Full publishes the same set, and moving back to Shallow
     /// withdraws it.
     #[tokio::test]
-    async fn held_sets_are_built_in_every_mode_and_published_only_in_full() {
+    async fn held_sets_are_built_in_shallow_and_published_only_in_full() {
         use triblespace_core::collection::{
             CollectionCommit, CollectionRecord, CollectionStore, empty_metadata_handle,
         };
@@ -1482,6 +1492,65 @@ mod tests {
             (false, false, false),
             "leaving Full withdraws it"
         );
+    }
+
+    /// Demand keeps no held sets: a Demand selection starts no held-set
+    /// thread and tracks nothing, so a snapshot knows no held set for the
+    /// selected collection. Shallow afterwards starts both.
+    #[tokio::test]
+    async fn a_demand_selection_tracks_no_held_sets() {
+        use triblespace_core::collection::{
+            CollectionCommit, CollectionRecord, CollectionStore, empty_metadata_handle,
+        };
+        let key = SigningKey::from_bytes(&[89; 32]);
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(
+                "no held sets in demand",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap()
+            .handle();
+        let data = store
+            .put::<UnknownBlob, _>(Bytes::from_source(b"demand holds nothing".to_vec()))
+            .unwrap()
+            .raw;
+        store
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &key,
+                collection,
+                Inline::new(data),
+                empty_metadata_handle(),
+            )))
+            .unwrap();
+        let (sender, receiver, _wiring) =
+            host::wire(crate::identity::iroh_secret(&key).public().into());
+        let mut peer = Peer::with_wiring(store, sender, receiver);
+        peer.activate_collection(collection);
+
+        peer.set_replication(ReplicationMode::Demand, [collection]);
+        let known = |peer: &mut Peer<MemoryRepo>| {
+            HeldRead::held(&peer.snapshot().unwrap(), collection).is_some()
+        };
+        assert_eq!(
+            (peer.held_driven, known(&mut peer)),
+            (false, false),
+            "Demand starts no held-set thread and tracks nothing"
+        );
+
+        peer.set_replication(ReplicationMode::Shallow, std::iter::empty());
+        assert!(!peer.held_driven, "an empty selection starts no thread");
+
+        peer.set_replication(ReplicationMode::Shallow, [collection]);
+        assert!(peer.held_driven, "Shallow starts the held-set thread");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !known(&mut peer) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Shallow tracks the collection"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[tokio::test]
