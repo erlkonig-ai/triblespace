@@ -1077,7 +1077,9 @@ where
     ///
     /// Acquired bytes are verified against `handle` on the wire, cached by the
     /// backing store's `put`, and read back from the store, so the returned
-    /// bytes never own the receive buffer. This operation never records a
+    /// bytes are the store's: on a pile, its own mapping, independent of the
+    /// receive buffer; a store that keeps the bytes it is given (such as
+    /// `MemoryBlobStore`) may keep the receive backing. This operation never records a
     /// WANT; durable delegation is an explicit [`WantStore::want`] operation.
     pub async fn acquire(
         &mut self,

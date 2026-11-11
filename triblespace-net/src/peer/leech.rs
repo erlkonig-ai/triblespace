@@ -89,7 +89,10 @@ where
     ///
     /// The existing wire verifier binds the returned blob to the requested H;
     /// the verified blob is cached locally and read back from the store, so the
-    /// returned bytes never own the receive buffer. Captured semantic snapshots
+    /// returned bytes are whatever the store's reader hands out. On a pile that
+    /// is the file's own mapping, independent of the receive buffer; a store
+    /// that keeps the bytes it is given (such as `MemoryBlobStore`) may keep the
+    /// receive backing, as before. Captured semantic snapshots
     /// are not advanced by acquisition.
     pub async fn acquire(
         &mut self,

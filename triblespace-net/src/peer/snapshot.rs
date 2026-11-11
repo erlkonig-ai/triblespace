@@ -182,7 +182,9 @@ where
     // snapshot to read them from, never the fetched bytes: those are owned by
     // the receive buffer, whose budget credit (protocol.rs, ExactBlobStorage)
     // they would hold for as long as the caller keeps them or anything
-    // decoded from them without a copy.
+    // decoded from them without a copy. Whether the store's copy is
+    // independent of that buffer is the store's property: a pile reads from
+    // its own mapping; a store that keeps the bytes it is given may not.
     pub(super) async fn acquire_reader(
         &self,
         handle: Inline<Handle<UnknownBlob>>,
