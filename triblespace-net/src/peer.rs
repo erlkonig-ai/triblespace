@@ -770,10 +770,18 @@ where
 
     /// Drain pending network evidence and publish one coherent store snapshot.
     pub fn try_refresh(&mut self) -> Result<(), PeerSnapshotError<S::SnapshotError>> {
+        self.refresh_observed().map(drop)
+    }
+
+    /// [`Self::try_refresh`], returning the store snapshot it published, or
+    /// `None` when the host is not running and nothing was observed.
+    fn refresh_observed(
+        &mut self,
+    ) -> Result<Option<S::Snapshot>, PeerSnapshotError<S::SnapshotError>> {
         // A local observation must not start networking, build bearer indexes,
         // or enqueue serving/provider notices for a dormant host.
         if !self.host_is_running() {
-            return Ok(());
+            return Ok(None);
         }
         self.sender.observe_store(|health| {
             health.last_refresh_started_at = Some(crate::clock::mono_now());
@@ -795,13 +803,13 @@ where
         if result.is_err() {
             serving.withdraw(&mut publication);
         }
-        result
+        result.map(Some)
     }
 
     fn refresh_checked(
         &mut self,
         publication: &mut Publication<S::Snapshot>,
-    ) -> Result<(), PeerSnapshotError<S::SnapshotError>> {
+    ) -> Result<S::Snapshot, PeerSnapshotError<S::SnapshotError>> {
         let mut incoming = Vec::new();
         for _ in 0..MAX_ADMISSION_BRIDGE_BATCHES {
             let Some(event) = self.receiver.try_recv() else {
@@ -869,8 +877,9 @@ where
         // need not wait for it.
         drop(guard);
         self.serving
-            .publish(publication, snapshot, received != 0)
-            .map_err(PeerSnapshotError::Overlay)
+            .publish(publication, snapshot.clone(), received != 0)
+            .map_err(PeerSnapshotError::Overlay)?;
+        Ok(snapshot)
     }
 
     /// Serving snapshots built so far.
@@ -944,11 +953,15 @@ where
         &mut self,
     ) -> Result<PeerSnapshot<S>, PeerSnapshotError<S::SnapshotError>> {
         let frozen = self.store().snapshot().map_err(PeerSnapshotError::Store)?;
-        Ok(PeerSnapshot {
+        Ok(self.peer_snapshot(frozen))
+    }
+
+    fn peer_snapshot(&self, frozen: S::Snapshot) -> PeerSnapshot<S> {
+        PeerSnapshot {
             frozen,
             store: self.store.clone(),
             host: Arc::downgrade(&self.host),
-        })
+        }
     }
 
     pub fn try_local(&mut self, hash: RawHash) -> Option<Bytes> {
@@ -957,9 +970,10 @@ where
 
     /// Read an exact handle locally or acquire it from the network.
     ///
-    /// Acquired bytes are checked by the backing store's content-addressed
-    /// `put`, then read from a fresh snapshot. This operation never records a
-    /// WANT; durable delegation is an explicit [`WantStore::want`] operation.
+    /// Acquired bytes are verified against `handle` on the wire, cached by the
+    /// backing store's `put`, and returned as verified. This operation never
+    /// records a WANT; durable delegation is an explicit [`WantStore::want`]
+    /// operation.
     pub async fn acquire(
         &mut self,
         handle: Inline<Handle<UnknownBlob>>,
@@ -967,13 +981,10 @@ where
         let snapshot = self
             .snapshot()
             .map_err(|error| PeerAcquireError(format!("cannot observe resident blob: {error}")))?;
-        let Some(reader) = snapshot.acquire_reader(handle).await? else {
+        let Some(acquired) = snapshot.acquire_reader(handle).await? else {
             return Ok(None);
         };
-        reader
-            .get(handle)
-            .map(Some)
-            .map_err(|error| PeerAcquireError(format!("cannot read acquired blob: {error}")))
+        acquired.bytes(handle).map(Some)
     }
 }
 
@@ -1087,9 +1098,13 @@ where
     type Snapshot = PeerSnapshot<S>;
     type SnapshotError = PeerSnapshotError<S::SnapshotError>;
 
+    /// A running host's refresh takes the one store snapshot this returns:
+    /// the store advances once. A dormant peer only freezes the store.
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
-        self.try_refresh()?;
-        self.snapshot_from_store()
+        match self.refresh_observed()? {
+            Some(frozen) => Ok(self.peer_snapshot(frozen)),
+            None => self.snapshot_from_store(),
+        }
     }
 }
 

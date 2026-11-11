@@ -39,6 +39,8 @@ struct Counts {
     get_calls: AtomicUsize,
     host_starts: AtomicUsize,
     requests: AtomicUsize,
+    /// Store snapshots taken: each one advances the store's cursors.
+    snapshots: AtomicUsize,
 }
 
 impl Counts {
@@ -60,6 +62,10 @@ impl Counts {
             self.inventory()[3]
         );
     }
+}
+
+fn snapshots(counts: &Counts) -> usize {
+    counts.snapshots.load(Ordering::Relaxed)
 }
 
 #[derive(Clone)]
@@ -93,6 +99,7 @@ impl<S: SnapshotSource> SnapshotSource for Counted<S> {
     type SnapshotError = S::SnapshotError;
 
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        self.counts.snapshots.fetch_add(1, Ordering::Relaxed);
         Ok(Counted {
             inner: self.inner.snapshot()?,
             counts: self.counts.clone(),
@@ -536,6 +543,69 @@ async fn second_peer_acquire_triggers_inventory_even_for_the_same_resident_handl
         counts.report("second-peer-acquire", resident);
         peer.close().unwrap();
     }
+}
+
+/// A running peer's snapshot advances its store once: the snapshot its
+/// refresh publishes is the one returned. A read that fetches a missing blob
+/// observes residency once, lands the verified bytes, and takes no snapshot
+/// to read them back. A dormant peer's snapshot only freezes the store.
+#[tokio::test]
+async fn a_peer_snapshot_and_a_fetched_read_each_take_one_store_snapshot() {
+    let Fixture {
+        mut peer,
+        counts,
+        remote,
+        _file,
+    } = Fixture::new(8, true);
+    let start = snapshots(&counts);
+    let frozen = peer.snapshot().unwrap();
+    assert_eq!(snapshots(&counts) - start, 1, "a running peer's snapshot");
+
+    let start = snapshots(&counts);
+    let handle = remote.get_handle();
+    assert_eq!(
+        frozen.get::<Bytes, UnknownBlob>(handle).await.unwrap(),
+        remote.bytes
+    );
+    assert_eq!(counts.requests.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        snapshots(&counts) - start,
+        1,
+        "a fetched read: the residency check only"
+    );
+
+    let start = snapshots(&counts);
+    let local = peer
+        .put::<UnknownBlob, _>(Bytes::from_source(b"acquired locally".to_vec()))
+        .unwrap();
+    assert!(peer.acquire(local).await.unwrap().is_some());
+    assert_eq!(
+        snapshots(&counts) - start,
+        1,
+        "a resident acquire: its snapshot only"
+    );
+    peer.close().unwrap();
+
+    let Fixture {
+        mut peer,
+        counts,
+        remote,
+        _file,
+    } = Fixture::new(8, false);
+    let start = snapshots(&counts);
+    peer.snapshot().unwrap();
+    assert_eq!(snapshots(&counts) - start, 1, "a dormant peer's snapshot");
+    let start = snapshots(&counts);
+    assert_eq!(
+        peer.acquire(remote.get_handle()).await.unwrap(),
+        Some(remote.bytes)
+    );
+    assert_eq!(
+        snapshots(&counts) - start,
+        2,
+        "a fetching acquire: its snapshot and the residency check"
+    );
+    peer.close().unwrap();
 }
 
 #[test]
