@@ -44,6 +44,9 @@ pub use snapshot::{PeerGetError, PeerSnapshot};
 mod leech;
 pub use leech::Leech;
 
+mod repair;
+pub use repair::{Repairing, RepairingSnapshot};
+
 /// Failure while starting a production network host.
 #[derive(Debug)]
 pub enum PeerOpenError {
@@ -247,6 +250,23 @@ impl<T: Clone> Latest<T> {
         let snapshot = store.snapshot()?;
         self.publish(order, snapshot.clone());
         Ok(snapshot)
+    }
+
+    /// Land wire-verified bytes and read them back: put them into `store`,
+    /// then [`advance`](Self::advance) it. Call this holding the store
+    /// mutex. The put consumes `verified`, so what the returned snapshot
+    /// reads is the store's copy, not the receive buffer.
+    fn land<S>(&self, store: &mut S, verified: Blob<UnknownBlob>) -> Result<T, PeerAcquireError>
+    where
+        S: SnapshotSource<Snapshot = T> + BlobStorePut,
+    {
+        // The wire handshake verified these bytes against their handle; they
+        // land under it without a second hash.
+        store
+            .put::<UnknownBlob, _>(verified)
+            .map_err(|error| PeerAcquireError(format!("cannot cache acquired blob: {error}")))?;
+        self.advance(store)
+            .map_err(|error| PeerAcquireError(format!("cannot observe acquired blob: {error}")))
     }
 
     /// Install the snapshot taken `order`th, unless a later one is already
@@ -650,6 +670,12 @@ where
     /// published once whole (until then its held set is unknown, and its
     /// references tree is not exchanged), and neither landing nor this call
     /// waits for it. The thread ends once the store is gone.
+    ///
+    /// That thread, and only it, repairs what it reads through a
+    /// [`Repairing`] store: a blob whose bytes fail validation is fetched,
+    /// landed and read back, so it and what is above it join the held set.
+    /// A corrupt blob a snapshot reads first, inline, is not repaired (see
+    /// the module documentation of `peer/repair.rs`).
     pub fn set_replication(
         &mut self,
         mode: ReplicationMode,
@@ -664,11 +690,19 @@ where
             // retried.
             let work = self.store().drive_held();
             if let Some(mut work) = work {
+                let fetch = self.held_repair();
                 // A thread that cannot start drops the work, which hands
                 // the building back to snapshots.
-                let spawned = std::thread::Builder::new()
-                    .name("held-sets".into())
-                    .spawn(move || while work.step(HELD_STEP, HELD_IDLE) {});
+                let spawned =
+                    std::thread::Builder::new()
+                        .name("held-sets".into())
+                        .spawn(move || {
+                            // This thread holds no store mutex and no held
+                            // index while it reads, so it is the one that may
+                            // wait for a fetch and land what it fetched.
+                            repair::Repair::install(fetch);
+                            while work.step(HELD_STEP, HELD_IDLE) {}
+                        });
                 match spawned {
                     Ok(_) => self.held_driven = true,
                     Err(error) => {
@@ -693,6 +727,61 @@ where
         }
         self.reconciler.set_replication(mode, collections);
         self.refresh();
+    }
+
+    /// How the held-set thread repairs a corrupt blob: fetch a verified copy
+    /// on the thread's own runtime, waiting for it, land it under the store
+    /// mutex, and read it back from the store snapshot that lands it
+    /// ([`Latest::land`], the step a fetched read takes). The put consumes
+    /// the fetched blob, so what the scan reads is the store's bytes, not the
+    /// network's buffer. Holds the peer weakly: the thread keeps no store
+    /// alive.
+    ///
+    /// Known gap: only blobs this thread reads are repaired. A corrupt blob
+    /// first read inside a snapshot -- a building collection's inline
+    /// allowance, or the publication barrier that extends every built
+    /// collection -- is marked unknown in that job and not read again, so it
+    /// and its ancestors stay out of that collection's held set until a reset
+    /// or a reopen (see the module documentation of `peer/repair.rs`).
+    fn held_repair(&self) -> impl FnMut(RawHash) -> Option<Bytes> + Send + 'static + use<S> {
+        let serving = Arc::downgrade(&self.serving);
+        let host = Arc::downgrade(&self.host);
+        let mut runtime = None;
+        move |hash| {
+            let sender = {
+                let host = host.upgrade()?;
+                let mut host = host.lock().expect("host mutex");
+                if let Err(error) = host.start() {
+                    tracing::warn!(%error, "cannot start held-set repair fetch");
+                    return None;
+                }
+                host.sender.clone()
+            };
+            let runtime = match &mut runtime {
+                Some(runtime) => runtime,
+                None => match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(built) => runtime.insert(built),
+                    Err(error) => {
+                        tracing::warn!(%error, "no runtime for held-set repair");
+                        return None;
+                    }
+                },
+            };
+            let verified =
+                runtime.block_on(sender.fetch_blob(hash, host::INTERACTIVE_FETCH_DEADLINE))?;
+            let serving = serving.upgrade()?;
+            let mut guard = serving.store.lock().expect("store mutex");
+            // Beside the corrupt copy, as a fetched read lands it.
+            let landed = serving.latest.land(guard.as_mut()?, verified);
+            drop(guard);
+            let landed = landed
+                .map_err(|error| tracing::warn!(%error, "held-set repair"))
+                .ok()?;
+            BlobStoreGet::get::<Bytes, UnknownBlob>(&landed, Inline::new(hash)).ok()
+        }
     }
 
     /// Continue hydration from `hydration`, an answer already advanced over

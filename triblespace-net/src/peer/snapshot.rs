@@ -232,17 +232,9 @@ where
         let store = guard
             .as_mut()
             .ok_or_else(|| PeerAcquireError("peer closed during blob acquisition".into()))?;
-        // The wire handshake verified these bytes against `handle`; they land
-        // under it without a second hash.
-        store
-            .put::<UnknownBlob, _>(verified)
-            .map_err(|error| PeerAcquireError(format!("cannot cache acquired blob: {error}")))?;
         // Read back under the same guard; the snapshot is published like any
         // other producer's.
-        self.latest
-            .advance(store)
-            .map(Some)
-            .map_err(|error| PeerAcquireError(format!("cannot observe acquired blob: {error}")))
+        self.latest.land(store, verified).map(Some)
     }
 }
 

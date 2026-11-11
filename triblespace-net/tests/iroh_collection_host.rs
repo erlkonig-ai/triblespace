@@ -480,3 +480,53 @@ async fn exact_acquisition_finds_a_provider_through_a_directory_without_wants() 
     assert_eq!(bytes.as_ref(), payload.as_ref());
     drop((directory.into_store(), reader.into_store()));
 }
+
+/// A peer's held-set thread is a plain OS thread with its own runtime, and
+/// it repairs through the host's fetch. An exact fetch made there completes
+/// over real iroh while the host runs on another runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exact_fetch_completes_on_a_plain_thread_with_its_own_runtime() {
+    let network = TestNetwork::new();
+    let directory_endpoint =
+        test_endpoint(&network, triblespace_net::identity::iroh_secret(&key(0xA3))).await;
+    let directory_id = directory_endpoint.id();
+    let server_endpoint =
+        test_endpoint(&network, triblespace_net::identity::iroh_secret(&key(0xB3))).await;
+    let reader_endpoint =
+        test_endpoint(&network, triblespace_net::identity::iroh_secret(&key(0xC3))).await;
+
+    let mut server_store = MemoryRepo::default();
+    let payload = Bytes::from_source(b"a payload fetched off the host runtime".to_vec());
+    let handle = server_store.put::<UnknownBlob, _>(payload.clone()).unwrap();
+    let mut directory = bring_up(directory_endpoint, MemoryRepo::default(), None).await;
+    let mut server = bring_up(server_endpoint, server_store, Some(directory_id)).await;
+    let mut reader = bring_up(reader_endpoint, MemoryRepo::default(), Some(directory_id)).await;
+    directory.refresh();
+    server.refresh();
+    reader.refresh();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let fetch = reader.fetch_blob(handle.raw);
+    let fetched = tokio::task::spawn_blocking(move || {
+        std::thread::Builder::new()
+            .name("plain".into())
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(fetch)
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(fetched.expect("fetched").as_ref(), payload.as_ref());
+    drop((
+        directory.into_store(),
+        server.into_store(),
+        reader.into_store(),
+    ));
+}
