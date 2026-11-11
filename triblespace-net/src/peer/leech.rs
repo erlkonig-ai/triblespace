@@ -88,8 +88,9 @@ where
     /// Read or acquire an exact blob without publishing WANT or serving state.
     ///
     /// The existing wire verifier binds the returned blob to the requested H;
-    /// the verified blob is cached locally and returned as verified. Captured
-    /// semantic snapshots are not advanced by acquisition.
+    /// the verified blob is cached locally and read back from the store, so the
+    /// returned bytes never own the receive buffer. Captured semantic snapshots
+    /// are not advanced by acquisition.
     pub async fn acquire(
         &mut self,
         handle: Inline<Handle<UnknownBlob>>,
@@ -97,10 +98,13 @@ where
         let snapshot = self
             .snapshot()
             .map_err(|error| PeerAcquireError(format!("cannot observe resident blob: {error}")))?;
-        let Some(acquired) = snapshot.acquire_reader(handle).await? else {
+        let Some(reader) = snapshot.acquire_reader(handle).await? else {
             return Ok(None);
         };
-        acquired.bytes(handle).map(Some)
+        reader
+            .get(handle)
+            .map(Some)
+            .map_err(|error| PeerAcquireError(format!("cannot read acquired blob: {error}")))
     }
 }
 

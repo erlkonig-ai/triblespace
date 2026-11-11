@@ -1049,9 +1049,9 @@ where
     /// Read an exact handle locally or acquire it from the network.
     ///
     /// Acquired bytes are verified against `handle` on the wire, cached by the
-    /// backing store's `put`, and returned as verified. This operation never
-    /// records a WANT; durable delegation is an explicit [`WantStore::want`]
-    /// operation.
+    /// backing store's `put`, and read back from the store, so the returned
+    /// bytes never own the receive buffer. This operation never records a
+    /// WANT; durable delegation is an explicit [`WantStore::want`] operation.
     pub async fn acquire(
         &mut self,
         handle: Inline<Handle<UnknownBlob>>,
@@ -1059,10 +1059,13 @@ where
         let snapshot = self
             .snapshot()
             .map_err(|error| PeerAcquireError(format!("cannot observe resident blob: {error}")))?;
-        let Some(acquired) = snapshot.acquire_reader(handle).await? else {
+        let Some(reader) = snapshot.acquire_reader(handle).await? else {
             return Ok(None);
         };
-        acquired.bytes(handle).map(Some)
+        reader
+            .get(handle)
+            .map(Some)
+            .map_err(|error| PeerAcquireError(format!("cannot read acquired blob: {error}")))
     }
 }
 
@@ -1913,6 +1916,71 @@ mod tests {
         assert!(!after.contains_blob(requested).unwrap());
         assert!(!after.contains_blob(own).unwrap());
         assert_eq!(after.wants().unwrap().count(), 0);
+        peer.close().unwrap();
+    }
+
+    /// Fetched bytes own a share of the process-wide receive budget until
+    /// their last owner drops (protocol.rs, ExactBlobStorage). A fetched read
+    /// lands them in the store and answers from a store snapshot, so neither
+    /// the bytes it returns nor a value decoded from them without a copy
+    /// keeps that credit once the read returns.
+    #[tokio::test]
+    async fn a_fetched_read_keeps_no_receive_credit() {
+        /// Hands each received blob out once, keeping no copy.
+        struct ReceivedOnce(Mutex<Vec<Blob<UnknownBlob>>>);
+        impl host::NetCapability for ReceivedOnce {
+            fn fetch_blob(
+                &self,
+                hash: RawHash,
+            ) -> futures::future::BoxFuture<'static, Option<Blob<UnknownBlob>>> {
+                let mut received = self.0.lock().unwrap();
+                let at = received
+                    .iter()
+                    .position(|blob| blob.get_handle().raw == hash);
+                Box::pin(std::future::ready(at.map(|at| received.swap_remove(at))))
+            }
+        }
+        use crate::protocol::exact_blob_storage_units as credit;
+        use triblespace_core::blob::encodings::utf8string::UTF8String;
+
+        let _guard = crate::protocol::exact_blob_receive_test_guard();
+        let contents: [&[u8]; 3] = [
+            b"fetched and returned",
+            b"fetched and decoded in place",
+            b"fetched through Peer::acquire",
+        ];
+        let mut received = Vec::new();
+        for content in contents {
+            let mut wire = content;
+            let bytes = crate::protocol::recv_exact_blob_body(&mut wire, content.len())
+                .await
+                .unwrap();
+            received.push(Blob::<UnknownBlob>::new(bytes));
+        }
+        let handles: Vec<_> = received.iter().map(Blob::get_handle).collect();
+        assert_eq!(credit(), 3, "one unit per received body");
+        let key = SigningKey::from_bytes(&[80; 32]);
+        let (sender, receiver, wiring) =
+            host::wire(crate::identity::iroh_secret(&key).public().into());
+        wiring.install_test_capability(Arc::new(ReceivedOnce(Mutex::new(received))));
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut peer = Peer::with_wiring(Pile::open(file.path()).unwrap(), sender, receiver);
+        let frozen = peer.snapshot().unwrap();
+
+        let returned = frozen.get::<Bytes, UnknownBlob>(handles[0]).await.unwrap();
+        assert_eq!(returned.as_ref(), contents[0]);
+        assert_eq!(credit(), 2, "the bytes a fetched read returned");
+        let decoded = frozen
+            .get::<anybytes::View<str>, UTF8String>(Inline::new(handles[1].raw))
+            .await
+            .unwrap();
+        assert_eq!(decoded.as_bytes(), contents[1]);
+        assert_eq!(credit(), 1, "a value decoded in place from a fetched read");
+        let acquired = peer.acquire(handles[2]).await.unwrap().unwrap();
+        assert_eq!(acquired.as_ref(), contents[2]);
+        assert_eq!(credit(), 0, "the bytes Peer::acquire returned");
+
+        drop((returned, decoded, acquired, frozen));
         peer.close().unwrap();
     }
 

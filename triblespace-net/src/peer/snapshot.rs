@@ -7,7 +7,6 @@ use std::future::Future;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, Weak};
 
-use anybytes::Bytes;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::{Blob, BlobEncoding, TryFromBlob};
 use triblespace_core::capability::{CapabilityProof, CapabilityProofId};
@@ -70,29 +69,6 @@ impl<S: SnapshotSource> Deref for PeerSnapshot<S> {
 
     fn deref(&self) -> &Self::Target {
         &self.frozen
-    }
-}
-
-/// Where one blob read through a snapshot found its bytes.
-pub(super) enum Acquired<R> {
-    /// A store observation in which the blob reads.
-    Resident(R),
-    /// Bytes fetched for the handle, verified against it on the wire, and
-    /// landed in the store.
-    Fetched(Blob<UnknownBlob>),
-}
-
-impl<R: BlobStoreGet> Acquired<R> {
-    pub(super) fn bytes(
-        self,
-        handle: Inline<Handle<UnknownBlob>>,
-    ) -> Result<Bytes, PeerAcquireError> {
-        match self {
-            Self::Resident(reader) => reader
-                .get(handle)
-                .map_err(|error| PeerAcquireError(format!("cannot read acquired blob: {error}"))),
-            Self::Fetched(blob) => Ok(blob.bytes),
-        }
     }
 }
 
@@ -200,13 +176,17 @@ where
     // A blob is here when its bytes read. A copy the backend lists but whose
     // bytes fail validation -- a pile's index answers presence without
     // reading -- is fetched like an absent blob, and the verified bytes land
-    // beside it and are the ones read from then on. A fetch returns the
-    // verified bytes themselves: nothing reads them back through a new store
-    // snapshot, so landing them advances the store by its put alone.
+    // beside it and are the ones read from then on.
+    //
+    // A fetch moves the verified bytes into the store and returns a store
+    // snapshot to read them from, never the fetched bytes: those are owned by
+    // the receive buffer, whose budget credit (protocol.rs, ExactBlobStorage)
+    // they would hold for as long as the caller keeps them or anything
+    // decoded from them without a copy.
     pub(super) async fn acquire_reader(
         &self,
         handle: Inline<Handle<UnknownBlob>>,
-    ) -> Result<Option<Acquired<S::Snapshot>>, PeerAcquireError> {
+    ) -> Result<Option<S::Snapshot>, PeerAcquireError> {
         let contains = |reader: &S::Snapshot| {
             reader
                 .metadata(handle)
@@ -214,18 +194,18 @@ where
                 .map_err(|error| PeerAcquireError(format!("cannot check blob residency: {error}")))
         };
         if contains(&self.frozen)? {
-            return Ok(Some(Acquired::Resident(self.frozen.clone())));
+            return Ok(Some(self.frozen.clone()));
         }
         // Lock-free: what a producer already observed. A blob not here may
         // have been written since, so a miss produces a snapshot below.
         if let Some(latest) = self.latest.get() {
             if contains(&latest)? {
-                return Ok(Some(Acquired::Resident(latest)));
+                return Ok(Some(latest));
             }
         }
         let reader = self.observe()?;
         if contains(&reader)? {
-            return Ok(Some(Acquired::Resident(reader)));
+            return Ok(Some(reader));
         }
         drop(reader);
         let sender = {
@@ -253,9 +233,14 @@ where
         // The wire handshake verified these bytes against `handle`; they land
         // under it without a second hash.
         store
-            .put::<UnknownBlob, _>(verified.clone())
+            .put::<UnknownBlob, _>(verified)
             .map_err(|error| PeerAcquireError(format!("cannot cache acquired blob: {error}")))?;
-        Ok(Some(Acquired::Fetched(verified)))
+        // Read back under the same guard; the snapshot is published like any
+        // other producer's.
+        self.latest
+            .advance(store)
+            .map(Some)
+            .map_err(|error| PeerAcquireError(format!("cannot observe acquired blob: {error}")))
     }
 }
 
@@ -278,7 +263,7 @@ where
     {
         let raw = handle.raw;
         async move {
-            let acquired = self
+            let reader = self
                 .acquire_reader(Inline::new(raw))
                 .await
                 .map_err(PeerGetError::Acquire)?
@@ -287,15 +272,6 @@ where
                         handle: Inline::new(raw),
                     })
                 })?;
-            let reader = match acquired {
-                Acquired::Resident(reader) => reader,
-                Acquired::Fetched(verified) => match T::try_from_blob(verified.transmute::<E>()) {
-                    Ok(value) => return Ok(value),
-                    // Only the store's reader can report a failed decode in
-                    // its own error type: read the landed copy through it.
-                    Err(_) => self.observe().map_err(PeerGetError::Acquire)?,
-                },
-            };
             reader.get(Inline::new(raw)).map_err(PeerGetError::Read)
         }
     }

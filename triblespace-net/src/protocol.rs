@@ -682,6 +682,13 @@ pub(crate) fn exact_blob_receive_test_guard() -> std::sync::MutexGuard<'static, 
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Receive-budget units held right now, by partial files and returned bytes.
+/// Read it holding [`exact_blob_receive_test_guard`].
+#[cfg(test)]
+pub(crate) fn exact_blob_storage_units() -> usize {
+    EXACT_BLOB_STORAGE_UNITS.load(Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,7 +725,7 @@ mod tests {
     }
 
     fn storage_units() -> usize {
-        EXACT_BLOB_STORAGE_UNITS.load(Ordering::Relaxed)
+        exact_blob_storage_units()
     }
 
     #[tokio::test]
@@ -1084,8 +1091,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(storage_units(), 1);
-        // This is PeerSnapshot's actual boundary: move the network Blob, with
-        // its cached handle and receive owner, into the independent pile.
+        // This is the pile half of PeerSnapshot::acquire_reader's boundary: it
+        // moves the network Blob, with its cached handle and receive owner,
+        // into the independent pile, then answers from a pile snapshot, never
+        // from the moved bytes. The whole read is covered by
+        // peer::tests::a_fetched_read_keeps_no_receive_credit.
         let blob = Blob::<UnknownBlob>::new(bytes);
         let expected = blob.get_handle();
         assert_eq!(expected.raw, handle(content));

@@ -547,10 +547,13 @@ async fn second_peer_acquire_triggers_inventory_even_for_the_same_resident_handl
 
 /// A running peer's snapshot advances its store once: the snapshot its
 /// refresh publishes is the one returned. A read that fetches a missing blob
-/// observes residency once, lands the verified bytes, and takes no snapshot
-/// to read them back. A dormant peer's snapshot only freezes the store.
+/// observes residency once, lands the verified bytes, and takes one more
+/// snapshot to read them back from the store: returning the fetched bytes
+/// would keep their receive credit (see
+/// peer::tests::a_fetched_read_keeps_no_receive_credit). A dormant peer's
+/// snapshot only freezes the store.
 #[tokio::test]
-async fn a_peer_snapshot_and_a_fetched_read_each_take_one_store_snapshot() {
+async fn a_peer_snapshot_and_a_fetched_read_take_one_and_two_store_snapshots() {
     let Fixture {
         mut peer,
         counts,
@@ -570,8 +573,8 @@ async fn a_peer_snapshot_and_a_fetched_read_each_take_one_store_snapshot() {
     assert_eq!(counts.requests.load(Ordering::Relaxed), 1);
     assert_eq!(
         snapshots(&counts) - start,
-        1,
-        "a fetched read: the residency check only"
+        2,
+        "a fetched read: the residency check and the read-back"
     );
 
     let start = snapshots(&counts);
@@ -602,8 +605,8 @@ async fn a_peer_snapshot_and_a_fetched_read_each_take_one_store_snapshot() {
     );
     assert_eq!(
         snapshots(&counts) - start,
-        2,
-        "a fetching acquire: its snapshot and the residency check"
+        3,
+        "a fetching acquire: its snapshot, the residency check and the read-back"
     );
     peer.close().unwrap();
 }
