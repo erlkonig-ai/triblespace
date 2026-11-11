@@ -228,8 +228,8 @@ pub struct Reconciler {
 pub struct Hydration<T> {
     /// The snapshot answered; `None` for the empty answer.
     snapshot: Option<T>,
-    /// The collections answered for, in ascending handle order.
-    collections: BTreeSet<CollectionHandle>,
+    /// The collections answered for, keyed by the handle's bytes.
+    collections: PATCH<32, IdentitySchema>,
     roots: BTreeSet<RawHash>,
     missing: BTreeSet<RawHash>,
     counts: HydrationCounts,
@@ -259,7 +259,7 @@ impl<T> Hydration<T> {
     pub fn new() -> Self {
         Self {
             snapshot: None,
-            collections: BTreeSet::new(),
+            collections: PATCH::new(),
             roots: BTreeSet::new(),
             missing: BTreeSet::new(),
             counts: HydrationCounts::default(),
@@ -276,8 +276,8 @@ impl<T> Hydration<T> {
         &self.missing
     }
 
-    /// The collections answered for.
-    pub fn collections(&self) -> &BTreeSet<CollectionHandle> {
+    /// The collections answered for, keyed by the handle's bytes.
+    pub fn collections(&self) -> &PATCH<32, IdentitySchema> {
         &self.collections
     }
 
@@ -344,8 +344,15 @@ impl<T: StoreRead> Hydration<T> {
         snapshot: &T,
         collections: &BTreeSet<CollectionHandle>,
     ) -> Result<(), NotAnAppend<T::RecordsError>> {
+        let collections = {
+            let mut set = PATCH::<32, IdentitySchema>::new();
+            for collection in collections {
+                set.insert(&PatchEntry::new(&collection.raw));
+            }
+            set
+        };
         // A root may be named only by a collection that left the selection.
-        if !self.collections.is_subset(collections) {
+        if !self.collections.difference(&collections).is_empty() {
             return Err(NotAnAppend::Reset);
         }
         #[cfg(test)]
@@ -357,8 +364,8 @@ impl<T: StoreRead> Hydration<T> {
         if let Some(previous) = &self.snapshot {
             let selectors: BTreeSet<_> = self
                 .collections
-                .iter()
-                .map(|&collection| CollectionRecordSelector::Foundations(collection))
+                .iter_ordered()
+                .map(|raw| CollectionRecordSelector::Foundations(Inline::new(*raw)))
                 .collect();
             let read_set = StoreDependencies {
                 records: selectors.iter().copied().collect(),
@@ -415,8 +422,10 @@ impl<T: StoreRead> Hydration<T> {
         // Collections not answered for before are read whole: their view in
         // the previous answer was empty. One indexed read per collection;
         // COMMIT signatures are checked once, before physical union.
-        for &collection in collections.difference(&self.collections) {
-            let selectors = BTreeSet::from([CollectionRecordSelector::Foundations(collection)]);
+        let fresh = collections.difference(&self.collections);
+        for raw in fresh.iter_ordered() {
+            let selectors =
+                BTreeSet::from([CollectionRecordSelector::Foundations(Inline::new(*raw))]);
             let views = snapshot
                 .select_record_views(&selectors)
                 .map_err(NotAnAppend::Failed)?;
@@ -439,7 +448,7 @@ impl<T: StoreRead> Hydration<T> {
             }
             yield_after_turn(&mut turn).await;
         }
-        self.collections = collections.clone();
+        self.collections = collections;
         self.snapshot = Some(snapshot.clone());
         Ok(())
     }
@@ -2470,6 +2479,93 @@ mod tests {
         assert_eq!(take_counts(), (0, 0));
         assert_eq!(derived_from_scratch(&mut peer, selection).await, (9, 0));
         peer.close().unwrap();
+    }
+
+    /// The selection a hydration answered for is kept as a key-only PATCH
+    /// set. A selection that grows is an append: only the new collections'
+    /// roots are read, in any order the caller names them. One that shrinks
+    /// resets. Every answer equals a fresh advance over the same selection.
+    #[tokio::test]
+    async fn a_selection_that_grows_advances_and_one_that_shrinks_resets() {
+        let mut store = MemoryRepo::default();
+        let metadata = put(&mut store, Vec::new());
+        let descriptors: Vec<RawHash> = (0..3)
+            .map(|ordinal| {
+                put(
+                    &mut store,
+                    format!("selection descriptor {ordinal}").into_bytes(),
+                )
+            })
+            .collect();
+        for (ordinal, &descriptor) in descriptors.iter().enumerate() {
+            for leaf in 0..=ordinal {
+                let data = put(
+                    &mut store,
+                    format!("selection data {ordinal} {leaf}").into_bytes(),
+                );
+                raw_commit(&mut store, descriptor, data, metadata);
+            }
+        }
+        // A root no blob backs, named only by the third collection.
+        raw_commit(&mut store, descriptors[2], [0xcd; 32], metadata);
+        let snapshot = store.snapshot().unwrap();
+        let [a, b, c] = [0, 1, 2].map(|ordinal| Inline::new(descriptors[ordinal]));
+        let fresh = |selection: Vec<CollectionHandle>| {
+            let snapshot = snapshot.clone();
+            async move {
+                let fresh = Hydration::new()
+                    .advance(&snapshot, &selection)
+                    .await
+                    .unwrap();
+                (fresh.roots, fresh.missing)
+            }
+        };
+        let answer =
+            |hydration: &Hydration<_>| (hydration.roots.clone(), hydration.missing.clone());
+
+        take_counts();
+        let hydration = Hydration::new().advance(&snapshot, &[a]).await.unwrap();
+        assert_eq!(take_counts(), (3, 1));
+        assert_eq!(hydration.roots().len(), 3);
+
+        // Growing: only b's three new roots are looked up, nothing resets.
+        let hydration = hydration.advance(&snapshot, &[b, a]).await.unwrap();
+        assert_eq!(
+            take_counts(),
+            (3, 0),
+            "a grown selection reads only the new collection"
+        );
+        assert_eq!(answer(&hydration), fresh(vec![a, b]).await);
+        take_counts();
+        let hydration = hydration.advance(&snapshot, &[a, b]).await.unwrap();
+        assert_eq!(
+            take_counts(),
+            (0, 0),
+            "the same set in another order is unchanged"
+        );
+        let hydration = hydration.advance(&snapshot, &[c, a, b]).await.unwrap();
+        assert_eq!(take_counts(), (5, 0));
+        assert_eq!(hydration.missing(), &BTreeSet::from([[0xcd; 32]]));
+        assert_eq!(answer(&hydration), fresh(vec![a, b, c]).await);
+        assert_eq!(hydration.counts().resets, 0);
+        assert_eq!(hydration.collections().len(), 3);
+
+        // Shrinking: a reset, and the answer for what is left.
+        take_counts();
+        let hydration = hydration.advance(&snapshot, &[c, a]).await.unwrap();
+        assert_eq!(
+            take_counts(),
+            (8, 1),
+            "a shrunk selection is read again from empty"
+        );
+        assert_eq!(hydration.counts().resets, 1);
+        assert_eq!(answer(&hydration), fresh(vec![a, c]).await);
+        assert!(hydration.roots().contains(&descriptors[2]));
+        assert!(!hydration.roots().contains(&descriptors[1]));
+        let hydration = hydration.advance(&snapshot, &[]).await.unwrap();
+        assert_eq!(hydration.counts().resets, 2);
+        assert!(hydration.roots().is_empty() && hydration.missing().is_empty());
+        assert!(hydration.collections().is_empty());
     }
 
     /// A snapshot that counts every payload it hands out (`get`, and a
