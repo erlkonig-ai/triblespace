@@ -24,8 +24,8 @@ use triblespace_core::collection::{
 use triblespace_core::inline::Inline;
 use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
 use triblespace_core::repo::{
-    BlobChildren, BlobStore, BlobStoreGet, CapabilityProofStore, SnapshotSource, StorageFlush,
-    StoreChanges, StoreDependencies, StoreRead, WantRead, WantRequest, WantStore,
+    BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, CapabilityProofStore, SnapshotSource,
+    StorageFlush, StoreChanges, StoreDependencies, StoreRead, WantRead, WantRequest, WantStore,
 };
 
 use crate::peer::{Peer, PeerSnapshot};
@@ -51,7 +51,7 @@ pub enum ReplicationMode {
 pub struct ReplicationStats {
     /// Distinct direct handles named by the selected records in this observation.
     pub roots: usize,
-    /// Direct roots not yet locally readable. Speculative misses are not roots.
+    /// Direct roots not yet resident. Speculative misses are not roots.
     pub pending: usize,
     /// Blobs fetched and locally landed for hydration during this tick.
     pub acquired: usize,
@@ -77,7 +77,7 @@ pub struct ReconcileStats {
     /// A payload shared by a WANT and a root counts once. Neither local hits nor failed puts contribute.
     pub landed: usize,
     pub received_bytes: u64,
-    /// Distinct unreadable exact blob WANTs and selected direct roots at the
+    /// Distinct unreadable exact blob WANTs and absent selected direct roots at the
     /// end of this tick's exact acquisition window. None means that exact-set
     /// observation failed.
     /// This excludes operation WANTs and unknown recursive descendants, not a
@@ -194,7 +194,7 @@ pub struct Reconciler {
 }
 
 /// The selected direct roots as of one store snapshot, and the subset of them
-/// that snapshot cannot read.
+/// that snapshot does not hold.
 ///
 /// This is a memo of one query answer, keyed on the snapshot it answers. It
 /// starts empty -- the answer for a store that holds nothing -- and is only
@@ -216,12 +216,15 @@ pub struct Reconciler {
 /// pile, so a root it names but does not yet hold is missing exactly as it
 /// would be at the tail.
 ///
-/// A root once read stays readable in a later snapshot unless it left the blob
-/// view. That holds for an append-only pile, whose occurrence validations are
-/// themselves cached across snapshots, and for an in-memory store, where
-/// membership is retrievability. Bytes rotting under an already validated
-/// occurrence were therefore not rediscovered here before either; the serving
-/// path validates every read it hands out.
+/// A root is held when the snapshot's blob index has it ([`resident`]). No
+/// payload is read or hashed here: the handle a store indexes was computed
+/// from the bytes when they were written, or checked against them when they
+/// were received, and hydration trusts it as written. The bytes are checked
+/// where they are used: every read that hands them out (serving, the held
+/// scan, a reader) validates them, and a fetch hashes what it receives
+/// against the handle it asked for. So a resident root whose bytes no longer
+/// match counts as held, and hydration does not fetch it again. A held root
+/// stays held in a later snapshot unless it left the blob view.
 pub struct Hydration<T> {
     /// The snapshot answered; `None` for the empty answer.
     snapshot: Option<T>,
@@ -239,7 +242,7 @@ pub struct HydrationCounts {
     pub advances: usize,
     /// Resets to the empty answer forced by evidence that was not an append.
     pub resets: usize,
-    /// Roots that were missing at one advance and readable at a later one.
+    /// Roots that were missing at one advance and resident at a later one.
     /// During a climb each would have been a fetch decision had a tick
     /// observed that prefix; in a daemon they are blobs that landed.
     pub arrived: usize,
@@ -268,7 +271,7 @@ impl<T> Hydration<T> {
         &self.roots
     }
 
-    /// The roots that snapshot cannot read.
+    /// The roots that snapshot does not hold.
     pub fn missing(&self) -> &BTreeSet<RawHash> {
         &self.missing
     }
@@ -307,16 +310,14 @@ impl<T: StoreRead> Hydration<T> {
     /// any collection not answered for before. Evidence that is not an append
     /// resets the answer to empty and advances it from there.
     ///
-    /// The first advance of a fresh process reads every root, and on a fresh
-    /// process every read hashes its blob, which for a large pile is minutes
-    /// of work. So it yields once a chunk of reads has taken
-    /// [`ADVANCE_TURN`]. That is a threshold between reads, not a latency
-    /// bound: a single read, and an index selection, stay synchronous. A
-    /// caller's other branches (a daemon's stop signal) are polled at those
-    /// yields. Dropped at a yield, it has read only immutable snapshots and
-    /// published nothing: the memo it consumed is gone, and the next advance
-    /// starts from empty. Validation-cache entries it completed are each
-    /// whole and survive for later reads.
+    /// The first advance reads every selected record and looks up every root
+    /// in the blob index, which for a large pile is still a lot of work. So
+    /// it yields once a chunk of that has taken [`ADVANCE_TURN`]. That is a
+    /// threshold between steps, not a latency bound: a single lookup, and an
+    /// index selection, stay synchronous. A caller's other branches (a
+    /// daemon's stop signal) are polled at those yields. Dropped at a yield,
+    /// it has read only immutable snapshots and published nothing: the memo
+    /// it consumed is gone, and the next advance starts from empty.
     pub async fn advance(
         mut self,
         snapshot: &T,
@@ -387,9 +388,9 @@ impl<T: StoreRead> Hydration<T> {
                 }
             }
             if changes.contains(StoreChanges::BLOBS) {
-                // An arrival, or another occurrence beside an unreadable one.
+                // An arrival.
                 for handle in self.missing.clone() {
-                    if readable(snapshot, handle) {
+                    if resident(snapshot, handle) {
                         self.missing.remove(&handle);
                         self.counts.arrived += 1;
                     }
@@ -403,7 +404,7 @@ impl<T: StoreRead> Hydration<T> {
                     let handle = gone.handle.raw;
                     if self.roots.contains(&handle)
                         && !self.missing.contains(&handle)
-                        && !readable(snapshot, handle)
+                        && !resident(snapshot, handle)
                     {
                         self.missing.insert(handle);
                     }
@@ -433,7 +434,7 @@ impl<T: StoreRead> Hydration<T> {
             }
         }
         for handle in added {
-            if !readable(snapshot, handle) {
+            if !resident(snapshot, handle) {
                 self.missing.insert(handle);
             }
             yield_after_turn(&mut turn).await;
@@ -500,9 +501,22 @@ async fn yield_after_turn(turn: &mut crate::clock::Mono) {
     }
 }
 
-/// Whether `snapshot` hands out bytes for `handle`. A physical occurrence
-/// alone can be corrupt, so this is the validated read rather than
-/// `contains_blob`/`blob_info`.
+/// Whether `snapshot` holds `handle`: one lookup in its blob index, without
+/// reading the payload. Hydration's root check; see [`Hydration`] for why the
+/// indexed handle is trusted. A failed lookup counts as absent.
+fn resident<R: BlobStoreList>(snapshot: &R, handle: RawHash) -> bool {
+    #[cfg(test)]
+    {
+        tests::READS.with(|count| count.set(count.get() + 1));
+        std::thread::sleep(tests::READ_DELAY.get());
+    }
+    snapshot
+        .contains_blob::<UnknownBlob>(Inline::new(handle))
+        .unwrap_or(false)
+}
+
+/// Whether `snapshot` hands out bytes for `handle`: the validated read, for
+/// an exact WANT. A physical occurrence alone can be corrupt.
 fn readable<R: BlobStoreGet>(snapshot: &R, handle: RawHash) -> bool {
     #[cfg(test)]
     {
@@ -946,14 +960,14 @@ mod tests {
     use triblespace_core::repo::{BlobStoreList, BlobStorePut, StorageClose};
 
     std::thread_local! {
-        /// Validated blob reads made by the reconciler on this thread.
+        /// Root lookups and WANT reads made by the reconciler on this thread.
         pub(super) static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// Hydration resets to empty forced on this thread.
         pub(super) static RESETS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// Hydration advances from the empty answer on this thread.
         pub(super) static FROM_EMPTY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-        /// Time each validated read takes on this thread, standing in for
-        /// hashing a large pile's roots on the first pass.
+        /// Time each root lookup or WANT read takes on this thread, standing
+        /// in for a large pile's first pass.
         pub(super) static READ_DELAY: std::cell::Cell<Duration> =
             const { std::cell::Cell::new(Duration::ZERO) };
     }
@@ -2456,6 +2470,277 @@ mod tests {
         assert_eq!(take_counts(), (0, 0));
         assert_eq!(derived_from_scratch(&mut peer, selection).await, (9, 0));
         peer.close().unwrap();
+    }
+
+    /// A snapshot that counts every payload it hands out (`get`, and a
+    /// pile's `metadata`, which validates) and delegates everything else,
+    /// the blob index included, to `inner`.
+    #[derive(Clone)]
+    struct PayloadCounting<T> {
+        inner: T,
+        payloads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<T: triblespace_core::repo::StoreSnapshot> triblespace_core::repo::StoreSnapshot
+        for PayloadCounting<T>
+    {
+        fn changes_since(&self, previous: &Self) -> StoreChanges {
+            self.inner.changes_since(&previous.inner)
+        }
+
+        fn changes_for(&self, previous: &Self, dependencies: &StoreDependencies) -> StoreChanges {
+            self.inner.changes_for(&previous.inner, dependencies)
+        }
+    }
+
+    impl<T: BlobStoreGet> BlobStoreGet for PayloadCounting<T> {
+        type GetError<E: std::error::Error + Send + Sync + 'static> = T::GetError<E>;
+
+        fn get<V, S>(
+            &self,
+            handle: Inline<Handle<S>>,
+        ) -> Result<V, Self::GetError<<V as triblespace_core::blob::TryFromBlob<S>>::Error>>
+        where
+            S: BlobEncoding + 'static,
+            V: triblespace_core::blob::TryFromBlob<S>,
+            Handle<S>: InlineEncoding,
+        {
+            self.payloads.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(handle)
+        }
+    }
+
+    impl<T: BlobStoreList> BlobStoreList for PayloadCounting<T> {
+        type Iter<'a>
+            = T::Iter<'a>
+        where
+            Self: 'a;
+        type Err = T::Err;
+
+        fn blobs<'a>(&'a self) -> Self::Iter<'a> {
+            self.inner.blobs()
+        }
+
+        fn contains_blob<S>(&self, handle: Inline<Handle<S>>) -> Result<bool, Self::Err>
+        where
+            S: BlobEncoding + 'static,
+            Handle<S>: InlineEncoding,
+        {
+            self.inner.contains_blob(handle)
+        }
+
+        fn blob_info<S>(
+            &self,
+            handle: Inline<Handle<S>>,
+        ) -> Result<Option<triblespace_core::repo::BlobInfo>, Self::Err>
+        where
+            S: BlobEncoding + 'static,
+            Handle<S>: InlineEncoding,
+        {
+            self.inner.blob_info(handle)
+        }
+
+        fn blobs_diff<'a>(&'a self, old: &Self) -> Self::Iter<'a> {
+            self.inner.blobs_diff(&old.inner)
+        }
+    }
+
+    impl<T: triblespace_core::repo::BlobStoreMeta> triblespace_core::repo::BlobStoreMeta
+        for PayloadCounting<T>
+    {
+        type MetaError = T::MetaError;
+
+        fn metadata<S>(
+            &self,
+            handle: Inline<Handle<S>>,
+        ) -> Result<Option<triblespace_core::repo::BlobMetadata>, Self::MetaError>
+        where
+            S: BlobEncoding + 'static,
+            Handle<S>: InlineEncoding,
+        {
+            self.payloads.fetch_add(1, Ordering::SeqCst);
+            self.inner.metadata(handle)
+        }
+
+        fn resident(
+            &self,
+            handles: &PATCH<32, IdentitySchema, ()>,
+        ) -> Result<PATCH<32, IdentitySchema, ()>, Self::MetaError> {
+            self.inner.resident(handles)
+        }
+    }
+
+    impl<T: CollectionRead> CollectionRead for PayloadCounting<T> {
+        type RecordsError = T::RecordsError;
+        type RecordIter<'a>
+            = T::RecordIter<'a>
+        where
+            Self: 'a;
+
+        fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
+            self.inner.records()
+        }
+
+        fn collections(&self) -> Result<Vec<CollectionHandle>, Self::RecordsError> {
+            self.inner.collections()
+        }
+
+        fn select_records(
+            &self,
+            selectors: &BTreeSet<CollectionRecordSelector>,
+        ) -> Result<Vec<CollectionRecord>, Self::RecordsError> {
+            self.inner.select_records(selectors)
+        }
+
+        fn select_record_views(
+            &self,
+            selectors: &BTreeSet<CollectionRecordSelector>,
+        ) -> Result<Vec<triblespace_core::collection::CollectionRecordView>, Self::RecordsError>
+        {
+            self.inner.select_record_views(selectors)
+        }
+
+        fn select_record_view_changes(
+            &self,
+            previous: &Self,
+            selectors: &BTreeSet<CollectionRecordSelector>,
+        ) -> Result<RecordViewChanges, Self::RecordsError> {
+            self.inner
+                .select_record_view_changes(&previous.inner, selectors)
+        }
+
+        fn select_record_changes(
+            &self,
+            previous: &Self,
+            selectors: &BTreeSet<CollectionRecordSelector>,
+        ) -> Result<(Vec<CollectionRecord>, Vec<CollectionRecord>), Self::RecordsError> {
+            self.inner.select_record_changes(&previous.inner, selectors)
+        }
+    }
+
+    impl<T: triblespace_core::collection::CoverageRead> triblespace_core::collection::CoverageRead
+        for PayloadCounting<T>
+    {
+        fn index(
+            &self,
+            lineage: &BTreeSet<CollectionHandle>,
+        ) -> Result<triblespace_core::collection::coverage::CoverageIndex, Self::RecordsError>
+        {
+            self.inner.index(lineage)
+        }
+    }
+
+    impl<T: triblespace_core::repo::CapabilityProofRead> triblespace_core::repo::CapabilityProofRead
+        for PayloadCounting<T>
+    {
+        type ProofsError = T::ProofsError;
+        type ProofIter<'a>
+            = T::ProofIter<'a>
+        where
+            Self: 'a;
+
+        fn proofs<'a>(&'a self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
+            self.inner.proofs()
+        }
+    }
+
+    impl<T: WantRead> WantRead for PayloadCounting<T> {
+        type WantsError = T::WantsError;
+        type WantIter<'a>
+            = T::WantIter<'a>
+        where
+            Self: 'a;
+
+        fn wants<'a>(&'a self) -> Result<Self::WantIter<'a>, Self::WantsError> {
+            self.inner.wants()
+        }
+    }
+
+    /// Hydration looks a root up in the blob index and never reads its
+    /// payload: through a first advance, an arrival and an unchanged
+    /// snapshot, the store hands out no payload at all. So a resident root
+    /// whose bytes were damaged after they were written counts as held, while
+    /// a read of it still fails validation; a root no blob backs is missing
+    /// until it arrives.
+    #[tokio::test]
+    async fn hydration_checks_presence_without_reading_payloads() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut pile = Pile::open(path.path()).unwrap();
+        let descriptor = put_pile(&mut pile, b"presence descriptor".to_vec());
+        let metadata = put_pile(&mut pile, b"presence metadata".to_vec());
+        let data: Vec<_> = (0..4)
+            .map(|ordinal| put_pile(&mut pile, format!("presence data {ordinal}")))
+            .collect();
+        for &handle in &data {
+            pile.insert(commit_record(descriptor, handle, metadata))
+                .unwrap();
+        }
+        let late = Blob::<UnknownBlob>::new(Bytes::from_source(b"presence late".to_vec()));
+        let late_handle = late.get_handle().raw;
+        pile.insert(commit_record(descriptor, late_handle, metadata))
+            .unwrap();
+        pile.close().unwrap();
+        // Damage one root's payload in place, after its handle was indexed.
+        let damaged = data[0];
+        let body_offset = PileRecords::open(path.path())
+            .unwrap()
+            .find_map(|record| match record.unwrap().content {
+                PileRecordContent::Blob {
+                    hash, data_offset, ..
+                } if hash.raw == damaged => Some(data_offset),
+                _ => None,
+            })
+            .unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path.path())
+            .unwrap();
+        file.seek(SeekFrom::Start(body_offset as u64)).unwrap();
+        file.write_all(&[0xff]).unwrap();
+        drop(file);
+
+        let payloads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut pile = Pile::open(path.path()).unwrap();
+        let counted = |snapshot| PayloadCounting {
+            inner: snapshot,
+            payloads: payloads.clone(),
+        };
+        let selection = [Inline::new(descriptor)];
+        let before = counted(pile.snapshot().unwrap());
+        let hydration = Hydration::new().advance(&before, &selection).await.unwrap();
+        assert_eq!(
+            payloads.load(Ordering::SeqCst),
+            0,
+            "a first advance reads no payload"
+        );
+        assert_eq!(hydration.roots().len(), 7);
+        // The damaged root is held; only the root no blob backs is missing.
+        assert_eq!(hydration.missing(), &BTreeSet::from([late_handle]));
+
+        pile.put::<UnknownBlob, _>(late).unwrap();
+        let after = counted(pile.snapshot().unwrap());
+        let hydration = hydration.advance(&after, &selection).await.unwrap();
+        assert!(hydration.missing().is_empty());
+        assert_eq!(hydration.counts().arrived, 1);
+        let hydration = hydration.advance(&after, &selection).await.unwrap();
+        assert!(hydration.missing().is_empty());
+        assert_eq!(
+            payloads.load(Ordering::SeqCst),
+            0,
+            "an arrival reads no payload"
+        );
+
+        // The damage is still there for any reader of the bytes.
+        assert!(matches!(
+            BlobStoreGet::get::<Bytes, UnknownBlob>(&after.inner, Inline::new(damaged)),
+            Err(triblespace_core::repo::pile::GetBlobError::ValidationError(
+                _
+            ))
+        ));
+        drop((before, after));
+        pile.close().unwrap();
     }
 
     fn put_pile(pile: &mut Pile, bytes: impl Into<Vec<u8>>) -> RawHash {
