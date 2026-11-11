@@ -103,14 +103,14 @@ fn typed_foundation_generations_are_independent_and_old_pins_survive() {
     let mut node = Node::new(195);
     let c = node.hold("typed-kind-generations", open());
     let before = node.store.snapshot().unwrap();
-    let first = StoreSnapshot::from_store_changes(before.clone(), &node.active,
+    let first = StoreSnapshot::from_store_changes(before.clone(), &node.active, &node.active,
         node.key.verifying_key(), None, None, StoreChanges::ALL).unwrap();
     let old_pin = first.collection(c).unwrap();
     let empty_commit = old_pin.cache(WalkKind::Commit);
     let empty_derive = old_pin.cache(WalkKind::Derive);
     let commit = node.commit(c, 42);
     let middle = node.store.snapshot().unwrap();
-    let second = StoreSnapshot::from_store_changes(middle.clone(), &node.active,
+    let second = StoreSnapshot::from_store_changes(middle.clone(), &node.active, &node.active,
         node.key.verifying_key(), Some(&before), Some(&first), middle.changes_since(&before)).unwrap();
     let middle_pin = second.collection(c).unwrap();
     assert!(!Arc::ptr_eq(&empty_commit, &middle_pin.cache(WalkKind::Commit)));
@@ -120,7 +120,7 @@ fn typed_foundation_generations_are_independent_and_old_pins_survive() {
         SourceLocator::of([42; 32]), Inline::new([43; 32])));
     node.store.insert(derive).unwrap();
     let after = node.store.snapshot().unwrap();
-    let third = StoreSnapshot::from_store_changes(after.clone(), &node.active,
+    let third = StoreSnapshot::from_store_changes(after.clone(), &node.active, &node.active,
         node.key.verifying_key(), Some(&middle), Some(&second), after.changes_since(&middle)).unwrap();
     let last = third.collection(c).unwrap();
     assert!(Arc::ptr_eq(&middle_pin.cache(WalkKind::Commit), &last.cache(WalkKind::Commit)));

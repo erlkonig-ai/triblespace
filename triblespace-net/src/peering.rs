@@ -1557,13 +1557,13 @@ mod tests {
             StoreSnapshot::from_store_changes(
                 self.store.snapshot().unwrap(),
                 &self.active,
+                &self.full,
                 self.key.verifying_key(),
                 None,
                 None,
                 StoreChanges::ALL,
             )
             .unwrap()
-            .with_full(self.full.clone())
         }
     }
 

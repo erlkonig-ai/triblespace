@@ -87,6 +87,7 @@ fn observe(
     StoreSnapshot::from_store_changes(
         snapshot.clone(),
         active,
+        active,
         local,
         prior.map(|(store, _)| store),
         prior.map(|(_, host)| host),

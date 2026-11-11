@@ -282,13 +282,13 @@ where
         let serving = StoreSnapshot::from_store_changes(
             snapshot.clone(),
             &publication.active,
+            &publication.full,
             VerifyingKey::from_bytes(self.sender.id().as_bytes())
                 .expect("endpoint id is an Ed25519 key"),
             publication.last_store_snapshot.as_ref(),
             previous_snapshot.as_ref(),
             changes,
-        )?
-        .with_full(publication.full.clone());
+        )?;
         #[cfg(test)]
         {
             publication.grant_evaluations = serving.grants().evaluations();
@@ -547,45 +547,47 @@ where
     /// Select optional payload replication, independently of collection READ
     /// admission or activation. The default remains explicit demand only.
     ///
-    /// In Full mode the store keeps held sets for `collections` from the next
-    /// snapshot on, and this side's peerings for them say it replicates them
-    /// in full, so that Full neighbours compare and pull held sets (design
-    /// 2.9). Other modes keep none, and peer with the full flag unset.
+    /// In every mode the store keeps held sets for `collections` from the
+    /// next snapshot on. Only in Full are they published: this side's
+    /// peerings for them say it replicates them in full, so that Full
+    /// neighbours compare and pull held sets (design 2.9). In other modes a
+    /// held set stays unknown in the serving snapshot, so no references tree
+    /// is exchanged and the peering's full flag is unset.
     ///
-    /// The first Full selection starts the peer's held-set thread: a
-    /// collection's first closure is computed there and published once
-    /// whole (until then its held set is unknown, and its references tree is
-    /// not exchanged), and neither landing nor this call waits for it. The
-    /// thread ends once the store is gone.
+    /// The first selection starts the peer's held-set thread: a collection's
+    /// first closure is computed there and published once whole (until then
+    /// its held set is unknown, and its references tree is not exchanged),
+    /// and neither landing nor this call waits for it. The thread ends once
+    /// the store is gone.
     pub fn set_replication(
         &mut self,
         mode: ReplicationMode,
         collections: impl IntoIterator<Item = CollectionHandle>,
     ) {
         let collections: Vec<_> = collections.into_iter().collect();
-        let mut full = ActiveCollections::new();
-        if mode == ReplicationMode::Full {
-            if !self.held_driven {
-                // `None`: another driver builds this store's sets now. Only a
-                // started thread marks this peer driven, so a later Full
-                // selection asks again once that driver is gone or a failed
-                // spawn can be retried.
-                let work = self.store().drive_held();
-                if let Some(mut work) = work {
-                    // A thread that cannot start drops the work, which hands
-                    // the building back to snapshots.
-                    let spawned = std::thread::Builder::new()
-                        .name("held-sets".into())
-                        .spawn(move || while work.step(HELD_STEP, HELD_IDLE) {});
-                    match spawned {
-                        Ok(_) => self.held_driven = true,
-                        Err(error) => {
-                            tracing::warn!(%error, "held sets are built by snapshots: no thread")
-                        }
+        if !self.held_driven {
+            // `None`: another driver builds this store's sets now. Only a
+            // started thread marks this peer driven, so a later selection
+            // asks again once that driver is gone or a failed spawn can be
+            // retried.
+            let work = self.store().drive_held();
+            if let Some(mut work) = work {
+                // A thread that cannot start drops the work, which hands
+                // the building back to snapshots.
+                let spawned = std::thread::Builder::new()
+                    .name("held-sets".into())
+                    .spawn(move || while work.step(HELD_STEP, HELD_IDLE) {});
+                match spawned {
+                    Ok(_) => self.held_driven = true,
+                    Err(error) => {
+                        tracing::warn!(%error, "held sets are built by snapshots: no thread")
                     }
                 }
             }
-            self.store().track_held(collections.iter().copied());
+        }
+        self.store().track_held(collections.iter().copied());
+        let mut full = ActiveCollections::new();
+        if mode == ReplicationMode::Full {
             for collection in &collections {
                 full.insert(&PatchEntry::new(&collection.raw));
             }
@@ -1398,6 +1400,88 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    /// Held sets are tracked in every mode and built on the held-set
+    /// thread, but published only for a collection replicated in full:
+    /// Shallow leaves the serving snapshot's set unknown although the store
+    /// built it, Full publishes the same set, and moving back to Shallow
+    /// withdraws it.
+    #[tokio::test]
+    async fn held_sets_are_built_in_every_mode_and_published_only_in_full() {
+        use triblespace_core::collection::{
+            CollectionCommit, CollectionRecord, CollectionStore, empty_metadata_handle,
+        };
+        let key = SigningKey::from_bytes(&[88; 32]);
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(
+                "held sets outside full",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap()
+            .handle();
+        let data = store
+            .put::<UnknownBlob, _>(Bytes::from_source(b"held outside full".to_vec()))
+            .unwrap()
+            .raw;
+        store
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &key,
+                collection,
+                Inline::new(data),
+                empty_metadata_handle(),
+            )))
+            .unwrap();
+        let (sender, receiver, _wiring) =
+            host::wire(crate::identity::iroh_secret(&key).public().into());
+        let mut peer = Peer::with_wiring(store, sender, receiver);
+        peer.activate_collection(collection);
+        let served = |peer: &mut Peer<MemoryRepo>| {
+            peer.refresh();
+            let serving = peer.sender.current_snapshot().expect("a serving snapshot");
+            let pinned = serving
+                .collection(collection)
+                .expect("the collection is active");
+            (
+                pinned.held_known(),
+                serving.full(collection),
+                pinned.repair().blob_inventory().has_prefix(&data),
+            )
+        };
+
+        peer.set_replication(ReplicationMode::Shallow, [collection]);
+        assert!(
+            peer.held_driven,
+            "a Shallow selection starts the held-set thread"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let built = loop {
+            if let Some(held) = HeldRead::held(&peer.snapshot().unwrap(), collection) {
+                break held;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the store builds the held set in Shallow"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(built.has_prefix(&data));
+        assert_eq!(
+            served(&mut peer),
+            (false, false, false),
+            "a Shallow collection's held set is unknown in the serving snapshot"
+        );
+
+        peer.set_replication(ReplicationMode::Full, [collection]);
+        assert_eq!(served(&mut peer), (true, true, true), "Full publishes it");
+
+        peer.set_replication(ReplicationMode::Shallow, [collection]);
+        assert_eq!(
+            served(&mut peer),
+            (false, false, false),
+            "leaving Full withdraws it"
+        );
     }
 
     #[tokio::test]

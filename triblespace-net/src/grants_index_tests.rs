@@ -519,6 +519,7 @@ fn collection_evidence_is_a_superset_of_its_indexed_grants() {
     let snapshot = StoreSnapshot::from_store_changes(
         store.snapshot().unwrap(),
         &active,
+        &active,
         owner.verifying_key(),
         None,
         None,

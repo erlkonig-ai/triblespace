@@ -168,7 +168,8 @@ impl CollectionSnapshot {
     /// Bind the collection's held set, fixed by the same store observation
     /// as the repair evidence. The store's held-blob index computed it: no
     /// blob is scanned while publishing. `None` is a set the store has not
-    /// published: the inventory is empty and [`Self::held_known`] says no.
+    /// published, or one of a collection not replicated in full here: the
+    /// inventory is empty and [`Self::held_known`] says no.
     fn with_held(
         repair: CollectionRepairOverlay,
         held: Option<HeldBlobs>,
@@ -206,9 +207,10 @@ impl CollectionSnapshot {
         Arc::new(Self::with_held(self.repair.as_ref().clone(), Some(held), None).unwrap())
     }
 
-    /// Whether the store published the collection's held set. An unknown
-    /// set is never exchanged: compared against a peer's, its emptiness
-    /// would read as lacking everything the peer holds.
+    /// Whether the store published the collection's held set and the
+    /// collection is replicated in full here. An unknown set is never
+    /// exchanged: compared against a peer's, its emptiness would read as
+    /// lacking everything the peer holds.
     pub(crate) fn held_known(&self) -> bool {
         self.held_known
     }
@@ -258,7 +260,9 @@ pub(crate) struct StoreSnapshot<R> {
     /// This pile's configuration collection, where its sync selection lives.
     config: TribleSet,
     /// The collections this side replicates in full
-    /// ([`ReplicationMode::Full`](crate::reconcile::ReplicationMode::Full)).
+    /// ([`ReplicationMode::Full`](crate::reconcile::ReplicationMode::Full)):
+    /// their peerings say so, their references trees are pushed to full
+    /// neighbours, and only their held sets are published.
     full: ActiveCollections,
     /// Every grant this host holds, over any resource, with each resource's
     /// participants: the one AUTH index (see [`GrantIndex`]).
@@ -273,6 +277,7 @@ impl<R> StoreSnapshot<R> {
     pub(crate) fn from_store_changes(
         snapshot: R,
         active: &ActiveCollections,
+        full: &ActiveCollections,
         local: VerifyingKey,
         previous_store: Option<&R>,
         previous: Option<&Self>,
@@ -307,8 +312,13 @@ impl<R> StoreSnapshot<R> {
         for raw in active.iter_ordered() {
             let collection = CollectionHandle::new(*raw);
             // Positive. `None` is unknown: a collection replicated on demand
-            // is untracked, and a tracked one is not settled yet.
-            let held = snapshot.held(collection);
+            // or shallow here, or one whose set the store has not published
+            // yet. A store may track held sets in any mode; only a Full
+            // collection's is published, so no references tree is exchanged
+            // outside Full.
+            let held = snapshot
+                .held(collection)
+                .filter(|_| full.get(raw).is_some());
             let prior = previous.and_then(|prior| prior.collections.get(&collection.raw));
             let relevant = match (previous_store, prior) {
                 (Some(before), Some(prior)) => snapshot.changes_for(before, &prior.dependencies),
@@ -425,7 +435,7 @@ impl<R> StoreSnapshot<R> {
             blobs: snapshot,
             bearer_locators,
             config,
-            full: ActiveCollections::new(),
+            full: full.clone(),
             grants,
             #[cfg(test)]
             observation: Arc::new(()),
@@ -448,13 +458,6 @@ impl<R> StoreSnapshot<R> {
     /// This node's key.
     pub(crate) fn local(&self) -> PeerId {
         self.local.to_bytes()
-    }
-
-    /// Replicate `full`'s collections in full: their peerings say so, and
-    /// their references trees are pushed to full neighbours.
-    pub(crate) fn with_full(mut self, full: ActiveCollections) -> Self {
-        self.full = full;
-        self
     }
 
     /// Whether this side replicates the collection in full.
@@ -2815,6 +2818,7 @@ mod tests {
         let serving_before = super::StoreSnapshot::from_store_changes(
             before.clone(),
             &active,
+            &active,
             reader,
             None,
             None,
@@ -2831,6 +2835,7 @@ mod tests {
         assert!(changes.contains(StoreChanges::BLOBS));
         let serving_after = super::StoreSnapshot::from_store_changes(
             after,
+            &active,
             &active,
             reader,
             Some(&before),

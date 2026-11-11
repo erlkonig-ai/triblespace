@@ -359,6 +359,7 @@ fn riblt_cache_snapshot_constructor_tracks_authored_and_inserted_record_deltas()
     let first = StoreSnapshot::from_store_changes(
         before.clone(),
         &node.active,
+        &node.active,
         node.key.verifying_key(),
         None,
         None,
@@ -378,6 +379,7 @@ fn riblt_cache_snapshot_constructor_tracks_authored_and_inserted_record_deltas()
     let after = node.store.snapshot().unwrap();
     let second = StoreSnapshot::from_store_changes(
         after.clone(),
+        &node.active,
         &node.active,
         node.key.verifying_key(),
         Some(&before),
@@ -406,6 +408,7 @@ fn riblt_cache_snapshot_constructor_tracks_authored_and_inserted_record_deltas()
 
     let third = StoreSnapshot::from_store_changes(
         after.clone(),
+        &node.active,
         &node.active,
         node.key.verifying_key(),
         Some(&after),

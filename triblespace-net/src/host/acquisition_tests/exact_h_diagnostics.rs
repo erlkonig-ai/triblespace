@@ -566,6 +566,7 @@ impl ThreeNodes {
         let snapshot = StoreSnapshot::from_store_changes(
             store.snapshot().unwrap(),
             &ActiveCollections::new(),
+            &ActiveCollections::new(),
             holder_key.verifying_key(),
             None,
             None,

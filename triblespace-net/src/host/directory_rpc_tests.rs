@@ -152,6 +152,7 @@ async fn find_value_answers_routes_and_provider_hints_in_one_reply() {
     let snapshot = StoreSnapshot::from_store_changes(
         store.snapshot().unwrap(),
         &ActiveCollections::new(),
+        &ActiveCollections::new(),
         provider_key.verifying_key(),
         None,
         None,

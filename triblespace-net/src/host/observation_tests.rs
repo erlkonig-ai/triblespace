@@ -326,6 +326,7 @@ fn serving_handoff_keeps_only_the_latest_coherent_observation() {
         let serving = StoreSnapshot::from_store_changes(
             fixture.snapshot(),
             &selected,
+            &selected,
             local,
             None,
             None,
@@ -366,6 +367,7 @@ fn serving_handoff_withdrawal_recovery_and_last_owner_drop_are_observable() {
     let mut install = |selected: &ActiveCollections| {
         let serving = StoreSnapshot::from_store_changes(
             fixture.snapshot(),
+            selected,
             selected,
             local,
             None,
@@ -544,6 +546,7 @@ fn unrelated_blob_arrivals_reuse_records_without_enumeration() {
     let mut serving_before = StoreSnapshot::from_store_changes(
         before.clone(),
         &active,
+        &active,
         local,
         None,
         None,
@@ -562,6 +565,7 @@ fn unrelated_blob_arrivals_reuse_records_without_enumeration() {
         assert_eq!(changes, StoreChanges::BLOBS);
         let serving_after = StoreSnapshot::from_store_changes(
             after.clone(),
+            &active,
             &active,
             local,
             Some(&before),
@@ -592,6 +596,7 @@ fn proof_arrival_refreshes_authorization_without_record_enumeration() {
     let serving_before = StoreSnapshot::from_store_changes(
         before.clone(),
         &active,
+        &active,
         reader,
         None,
         None,
@@ -615,6 +620,7 @@ fn proof_arrival_refreshes_authorization_without_record_enumeration() {
     assert_eq!(changes, StoreChanges::CAPABILITY_PROOFS);
     let serving_after = StoreSnapshot::from_store_changes(
         after,
+        &active,
         &active,
         reader,
         Some(&before),
@@ -648,6 +654,7 @@ fn new_commit_updates_the_record_summary_without_reenumeration() {
     let serving_before = StoreSnapshot::from_store_changes(
         before.clone(),
         &active,
+        &active,
         local,
         None,
         None,
@@ -666,6 +673,7 @@ fn new_commit_updates_the_record_summary_without_reenumeration() {
     assert_eq!(changes, StoreChanges::COLLECTION_RECORDS);
     let serving_after = StoreSnapshot::from_store_changes(
         after.clone(),
+        &active,
         &active,
         local,
         Some(&before),
@@ -693,6 +701,7 @@ fn new_commit_updates_the_record_summary_without_reenumeration() {
     // difference, rather than retaining an absent record forever.
     let restored = StoreSnapshot::from_store_changes(
         before.clone(),
+        &active,
         &active,
         local,
         Some(&after),
@@ -741,6 +750,7 @@ fn cold_collection_activation_enumerates_even_with_a_blob_only_change_mask() {
     let serving_before = StoreSnapshot::from_store_changes(
         before.clone(),
         &active,
+        &active,
         local,
         None,
         None,
@@ -767,6 +777,7 @@ fn cold_collection_activation_enumerates_even_with_a_blob_only_change_mask() {
     assert_eq!(changes, StoreChanges::BLOBS);
     let serving_after = StoreSnapshot::from_store_changes(
         after,
+        &active,
         &active,
         local,
         Some(&before),
@@ -836,6 +847,7 @@ fn arriving_read_definition_refreshes_admission_with_same_wake_root_and_record_l
     let serving_before = StoreSnapshot::from_store_changes(
         before.clone(),
         &active,
+        &active,
         reader,
         None,
         None,
@@ -862,6 +874,7 @@ fn arriving_read_definition_refreshes_admission_with_same_wake_root_and_record_l
     assert_eq!(changes, StoreChanges::BLOBS);
     let serving_after = StoreSnapshot::from_store_changes(
         after,
+        &active,
         &active,
         reader,
         Some(&before),
@@ -994,6 +1007,7 @@ impl ScopedFixture {
         });
         let serving = StoreSnapshot::from_store_changes(
             snapshot.clone(),
+            selected,
             selected,
             self.local,
             previous.map(|previous| &previous.0),

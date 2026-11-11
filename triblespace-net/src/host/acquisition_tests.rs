@@ -121,6 +121,7 @@ impl Fixture {
         let snapshot = StoreSnapshot::from_store_changes(
             store.snapshot().unwrap(),
             &ActiveCollections::new(),
+            &ActiveCollections::new(),
             provider_key.verifying_key(),
             None,
             None,
@@ -615,6 +616,7 @@ async fn stale_provider_lease_survives_loss_alternate_fetch_and_same_endpoint_re
     let restored = StoreSnapshot::from_store_changes(
         fixture.store.snapshot().unwrap(),
         &ActiveCollections::new(),
+        &ActiveCollections::new(),
         provider_key.verifying_key(),
         None,
         None,
@@ -794,6 +796,7 @@ async fn mid_transfer_crash_rejects_old_bytes_after_restart_and_allows_fresh_ret
     let provider_key = SigningKey::from_bytes(&[91; 32]);
     let restored = StoreSnapshot::from_store_changes(
         fixture.store.snapshot().unwrap(),
+        &ActiveCollections::new(),
         &ActiveCollections::new(),
         provider_key.verifying_key(),
         None,
@@ -1507,6 +1510,7 @@ async fn resident_descriptor_is_not_a_collection_participant_hint() {
     let snapshot = StoreSnapshot::from_store_changes(
         fixture.store.snapshot().unwrap(),
         &ActiveCollections::new(),
+        &ActiveCollections::new(),
         VerifyingKey::from_bytes(&fixture.provider).unwrap(),
         None,
         None,
@@ -1643,6 +1647,7 @@ async fn zero_announcement_budget_still_answers_resident_self_hints() {
             let hash = store.put::<UnknownBlob, _>(bytes.clone()).unwrap().raw;
             let serving = StoreSnapshot::from_store_changes(
                 store.snapshot().unwrap(),
+                &ActiveCollections::new(),
                 &ActiveCollections::new(),
                 server_key.verifying_key(),
                 None,

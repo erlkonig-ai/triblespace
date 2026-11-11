@@ -45,6 +45,7 @@ impl Node {
         StoreSnapshot::from_store_changes(
             self.store.snapshot().unwrap(),
             &self.active,
+            &self.active,
             self.key.verifying_key(),
             None,
             None,

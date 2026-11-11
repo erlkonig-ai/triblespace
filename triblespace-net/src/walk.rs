@@ -2512,6 +2512,7 @@ pub(crate) mod tests {
                 let snapshot = StoreSnapshot::from_store_changes(
                     self.store.snapshot().unwrap(),
                     &self.active,
+                    &self.active,
                     self.key.verifying_key(),
                     None,
                     None,
@@ -2764,6 +2765,71 @@ pub(crate) mod tests {
         node.observe();
         assert!(node.pinned(collection).held_known());
         assert!(!refused(&node, WalkKind::References));
+    }
+
+    /// A held set the store built for a collection this side does not
+    /// replicate in full is unknown in the serving snapshot, so this side
+    /// neither opens nor joins an exchange of its references tree, in either
+    /// algorithm: the responder path checks no `full` flag of its own.
+    /// Replicated in full, the same set is published and exchanged.
+    #[test]
+    fn a_held_set_outside_full_is_never_exchanged() {
+        use crate::host::{ActiveCollections, StoreSnapshot};
+        use crate::walk_stream::Algorithm;
+        use triblespace_core::collection::{HeldRead, HeldStore};
+        use triblespace_core::repo::{SnapshotSource, StoreChanges};
+        let mut node = Node::new(113);
+        let collection = node.hold("held set outside full", open());
+        node.commit(collection, 1);
+        node.store.track_held([collection]);
+        let peer = Node::new(114).id();
+        let observe = |node: &mut Node, full: &ActiveCollections| {
+            let store = node.store.snapshot().unwrap();
+            assert!(store.held(collection).is_some(), "the store built the set");
+            let snapshot = StoreSnapshot::from_store_changes(
+                store,
+                &node.active,
+                full,
+                node.key.verifying_key(),
+                None,
+                None,
+                StoreChanges::ALL,
+            )
+            .unwrap();
+            node.walks.observe(snapshot);
+        };
+        // A peer's References start, in either algorithm.
+        let joined = |node: &Node| {
+            [Algorithm::Prefix, Algorithm::CachedRiblt]
+                .into_iter()
+                .any(|algorithm| {
+                    node.walks
+                        .start_incoming(0, peer, collection, WalkKind::References, algorithm, None)
+                        .is_some()
+                })
+        };
+        let opened = |node: &Node| {
+            node.walks
+                .start(0, peer, collection, WalkKind::References)
+                .is_some()
+        };
+
+        observe(&mut node, &ActiveCollections::new());
+        assert!(!node.serving().full(collection));
+        assert!(
+            !joined(&node),
+            "a peer's References start is refused outside Full"
+        );
+        assert!(!opened(&node), "none is opened outside Full");
+        assert!(!node.pinned(collection).held_known());
+
+        let full = node.active.clone();
+        observe(&mut node, &full);
+        assert!(node.pinned(collection).held_known());
+        assert!(
+            joined(&node) && opened(&node),
+            "the same set exchanges in Full"
+        );
     }
 
     #[test]
