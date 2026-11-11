@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `triblespace-net` hydration has one function: `Hydration` starts empty and
+  only advances by snapshot difference; evidence that is not an append resets
+  it to empty and it advances again through the same steps. `Hydration::derive`
+  is gone. Advances yield between reads, so a stop ends a large one.
+  `reconcile::climb` replays a pile in bounded steps
+  (`Covered::<PileFile>::snapshot_step`, `PileFile::refresh_step`) and advances
+  one answer through every prefix; `Peer::adopt_hydration` continues from it.
+  `trible pile net sync` climbs at startup whenever hydration is on.
+
 - Record JP's 2026-09-17 BTree/PATCH guidance with its exact wording and source,
   separating it from engineering details on retained state, ephemeral scratch,
   exceptions and observable value changes. This changes contributor documentation

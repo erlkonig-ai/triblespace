@@ -477,10 +477,17 @@ fn selected_collections(
     pile: &mut Pile,
     authority: ed25519_dalek::VerifyingKey,
 ) -> Result<BTreeSet<CollectionHandle>> {
+    selected_in(&pile.snapshot()?, authority)
+}
+
+/// [`selected_collections`] as of one snapshot.
+fn selected_in(
+    snapshot: &triblespace_core::repo::pile::PileSnapshot,
+    authority: ed25519_dalek::VerifyingKey,
+) -> Result<BTreeSet<CollectionHandle>> {
     use triblespace_core::macros::{find, pattern};
 
-    let snapshot = pile.snapshot()?;
-    let facts = config_facts(&snapshot, authority)?;
+    let facts = config_facts(snapshot, authority)?;
     Ok(find!(
         collection: CollectionHandle,
         pattern!(&facts, [{ _?state @ sync_collection: ?collection }])
@@ -506,13 +513,68 @@ fn run_sync(
         .enable_all()
         .build()
         .map_err(|error| anyhow!("reconcile runtime: {error}"))?;
-    let stop = {
+    let mut stop = {
         let _entered = runtime.enter();
-        crate::cli::util::shutdown_signal()?
+        Box::pin(crate::cli::util::shutdown_signal()?)
     };
     // Sync writes and serves records and never publishes or reads a MERGE,
     // so it opens with no host, whichever key signs its telemetry.
-    let mut pile = open_pile(&pile_path, None)?;
+    //
+    // With hydration on, the replay is a climb: the pile is replayed in
+    // bounded steps and the hydration answer advanced through each prefix,
+    // so the first pass reads the roots step by step and a stop is answered
+    // between and within steps.
+    let (mut pile, climbed) = if replication == ReplicationMode::Demand {
+        (open_pile(&pile_path, None)?, None)
+    } else {
+        let mut pile = Pile::open(&pile_path)
+            .map_err(|e| anyhow!("open pile {}: {e:?}", pile_path.display()))?;
+        let authority = key.verifying_key();
+        let climbed = runtime.block_on(async {
+            tokio::select! {
+                biased;
+                stopped = &mut stop => stopped.map(|()| None).map_err(anyhow::Error::from),
+                climbed = triblespace_net::reconcile::climb(
+                    &mut pile,
+                    triblespace_net::reconcile::CLIMB_STEP_BYTES,
+                    |snapshot| {
+                        selected_in(snapshot, authority)
+                            .map(|selected| selected.into_iter().collect())
+                    },
+                    |_, _| {},
+                ) => climbed.map(Some),
+            }
+        });
+        match climbed {
+            Ok(Some(hydration)) => {
+                let counts = hydration.counts();
+                eprintln!(
+                    "climbed: {} steps, {} direct roots, {} missing; {} arrived during the climb, {} resets",
+                    counts.advances,
+                    hydration.roots().len(),
+                    hydration.missing().len(),
+                    counts.arrived,
+                    counts.resets,
+                );
+                (pile, Some(hydration))
+            }
+            Ok(None) => {
+                eprintln!("sync stopped during startup; closing pile");
+                pile.close()
+                    .map_err(|error| anyhow!("close pile: {error}"))?;
+                return Ok(());
+            }
+            Err(error) => {
+                let _ = pile.close();
+                return Err(
+                    match error.downcast::<triblespace_core::repo::pile::ReadError>() {
+                        Ok(error) => crate::cli::pile::pile_read_error(&pile_path, error),
+                        Err(error) => error,
+                    },
+                );
+            }
+        }
+    };
     let mut selected = selected_collections(&mut pile, key.verifying_key())?;
     let mut telemetry = telemetry::Publisher::open(&mut pile, &key, telemetry_options)?;
     let mut recorder = Recorder::new(key.verifying_key());
@@ -605,6 +667,9 @@ fn run_sync(
     let duration_limit = duration.map(std::time::Duration::from_secs);
     let quiescent_limit = quiescent_for.map(std::time::Duration::from_secs);
     peer.set_replication(replication, selected.iter().copied());
+    if let Some(hydration) = climbed {
+        peer.adopt_hydration(hydration);
+    }
     let reconcile_every = std::time::Duration::from_secs(1);
     let mut next_reconcile = std::time::Instant::now();
     let mut next_health = std::time::Instant::now();
@@ -730,7 +795,7 @@ fn run_sync(
     let result = runtime.block_on(async {
         tokio::select! {
             biased;
-            stopped = stop => {
+            stopped = &mut stop => {
                 stopped?;
                 eprintln!("sync stopped; closing pile");
                 Ok(())

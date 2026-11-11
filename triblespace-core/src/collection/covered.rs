@@ -249,17 +249,29 @@ where
 
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
         let now = self.inner.snapshot()?;
+        Ok(self.observe(now))
+    }
+}
+
+impl<S> Covered<S>
+where
+    S: SnapshotSource,
+    S::Snapshot: HeldSource,
+{
+    /// Hand out `now`, an observation of the inner store at or after the
+    /// last one handed out, with the indexes caught up to it.
+    fn observe(&mut self, now: S::Snapshot) -> CoveredSnapshot<S::Snapshot> {
         let memo = self.carry_forward(&now);
         // The publication barrier: for every built collection, the closures
         // of what arrived since the last snapshot are computed against this
         // one before it is handed out. Nothing is tracked, nothing is paid.
         let held = self.held.observe(&now);
         self.last = Some((now.clone(), std::sync::Arc::clone(&memo)));
-        Ok(CoveredSnapshot {
+        CoveredSnapshot {
             inner: now,
             memo,
             held,
-        })
+        }
     }
 }
 
@@ -378,6 +390,28 @@ impl<S: SnapshotSource + StorageClose> Covered<S> {
 }
 
 impl Covered<crate::repo::pile::PileFile> {
+    /// One step of a climb: replay at most about `max_bytes` more of the pile
+    /// ([`PileFile::refresh_step`](crate::repo::pile::PileFile::refresh_step))
+    /// and hand out a snapshot of exactly that prefix, as
+    /// [`SnapshotSource::snapshot`] would hand out the whole file. The flag
+    /// says whether this step reached the end of the file it observed.
+    ///
+    /// Every step is an ordinary snapshot of one lineage: the coverage memo
+    /// and the held sets catch up by difference, as between any two
+    /// snapshots. A prefix is a partial pile, nothing more, so a consumer
+    /// that advances by snapshot difference can climb a large pile in
+    /// bounded pieces and reach the same answer as one snapshot of the end.
+    /// A step bounds the records replayed, not what a consumer then reads
+    /// because of them, nor the closures the held sets compute.
+    pub fn snapshot_step(
+        &mut self,
+        max_bytes: u64,
+    ) -> Result<(crate::repo::pile::PileSnapshot, bool), crate::repo::pile::ReadError> {
+        let reached_end = self.inner.refresh_step(max_bytes)?;
+        let now = self.inner.snapshot_replayed();
+        Ok((self.observe(now), reached_end))
+    }
+
     /// Close a pile as the last act of a process that exits right after.
     ///
     /// The pile is flushed and its file closed exactly as by [`Self::close`],

@@ -18,8 +18,8 @@ use anybytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::collection::{
-    CollectionHandle, CollectionRead, CollectionRecordSelector, CollectionStore, HeldRead,
-    HeldStore, RecordViewChanges,
+    CollectionHandle, CollectionRecordSelector, CollectionStore, HeldRead, HeldStore,
+    RecordViewChanges,
 };
 use triblespace_core::inline::Inline;
 use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
@@ -189,21 +189,32 @@ pub struct Reconciler {
     /// A [`Hydration`] over the snapshot type of the store last ticked. It is
     /// type-erased only so the reconciler stays independent of its store; a
     /// different store type, a selection change, or a failed observation
-    /// discards it, and the next tick derives it again from scratch.
+    /// discards it, and the next tick advances a new one from empty.
     hydration: Option<Box<dyn Any + Send + Sync>>,
 }
 
 /// The selected direct roots as of one store snapshot, and the subset of them
 /// that snapshot cannot read.
 ///
-/// This is a memo of one query answer, keyed on the snapshot it answers. It is
-/// advanced to a later snapshot only through that snapshot's own change
+/// This is a memo of one query answer, keyed on the snapshot it answers. It
+/// starts empty -- the answer for a store that holds nothing -- and is only
+/// ever advanced, to a later snapshot, through that snapshot's own change
 /// evidence: `changes_for` says whether the selected records or the blob view
 /// moved at all, `select_record_view_changes` supplies the selected records
-/// that were added, and `blobs_diff` in reverse names blobs that went away.
-/// Anything the evidence cannot express as pure addition -- a semantic record
-/// removal, a replaced or truncated source, a failed enumeration -- discards
-/// the memo and derives it again from the current snapshot.
+/// that were added, and `blobs_diff` in reverse names blobs that went away. A
+/// collection the memo has not answered for yet is read whole, as an advance
+/// from its empty view. Anything the evidence cannot express as pure addition
+/// -- a semantic record removal, a replaced or truncated source, a failed
+/// enumeration, a collection leaving the selection -- resets the memo to empty
+/// and advances it again, through the same steps, to the current snapshot.
+///
+/// So there is one way to reach an answer, and a caller decides only how big
+/// the steps are. A daemon's ticks are small steps. A cold start is one big
+/// step, unless the store is climbed: snapshots of growing prefixes of one
+/// pile ([`Covered::snapshot_step`](triblespace_core::collection::covered::Covered::snapshot_step)),
+/// each an append to the last, fed here in order. A prefix is only a partial
+/// pile, so a root it names but does not yet hold is missing exactly as it
+/// would be at the tail.
 ///
 /// A root once read stays readable in a later snapshot unless it left the blob
 /// view. That holds for an append-only pile, whose occurrence validations are
@@ -211,120 +222,279 @@ pub struct Reconciler {
 /// membership is retrievability. Bytes rotting under an already validated
 /// occurrence were therefore not rediscovered here before either; the serving
 /// path validates every read it hands out.
-struct Hydration<T> {
-    snapshot: T,
+pub struct Hydration<T> {
+    /// The snapshot answered; `None` for the empty answer.
+    snapshot: Option<T>,
+    /// The collections answered for, in ascending handle order.
+    collections: BTreeSet<CollectionHandle>,
     roots: BTreeSet<RawHash>,
     missing: BTreeSet<RawHash>,
+    counts: HydrationCounts,
+}
+
+/// What a [`Hydration`] has done since it was created, across resets.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HydrationCounts {
+    /// Advances, including the first from the empty answer.
+    pub advances: usize,
+    /// Resets to the empty answer forced by evidence that was not an append.
+    pub resets: usize,
+    /// Roots that were missing at one advance and readable at a later one.
+    /// During a climb each would have been a fetch decision had a tick
+    /// observed that prefix; in a daemon they are blobs that landed.
+    pub arrived: usize,
+}
+
+impl<T> Default for Hydration<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> Hydration<T> {
+    /// The empty answer: no collection, no root, no snapshot.
+    pub fn new() -> Self {
+        Self {
+            snapshot: None,
+            collections: BTreeSet::new(),
+            roots: BTreeSet::new(),
+            missing: BTreeSet::new(),
+            counts: HydrationCounts::default(),
+        }
+    }
+
+    /// The selected direct roots of the snapshot answered.
+    pub fn roots(&self) -> &BTreeSet<RawHash> {
+        &self.roots
+    }
+
+    /// The roots that snapshot cannot read.
+    pub fn missing(&self) -> &BTreeSet<RawHash> {
+        &self.missing
+    }
+
+    /// The collections answered for.
+    pub fn collections(&self) -> &BTreeSet<CollectionHandle> {
+        &self.collections
+    }
+
+    pub fn counts(&self) -> HydrationCounts {
+        self.counts
+    }
+
+    fn reset(&mut self) {
+        #[cfg(test)]
+        tests::RESETS.with(|count| count.set(count.get() + 1));
+        let counts = HydrationCounts {
+            resets: self.counts.resets + 1,
+            ..self.counts
+        };
+        *self = Self::new();
+        self.counts = counts;
+    }
+}
+
+/// Evidence an advance cannot apply as an append.
+enum NotAnAppend<E> {
+    Reset,
+    Failed(E),
 }
 
 impl<T: StoreRead> Hydration<T> {
-    /// Derive every selected root from `snapshot` and read each one.
+    /// The same answer for `snapshot` and `collections`, reading only what
+    /// changed since the snapshot answered: added selected records, the
+    /// still-missing roots, roots whose blobs left the view, and the whole of
+    /// any collection not answered for before. Evidence that is not an append
+    /// resets the answer to empty and advances it from there.
     ///
-    /// On a fresh process every read hashes its blob, which for a large pile
-    /// is minutes of work, so the derivation yields once a chunk of reads has
-    /// taken [`DERIVE_TURN`]. That is a threshold between reads, not a latency
-    /// bound: a single read, and the work before and after the derivation,
-    /// stay synchronous. A caller's other branches (a daemon's stop signal)
-    /// are polled at those yields. Dropped at a yield, it has read only an
-    /// immutable snapshot and published no partial state. Validation-cache
-    /// entries it completed are each whole and survive for later reads.
-    async fn derive(
-        snapshot: &T,
-        collections: &[CollectionHandle],
-    ) -> Result<Self, T::RecordsError> {
-        #[cfg(test)]
-        tests::DERIVATIONS.with(|count| count.set(count.get() + 1));
-        let mut turn = crate::clock::mono_now();
-        let mut roots = BTreeSet::new();
-        // One indexed read per selection. COMMIT signatures are checked once,
-        // before physical union.
-        for &collection in collections {
-            roots.extend(direct_roots(snapshot, collection)?);
-            yield_after_turn(&mut turn).await;
-        }
-        let mut missing = BTreeSet::new();
-        for &handle in &roots {
-            if !readable(snapshot, handle) {
-                missing.insert(handle);
-            }
-            yield_after_turn(&mut turn).await;
-        }
-        Ok(Self {
-            snapshot: snapshot.clone(),
-            roots,
-            missing,
-        })
-    }
-
-    /// The same answer for `snapshot`, reading only what changed since
-    /// `self.snapshot`: added selected records, the still-missing roots, and
-    /// roots whose blobs left the view.
-    async fn advance(
+    /// The first advance of a fresh process reads every root, and on a fresh
+    /// process every read hashes its blob, which for a large pile is minutes
+    /// of work. So it yields once a chunk of reads has taken
+    /// [`ADVANCE_TURN`]. That is a threshold between reads, not a latency
+    /// bound: a single read, and an index selection, stay synchronous. A
+    /// caller's other branches (a daemon's stop signal) are polled at those
+    /// yields. Dropped at a yield, it has read only immutable snapshots and
+    /// published nothing: the memo it consumed is gone, and the next advance
+    /// starts from empty. Validation-cache entries it completed are each
+    /// whole and survive for later reads.
+    pub async fn advance(
         mut self,
         snapshot: &T,
         collections: &[CollectionHandle],
     ) -> Result<Self, T::RecordsError> {
-        let selectors: BTreeSet<_> = collections
-            .iter()
-            .map(|&collection| CollectionRecordSelector::Foundations(collection))
-            .collect();
-        let read_set = StoreDependencies {
-            records: selectors.iter().copied().collect(),
-            all_blobs: true,
-            ..StoreDependencies::default()
-        };
-        let changes = snapshot.changes_for(&self.snapshot, &read_set);
+        let collections: BTreeSet<_> = collections.iter().copied().collect();
+        self.counts.advances += 1;
+        match self.advance_from(snapshot, &collections).await {
+            Ok(()) => return Ok(self),
+            Err(NotAnAppend::Failed(error)) => return Err(error),
+            Err(NotAnAppend::Reset) => self.reset(),
+        }
+        // From the empty answer every collection is read whole, and nothing
+        // can be anything but an append.
+        match self.advance_from(snapshot, &collections).await {
+            Ok(()) => Ok(self),
+            Err(NotAnAppend::Failed(error)) => Err(error),
+            Err(NotAnAppend::Reset) => unreachable!("an advance from empty is an append"),
+        }
+    }
+
+    async fn advance_from(
+        &mut self,
+        snapshot: &T,
+        collections: &BTreeSet<CollectionHandle>,
+    ) -> Result<(), NotAnAppend<T::RecordsError>> {
+        // A root may be named only by a collection that left the selection.
+        if !self.collections.is_subset(collections) {
+            return Err(NotAnAppend::Reset);
+        }
+        #[cfg(test)]
+        if self.snapshot.is_none() {
+            tests::FROM_EMPTY.with(|count| count.set(count.get() + 1));
+        }
+        let mut turn = crate::clock::mono_now();
         let mut added = Vec::new();
-        if changes.contains(StoreChanges::COLLECTION_RECORDS) {
-            let views = match snapshot.select_record_view_changes(&self.snapshot, &selectors)? {
-                RecordViewChanges::Append(views) => views,
-                RecordViewChanges::Delta { added, removed } if removed.is_empty() => added,
-                // A removed record may have been the only one naming a root.
-                RecordViewChanges::Delta { .. } | RecordViewChanges::Rebuild => {
-                    return Self::derive(snapshot, collections).await;
-                }
+        if let Some(previous) = &self.snapshot {
+            let selectors: BTreeSet<_> = self
+                .collections
+                .iter()
+                .map(|&collection| CollectionRecordSelector::Foundations(collection))
+                .collect();
+            let read_set = StoreDependencies {
+                records: selectors.iter().copied().collect(),
+                all_blobs: true,
+                ..StoreDependencies::default()
             };
+            let changes = snapshot.changes_for(previous, &read_set);
+            if changes.contains(StoreChanges::COLLECTION_RECORDS) && !selectors.is_empty() {
+                let views = match snapshot
+                    .select_record_view_changes(previous, &selectors)
+                    .map_err(NotAnAppend::Failed)?
+                {
+                    RecordViewChanges::Append(views) => views,
+                    RecordViewChanges::Delta { added, removed } if removed.is_empty() => added,
+                    // A removed record may have been the only one naming a root.
+                    RecordViewChanges::Delta { .. } | RecordViewChanges::Rebuild => {
+                        return Err(NotAnAppend::Reset);
+                    }
+                };
+                for view in views {
+                    for handle in view.to_record().blob_references() {
+                        if self.roots.insert(handle.raw) {
+                            added.push(handle.raw);
+                        }
+                    }
+                    yield_after_turn(&mut turn).await;
+                }
+            }
+            if changes.contains(StoreChanges::BLOBS) {
+                // An arrival, or another occurrence beside an unreadable one.
+                for handle in self.missing.clone() {
+                    if readable(snapshot, handle) {
+                        self.missing.remove(&handle);
+                        self.counts.arrived += 1;
+                    }
+                    yield_after_turn(&mut turn).await;
+                }
+                // What was here before and is not now; empty for an append-only pile.
+                for gone in previous.blobs_diff(snapshot) {
+                    let Ok(gone) = gone else {
+                        return Err(NotAnAppend::Reset);
+                    };
+                    let handle = gone.handle.raw;
+                    if self.roots.contains(&handle)
+                        && !self.missing.contains(&handle)
+                        && !readable(snapshot, handle)
+                    {
+                        self.missing.insert(handle);
+                    }
+                    yield_after_turn(&mut turn).await;
+                }
+            }
+        }
+        // Collections not answered for before are read whole: their view in
+        // the previous answer was empty. One indexed read per collection;
+        // COMMIT signatures are checked once, before physical union.
+        for &collection in collections.difference(&self.collections) {
+            let selectors = BTreeSet::from([CollectionRecordSelector::Foundations(collection)]);
+            let views = snapshot
+                .select_record_views(&selectors)
+                .map_err(NotAnAppend::Failed)?;
+            yield_after_turn(&mut turn).await;
             for view in views {
+                // Records are trusted local evidence; foreign signatures were
+                // checked at ingress. WRITE admission does not govern
+                // structural ownership.
                 for handle in view.to_record().blob_references() {
                     if self.roots.insert(handle.raw) {
                         added.push(handle.raw);
                     }
                 }
-            }
-        }
-        if changes.contains(StoreChanges::BLOBS) {
-            // An arrival, or another occurrence beside an unreadable one.
-            self.missing.retain(|&handle| !readable(snapshot, handle));
-            // What was here before and is not now; empty for an append-only pile.
-            for gone in self.snapshot.blobs_diff(snapshot) {
-                let Ok(gone) = gone else {
-                    return Self::derive(snapshot, collections).await;
-                };
-                let handle = gone.handle.raw;
-                if self.roots.contains(&handle)
-                    && !self.missing.contains(&handle)
-                    && !readable(snapshot, handle)
-                {
-                    self.missing.insert(handle);
-                }
+                yield_after_turn(&mut turn).await;
             }
         }
         for handle in added {
             if !readable(snapshot, handle) {
                 self.missing.insert(handle);
             }
+            yield_after_turn(&mut turn).await;
         }
-        self.snapshot = snapshot.clone();
-        Ok(self)
+        self.collections = collections.clone();
+        self.snapshot = Some(snapshot.clone());
+        Ok(())
     }
 }
 
-/// How long a root derivation runs before it yields to its runtime.
-const DERIVE_TURN: Duration = Duration::from_millis(10);
+/// Bytes of pile replayed per [`climb`] step at a daemon's startup. Replay
+/// does not read blob payloads, so a step's replay is short; what the step
+/// then reads for hydration is about the payload of the roots its own records
+/// name, which in file order sit in the same step or an earlier one.
+pub const CLIMB_STEP_BYTES: u64 = 1 << 30;
 
-/// Yield once `turn` is [`DERIVE_TURN`] old, and start a new turn.
+/// Replay `pile` to the end of its file in steps of about `step_bytes`, and
+/// advance one [`Hydration`] from empty through a snapshot of every prefix,
+/// each with the collections `selection` names in it.
+///
+/// This is a cold start fed in pieces. Every prefix is a partial pile and
+/// every step an append to the previous one, so the answer equals one advance
+/// over the last snapshot, while no single advance reads more than one step's
+/// roots and the caller's other branches (a stop) are polled between and
+/// within steps. A collection the selection names only from some prefix on is
+/// read whole from there; one it stops naming resets the climb's answer.
+/// `on_step` sees the answer after each step, and whether that step reached
+/// the end of the file as it observed it.
+///
+/// Hand the result to [`Peer::adopt_hydration`](crate::peer::Peer::adopt_hydration)
+/// once the peer is assembled over the same `pile`.
+pub async fn climb<E>(
+    pile: &mut triblespace_core::repo::pile::Pile,
+    step_bytes: u64,
+    mut selection: impl FnMut(
+        &triblespace_core::repo::pile::PileSnapshot,
+    ) -> Result<Vec<CollectionHandle>, E>,
+    mut on_step: impl FnMut(&Hydration<triblespace_core::repo::pile::PileSnapshot>, bool),
+) -> anyhow::Result<Hydration<triblespace_core::repo::pile::PileSnapshot>>
+where
+    E: Into<anyhow::Error>,
+{
+    let mut hydration = Hydration::new();
+    loop {
+        let (snapshot, reached_end) = pile.snapshot_step(step_bytes)?;
+        let collections = selection(&snapshot).map_err(Into::into)?;
+        hydration = hydration.advance(&snapshot, &collections).await?;
+        on_step(&hydration, reached_end);
+        if reached_end {
+            return Ok(hydration);
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// How long a hydration advance runs before it yields to its runtime.
+const ADVANCE_TURN: Duration = Duration::from_millis(10);
+
+/// Yield once `turn` is [`ADVANCE_TURN`] old, and start a new turn.
 async fn yield_after_turn(turn: &mut crate::clock::Mono) {
-    if crate::clock::mono_now().duration_since(*turn) >= DERIVE_TURN {
+    if crate::clock::mono_now().duration_since(*turn) >= ADVANCE_TURN {
         tokio::task::yield_now().await;
         *turn = crate::clock::mono_now();
     }
@@ -704,23 +874,33 @@ impl Reconciler {
         stats
     }
 
-    /// The selected root count and the roots `snapshot` cannot read, advanced
-    /// from the previous tick's [`Hydration`] when there is one for this store
-    /// type and selection, and derived from scratch otherwise.
+    /// Continue from `hydration`, an answer advanced over earlier snapshots of
+    /// the store this reconciler will tick (a climb at startup), instead of
+    /// from empty. The next tick advances it to its own snapshot, which
+    /// resets it if the store or the selection moved in a way that is not an
+    /// append, so a stale or foreign answer costs a reread, never a wrong
+    /// one.
+    pub(crate) fn adopt_hydration<T: StoreRead>(&mut self, hydration: Hydration<T>) {
+        if self.mode != ReplicationMode::Demand {
+            self.hydration = Some(Box::new(hydration));
+        }
+    }
+
+    /// The selected root count and the roots `snapshot` cannot read: the
+    /// previous tick's [`Hydration`] when there is one for this store type
+    /// and selection, or the empty one, advanced to `snapshot`.
     async fn observe_roots<T: StoreRead>(
         &mut self,
         snapshot: &T,
     ) -> Result<(usize, BTreeSet<RawHash>), T::RecordsError> {
         let collections: Vec<_> = self.selected().collect();
+        // Taken before the read: a failure leaves no memo behind.
         let previous = self
             .hydration
             .take()
-            .and_then(|memo| memo.downcast::<Hydration<T>>().ok());
-        // Taken before the read: a failure leaves no memo behind.
-        let hydration = match previous {
-            Some(previous) => previous.advance(snapshot, &collections).await?,
-            None => Hydration::derive(snapshot, &collections).await?,
-        };
+            .and_then(|memo| memo.downcast::<Hydration<T>>().ok())
+            .map_or_else(Hydration::new, |memo| *memo);
+        let hydration = previous.advance(snapshot, &collections).await?;
         let observed = (hydration.roots.len(), hydration.missing.clone());
         self.hydration = Some(Box::new(hydration));
         Ok(observed)
@@ -743,26 +923,6 @@ impl Reconciler {
     }
 }
 
-/// The blobs one collection's foundations name directly: its descriptor,
-/// COMMIT data and metadata, and DERIVE outputs. A MERGE never replicates, so
-/// neither its inputs nor its result are roots.
-fn direct_roots<R>(
-    snapshot: &R,
-    collection: CollectionHandle,
-) -> Result<BTreeSet<RawHash>, R::RecordsError>
-where
-    R: CollectionRead,
-{
-    let mut roots = BTreeSet::new();
-    let selectors = BTreeSet::from([CollectionRecordSelector::Foundations(collection)]);
-    for record in snapshot.select_records(&selectors)? {
-        // Records are trusted local evidence; foreign signatures were checked
-        // at ingress. WRITE admission does not govern structural ownership.
-        roots.extend(record.blob_references().map(|handle| handle.raw));
-    }
-    Ok(roots)
-}
-
 #[cfg(test)]
 mod tests {
     // Canonical but deliberately uninserted COMMIT witnesses keep these
@@ -777,7 +937,7 @@ mod tests {
     use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob};
     use triblespace_core::capability::CapabilityProof;
     use triblespace_core::collection::{
-        CollectionCommit, CollectionDerive, CollectionMerge, CollectionRecord,
+        CollectionCommit, CollectionDerive, CollectionMerge, CollectionRead, CollectionRecord,
     };
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::inline::{Inline, InlineEncoding};
@@ -788,17 +948,21 @@ mod tests {
     std::thread_local! {
         /// Validated blob reads made by the reconciler on this thread.
         pub(super) static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-        /// From-scratch hydration derivations made on this thread.
-        pub(super) static DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// Hydration resets to empty forced on this thread.
+        pub(super) static RESETS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        /// Hydration advances from the empty answer on this thread.
+        pub(super) static FROM_EMPTY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// Time each validated read takes on this thread, standing in for
         /// hashing a large pile's roots on the first pass.
         pub(super) static READ_DELAY: std::cell::Cell<Duration> =
             const { std::cell::Cell::new(Duration::ZERO) };
     }
 
-    /// Reset both counters, returning their previous `(reads, derivations)`.
+    /// Reset the counters, returning their previous `(reads, advances from
+    /// empty)`; a reset is followed by an advance from empty, so it counts.
     fn take_counts() -> (usize, usize) {
-        (READS.replace(0), DERIVATIONS.replace(0))
+        RESETS.replace(0);
+        (READS.replace(0), FROM_EMPTY.replace(0))
     }
 
     // Scheduling tokens only; no record or blob is published by these tests.
@@ -932,26 +1096,11 @@ mod tests {
         assert!(reconciler.states[&root].first_root_attempt);
     }
 
-    struct FailingCollectionRead;
-
-    impl CollectionRead for FailingCollectionRead {
-        type RecordsError = std::io::Error;
-        type RecordIter<'a> = std::vec::IntoIter<Result<CollectionRecord, Self::RecordsError>>;
-
-        fn records<'a>(&'a self) -> Result<Self::RecordIter<'a>, Self::RecordsError> {
-            Err(std::io::Error::other("collection observation failed"))
-        }
-
-        fn collections(&self) -> Result<Vec<CollectionHandle>, Self::RecordsError> {
-            Err(std::io::Error::other("collection observation failed"))
-        }
-    }
-
     /// Hydration roots are the foundations' direct references: descriptor,
     /// commit data and metadata, and derive outputs -- never a MERGE's inputs
     /// or result.
-    #[test]
-    fn hydration_roots_are_foundation_references_without_loading_descriptors() {
+    #[tokio::test]
+    async fn hydration_roots_are_foundation_references_without_loading_descriptors() {
         let key = SigningKey::from_bytes(&[7; 32]);
         let collection = Inline::new([1; 32]);
         let other = Inline::new([9; 32]);
@@ -988,16 +1137,15 @@ mod tests {
             store.insert(record).unwrap();
         }
         let snapshot = store.snapshot().unwrap();
+        let selected = Hydration::new().advance(&snapshot, &[collection]).await;
         assert_eq!(
-            direct_roots(&snapshot, collection).unwrap(),
+            selected.unwrap().roots,
             [1, 2, 3, 7].map(|byte| [byte; 32]).into_iter().collect(),
         );
-        assert!(
-            direct_roots(&snapshot, Inline::new([12; 32]))
-                .unwrap()
-                .is_empty()
-        );
-        assert!(direct_roots(&FailingCollectionRead, collection).is_err());
+        let unknown = Hydration::new()
+            .advance(&snapshot, &[Inline::new([12; 32])])
+            .await;
+        assert!(unknown.unwrap().roots.is_empty());
     }
 
     fn put(store: &mut MemoryRepo, bytes: impl Into<Vec<u8>>) -> RawHash {
@@ -2210,7 +2358,7 @@ mod tests {
         let held = held.snapshot().unwrap();
         let lost = lost.snapshot().unwrap();
         let selection = [Inline::new(collection)];
-        let hydration = Hydration::derive(&held, &selection).await.unwrap();
+        let hydration = Hydration::new().advance(&held, &selection).await.unwrap();
         assert_eq!(hydration.roots.len(), 2);
         assert!(hydration.missing.is_empty());
         take_counts();
@@ -2403,5 +2551,311 @@ mod tests {
             );
         }
         peer.close().unwrap();
+    }
+
+    /// A pile in file order, as local writes leave it: every blob before the
+    /// COMMIT naming it, children before the parents naming them. Three
+    /// collections, the third first written to well into the file; one root
+    /// never resident; and one root whose bytes land only later in the file,
+    /// as a repaired record can arrive before its blob. Returns the path and
+    /// the collections.
+    fn file_order_pile() -> (tempfile::NamedTempFile, Vec<CollectionHandle>) {
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut pile = Pile::open(path.path()).unwrap();
+        let collections: Vec<_> = (0..3)
+            .map(|ordinal| put_pile(&mut pile, format!("climb descriptor {ordinal}")))
+            .collect();
+        let metadata = put_pile(&mut pile, b"climb metadata".to_vec());
+        let late = b"a root whose bytes land later".to_vec();
+        let late_handle = Blob::<UnknownBlob>::new(Bytes::from_source(late.clone()))
+            .get_handle()
+            .raw;
+        for ordinal in 0..24u32 {
+            // The third collection is first written to after the twelfth.
+            let collection = collections[if ordinal < 12 {
+                ordinal as usize % 2
+            } else {
+                ordinal as usize % 3
+            }];
+            let leaf = put_pile(&mut pile, format!("climb leaf {ordinal}"));
+            // An aligned word naming the leaf makes it the payload's child.
+            let payload = put_pile(&mut pile, [&leaf[..], &[ordinal as u8; 32][..]].concat());
+            pile.insert(commit_record(collection, payload, metadata))
+                .unwrap();
+            if ordinal == 5 {
+                pile.insert(commit_record(collections[0], late_handle, metadata))
+                    .unwrap();
+                pile.insert(commit_record(collections[1], [0xab; 32], metadata))
+                    .unwrap();
+            }
+            if ordinal == 17 {
+                put_pile(&mut pile, late.clone());
+            }
+        }
+        pile.close().unwrap();
+        (path, collections.into_iter().map(Inline::new).collect())
+    }
+
+    /// The collections of `selection` that have a record in `snapshot`: a
+    /// selection that grows as a climb reaches the records.
+    fn written(
+        snapshot: &triblespace_core::repo::pile::PileSnapshot,
+        selection: &[CollectionHandle],
+    ) -> Vec<CollectionHandle> {
+        let present = snapshot.collections().unwrap();
+        selection
+            .iter()
+            .copied()
+            .filter(|collection| present.contains(collection))
+            .collect()
+    }
+
+    fn held_sets(
+        snapshot: &impl HeldRead,
+        collections: &[CollectionHandle],
+    ) -> Vec<Option<BTreeSet<RawHash>>> {
+        collections
+            .iter()
+            .map(|&collection| {
+                snapshot
+                    .held(collection)
+                    .map(|held| held.iter_ordered().copied().collect())
+            })
+            .collect()
+    }
+
+    /// Hydration and held sets a fresh store reads from `length` bytes of
+    /// `path` at once: no climb, no cached state.
+    async fn read_at_once(
+        path: &std::path::Path,
+        length: u64,
+        collections: &[CollectionHandle],
+    ) -> (
+        BTreeSet<RawHash>,
+        BTreeSet<RawHash>,
+        Vec<Option<BTreeSet<RawHash>>>,
+    ) {
+        let mut fresh = Pile::open_prefix(path, length).unwrap();
+        fresh.track_held(collections.iter().copied());
+        let snapshot = fresh.snapshot().unwrap();
+        let hydration = Hydration::new()
+            .advance(&snapshot, &written(&snapshot, collections))
+            .await
+            .unwrap();
+        let held = held_sets(&snapshot, collections);
+        drop(snapshot);
+        fresh.close().unwrap();
+        (hydration.roots, hydration.missing, held)
+    }
+
+    /// Climbing a file-order pile in small steps, with the selection growing
+    /// as collections appear, gives at every prefix the hydration and the
+    /// held sets that a fresh store reading that prefix at once gives, and at
+    /// the end the answer for the whole file. A peer assembled over the
+    /// climbed pile then continues from the climb without rereading a root.
+    #[tokio::test]
+    async fn a_climb_over_a_file_order_pile_equals_reading_its_end() {
+        let (path, collections) = file_order_pile();
+        let length = std::fs::metadata(path.path()).unwrap().len();
+        let mut pile = Pile::open(path.path()).unwrap();
+        pile.track_held(collections.iter().copied());
+        let mut hydration = Hydration::new();
+        let mut steps = 0;
+        loop {
+            let (snapshot, reached_end) = pile.snapshot_step(700).unwrap();
+            steps += 1;
+            hydration = hydration
+                .advance(&snapshot, &written(&snapshot, &collections))
+                .await
+                .unwrap();
+            let prefix = pile.replayed_length();
+            let (roots, missing, held) = read_at_once(path.path(), prefix, &collections).await;
+            assert_eq!(hydration.roots, roots, "roots at prefix {prefix}");
+            assert_eq!(hydration.missing, missing, "missing at prefix {prefix}");
+            assert_eq!(
+                held_sets(&snapshot, &collections),
+                held,
+                "held sets at prefix {prefix}"
+            );
+            if reached_end {
+                break;
+            }
+        }
+        assert_eq!(pile.replayed_length(), length);
+        assert!(steps > 20, "{steps} steps is not a climb");
+        let counts = hydration.counts();
+        assert_eq!((counts.advances, counts.resets), (steps, 0));
+        assert_eq!(counts.arrived, 1, "the late root was missing, then arrived");
+        assert_eq!(hydration.missing, BTreeSet::from([[0xab; 32]]));
+        let (roots, missing, held) = read_at_once(path.path(), length, &collections).await;
+        assert_eq!((&hydration.roots, &hydration.missing), (&roots, &missing));
+        assert!(held.iter().all(Option::is_some), "every held set is known");
+        pile.close().unwrap();
+
+        // The library climb, from a fresh open, reaches the same answer, and
+        // a peer over that pile adopts it: its first pass reads no root.
+        let mut pile = Pile::open(path.path()).unwrap();
+        let climbed = climb(
+            &mut pile,
+            700,
+            |snapshot| Ok::<_, std::convert::Infallible>(written(snapshot, &collections)),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!((&climbed.roots, &climbed.missing), (&roots, &missing));
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let (sender, receiver, wiring) =
+            crate::host::wire(crate::identity::iroh_secret(&key).public().into());
+        // No host serves the wiring, so the absent root's fetch fails at once.
+        drop(wiring);
+        let mut peer = Peer::with_wiring(pile, sender, receiver);
+        peer.set_replication(ReplicationMode::Shallow, collections.iter().copied());
+        peer.adopt_hydration(climbed);
+        take_counts();
+        let stats = peer.reconcile().await;
+        assert_eq!(
+            take_counts(),
+            (0, 0),
+            "the adopted climb is advanced, not reread"
+        );
+        assert_eq!(
+            (stats.replication.roots, stats.replication.pending),
+            (roots.len(), 1)
+        );
+        peer.into_store().close().unwrap();
+    }
+
+    /// Evidence that is not an append resets the answer to empty, and the
+    /// same advance climbs again to the answer a fresh read gives: a record
+    /// removed between two stores, and a pile reopened under a held answer
+    /// (another origin, so its records cannot be compared by offset).
+    #[tokio::test]
+    async fn evidence_that_is_not_an_append_resets_and_climbs_again() {
+        // A removed record: the only one naming its root.
+        let mut store = MemoryRepo::default();
+        let descriptor = put(&mut store, b"reset descriptor".to_vec());
+        let metadata = put(&mut store, Vec::new());
+        let kept = put(&mut store, b"kept data".to_vec());
+        raw_commit(&mut store, descriptor, kept, metadata);
+        let mut without = store.clone();
+        let removed = put(&mut store, b"removed data".to_vec());
+        raw_commit(&mut store, descriptor, removed, metadata);
+        let selection = [Inline::new(descriptor)];
+        let with = store.snapshot().unwrap();
+        let without = without.snapshot().unwrap();
+        let hydration = Hydration::new().advance(&with, &selection).await.unwrap();
+        assert!(hydration.roots.contains(&removed));
+        take_counts();
+        let hydration = hydration.advance(&without, &selection).await.unwrap();
+        assert_eq!(RESETS.get(), 1);
+        assert_eq!(take_counts(), (3, 1), "reset, then every root read again");
+        assert_eq!(
+            hydration.roots,
+            BTreeSet::from([descriptor, metadata, kept]),
+            "a root only the removed record named is gone"
+        );
+        assert_eq!(hydration.counts().resets, 1);
+
+        // A pile reopened under a held answer, with a record appended.
+        let (path, collections) = file_order_pile();
+        let mut pile = Pile::open(path.path()).unwrap();
+        let hydration = climb(
+            &mut pile,
+            1 << 20,
+            |_| Ok::<_, std::convert::Infallible>(collections.clone()),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        pile.close().unwrap();
+        let mut reopened = Pile::open(path.path()).unwrap();
+        let extra = put_pile(&mut reopened, b"appended after the reopen".to_vec());
+        reopened
+            .insert(commit_record(collections[2].raw, extra, extra))
+            .unwrap();
+        let snapshot = reopened.snapshot().unwrap();
+        take_counts();
+        let hydration = hydration.advance(&snapshot, &collections).await.unwrap();
+        assert_eq!(RESETS.get(), 1, "another origin is not an append");
+        let fresh = Hydration::new()
+            .advance(&snapshot, &collections)
+            .await
+            .unwrap();
+        let (reads, _) = take_counts();
+        assert_eq!(reads, 2 * fresh.roots.len(), "the reset reread every root");
+        assert!(hydration.roots.contains(&extra));
+        assert_eq!(
+            (&hydration.roots, &hydration.missing),
+            (&fresh.roots, &fresh.missing)
+        );
+        drop(snapshot);
+        reopened.close().unwrap();
+    }
+
+    /// The daemon's shape again, for an advance that is not the first: after
+    /// a first pass over a small store, two thousand records arrive at once,
+    /// and a stop raised while the next pass reads them is answered long
+    /// before the pass would end. The pass after that, from empty, reaches
+    /// the full answer.
+    #[test]
+    fn a_stop_during_a_large_incremental_advance_is_answered_promptly() {
+        const ROOTS: u32 = 2_000;
+        const READ: Duration = Duration::from_millis(2);
+        let mut store = MemoryRepo::default();
+        let descriptor = put(&mut store, b"long incremental pass".to_vec());
+        let metadata = put(&mut store, Vec::new());
+        let (mut peer, fetches, _) = controlled_peer(store, BTreeMap::new(), BTreeSet::new());
+        peer.set_replication(ReplicationMode::Shallow, [Inline::new(descriptor)]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // The first pass has no record: nothing to read.
+        let stats = runtime.block_on(peer.reconcile());
+        assert_eq!(stats.replication.roots, 0);
+        for ordinal in 0..ROOTS {
+            let mut store = peer.store();
+            let data = put(
+                &mut store.inner,
+                format!("arriving root {ordinal}").into_bytes(),
+            );
+            raw_commit(&mut store.inner, descriptor, data, metadata);
+        }
+        let (raise, stop) = tokio::sync::oneshot::channel::<()>();
+        let raiser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            raise.send(()).unwrap();
+        });
+        READ_DELAY.set(READ);
+        take_counts();
+        let started = std::time::Instant::now();
+        let stopped = runtime.block_on(async {
+            tokio::select! {
+                biased;
+                _ = stop => true,
+                _ = peer.reconcile() => false,
+            }
+        });
+        let elapsed = started.elapsed();
+        READ_DELAY.set(Duration::ZERO);
+        raiser.join().unwrap();
+        let (reads, from_empty) = take_counts();
+        assert!(
+            stopped,
+            "the pass ended before the stop was seen, after {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the stop took {elapsed:?}, after {reads} of {} reads",
+            ROOTS + 2,
+        );
+        assert_eq!(from_empty, 0, "the stopped pass was an incremental advance");
+        assert!(reads < ROOTS as usize / 2, "{reads} reads before the stop");
+        let stats = runtime.block_on(peer.reconcile());
+        assert_eq!(take_counts(), (ROOTS as usize + 2, 1));
+        assert_eq!(stats.replication.roots, ROOTS as usize + 2);
+        assert_eq!(stats.replication.pending, 0);
+        assert!(fetches.trace.lock().unwrap().calls.is_empty());
     }
 }

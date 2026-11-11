@@ -3536,19 +3536,7 @@ impl super::SnapshotSource for PileFile {
 
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
         self.refresh()?;
-        Ok(PileFileSnapshot::new(
-            self.record_origin.clone(),
-            self.mmap.clone(),
-            self.applied_length,
-            self.opaque_records,
-            self.blobs.clone(),
-            self.collection_records.clone(),
-            self.legacy_collection_headers.clone(),
-            self.retired_equations.clone(),
-            self.capability_proofs.clone(),
-            self.wants.clone(),
-            self.retired_proof_frames.clone(),
-        ))
+        Ok(self.snapshot_replayed())
     }
 }
 
@@ -4078,11 +4066,61 @@ impl PileFile {
     /// cannot keep a writer out.
     pub fn refresh(&mut self) -> Result<(), ReadError> {
         self.lock_shared()?;
-        let res = self.refresh_shared_locked();
+        let res = self.refresh_shared_locked(usize::MAX);
         let unlock_res = self.file.unlock();
         res?;
         unlock_res?;
         Ok(())
+    }
+
+    /// One step of a replay: [`Self::refresh`], stopping at the first record
+    /// boundary at or past `max_bytes` beyond what is already applied.
+    /// Returns whether the replay reached the end of the file as observed by
+    /// this step, so that `while !pile.refresh_step(n)? {}` is a full
+    /// refresh taken in bounded pieces.
+    ///
+    /// The bound counts replayed bytes, never splits a record, and is the
+    /// only difference from [`Self::refresh`]: the same shared lock, the same
+    /// writer yields, and the same exclusive recheck of a parse failure.
+    /// [`Self::snapshot_replayed`] then observes exactly the applied prefix,
+    /// so consecutive steps are snapshots of one lineage whose differences
+    /// are appends.
+    pub fn refresh_step(&mut self, max_bytes: u64) -> Result<bool, ReadError> {
+        let until = self
+            .applied_length
+            .saturating_add(usize::try_from(max_bytes).unwrap_or(usize::MAX));
+        self.lock_shared()?;
+        let res = self.refresh_shared_locked(until);
+        let unlock_res = self.file.unlock();
+        let reached_end = res?;
+        unlock_res?;
+        Ok(reached_end)
+    }
+
+    /// The bytes replayed so far: the length of the prefix the next
+    /// [`Self::snapshot_replayed`] observes.
+    pub fn replayed_length(&self) -> u64 {
+        self.applied_length as u64
+    }
+
+    /// A snapshot of exactly the records applied so far, without replaying
+    /// anything new. After [`Self::refresh_step`] it is a prefix of the file;
+    /// [`SnapshotSource::snapshot`](super::SnapshotSource::snapshot) is a full
+    /// refresh followed by this.
+    pub fn snapshot_replayed(&self) -> PileFileSnapshot {
+        PileFileSnapshot::new(
+            self.record_origin.clone(),
+            self.mmap.clone(),
+            self.applied_length,
+            self.opaque_records,
+            self.blobs.clone(),
+            self.collection_records.clone(),
+            self.legacy_collection_headers.clone(),
+            self.retired_equations.clone(),
+            self.capability_proofs.clone(),
+            self.wants.clone(),
+            self.retired_proof_frames.clone(),
+        )
     }
 
     /// Applies the next record from disk to in-memory indices.
@@ -4301,8 +4339,10 @@ impl PileFile {
     /// Replay with a shared lock already held. On a parse failure, replace it
     /// with an exclusive lock and replay once more. The caller must unlock on
     /// every return path; successful recovery retains the stronger lock.
-    fn refresh_shared_locked(&mut self) -> Result<(), ReadError> {
-        match self.replay_observed(self.turnstile) {
+    /// Replay stops at the first record boundary at or past `until`; the
+    /// result says whether it reached the end of the observed file.
+    fn refresh_shared_locked(&mut self, until: usize) -> Result<bool, ReadError> {
+        match self.replay_observed(self.turnstile, until) {
             // A bounded handle never rechecks: its replay bound is the fixed
             // prefix, not a fresh length an in-flight append could move, and
             // the recheck would take the exclusive lock.
@@ -4317,14 +4357,14 @@ impl PileFile {
                 // Do not retry the append, truncate, or suppress a stable error.
                 self.file.unlock()?;
                 self.lock_exclusive()?;
-                self.refresh_locked()
+                self.replay_observed(false, until)
             }
             result => result,
         }
     }
 
     fn refresh_locked(&mut self) -> Result<(), ReadError> {
-        self.replay_observed(false)
+        self.replay_observed(false, usize::MAX).map(|_| ())
     }
 
     /// Replays the observed prefix with the pile lock already held.
@@ -4351,7 +4391,11 @@ impl PileFile {
     ///   flight without yielding, and `refresh_shared_locked` resolves both
     ///   the same way: an exclusive recheck at a fresh length.
     ///   `turnstile_tests::amputation_gap_during_a_yield` drives this schedule.
-    fn replay_observed(&mut self, yield_shared: bool) -> Result<(), ReadError> {
+    ///
+    /// Replay also stops at the first record boundary at or past `until`
+    /// (`usize::MAX` for none). The result says whether it reached the end of
+    /// the observed file.
+    fn replay_observed(&mut self, yield_shared: bool, until: usize) -> Result<bool, ReadError> {
         // A fixed bound avoids a metadata syscall per record. Under a shared
         // lock this can end inside an in-flight append; refresh_shared_locked
         // confirms a parse failure after excluding all participating writers.
@@ -4364,6 +4408,9 @@ impl PileFile {
         let mut held_since = Instant::now();
         let mut stride = 0u32;
         loop {
+            if self.applied_length >= until {
+                return Ok(self.applied_length == file_len);
+            }
             match self.apply_next_bounded(file_len) {
                 Ok(Some(_)) if yield_shared => {
                     stride += 1;
@@ -4388,7 +4435,7 @@ impl PileFile {
                     held_since = Instant::now();
                 }
                 Ok(Some(_)) => {}
-                Ok(None) => return Ok(()),
+                Ok(None) => return Ok(true),
                 Err(ReadError::CorruptPile { valid_length }) if self.prefix.is_some() => {
                     return Err(ReadError::PrefixNotRecordBoundary {
                         prefix: self.prefix.unwrap_or(file_len),
@@ -5395,7 +5442,8 @@ impl PileFile {
         }
         let res = (|| {
             if use_atomic {
-                self.refresh_shared_locked().map_err(InsertError::from)?;
+                self.refresh_shared_locked(usize::MAX)
+                    .map_err(InsertError::from)?;
             } else {
                 self.refresh_locked().map_err(InsertError::from)?;
             }

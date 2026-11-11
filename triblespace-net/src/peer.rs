@@ -599,6 +599,19 @@ where
         self.refresh();
     }
 
+    /// Continue hydration from `hydration`, an answer already advanced over
+    /// earlier snapshots of this peer's store -- typically a climb over the
+    /// pile before the peer was assembled
+    /// ([`crate::reconcile::climb`]) -- instead of from empty. Call it after
+    /// [`Self::set_replication`], which discards any answer held. The next
+    /// [`Self::reconcile`] advances it to that pass's snapshot, and anything
+    /// that is not an append since (another store, a changed selection)
+    /// resets it there, so adopting a stale answer costs a reread, never a
+    /// wrong one. Ignored in [`ReplicationMode::Demand`].
+    pub fn adopt_hydration(&mut self, hydration: crate::reconcile::Hydration<S::Snapshot>) {
+        self.reconciler.adopt_hydration(hydration);
+    }
+
     /// Service one bounded hydration quantum from a coherent local snapshot.
     /// Network reads hold no store lock; verified results land serially and
     /// the completed batch is published once through `refresh`.
