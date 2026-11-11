@@ -25,7 +25,7 @@ use triblespace_core::repo::{
     StoreSnapshot, WantRead,
 };
 
-use super::{PeerAcquireError, SharedHost};
+use super::{Latest, PeerAcquireError, SharedHost};
 use crate::host::INTERACTIVE_FETCH_DEADLINE;
 use crate::protocol::RawHash;
 
@@ -37,9 +37,14 @@ use crate::protocol::RawHash;
 /// read of the captured resident prefix, as used by collection observation.
 /// Closing the peer closes live acquisition; already captured bytes remain
 /// readable for the lifetime of this snapshot.
+///
+/// A read first looks in the latest snapshot any of the peer's producers
+/// published, without the store mutex; only a blob not found there takes
+/// the mutex and advances the store to look again.
 pub struct PeerSnapshot<S: SnapshotSource> {
     pub(super) frozen: S::Snapshot,
     pub(super) store: Arc<Mutex<Option<S>>>,
+    pub(super) latest: Arc<Latest<S::Snapshot>>,
     pub(super) host: Weak<Mutex<SharedHost<S::Snapshot>>>,
 }
 
@@ -48,6 +53,7 @@ impl<S: SnapshotSource> Clone for PeerSnapshot<S> {
         Self {
             frozen: self.frozen.clone(),
             store: self.store.clone(),
+            latest: self.latest.clone(),
             host: self.host.clone(),
         }
     }
@@ -176,14 +182,15 @@ where
         AsyncBlobStoreGet::get(self, handle)
     }
 
-    /// Take the store and freeze it: a reader for this one read.
+    /// Take the store and advance it: a reader for this one read, which
+    /// becomes the latest snapshot.
     fn observe(&self) -> Result<S::Snapshot, PeerAcquireError> {
         let mut guard = self.store.lock().expect("store mutex");
         let store = guard
             .as_mut()
             .ok_or_else(|| PeerAcquireError("peer is closed".into()))?;
-        store
-            .snapshot()
+        self.latest
+            .advance(store)
             .map_err(|error| PeerAcquireError(format!("cannot observe blob cache: {error}")))
     }
 
@@ -208,6 +215,13 @@ where
         };
         if contains(&self.frozen)? {
             return Ok(Some(Acquired::Resident(self.frozen.clone())));
+        }
+        // Lock-free: what a producer already observed. A blob not here may
+        // have been written since, so a miss produces a snapshot below.
+        if let Some(latest) = self.latest.get() {
+            if contains(&latest)? {
+                return Ok(Some(Acquired::Resident(latest)));
+            }
         }
         let reader = self.observe()?;
         if contains(&reader)? {
@@ -518,6 +532,7 @@ mod tests {
         let freeze = |pile: &mut Pile| PeerSnapshot::<Pile> {
             frozen: pile.snapshot().unwrap(),
             store: Arc::new(Mutex::new(None)),
+            latest: Arc::new(Latest::new()),
             host: Weak::new(),
         };
         let before = freeze(&mut pile);

@@ -10,6 +10,7 @@ use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use anybytes::Bytes;
@@ -205,11 +206,78 @@ impl<S> DerefMut for StoreGuard<'_, S> {
     }
 }
 
+/// The latest store snapshot any producer took.
+///
+/// A store snapshot is a difference against the store's previous one (the
+/// pile's applied length, Covered's last observation, the held index's fed
+/// snapshot), and a write moves the same cursors, so snapshots are produced
+/// one at a time: whoever holds the store mutex produces. Every producer
+/// publishes what it took here before it lets the mutex go. A reader that
+/// needs only the latest observation reads it here without the mutex; a
+/// blob it does not find may be newer, and the reader then produces.
+struct Latest<T> {
+    cell: tokio::sync::watch::Sender<Option<(u64, T)>>,
+    /// Snapshots taken so far, counted under the store mutex: the order in
+    /// which the mutex let producers advance the store.
+    taken: AtomicU64,
+}
+
+impl<T: Clone> Latest<T> {
+    fn new() -> Self {
+        Self {
+            cell: tokio::sync::watch::channel(None).0,
+            taken: AtomicU64::new(0),
+        }
+    }
+
+    /// Advance `store` by one snapshot and publish it. Call this holding the
+    /// store mutex, which orders the snapshots.
+    fn advance<S>(&self, store: &mut S) -> Result<T, S::SnapshotError>
+    where
+        S: SnapshotSource<Snapshot = T>,
+    {
+        let order = self.taken.fetch_add(1, Ordering::Relaxed) + 1;
+        let snapshot = store.snapshot()?;
+        self.publish(order, snapshot.clone());
+        Ok(snapshot)
+    }
+
+    /// Install the snapshot taken `order`th, unless a later one is already
+    /// installed: the cell only moves forward.
+    fn publish(&self, order: u64, snapshot: T) {
+        let mut retired = None;
+        self.cell.send_if_modified(|latest| {
+            if latest.as_ref().is_some_and(|(newest, _)| *newest >= order) {
+                return false;
+            }
+            retired = latest.replace((order, snapshot));
+            true
+        });
+        // A store snapshot is dropped outside the cell's lock.
+        drop(retired);
+    }
+
+    fn get(&self) -> Option<T> {
+        self.cell
+            .borrow()
+            .as_ref()
+            .map(|(_, snapshot)| snapshot.clone())
+    }
+
+    /// Forget the latest snapshot: readers retained past a close must not
+    /// read what was written after them.
+    fn clear(&self) {
+        drop(self.cell.send_replace(None));
+    }
+}
+
 /// What a peer's serving snapshot is built from. [`Peer::refresh`] and the
 /// host's landing task both publish through it, one at a time: whoever holds
 /// the publication observes the store and publishes.
 struct Serving<S: SnapshotSource> {
     store: Arc<Mutex<Option<S>>>,
+    /// The latest snapshot of `store`, which every producer publishes.
+    latest: Arc<Latest<S::Snapshot>>,
     sender: NetSender<S::Snapshot>,
     publication: Mutex<Publication<S::Snapshot>>,
     /// When evidence passed outside walks was last drained, or values a
@@ -342,7 +410,7 @@ where
                 }
             })
             .collect::<Vec<_>>();
-        let snapshot = store.snapshot();
+        let snapshot = serving.latest.advance(store);
         drop(guard);
         let published = snapshot
             .map_err(anyhow::Error::new)
@@ -370,7 +438,7 @@ where
         let Some(store) = guard.as_mut() else {
             return;
         };
-        let snapshot = store.snapshot();
+        let snapshot = serving.latest.advance(store);
         drop(guard);
         let published = snapshot
             .map_err(anyhow::Error::new)
@@ -496,6 +564,7 @@ where
     ) -> Self {
         let serving = Arc::new(Serving {
             store: store.clone(),
+            latest: Arc::new(Latest::new()),
             sender: sender.clone(),
             publication: Mutex::new(Publication {
                 active: PATCH::new(),
@@ -872,7 +941,11 @@ where
                 "collection repair admission applied"
             );
         }
-        let snapshot = store.snapshot().map_err(PeerSnapshotError::Store)?;
+        let snapshot = self
+            .serving
+            .latest
+            .advance(store)
+            .map_err(PeerSnapshotError::Store)?;
         // Publication reads only the frozen snapshot; landing and reconcile
         // need not wait for it.
         drop(guard);
@@ -918,6 +991,7 @@ where
     pub fn shutdown_and_join(&mut self) -> anyhow::Result<()> {
         self.serving
             .withdraw(&mut self.serving.publication.lock().expect("publication mutex"));
+        self.serving.latest.clear();
         let started = {
             let mut host = self.host.lock().expect("host mutex");
             host.state = HostState::Closed;
@@ -939,12 +1013,11 @@ where
             host.state = HostState::Closed;
             host.started = None;
         }
-        let store = self
-            .store
-            .lock()
-            .expect("store mutex")
-            .take()
-            .expect("a live Peer owns its backend");
+        let mut guard = self.store.lock().expect("store mutex");
+        let store = guard.take().expect("a live Peer owns its backend");
+        // Cleared under the mutex, after which no producer can publish.
+        self.serving.latest.clear();
+        drop(guard);
         store
     }
 
@@ -952,7 +1025,11 @@ where
     fn snapshot_from_store(
         &mut self,
     ) -> Result<PeerSnapshot<S>, PeerSnapshotError<S::SnapshotError>> {
-        let frozen = self.store().snapshot().map_err(PeerSnapshotError::Store)?;
+        let frozen = self
+            .serving
+            .latest
+            .advance(&mut *self.store())
+            .map_err(PeerSnapshotError::Store)?;
         Ok(self.peer_snapshot(frozen))
     }
 
@@ -960,6 +1037,7 @@ where
         PeerSnapshot {
             frozen,
             store: self.store.clone(),
+            latest: self.serving.latest.clone(),
             host: Arc::downgrade(&self.host),
         }
     }
@@ -1836,6 +1914,152 @@ mod tests {
         assert!(!after.contains_blob(own).unwrap());
         assert_eq!(after.wants().unwrap().count(), 0);
         peer.close().unwrap();
+    }
+
+    /// A read whose blob the latest store snapshot holds does not wait for
+    /// the store mutex: here the owner holds the store the whole time.
+    #[test]
+    fn a_read_the_latest_snapshot_answers_does_not_wait_for_the_store() {
+        let key = SigningKey::from_bytes(&[76; 32]);
+        let (sender, receiver, _wiring) =
+            host::wire(crate::identity::iroh_secret(&key).public().into());
+        let mut peer = Peer::with_wiring(MemoryRepo::default(), sender, receiver);
+        let frozen = peer.snapshot().unwrap();
+        let bytes = Bytes::from_source(b"published by a later refresh".to_vec());
+        let handle = peer.put::<UnknownBlob, _>(bytes.clone()).unwrap();
+        peer.refresh();
+        assert!(!frozen.contains_blob(handle).unwrap());
+
+        let held = peer.store();
+        let (done, read) = std::sync::mpsc::channel();
+        let reader = frozen.clone();
+        let reading = std::thread::spawn(move || {
+            let got = futures::executor::block_on(reader.get::<Bytes, UnknownBlob>(handle));
+            let _ = done.send(got.ok());
+        });
+        let answered = read.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        reading.join().unwrap();
+        assert_eq!(
+            answered.expect("the read finished while the store was held"),
+            Some(bytes)
+        );
+    }
+
+    /// The latest cell refuses a snapshot taken before the one it holds.
+    #[test]
+    fn the_latest_snapshot_never_moves_back() {
+        let latest = Latest::new();
+        latest.publish(2, "second");
+        latest.publish(1, "first");
+        assert_eq!(latest.get(), Some("second"));
+        latest.publish(3, "third");
+        assert_eq!(latest.get(), Some("third"));
+    }
+
+    /// Producers on several threads (the landing task, the owner's refresh
+    /// and writes, readers that advance on a miss) only ever move the
+    /// latest snapshot forward: every blob one shows, every later one shows.
+    #[test]
+    fn the_latest_snapshot_is_monotone_under_concurrent_producers() {
+        const ROUNDS: usize = 200;
+        let key = SigningKey::from_bytes(&[77; 32]);
+        let (sender, receiver, wiring) =
+            host::wire(crate::identity::iroh_secret(&key).public().into());
+        // Answers every fetch at once, with nothing.
+        wiring.install_test_capability(Arc::new(ExactBlob {
+            hash: [0; 32],
+            bytes: Bytes::empty(),
+            requests: Arc::new(AtomicUsize::new(0)),
+        }));
+        let mut peer = Peer::with_wiring(MemoryRepo::default(), sender, receiver);
+        let frozen = peer.snapshot().unwrap();
+        let mut watch = peer.serving.latest.cell.subscribe();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observer = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let (mut seen, mut changes) = (0_usize, 0_usize);
+                while !stop.load(Ordering::SeqCst) {
+                    let latest = watch.borrow_and_update().clone();
+                    if let Some((_, snapshot)) = latest {
+                        let blobs = snapshot.blobs().count();
+                        assert!(blobs >= seen, "latest moved back: {blobs} after {seen}");
+                        changes += usize::from(blobs > seen);
+                        seen = blobs;
+                    }
+                }
+                changes
+            })
+        };
+        let lander = Lander(Arc::downgrade(&peer.serving));
+        let landing = std::thread::spawn(move || {
+            for round in 0..ROUNDS {
+                let blob = Blob::<UnknownBlob>::new(Bytes::from_source(
+                    format!("landed {round}").into_bytes(),
+                ));
+                assert_eq!(lander.land(vec![NetEvent::Blob(blob)]), [true]);
+            }
+        });
+        let writing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let reading = {
+            let writing = writing.clone();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let missing = Inline::<Handle<UnknownBlob>>::new([0x77; 32]);
+                while writing.load(Ordering::SeqCst) {
+                    // A miss everywhere advances the store and publishes,
+                    // outside the publication mutex landing and refresh share.
+                    let read = runtime.block_on(frozen.get::<Bytes, UnknownBlob>(missing));
+                    assert!(read.is_err());
+                }
+            })
+        };
+        for round in 0..ROUNDS {
+            peer.put::<UnknownBlob, _>(Bytes::from_source(format!("owned {round}").into_bytes()))
+                .unwrap();
+            // Most writes are not followed by a refresh: a write takes the
+            // store mutex alone, as readers that advance do.
+            if round % 8 == 0 {
+                peer.refresh();
+            }
+        }
+        landing.join().unwrap();
+        writing.store(false, Ordering::SeqCst);
+        reading.join().unwrap();
+        peer.refresh();
+        stop.store(true, Ordering::SeqCst);
+        let changes = observer.join().unwrap();
+        assert!(changes > 1, "the observer saw the cell move");
+        let last = peer.serving.latest.get().unwrap();
+        assert_eq!(last.blobs().count(), 2 * ROUNDS);
+    }
+
+    /// Close forgets the latest snapshot, so a snapshot retained past it
+    /// cannot read bytes written after it was taken.
+    #[test]
+    fn close_clears_the_latest_snapshot() {
+        let key = SigningKey::from_bytes(&[78; 32]);
+        let (sender, receiver, _wiring) =
+            host::wire(crate::identity::iroh_secret(&key).public().into());
+        let mut peer = Peer::with_wiring(MemoryRepo::default(), sender, receiver);
+        let frozen = peer.snapshot().unwrap();
+        let handle = peer
+            .put::<UnknownBlob, _>(Bytes::from_source(b"written before close".to_vec()))
+            .unwrap();
+        peer.refresh();
+        let latest = peer.serving.latest.clone();
+        assert!(latest.get().unwrap().contains_blob(handle).unwrap());
+
+        peer.close().unwrap();
+
+        assert!(latest.get().is_none(), "close cleared the latest snapshot");
+        let error =
+            futures::executor::block_on(frozen.get::<Bytes, UnknownBlob>(handle)).unwrap_err();
+        assert!(error.to_string().contains("closed"), "{error}");
     }
 
     #[test]
