@@ -25,6 +25,41 @@ The project balances a few key goals:
 * Avoid writing asynchronous code. Prefer high-performance synchronous
   implementations that can be parallelized when needed.
 
+## Retained Collection State
+
+JP, 2026-09-17 at 09:57:57 UTC:
+
+> can we in general have a ban on BTree* in triblespace structs? Those should usually be PATCHes unless they are ephemeral.
+
+Source: user message in Codex session
+`01a07655-e5c9-7db1-940b-ef9a535a0fbc`, timestamp
+`2026-09-17T09:57:57.101Z`; provenance is also recorded in
+wiki `5b6ec69ac6987260c54757cace4101e0`.
+
+The application details below are Astra's engineering elaboration, first written
+on 2026-09-17, rather than additional statements by JP.
+
+Do not use `BTreeMap` or `BTreeSet` for retained state in TribleSpace structs,
+including through aliases or wrappers. Use PATCH for sets and maps kept across
+observations, snapshots, calls, or worker iterations. Retained state includes
+in-memory state; the rule is not limited to data persisted to disk. Structural
+sharing and content-based set operations belong in the representation rather
+than being reconstructed by consumers.
+
+BTree collections are allowed for ephemeral scratch within one operation,
+including short-lived helper structs used for sorting, deduplication or planning.
+Make that lifetime clear at the declaration. A field is not exempt merely because
+its containing type is called a builder or a cache. Any non-ephemeral exception
+needs explicit justification and engineering review; this does not establish a
+separate JP approval gate.
+
+This is not a mechanical container-substitution rule. PATCH equality observes
+keys, not attached values: preserve observable value changes and invalidation
+explicitly, and choose keys according to the represented identity. Do not build a
+shadow catalogue of queryable facts in PATCH to satisfy this rule. Existing
+retained BTree uses are migration candidates to address in scoped changes, not
+permission for an unrelated bulk rewrite or a claim of measured speedup.
+
 ## Inventory
 
 Record future work and ideas in `INVENTORY.md`. Whenever you notice a task that

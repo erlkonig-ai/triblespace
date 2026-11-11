@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Record JP's 2026-09-17 BTree/PATCH guidance with its exact wording and source,
+  separating it from engineering details on retained state, ephemeral scratch,
+  exceptions and observable value changes. This changes contributor documentation
+  only; it does not migrate runtime collections.
+
 - Compile value formatters in private directories and atomically publish only
   successful Wasm outputs without overwriting a competing cache winner. Failed
   and losing attempts remove their temporary source and output files; cache
