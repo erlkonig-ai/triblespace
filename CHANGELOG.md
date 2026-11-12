@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `trible::maintenance::Driver`: a registered hop runs when its registration
+  says it has work (`Mappings::pending`), not only when an input changed, so
+  work a registration deferred (a failed bind, a model waiting a pass) is
+  done on its due pass on an unchanged store. Before, the hop was skipped as
+  unchanged and the retry never happened through the Driver.
+
 - `triblespace-search` `semantic_wemm`: the scoped runtime is an
   `Arc<Mutex<WemmRuntime>>` (`with_wemm_runtime` takes one) instead of an
   `Rc<RefCell<..>>`, so a holder of a bound runtime is `Send + Sync`;

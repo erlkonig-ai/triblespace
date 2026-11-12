@@ -999,6 +999,10 @@ async fn attached_and_derived_registrations_run_in_one_driver() {
     let pass = plain.tick(&mut pile, &signer, &mut |_| {}).await.unwrap().unwrap();
     assert_eq!((pass.maintained, pass.failures), (1, 1), "the copy is not registered");
     drop(plain);
+    // New input for both: a registered hop runs when its registration says
+    // it has work, and the plain Driver already attached the first commit.
+    pile.commit(source, &signer, entity! { metadata::supersedes: &triblespace_core::id::genid() })
+        .unwrap();
 
     let mut driver = Driver::new(targets(), false, SuccinctBackend::Cpu)
         .unwrap()
@@ -1035,6 +1039,105 @@ async fn attached_and_derived_registrations_run_in_one_driver() {
     *driver.registered().1.due.lock().unwrap() = Some(Instant::now());
     assert!(driver.tick(&mut pile, &signer, &mut |_| {}).await.unwrap().is_some());
     assert_eq!(driver.registered().1.passes.load(Ordering::SeqCst), passes + 1);
+    drop(driver);
+    pile.close().unwrap();
+}
+
+/// The copy registration whose first maintain defers its work, as a failed
+/// bind does: it publishes nothing, says the work is due now, and leaves the
+/// store unchanged.
+struct Deferring {
+    inner: triblespace_core::collection::DerivedMapping<CopyNodes>,
+    attempts: std::sync::atomic::AtomicUsize,
+    due: std::sync::Mutex<Option<Instant>>,
+}
+
+impl Mappings for Deferring {
+    fn runs(&self, algorithm: Id) -> bool {
+        self.inner.runs(algorithm)
+    }
+
+    fn pending<R: StoreRead>(
+        &self,
+        snapshot: &R,
+        handle: CollectionHandle,
+        algorithm: Id,
+    ) -> Result<usize, triblespace_core::collection::CollectionRealizationError> {
+        self.inner.pending(snapshot, handle, algorithm)
+    }
+
+    fn maintain<'a, S>(
+        &'a self,
+        pile: &'a mut S,
+        snapshot: &S::Snapshot,
+        handle: CollectionHandle,
+        algorithm: Id,
+        signer: &'a SigningKey,
+    ) -> triblespace_core::collection::Maintenance<'a, S>
+    where
+        S: Store + AsyncBlobStoreAcquire + Send,
+    {
+        let attempt = self
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if attempt == 0 {
+            *self.due.lock().unwrap() = Some(Instant::now());
+            return Box::pin(async move {
+                pile.snapshot().map_err(|error| {
+                    triblespace_core::collection::CollectionRealizationError::Resolution(format!(
+                        "{error:?}"
+                    ))
+                })
+            });
+        }
+        *self.due.lock().unwrap() = None;
+        self.inner.maintain(pile, snapshot, handle, algorithm, signer)
+    }
+
+    fn due(&self) -> Option<Instant> {
+        *self.due.lock().unwrap()
+    }
+}
+
+/// Work a registration deferred is done on its due pass although the store
+/// has not changed: the Driver asks the registration whether a registered
+/// hop has work instead of skipping it as unchanged.
+#[tokio::test]
+async fn a_due_registration_is_maintained_on_an_unchanged_store() {
+    use std::sync::atomic::Ordering;
+    use triblespace_core::collection::DerivedMapping;
+    use triblespace_core::macros::entity;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("deferred.pile");
+    std::fs::File::create(&path).unwrap();
+    let signer = SigningKey::from_bytes(&[91; 32]);
+    let mut pile = Pile::open_as(&path, signer.verifying_key()).unwrap();
+    let policy = direct_policy(signer.verifying_key());
+    let source = pile.collection("deferred", policy.clone()).unwrap();
+    let copy = pile.derive_with(source, CopyNodes, policy).unwrap();
+    pile.commit(source, &signer, entity! { metadata::supersedes: &triblespace_core::id::genid() })
+        .unwrap();
+    let mut driver = Driver::new([Target::Handle(copy.handle())], false, SuccinctBackend::Cpu)
+        .unwrap()
+        .with_registered(Deferring {
+            inner: DerivedMapping::new(COPY_NODES),
+            attempts: Default::default(),
+            due: Default::default(),
+        });
+    let pending = |pile: &mut Pile| {
+        DerivedMapping::<CopyNodes>::new(COPY_NODES)
+            .pending(&pile.snapshot().unwrap(), copy.handle(), COPY_NODES)
+            .unwrap()
+    };
+    // The first pass defers: nothing derived, the work due now.
+    driver.tick(&mut pile, &signer, &mut |_| {}).await.unwrap().unwrap();
+    assert_eq!(driver.registered().1.attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(pending(&mut pile), 1);
+    // Nothing has changed in the store; the due pass maintains it anyway.
+    let pass = driver.tick(&mut pile, &signer, &mut |_| {}).await.unwrap().unwrap();
+    assert_eq!(driver.registered().1.attempts.load(Ordering::SeqCst), 2);
+    assert_eq!((pass.maintained, pass.failures), (1, 0));
+    assert_eq!(pending(&mut pile), 0);
     drop(driver);
     pile.close().unwrap();
 }

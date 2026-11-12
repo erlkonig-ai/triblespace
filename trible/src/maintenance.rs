@@ -920,7 +920,22 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
                     continue;
                 }
             };
-            if !state.needs_work(handle, &before) {
+            // A registered hop is its registration's to decide: what it
+            // deferred (a failed bind, a model waiting for a pass) is no
+            // change of input, so its pending work is asked, not inferred.
+            let changed = state.needs_work(handle, &before);
+            let registered_pending = before
+                .get::<TribleSet, SimpleArchive>(handle)
+                .ok()
+                .and_then(|facts| descriptor::mapping_algorithm(&facts).ok().flatten())
+                .filter(|algorithm| registered.runs(*algorithm))
+                .map(|algorithm| registered.pending(&before, handle, algorithm));
+            let needed = match registered_pending {
+                Some(Ok(pending)) => pending > 0,
+                Some(Err(_)) => true,
+                None => changed,
+            };
+            if !needed {
                 continue;
             }
             let observation = HopObservation::start(observer, handle);
