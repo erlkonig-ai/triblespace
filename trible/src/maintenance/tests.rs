@@ -831,7 +831,7 @@ async fn a_registered_attached_mapping_runs_by_its_algorithm() {
 
     let mut driver = Driver::new([Target::Handle(target.handle())], false, SuccinctBackend::Cpu)
         .unwrap()
-        .with_attached(registration);
+        .with_registered(registration);
     let mut events = Vec::new();
     let pass = driver
         .tick(&mut pile, &signer, &mut |event| events.push(event))
@@ -844,7 +844,7 @@ async fn a_registered_attached_mapping_runs_by_its_algorithm() {
     ));
     let snapshot = pile.snapshot().unwrap();
     assert_eq!(
-        registered_targets(&snapshot, driver.mappings()).unwrap(),
+        registered_targets(&snapshot, driver.registered()).unwrap(),
         vec![(target.handle(), RENAMED_ID_SET)]
     );
     let attached = snapshot.attached(target).unwrap();
@@ -857,6 +857,184 @@ async fn a_registered_attached_mapping_runs_by_its_algorithm() {
     let pass = driver.tick(&mut pile, &signer, &mut |_| {}).await.unwrap().unwrap();
     assert_eq!((pass.maintained, pass.failures), (1, 0));
     assert!(pile.snapshot().unwrap().attached(target).unwrap().residual().is_empty());
+    drop(driver);
+    pile.close().unwrap();
+}
+
+/// A derived mapping this crate does not define: the copy of each node,
+/// under its own algorithm id, minted with `trible genid` on 2026-11-12 for
+/// this test: 3ACEFFEACFE5C6AB0E24C22530189721.
+const COPY_NODES: Id = triblespace_core::id::id_hex!("3ACEFFEACFE5C6AB0E24C22530189721");
+
+struct CopyNodesAlgorithm;
+
+impl MetaDescribe for CopyNodesAlgorithm {
+    fn describe() -> Fragment {
+        use triblespace_core::macros::entity;
+        let id = COPY_NODES;
+        entity! {
+            triblespace_core::id::ExclusiveId::force_ref(&id) @
+                metadata::name: "test-copy-nodes",
+                metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
+        }
+    }
+}
+
+struct CopyNodes;
+
+impl triblespace_core::collection::DeriveMapping for CopyNodes {
+    type Source = SimpleArchive;
+    type Target = SimpleArchive;
+
+    fn fragment(&self) -> Fragment {
+        use triblespace_core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
+        use triblespace_core::macros::entity;
+        entity! { _ @
+            metadata::tag: KIND_COLLECTION_MAPPING,
+            mapping_algorithm*: <CopyNodesAlgorithm as MetaDescribe>::describe(),
+        }
+    }
+
+    fn bind(
+        _source: &Fragment,
+        target: &Fragment,
+    ) -> Result<Self, triblespace_core::collection::CollectionOperationError> {
+        match descriptor::mapping_algorithm(target.facts()) {
+            Ok(Some(algorithm)) if algorithm == COPY_NODES => Ok(Self),
+            other => Err(triblespace_core::collection::CollectionOperationError::Fatal(
+                format!("not the copy: {other:?}"),
+            )),
+        }
+    }
+
+    fn map<R: StoreRead>(
+        &self,
+        source: &triblespace_core::blob::Blob<SimpleArchive>,
+        _reader: &R,
+    ) -> Result<
+        triblespace_core::blob::Blob<SimpleArchive>,
+        triblespace_core::collection::CollectionOperationError,
+    > {
+        Ok(source.clone())
+    }
+}
+
+/// The copy registration, counting the passes it is told about and saying
+/// once that deferred work is due now.
+struct Counted {
+    inner: triblespace_core::collection::DerivedMapping<CopyNodes>,
+    passes: std::sync::atomic::AtomicUsize,
+    due: std::sync::Mutex<Option<Instant>>,
+}
+
+impl Mappings for Counted {
+    fn runs(&self, algorithm: Id) -> bool {
+        self.inner.runs(algorithm)
+    }
+
+    fn begin_pass<R: StoreRead>(&self, _snapshot: &R) {
+        self.passes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.due.lock().unwrap() = None;
+    }
+
+    fn pending<R: StoreRead>(
+        &self,
+        snapshot: &R,
+        handle: CollectionHandle,
+        algorithm: Id,
+    ) -> Result<usize, triblespace_core::collection::CollectionRealizationError> {
+        self.inner.pending(snapshot, handle, algorithm)
+    }
+
+    fn maintain<'a, S>(
+        &'a self,
+        pile: &'a mut S,
+        snapshot: &S::Snapshot,
+        handle: CollectionHandle,
+        algorithm: Id,
+        signer: &'a SigningKey,
+    ) -> triblespace_core::collection::Maintenance<'a, S>
+    where
+        S: Store + AsyncBlobStoreAcquire + Send,
+    {
+        self.inner.maintain(pile, snapshot, handle, algorithm, signer)
+    }
+
+    fn due(&self) -> Option<Instant> {
+        *self.due.lock().unwrap()
+    }
+}
+
+/// One Driver maintains an attached and a derived collection, each through
+/// its registration; without the derived registration the derived hop fails
+/// as before. A registration's due work makes a tick pass with no input
+/// changed.
+#[tokio::test]
+async fn attached_and_derived_registrations_run_in_one_driver() {
+    use std::sync::atomic::Ordering;
+    use triblespace_core::collection::{CollectionSnapshotExt, DerivedMapping};
+    use triblespace_core::macros::entity;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("both.pile");
+    std::fs::File::create(&path).unwrap();
+    let signer = SigningKey::from_bytes(&[91; 32]);
+    let mut pile = Pile::open_as(&path, signer.verifying_key()).unwrap();
+    let policy = direct_policy(signer.verifying_key());
+    let source = pile.collection("both", policy.clone()).unwrap();
+    let attached = pile.attach_with(source, RenamedIdSet).unwrap();
+    let copy = pile.derive_with(source, CopyNodes, policy).unwrap();
+    pile.commit(source, &signer, entity! { metadata::supersedes: &triblespace_core::id::genid() })
+        .unwrap();
+    let targets = || {
+        [
+            Target::Handle(attached.handle()),
+            Target::Handle(copy.handle()),
+        ]
+    };
+
+    let mut plain = Driver::new(targets(), false, SuccinctBackend::Cpu)
+        .unwrap()
+        .with_registered(AttachedMapping::<RenamedIdSet>::new(RENAMED_ID_SET));
+    let pass = plain.tick(&mut pile, &signer, &mut |_| {}).await.unwrap().unwrap();
+    assert_eq!((pass.maintained, pass.failures), (1, 1), "the copy is not registered");
+    drop(plain);
+
+    let mut driver = Driver::new(targets(), false, SuccinctBackend::Cpu)
+        .unwrap()
+        .with_registered(AttachedMapping::<RenamedIdSet>::new(RENAMED_ID_SET))
+        .with_registered(Counted {
+            inner: DerivedMapping::new(COPY_NODES),
+            passes: Default::default(),
+            due: Default::default(),
+        });
+    let pass = driver.tick(&mut pile, &signer, &mut |_| {}).await.unwrap().unwrap();
+    assert_eq!((pass.maintained, pass.failures), (2, 0));
+    let snapshot = pile.snapshot().unwrap();
+    assert!(snapshot.attached(attached).unwrap().residual().is_empty());
+    assert_eq!(
+        driver
+            .registered()
+            .pending(&snapshot, copy.handle(), COPY_NODES)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        registered_targets(&snapshot, &driver.registered().1).unwrap(),
+        vec![(copy.handle(), COPY_NODES)]
+    );
+    drop(snapshot);
+
+    // Quiet: no input changed, nothing due.
+    for _ in 0..3 {
+        driver.tick(&mut pile, &signer, &mut |_| {}).await.unwrap();
+    }
+    assert!(driver.tick(&mut pile, &signer, &mut |_| {}).await.unwrap().is_none());
+    let passes = driver.registered().1.passes.load(Ordering::SeqCst);
+    // Deferred work due now: the next tick passes although nothing changed.
+    *driver.registered().1.due.lock().unwrap() = Some(Instant::now());
+    assert!(driver.tick(&mut pile, &signer, &mut |_| {}).await.unwrap().is_some());
+    assert_eq!(driver.registered().1.passes.load(Ordering::SeqCst), passes + 1);
     drop(driver);
     pile.close().unwrap();
 }

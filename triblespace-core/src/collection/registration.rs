@@ -1,22 +1,28 @@
-//! Attached mappings registered by the algorithm id their descriptors name.
+//! Mappings registered by the algorithm id their descriptors name.
 //!
-//! A maintainer that finds attached collections by their descriptors can
-//! only run the mappings it was built with. For each representation this
-//! crate defines one canonical mapping ([`super::CollectionAttachment`]); a
-//! crate that defines another mapping onto a known representation (the
+//! A maintainer that finds collections by their descriptors can only run
+//! the mappings it was built with. For each representation this crate
+//! defines one canonical mapping; a crate that defines another (the
 //! Archive's BM25 over text payloads is a `PortableBM25Blob` under its own
-//! algorithm) hands it to a maintainer as an [`AttachedMappings`]
-//! registration: one [`AttachedMapping`], or a pair of registrations. There
-//! is no global registry; a maintainer runs what it is given.
+//! algorithm, a WeMM index derives NVFP4 rows with a model) hands it to a
+//! maintainer as a registration ([`Mappings`]): an [`AttachedMapping`], a
+//! [`DerivedMapping`], its own implementation, or a pair of registrations.
+//! There is no global registry; a maintainer runs what it is given.
 //!
-//! [`registered_targets`] lists the attached collections a store's records
-//! name whose algorithm a registration runs. An attached collection is named
-//! by a record once it has a `MAP`: the first read that keeps its images
-//! ([`super::CollectionStoreExt::keep_attached`]) declares it.
+//! [`registered_targets`] lists the collections a store's records name whose
+//! algorithm a registration runs. A collection is named by a record once it
+//! has one: an attached collection from its first `MAP` (the first read that
+//! keeps its images, [`super::CollectionStoreExt::keep_attached`], declares
+//! it), a derived one from its first leaf.
+//!
+//! A mapping may need what only some hosts have, a bound model say; its
+//! registration owns that (when it binds, what it keeps bound, when it tries
+//! again, [`Mappings::due`]). This module knows nothing about it.
 
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::time::Instant;
 
 use ed25519_dalek::SigningKey;
 
@@ -30,11 +36,11 @@ use crate::trible::TribleSet;
 
 use super::{
     descriptor, Collection, CollectionHandle, CollectionRead, CollectionRealizationError,
-    CollectionSnapshotExt, CollectionStoreExt, MapMapping,
+    CollectionSnapshotExt, CollectionStoreExt, DeriveMapping, MapMapping,
 };
 
-/// The future one registered mapping maintains an attached collection with.
-pub type AttachedMaintenance<'a, S> = Pin<
+/// The future one registered mapping maintains a collection with.
+pub type Maintenance<'a, S> = Pin<
     Box<
         dyn Future<Output = Result<<S as SnapshotSource>::Snapshot, CollectionRealizationError>>
             + Send
@@ -42,25 +48,35 @@ pub type AttachedMaintenance<'a, S> = Pin<
     >,
 >;
 
-/// Attached mappings, each run for the attached collections whose
-/// descriptors name its algorithm.
-pub trait AttachedMappings: Send + Sync {
+/// Registered mappings, each run for the collections whose descriptors name
+/// its algorithm.
+///
+/// A maintainer calls [`Self::begin_pass`] once at the start of each pass,
+/// then, for each target, [`Self::pending`] and, when it is not zero,
+/// [`Self::maintain`]; it passes again at [`Self::due`] even when the store
+/// has not grown.
+pub trait Mappings: Send + Sync {
     /// Whether one of these mappings runs `algorithm`.
     fn runs(&self, algorithm: Id) -> bool;
 
-    /// How many foundations of the attached collection `handle`'s parent no
-    /// usable attachment reaches in `snapshot` (its residual), for an
-    /// `algorithm` one of these runs.
-    fn residual<R: StoreRead>(
+    /// A pass over `snapshot` begins: a registration may look at everything
+    /// it will be asked about before the first [`Self::maintain`].
+    fn begin_pass<R: StoreRead>(&self, _snapshot: &R) {}
+
+    /// How much of collection `handle`'s input it does not answer for in
+    /// `snapshot`, for an `algorithm` one of these runs: the parent
+    /// foundations no attachment reaches, or the source foundations with no
+    /// leaf. Zero means nothing to do here.
+    fn pending<R: StoreRead>(
         &self,
         snapshot: &R,
         handle: CollectionHandle,
         algorithm: Id,
     ) -> Result<usize, CollectionRealizationError>;
 
-    /// Maintain the attached collection `handle`, whose descriptor names
-    /// `algorithm`, one these run: carry its parent and attach the frontier
-    /// ([`CollectionStoreExt::maintain_attached_with`]).
+    /// Maintain collection `handle`, whose descriptor names `algorithm`, one
+    /// these run ([`CollectionStoreExt::maintain_attached_with`],
+    /// [`CollectionStoreExt::maintain_with`]).
     fn maintain<'a, S>(
         &'a self,
         pile: &'a mut S,
@@ -68,24 +84,35 @@ pub trait AttachedMappings: Send + Sync {
         handle: CollectionHandle,
         algorithm: Id,
         signer: &'a SigningKey,
-    ) -> AttachedMaintenance<'a, S>
+    ) -> Maintenance<'a, S>
     where
         S: Store + AsyncBlobStoreAcquire + Send;
+
+    /// When work these deferred (a bind that failed, a model that waits for
+    /// the next pass) is due again, if any: a maintainer passes then even if
+    /// the store has not changed.
+    fn due(&self) -> Option<Instant> {
+        None
+    }
 }
 
 fn unregistered(algorithm: Id) -> CollectionRealizationError {
     CollectionRealizationError::Resolution(format!(
-        "attached mapping algorithm {algorithm:X} is not registered here"
+        "mapping algorithm {algorithm:X} is not registered here"
     ))
 }
 
+fn resolution(what: &str, error: impl std::fmt::Display) -> CollectionRealizationError {
+    CollectionRealizationError::Resolution(format!("{what}: {error}"))
+}
+
 /// No registered mappings.
-impl AttachedMappings for () {
+impl Mappings for () {
     fn runs(&self, _algorithm: Id) -> bool {
         false
     }
 
-    fn residual<R: StoreRead>(
+    fn pending<R: StoreRead>(
         &self,
         _snapshot: &R,
         _handle: CollectionHandle,
@@ -101,7 +128,7 @@ impl AttachedMappings for () {
         _handle: CollectionHandle,
         algorithm: Id,
         _signer: &'a SigningKey,
-    ) -> AttachedMaintenance<'a, S>
+    ) -> Maintenance<'a, S>
     where
         S: Store + AsyncBlobStoreAcquire + Send,
     {
@@ -110,21 +137,26 @@ impl AttachedMappings for () {
 }
 
 /// Two registrations: the first that runs an algorithm runs it.
-impl<A: AttachedMappings, B: AttachedMappings> AttachedMappings for (A, B) {
+impl<A: Mappings, B: Mappings> Mappings for (A, B) {
     fn runs(&self, algorithm: Id) -> bool {
         self.0.runs(algorithm) || self.1.runs(algorithm)
     }
 
-    fn residual<R: StoreRead>(
+    fn begin_pass<R: StoreRead>(&self, snapshot: &R) {
+        self.0.begin_pass(snapshot);
+        self.1.begin_pass(snapshot);
+    }
+
+    fn pending<R: StoreRead>(
         &self,
         snapshot: &R,
         handle: CollectionHandle,
         algorithm: Id,
     ) -> Result<usize, CollectionRealizationError> {
         if self.0.runs(algorithm) {
-            self.0.residual(snapshot, handle, algorithm)
+            self.0.pending(snapshot, handle, algorithm)
         } else {
-            self.1.residual(snapshot, handle, algorithm)
+            self.1.pending(snapshot, handle, algorithm)
         }
     }
 
@@ -135,7 +167,7 @@ impl<A: AttachedMappings, B: AttachedMappings> AttachedMappings for (A, B) {
         handle: CollectionHandle,
         algorithm: Id,
         signer: &'a SigningKey,
-    ) -> AttachedMaintenance<'a, S>
+    ) -> Maintenance<'a, S>
     where
         S: Store + AsyncBlobStoreAcquire + Send,
     {
@@ -145,11 +177,25 @@ impl<A: AttachedMappings, B: AttachedMappings> AttachedMappings for (A, B) {
             self.1.maintain(pile, snapshot, handle, algorithm, signer)
         }
     }
+
+    fn due(&self) -> Option<Instant> {
+        match (self.0.due(), self.1.due()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
 }
 
 /// One attached mapping `M`, registered for the descriptors naming
 /// `algorithm` (the id `M::bind` accepts).
 pub struct AttachedMapping<M> {
+    algorithm: Id,
+    mapping: PhantomData<fn() -> M>,
+}
+
+/// One derived mapping `M` that every host can compute, registered for the
+/// descriptors naming `algorithm` (the id `M::bind` accepts).
+pub struct DerivedMapping<M> {
     algorithm: Id,
     mapping: PhantomData<fn() -> M>,
 }
@@ -168,22 +214,21 @@ impl<M> AttachedMapping<M> {
     }
 }
 
-fn open<M, R>(
-    snapshot: &R,
-    handle: CollectionHandle,
-) -> Result<Collection<M::Target>, CollectionRealizationError>
-where
-    M: MapMapping,
-    R: BlobStoreGet,
-{
-    Collection::<M::Target>::open(snapshot, handle).map_err(|error| {
-        CollectionRealizationError::Resolution(format!(
-            "open attached collection descriptor: {error}"
-        ))
-    })
+impl<M> DerivedMapping<M> {
+    pub const fn new(algorithm: Id) -> Self {
+        Self {
+            algorithm,
+            mapping: PhantomData,
+        }
+    }
+
+    /// The algorithm this registration runs.
+    pub const fn algorithm(&self) -> Id {
+        self.algorithm
+    }
 }
 
-impl<M> AttachedMappings for AttachedMapping<M>
+impl<M> Mappings for AttachedMapping<M>
 where
     M: MapMapping + 'static,
     Handle<M::Target>: InlineEncoding,
@@ -192,16 +237,16 @@ where
         algorithm == self.algorithm
     }
 
-    fn residual<R: StoreRead>(
+    /// The parent foundations no usable attachment reaches (the residual).
+    fn pending<R: StoreRead>(
         &self,
         snapshot: &R,
         handle: CollectionHandle,
         _algorithm: Id,
     ) -> Result<usize, CollectionRealizationError> {
-        Ok(snapshot
-            .attached(open::<M, R>(snapshot, handle)?)?
-            .residual()
-            .len())
+        let attached = Collection::<M::Target>::open(snapshot, handle)
+            .map_err(|error| resolution("open attached collection descriptor", error))?;
+        Ok(snapshot.attached(attached)?.residual().len())
     }
 
     fn maintain<'a, S>(
@@ -211,17 +256,80 @@ where
         handle: CollectionHandle,
         _algorithm: Id,
         signer: &'a SigningKey,
-    ) -> AttachedMaintenance<'a, S>
+    ) -> Maintenance<'a, S>
     where
         S: Store + AsyncBlobStoreAcquire + Send,
     {
-        let collection = open::<M, S::Snapshot>(snapshot, handle);
-        Box::pin(async move { pile.maintain_attached_with::<M>(collection?, signer).await })
+        let attached = Collection::<M::Target>::open(snapshot, handle)
+            .map_err(|error| resolution("open attached collection descriptor", error));
+        Box::pin(async move { pile.maintain_attached_with::<M>(attached?, signer).await })
     }
 }
 
-/// The attached collections `snapshot`'s records name whose descriptor
-/// names an algorithm `mappings` runs, each with that algorithm.
+/// The derived collection `handle` and its source, typed.
+pub fn open_derived<M, R>(
+    snapshot: &R,
+    handle: CollectionHandle,
+) -> Result<(Collection<M::Source>, Collection<M::Target>), CollectionRealizationError>
+where
+    M: DeriveMapping,
+    R: BlobStoreGet,
+{
+    let target = Collection::<M::Target>::open(snapshot, handle)
+        .map_err(|error| resolution("open derived collection descriptor", error))?;
+    let facts: TribleSet = snapshot
+        .get(handle)
+        .map_err(|error| resolution("read derived collection descriptor", error))?;
+    let source = descriptor::source(&facts)
+        .map_err(|error| resolution("read derived collection source", error))?
+        .ok_or_else(|| resolution("derived collection descriptor", "names no source"))?;
+    let source = Collection::<M::Source>::open(snapshot, source)
+        .map_err(|error| resolution("open derived collection source", error))?;
+    Ok((source, target))
+}
+
+impl<M> Mappings for DerivedMapping<M>
+where
+    M: DeriveMapping + 'static,
+    Handle<M::Source>: InlineEncoding,
+    Handle<M::Target>: InlineEncoding,
+{
+    fn runs(&self, algorithm: Id) -> bool {
+        algorithm == self.algorithm
+    }
+
+    /// The source foundations with no usable leaf (the backlog).
+    fn pending<R: StoreRead>(
+        &self,
+        snapshot: &R,
+        handle: CollectionHandle,
+        _algorithm: Id,
+    ) -> Result<usize, CollectionRealizationError> {
+        let (source, target) = open_derived::<M, R>(snapshot, handle)?;
+        let source = snapshot.collection::<M::Source>(source)?;
+        let target = snapshot.collection::<M::Target>(target)?;
+        Ok(target.missing_from(&source)?.len())
+    }
+
+    fn maintain<'a, S>(
+        &'a self,
+        pile: &'a mut S,
+        snapshot: &S::Snapshot,
+        handle: CollectionHandle,
+        _algorithm: Id,
+        signer: &'a SigningKey,
+    ) -> Maintenance<'a, S>
+    where
+        S: Store + AsyncBlobStoreAcquire + Send,
+    {
+        let opened = open_derived::<M, S::Snapshot>(snapshot, handle);
+        Box::pin(async move { pile.maintain_with::<M>(opened?.1, signer).await })
+    }
+}
+
+/// The collections `snapshot`'s records name whose descriptor names an
+/// algorithm `mappings` runs, each with that algorithm: attached
+/// collections (a descriptor with a parent) and derived ones (a source).
 ///
 /// Descriptors are read only from what `snapshot` holds: one that is not
 /// here or does not decode is passed over, and so is a mapping nothing
@@ -232,7 +340,7 @@ pub fn registered_targets<R, M>(
 ) -> Result<Vec<(CollectionHandle, Id)>, R::RecordsError>
 where
     R: CollectionRead + BlobStoreGet,
-    M: AttachedMappings,
+    M: Mappings,
 {
     let mut targets = Vec::new();
     for handle in snapshot.collections()? {
@@ -243,7 +351,8 @@ where
             continue;
         };
         let attached = descriptor::parents(&facts).is_ok_and(|parents| !parents.is_empty());
-        if attached && mappings.runs(algorithm) {
+        let derived = matches!(descriptor::source(&facts), Ok(Some(_)));
+        if (attached || derived) && mappings.runs(algorithm) {
             targets.push((handle, algorithm));
         }
     }

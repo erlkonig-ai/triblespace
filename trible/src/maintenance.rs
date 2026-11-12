@@ -20,7 +20,7 @@ use triblespace_core::blob::{Blob, TryFromBlob};
 use triblespace_core::collection::records::{CollectionHandle, CollectionRecord};
 use triblespace_core::collection::CollectionRead;
 use triblespace_core::collection::{
-    descriptor, AttachedMappings, Collection, CollectionRecordSelector, CollectionStoreExt,
+    descriptor, Collection, CollectionRecordSelector, CollectionStoreExt, Mappings,
 };
 #[cfg(test)]
 use triblespace_core::collection::{grant_collection_read, AdmissionPolicy, CollectionPolicy};
@@ -219,7 +219,7 @@ impl Drop for HopObservation<'_> {
 /// Drop this driver before closing the store to release those immutable snapshots.
 pub struct Driver<R, M = ()> {
     references: Vec<Reference>,
-    mappings: M,
+    registered: M,
     dependencies: bool,
     backend: SuccinctBackend,
     state: MaintenanceState<R>,
@@ -266,7 +266,7 @@ impl<R: StoreSnapshot> Driver<R> {
             references,
             dependencies,
             backend,
-            mappings: (),
+            registered: (),
             state: MaintenanceState::default(),
             baseline: None,
             catch_up: true,
@@ -277,13 +277,17 @@ impl<R: StoreSnapshot> Driver<R> {
     }
 }
 
-impl<R: StoreSnapshot, M: AttachedMappings> Driver<R, M> {
-    /// This Driver, also running `mappings` for the attached collections
-    /// whose descriptors name their algorithms ([`AttachedMappings`]).
-    pub fn with_attached<N: AttachedMappings>(self, mappings: N) -> Driver<R, (M, N)> {
+impl<R: StoreSnapshot, M: Mappings> Driver<R, M> {
+    /// This Driver, also running `registered` for the collections whose
+    /// descriptors name their algorithms ([`Mappings`], attached or
+    /// derived): tried before the representation's own mapping, told when
+    /// each pass begins, and asked when deferred work is due
+    /// ([`Mappings::due`]), which makes a tick pass even if no input
+    /// changed.
+    pub fn with_registered<N: Mappings>(self, registered: N) -> Driver<R, (M, N)> {
         Driver {
             references: self.references,
-            mappings: (self.mappings, mappings),
+            registered: (self.registered, registered),
             dependencies: self.dependencies,
             backend: self.backend,
             state: self.state,
@@ -295,9 +299,9 @@ impl<R: StoreSnapshot, M: AttachedMappings> Driver<R, M> {
         }
     }
 
-    /// The registered attached mappings.
-    pub fn mappings(&self) -> &M {
-        &self.mappings
+    /// The registered mappings.
+    pub fn registered(&self) -> &M {
+        &self.registered
     }
 
     /// Select `targets` instead, keeping what earlier passes learned about
@@ -342,7 +346,12 @@ impl<R: StoreSnapshot, M: AttachedMappings> Driver<R, M> {
         let before = store
             .snapshot()
             .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
+        let due = self
+            .registered
+            .due()
+            .is_some_and(|due| due <= Instant::now());
         if !self.catch_up
+            && !due
             && !self
                 .baseline
                 .as_ref()
@@ -361,7 +370,7 @@ impl<R: StoreSnapshot, M: AttachedMappings> Driver<R, M> {
             signer,
             self.dependencies,
             self.backend,
-            &self.mappings,
+            &self.registered,
             &mut self.state,
             self.telemetry.as_mut(),
             observer,
@@ -419,7 +428,7 @@ fn cover_census<R: CollectionRead>(
 /// the CLI's representation display does, and reports an unknown one rather than
 /// guessing. An attached collection carries its parent first and then
 /// attaches the parent's new frontier.
-async fn maintain_by_representation<S: Store + AsyncBlobStoreAcquire + Send, M: AttachedMappings>(
+async fn maintain_by_representation<S: Store + AsyncBlobStoreAcquire + Send, M: Mappings>(
     pile: &mut S,
     snapshot: &S::Snapshot,
     handle: CollectionHandle,
@@ -428,7 +437,7 @@ async fn maintain_by_representation<S: Store + AsyncBlobStoreAcquire + Send, M: 
     attached: bool,
     signer: &SigningKey,
     succinct_backend: SuccinctBackend,
-    mappings: &M,
+    registered: &M,
 ) -> Result<S::Snapshot> {
     use triblespace_core::collection::latest::LatestBlob;
     use triblespace_core::collection::lww_register::LwwRegisterBlob;
@@ -453,15 +462,15 @@ async fn maintain_by_representation<S: Store + AsyncBlobStoreAcquire + Send, M: 
             .map_err(|error| anyhow!("maintain attached collection: {error}"))
     }
 
+    // A registered mapping is chosen by its algorithm, before the
+    // representation's canonical one, which would refuse it.
+    if let Some(algorithm) = algorithm.filter(|algorithm| registered.runs(*algorithm)) {
+        return registered
+            .maintain(pile, snapshot, handle, algorithm, signer)
+            .await
+            .map_err(|error| anyhow!("maintain registered collection: {error}"));
+    }
     if attached {
-        // A registered mapping is chosen by its algorithm, before the
-        // representation's canonical one, which would refuse it.
-        if let Some(algorithm) = algorithm.filter(|algorithm| mappings.runs(*algorithm)) {
-            return mappings
-                .maintain(pile, snapshot, handle, algorithm, signer)
-                .await
-                .map_err(|error| anyhow!("maintain attached collection: {error}"));
-        }
         return if representation == <SuccinctArchiveBlob as MetaDescribe>::id() {
             #[cfg(feature = "succinct-cuda")]
             if matches!(succinct_backend, SuccinctBackend::Cuda) {
@@ -791,7 +800,7 @@ async fn maintenance_pass_events<S: Store + AsyncBlobStoreAcquire + Send>(
     signer: &SigningKey,
     dependencies: bool,
     succinct_backend: SuccinctBackend,
-    mappings: &impl AttachedMappings,
+    registered: &impl Mappings,
     state: &mut MaintenanceState<S::Snapshot>,
     mut telemetry: Option<&mut maintenance_telemetry::Telemetry>,
     observer: &mut (dyn FnMut(Event) + Send),
@@ -805,7 +814,7 @@ async fn maintenance_pass_events<S: Store + AsyncBlobStoreAcquire + Send>(
         signer,
         dependencies,
         succinct_backend,
-        mappings,
+        registered,
         state,
         telemetry.as_deref_mut(),
         observer,
@@ -827,7 +836,7 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
     signer: &SigningKey,
     dependencies: bool,
     succinct_backend: SuccinctBackend,
-    mappings: &impl AttachedMappings,
+    registered: &impl Mappings,
     state: &mut MaintenanceState<S::Snapshot>,
     mut telemetry: Option<&mut maintenance_telemetry::Telemetry>,
     observer: &mut (dyn FnMut(Event) + Send),
@@ -836,6 +845,7 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
         pile.snapshot()
             .map_err(|error| anyhow!("pile snapshot: {error:?}"))?,
     );
+    registered.begin_pass(&snapshot);
     let mut selected = BTreeSet::new();
     let mut pass = Pass::default();
     for reference in references {
@@ -953,7 +963,7 @@ async fn maintenance_pass_inner<S: Store + AsyncBlobStoreAcquire + Send>(
                     attached,
                     signer,
                     succinct_backend,
-                    mappings,
+                    registered,
                 )
                 .await?;
                 let after = cover_census(&after, handle)?;

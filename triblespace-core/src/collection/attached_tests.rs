@@ -1794,7 +1794,7 @@ fn keeping_as_another_key_stores_nothing() {
 #[test]
 fn a_registration_finds_and_maintains_what_the_records_name() {
     use crate::collection::{
-        descriptor, registered_targets, AttachedMapping, AttachedMappings, CanonicalAttachment,
+        descriptor, registered_targets, AttachedMapping, CanonicalAttachment, Mappings,
     };
     type Read = CanonicalAttachment<SuccinctArchiveBlob>;
     let (mut store, root, attached) = succinct_root("registered");
@@ -1831,7 +1831,7 @@ fn a_registration_finds_and_maintains_what_the_records_name() {
     assert!(registered_targets(&snapshot, &elsewhere).unwrap().is_empty());
     assert_eq!(
         registration
-            .residual(&snapshot, attached.handle(), algorithm)
+            .pending(&snapshot, attached.handle(), algorithm)
             .unwrap(),
         2
     );
@@ -1846,11 +1846,125 @@ fn a_registration_finds_and_maintains_what_the_records_name() {
     drop(snapshot);
     assert_eq!(
         registration
-            .residual(&after, attached.handle(), algorithm)
+            .pending(&after, attached.handle(), algorithm)
             .unwrap(),
         0
     );
     assert!(()
-        .residual(&after, attached.handle(), algorithm)
+        .pending(&after, attached.handle(), algorithm)
+        .is_err());
+}
+
+/// A derived mapping under its own algorithm id (the copy of each node),
+/// minted with `trible genid` on 2026-11-12 for this test:
+/// 54C32B1891F78831A726FF0DA037E4D3.
+const COPY_ALGORITHM: Id = crate::id::id_hex!("54C32B1891F78831A726FF0DA037E4D3");
+
+struct CopyAlgorithm;
+
+impl crate::metadata::MetaDescribe for CopyAlgorithm {
+    fn describe() -> Fragment {
+        let id = COPY_ALGORITHM;
+        entity! {
+            ExclusiveId::force_ref(&id) @
+                metadata::name: "test-copy",
+                metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
+        }
+    }
+}
+
+struct CopyNodes;
+
+impl crate::collection::DeriveMapping for CopyNodes {
+    type Source = SimpleArchive;
+    type Target = SimpleArchive;
+
+    fn fragment(&self) -> Fragment {
+        use crate::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
+        entity! { _ @
+            metadata::tag: KIND_COLLECTION_MAPPING,
+            mapping_algorithm*: <CopyAlgorithm as crate::metadata::MetaDescribe>::describe(),
+        }
+    }
+
+    fn bind(
+        _source: &Fragment,
+        target: &Fragment,
+    ) -> Result<Self, crate::collection::CollectionOperationError> {
+        match crate::collection::descriptor::mapping_algorithm(target.facts()) {
+            Ok(Some(algorithm)) if algorithm == COPY_ALGORITHM => Ok(Self),
+            other => Err(crate::collection::CollectionOperationError::Fatal(format!(
+                "not the copy: {other:?}"
+            ))),
+        }
+    }
+
+    fn map<R: StoreRead>(
+        &self,
+        source: &Blob<SimpleArchive>,
+        _reader: &R,
+    ) -> Result<Blob<SimpleArchive>, crate::collection::CollectionOperationError> {
+        Ok(source.clone())
+    }
+}
+
+/// A derived registration finds the derived collections the records name
+/// whose algorithm it runs, counts their backlog and maintains them; an
+/// attached collection, or another algorithm, is passed over.
+#[test]
+fn a_derived_registration_finds_and_maintains_what_the_records_name() {
+    use crate::collection::{registered_targets, DerivedMapping, Mappings};
+    let (mut store, root, attached) = succinct_root("derived");
+    for byte in 1..=3 {
+        commit(&mut store, root, row(byte, 1, 1));
+    }
+    let copy = store.derive_with(root, CopyNodes, policy()).unwrap();
+    let registration = DerivedMapping::<CopyNodes>::new(COPY_ALGORITHM);
+    // Registered, named by no record yet.
+    let snapshot = store.snapshot().unwrap();
+    assert!(registered_targets(&snapshot, &registration)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        registration
+            .pending(&snapshot, copy.handle(), COPY_ALGORITHM)
+            .unwrap(),
+        3
+    );
+    let after = block_on(registration.maintain(
+        &mut store,
+        &snapshot,
+        copy.handle(),
+        COPY_ALGORITHM,
+        &host(),
+    ))
+    .unwrap();
+    drop(snapshot);
+    assert_eq!(
+        registration
+            .pending(&after, copy.handle(), COPY_ALGORITHM)
+            .unwrap(),
+        0
+    );
+    // Its leaves name it now; the attached collection and another
+    // algorithm are not targets.
+    block_on(store.maintain_attached(attached, &host())).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(
+        registered_targets(&snapshot, &registration).unwrap(),
+        vec![(copy.handle(), COPY_ALGORITHM)]
+    );
+    assert_eq!(
+        registered_targets(&snapshot, &((), DerivedMapping::<CopyNodes>::new(COPY_ALGORITHM)))
+            .unwrap(),
+        vec![(copy.handle(), COPY_ALGORITHM)]
+    );
+    assert!(
+        registered_targets(&snapshot, &DerivedMapping::<CopyNodes>::new(id(78)))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(()
+        .pending(&snapshot, copy.handle(), COPY_ALGORITHM)
         .is_err());
 }
