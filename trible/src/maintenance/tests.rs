@@ -733,6 +733,8 @@ async fn native_name_selection_preserves_literal_whitespace() {
     assert_eq!(pass.failures, 0);
 }
 
+use triblespace_core::collection::{registered_targets, AttachedMapping, MapMapping};
+
 /// An attached mapping this crate does not define, onto a representation it
 /// knows: the supersedes id set under its own algorithm id. Minted with
 /// `trible genid` on 2026-11-12 for this test: 05A39DCCB574AE6BE0AF228D4F515AA8.
@@ -843,7 +845,7 @@ async fn a_registered_attached_mapping_runs_by_its_algorithm() {
     let snapshot = pile.snapshot().unwrap();
     assert_eq!(
         registered_targets(&snapshot, driver.mappings()).unwrap(),
-        vec![target.handle()]
+        vec![(target.handle(), RENAMED_ID_SET)]
     );
     let attached = snapshot.attached(target).unwrap();
     assert!(attached.residual().is_empty());

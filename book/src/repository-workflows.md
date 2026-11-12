@@ -695,7 +695,11 @@ trible pile collection maintain-all self.pile blake3:<RANK9_TARGET> --watch
 ```
 
 The executable still needs the encoding and concrete mapping implementation;
-descriptors are data, not dynamically loaded code. This local maintainer and
+descriptors are data, not dynamically loaded code. A crate that defines
+another mapping onto a known representation hands it to a maintainer as an
+`AttachedMappings` registration keyed by its algorithm id
+(`collection::registration`); `registered_targets` lists the attached
+collections the records name that a registration runs. This local maintainer and
 a network sync process can run independently over the same append-only pile.
 Readers attach the resident target from their own snapshot and do not wait
 for a global maintenance frontier.

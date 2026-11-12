@@ -19,15 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ends the build, and the rest is `unread` without being looked at, so the
   work is bounded by the budget rather than by the lag.
 
-- `trible::maintenance::Driver` runs attached mappings defined downstream:
-  `Driver::with_attached(mappings)` registers an `AttachedMappings` (one
-  `AttachedMapping::<M>::new(algorithm_id)`, or a tuple of them), tried by
-  the descriptor's mapping algorithm before the representation's canonical
-  mapping; an algorithm nothing registered is dispatched as before. No global
-  registry. `registered_targets(snapshot, mappings)` lists the attached
-  collections the records name whose algorithm is registered, and
-  `Driver::retarget` replaces the selection while keeping what earlier
-  passes learned.
+- Attached mappings can be registered by their algorithm id
+  (`collection::registration`): `AttachedMappings` (`runs`, `residual`,
+  `maintain`), one `AttachedMapping::<M>::new(algorithm_id)` or a pair of
+  registrations, and `registered_targets(snapshot, mappings)`, the attached
+  collections the records name whose algorithm is registered, each with
+  that algorithm. `trible::maintenance::Driver::with_attached(mappings)`
+  runs a registered algorithm before the representation's canonical
+  mapping; an algorithm nothing registered is dispatched as before. No
+  global registry. `Driver::retarget` replaces the selection while keeping
+  what earlier passes learned.
 
 - `triblespace-search`: `semantic_wemm::declared_indexes(snapshot)` answers
   which WeMM indexes a store's records name, each with the source and the

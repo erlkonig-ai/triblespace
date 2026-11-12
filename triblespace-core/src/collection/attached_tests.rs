@@ -1787,3 +1787,70 @@ fn keeping_as_another_key_stores_nothing() {
         .is_none());
     assert_eq!(snapshot.attached(attached).unwrap().residual().len(), 1);
 }
+
+/// A registration finds the attached collections the records name whose
+/// algorithm it runs, says how far each lags, and maintains it; a mapping
+/// nothing registered is passed over.
+#[test]
+fn a_registration_finds_and_maintains_what_the_records_name() {
+    use crate::collection::{
+        descriptor, registered_targets, AttachedMapping, AttachedMappings, CanonicalAttachment,
+    };
+    type Read = CanonicalAttachment<SuccinctArchiveBlob>;
+    let (mut store, root, attached) = succinct_root("registered");
+    for byte in 1..=3 {
+        commit(&mut store, root, row(byte, 1, 1));
+    }
+    let snapshot = store.snapshot().unwrap();
+    let facts: TribleSet = snapshot.get(attached.handle()).unwrap();
+    let algorithm = descriptor::mapping_algorithm(&facts).unwrap().unwrap();
+    let registration = AttachedMapping::<Read>::new(algorithm);
+    let elsewhere = AttachedMapping::<Read>::new(id(77));
+    // Registered, but no record names it yet.
+    assert!(registered_targets(&snapshot, &registration)
+        .unwrap()
+        .is_empty());
+
+    let read = snapshot
+        .attached(attached)
+        .unwrap()
+        .read_within_with::<Read, UnionArchive<OrderedUniverse>>(0)
+        .unwrap();
+    drop(snapshot);
+    store.keep_attached(read.built(), &host()).unwrap();
+
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(
+        registered_targets(&snapshot, &registration).unwrap(),
+        vec![(attached.handle(), algorithm)]
+    );
+    assert_eq!(
+        registered_targets(&snapshot, &((), AttachedMapping::<Read>::new(algorithm))).unwrap(),
+        vec![(attached.handle(), algorithm)]
+    );
+    assert!(registered_targets(&snapshot, &elsewhere).unwrap().is_empty());
+    assert_eq!(
+        registration
+            .residual(&snapshot, attached.handle(), algorithm)
+            .unwrap(),
+        2
+    );
+    let after = block_on(registration.maintain(
+        &mut store,
+        &snapshot,
+        attached.handle(),
+        algorithm,
+        &host(),
+    ))
+    .unwrap();
+    drop(snapshot);
+    assert_eq!(
+        registration
+            .residual(&after, attached.handle(), algorithm)
+            .unwrap(),
+        0
+    );
+    assert!(()
+        .residual(&after, attached.handle(), algorithm)
+        .is_err());
+}

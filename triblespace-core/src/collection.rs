@@ -73,6 +73,8 @@ pub mod ownership;
 /// Immutable collection-local READ and WRITE authorization ceilings.
 pub mod policy;
 pub mod records;
+/// Attached mappings registered by the algorithm id their descriptors name.
+pub mod registration;
 /// Which collections the pile syncs, in its own configuration collection.
 pub mod selection;
 /// Canonical `SimpleArchive` set-union collection kind.
@@ -101,6 +103,7 @@ pub use held::{HeldBlobs, HeldRead, HeldStore, HeldWork};
 pub use maintenance::MERGE_FAN_IN;
 pub use policy::*;
 pub use records::*;
+pub use registration::*;
 pub use simplearchive_union::{PreparedCollectionCommit, StagedCollectionCommit};
 pub use store::*;
 pub use view::*;

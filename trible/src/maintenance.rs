@@ -6,9 +6,6 @@
 use anyhow::{anyhow, Result};
 use ed25519_dalek::SigningKey;
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
-use std::marker::PhantomData;
-use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use triblespace_core::blob::encodings::entity_id_set::EntityIdSetBlob;
@@ -23,7 +20,7 @@ use triblespace_core::blob::{Blob, TryFromBlob};
 use triblespace_core::collection::records::{CollectionHandle, CollectionRecord};
 use triblespace_core::collection::CollectionRead;
 use triblespace_core::collection::{
-    descriptor, Collection, CollectionRecordSelector, CollectionStoreExt, MapMapping,
+    descriptor, AttachedMappings, Collection, CollectionRecordSelector, CollectionStoreExt,
 };
 #[cfg(test)]
 use triblespace_core::collection::{grant_collection_read, AdmissionPolicy, CollectionPolicy};
@@ -208,177 +205,6 @@ impl Drop for HopObservation<'_> {
             });
         }
     }
-}
-
-/// The future one registered attached mapping maintains a collection with.
-pub type AttachedMaintenance<'a, S> =
-    Pin<Box<dyn Future<Output = Result<<S as SnapshotSource>::Snapshot>> + Send + 'a>>;
-
-/// Attached mappings defined downstream of this crate, which a [`Driver`]
-/// runs for an attached collection whose descriptor names one of their
-/// mapping algorithms.
-///
-/// The Driver dispatches an attached collection by its representation, and
-/// for each representation it knows one canonical mapping. A crate that
-/// defines another mapping onto a known representation (the Archive's
-/// BM25 over text payloads is a `PortableBM25Blob` under its own algorithm
-/// id) registers it here, by that algorithm id, when it builds the
-/// Driver ([`Driver::with_attached`]). A registered algorithm is tried before
-/// the representation's canonical mapping; an algorithm nothing registered
-/// is dispatched as before. There is no global registry: a Driver runs what
-/// it was built with.
-pub trait AttachedMappings: Send + Sync {
-    /// Whether one of these mappings runs `algorithm`.
-    fn runs(&self, algorithm: Id) -> bool;
-
-    /// Maintain the attached collection `handle`, whose descriptor names
-    /// `algorithm`, one [`Self::runs`]: carry its parent and attach the
-    /// frontier ([`CollectionStoreExt::maintain_attached_with`]).
-    fn maintain<'a, S>(
-        &'a self,
-        pile: &'a mut S,
-        snapshot: &S::Snapshot,
-        handle: CollectionHandle,
-        algorithm: Id,
-        signer: &'a SigningKey,
-    ) -> AttachedMaintenance<'a, S>
-    where
-        S: Store + AsyncBlobStoreAcquire + Send;
-}
-
-/// No registered mappings: what a Driver is built with.
-impl AttachedMappings for () {
-    fn runs(&self, _algorithm: Id) -> bool {
-        false
-    }
-
-    fn maintain<'a, S>(
-        &'a self,
-        _pile: &'a mut S,
-        _snapshot: &S::Snapshot,
-        _handle: CollectionHandle,
-        algorithm: Id,
-        _signer: &'a SigningKey,
-    ) -> AttachedMaintenance<'a, S>
-    where
-        S: Store + AsyncBlobStoreAcquire + Send,
-    {
-        Box::pin(async move {
-            Err(anyhow!(
-                "attached mapping algorithm {algorithm:X} is not registered with this Driver"
-            ))
-        })
-    }
-}
-
-/// Two registrations: the first that runs an algorithm runs it.
-impl<A: AttachedMappings, B: AttachedMappings> AttachedMappings for (A, B) {
-    fn runs(&self, algorithm: Id) -> bool {
-        self.0.runs(algorithm) || self.1.runs(algorithm)
-    }
-
-    fn maintain<'a, S>(
-        &'a self,
-        pile: &'a mut S,
-        snapshot: &S::Snapshot,
-        handle: CollectionHandle,
-        algorithm: Id,
-        signer: &'a SigningKey,
-    ) -> AttachedMaintenance<'a, S>
-    where
-        S: Store + AsyncBlobStoreAcquire + Send,
-    {
-        if self.0.runs(algorithm) {
-            self.0.maintain(pile, snapshot, handle, algorithm, signer)
-        } else {
-            self.1.maintain(pile, snapshot, handle, algorithm, signer)
-        }
-    }
-}
-
-/// One attached mapping `M`, registered for descriptors naming `algorithm`
-/// (the id `M::bind` accepts).
-pub struct AttachedMapping<M> {
-    algorithm: Id,
-    mapping: PhantomData<fn() -> M>,
-}
-
-impl<M> AttachedMapping<M> {
-    pub const fn new(algorithm: Id) -> Self {
-        Self {
-            algorithm,
-            mapping: PhantomData,
-        }
-    }
-
-    /// The algorithm this registration runs.
-    pub const fn algorithm(&self) -> Id {
-        self.algorithm
-    }
-}
-
-impl<M> AttachedMappings for AttachedMapping<M>
-where
-    M: MapMapping + 'static,
-    Handle<M::Target>: triblespace_core::inline::InlineEncoding,
-{
-    fn runs(&self, algorithm: Id) -> bool {
-        algorithm == self.algorithm
-    }
-
-    fn maintain<'a, S>(
-        &'a self,
-        pile: &'a mut S,
-        snapshot: &S::Snapshot,
-        handle: CollectionHandle,
-        _algorithm: Id,
-        signer: &'a SigningKey,
-    ) -> AttachedMaintenance<'a, S>
-    where
-        S: Store + AsyncBlobStoreAcquire + Send,
-    {
-        let collection = Collection::<M::Target>::open(snapshot, handle)
-            .map_err(|error| anyhow!("open collection descriptor: {error}"));
-        Box::pin(async move {
-            pile.maintain_attached_with::<M>(collection?, signer)
-                .await
-                .map_err(|error| anyhow!("maintain attached collection: {error}"))
-        })
-    }
-}
-
-/// The attached collections `snapshot`'s records name whose descriptor
-/// names an algorithm `mappings` runs: the targets a maintainer that keeps
-/// every such index current gives a [`Driver`] ([`Driver::retarget`]).
-///
-/// An index is found once some record names it, which for an attached
-/// collection is a `MAP`: the first read that keeps its images
-/// (`CollectionStoreExt::keep_attached`) declares it. Descriptors are read
-/// only from what `snapshot` holds; one that is not here or does not decode
-/// is passed over, and so is any mapping nothing registered. The answer is
-/// one observation's, recomputed by each caller.
-pub fn registered_targets<R, M>(snapshot: &R, mappings: &M) -> Result<Vec<CollectionHandle>>
-where
-    R: CollectionRead + BlobStoreGet,
-    M: AttachedMappings,
-{
-    let mut targets = Vec::new();
-    for handle in snapshot
-        .collections()
-        .map_err(|error| anyhow!("list the collections records name: {error:?}"))?
-    {
-        let Ok(facts) = snapshot.get::<TribleSet, SimpleArchive>(handle) else {
-            continue;
-        };
-        let Ok(Some(algorithm)) = descriptor::mapping_algorithm(&facts) else {
-            continue;
-        };
-        let attached = descriptor::parents(&facts).is_ok_and(|parents| !parents.is_empty());
-        if attached && mappings.runs(algorithm) {
-            targets.push(handle);
-        }
-    }
-    Ok(targets)
 }
 
 /// Incremental maintenance on a caller-owned store, without tasks or runtime ownership.
@@ -633,7 +459,8 @@ async fn maintain_by_representation<S: Store + AsyncBlobStoreAcquire + Send, M: 
         if let Some(algorithm) = algorithm.filter(|algorithm| mappings.runs(*algorithm)) {
             return mappings
                 .maintain(pile, snapshot, handle, algorithm, signer)
-                .await;
+                .await
+                .map_err(|error| anyhow!("maintain attached collection: {error}"));
         }
         return if representation == <SuccinctArchiveBlob as MetaDescribe>::id() {
             #[cfg(feature = "succinct-cuda")]
