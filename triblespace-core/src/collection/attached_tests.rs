@@ -1653,3 +1653,117 @@ fn entity_id_set_covers_answer_like_the_union() {
         );
     }
 }
+
+/// What a read builds for its residual, kept, is what the next read takes:
+/// the first read names the attached collection in the store's records, and
+/// a later one reads without building.
+#[test]
+fn a_kept_read_is_the_next_reads_cover() {
+    use crate::collection::CanonicalAttachment;
+    type Read = CanonicalAttachment<SuccinctArchiveBlob>;
+    let (mut store, root, attached) = succinct_root("kept");
+    let small = commit(&mut store, root, row(1, 1, 1));
+    let large = commit(&mut store, root, row(2, 1, 1) + row(2, 2, 2) + row(2, 3, 3));
+    let middle = commit(&mut store, root, row(3, 1, 1) + row(3, 2, 2));
+    let union: TribleSet =
+        row(1, 1, 1) + row(2, 1, 1) + row(2, 2, 2) + row(2, 3, 3) + row(3, 1, 1) + row(3, 2, 2);
+
+    // Registered, attached, read: still named by no record.
+    let snapshot = store.snapshot().unwrap();
+    assert!(!snapshot.collections().unwrap().contains(&attached.handle()));
+    let observed = snapshot.attached(attached).unwrap();
+    assert_eq!(observed.residual().len(), 3);
+
+    // A budget of nothing still builds the smallest foundation, and only it.
+    let first = observed
+        .read_within_with::<Read, UnionArchive<OrderedUniverse>>(0)
+        .unwrap();
+    assert_eq!(
+        first.built().iter().map(|b| b.node()).collect::<Vec<_>>(),
+        vec![small]
+    );
+    assert_eq!(
+        first.unread().data_members().collect::<BTreeSet<_>>(),
+        BTreeSet::from([middle, large])
+    );
+    assert_eq!(first.value().iter().collect::<TribleSet>(), row(1, 1, 1));
+    drop((observed, snapshot));
+    assert_eq!(store.keep_attached(first.built(), &host()).unwrap(), 1);
+
+    // The MAP names the attached collection, and the next read takes it.
+    let snapshot = store.snapshot().unwrap();
+    assert!(snapshot.collections().unwrap().contains(&attached.handle()));
+    let observed = snapshot.attached(attached).unwrap();
+    assert_eq!(observed.cover().len(), 1);
+    assert_eq!(residual(&observed), BTreeSet::from([middle, large]));
+
+    // Smallest first: a budget of the middle one's bytes builds it alone.
+    let middle_length = snapshot
+        .metadata(Handle::<SimpleArchive>::from_hash(middle))
+        .unwrap()
+        .unwrap()
+        .length;
+    let second = observed
+        .read_within_with::<Read, UnionArchive<OrderedUniverse>>(middle_length)
+        .unwrap();
+    assert_eq!(
+        second.built().iter().map(|b| b.node()).collect::<Vec<_>>(),
+        vec![middle]
+    );
+    assert_eq!(second.unread().data_members().collect::<Vec<_>>(), vec![large]);
+    drop((observed, snapshot));
+    store.keep_attached(second.built(), &host()).unwrap();
+
+    // The rest, unbounded; then a read with nothing to build.
+    let snapshot = store.snapshot().unwrap();
+    let third = snapshot
+        .attached(attached)
+        .unwrap()
+        .read_with::<Read, UnionArchive<OrderedUniverse>>()
+        .unwrap();
+    assert_eq!(third.built().len(), 1);
+    drop(snapshot);
+    store.keep_attached(third.built(), &host()).unwrap();
+    // Keeping again is the same records.
+    store.keep_attached(third.built(), &host()).unwrap();
+
+    let snapshot = store.snapshot().unwrap();
+    let observed = snapshot.attached(attached).unwrap();
+    assert!(observed.residual().is_empty());
+    assert_eq!(observed.cover().len(), 3);
+    let last = observed
+        .read_within_with::<Read, UnionArchive<OrderedUniverse>>(0)
+        .unwrap();
+    assert!(last.built().is_empty());
+    assert!(last.unread().is_empty());
+    assert_eq!(last.value().iter().collect::<TribleSet>(), union);
+}
+
+/// Another key's MAPs are believed nowhere, so keeping as that key is
+/// refused before anything is stored.
+#[test]
+fn keeping_as_another_key_stores_nothing() {
+    use crate::collection::CanonicalAttachment;
+    let (mut store, root, attached) = succinct_root("kept-elsewhere");
+    let node = commit(&mut store, root, row(1, 1, 1));
+    let snapshot = store.snapshot().unwrap();
+    let read = snapshot
+        .attached(attached)
+        .unwrap()
+        .read_with::<CanonicalAttachment<SuccinctArchiveBlob>, UnionArchive<OrderedUniverse>>()
+        .unwrap();
+    drop(snapshot);
+    let built = &read.built()[0];
+    assert_eq!(built.node(), node);
+    assert!(matches!(
+        store.keep_attached(read.built(), &other()),
+        Err(CollectionRealizationError::HostMismatch { .. })
+    ));
+    let snapshot = store.snapshot().unwrap();
+    assert!(!snapshot.collections().unwrap().contains(&attached.handle()));
+    assert!(snapshot
+        .metadata(Handle::<SuccinctArchiveBlob>::from_hash(built.attachment()))
+        .unwrap()
+        .is_none());
+    assert_eq!(snapshot.attached(attached).unwrap().residual().len(), 1);
+}

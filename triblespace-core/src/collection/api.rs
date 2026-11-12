@@ -1841,6 +1841,68 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         }
     }
 
+    /// Keep what a read built: store each image an attached read built in
+    /// memory for a residual foundation ([`super::AttachedRead::built`]) and
+    /// publish the host's `MAP` naming it as that foundation's attachment.
+    /// The next read then takes it instead of building it again, and the
+    /// store's records name the attached collection, so a maintainer that
+    /// finds attached collections by their records finds this one.
+    ///
+    /// An image is exactly what maintenance would attach to that node, so
+    /// keeping it is a partial [`Self::ensure_attached`] over the
+    /// foundations the read happened to build: nothing is carried and no
+    /// node is mapped here. A foundation later merged by the host is still
+    /// reached through its own `MAP` until maintenance attaches the merge.
+    ///
+    /// Every `MAP` is signed by `signing_key`, which must be the store's
+    /// host ([`CollectionRealizationError::HostMismatch`] otherwise, before
+    /// anything is stored): another key's `MAP`s are believed nowhere.
+    /// Keeping the same images twice publishes the same records, an
+    /// idempotent insert. Returns how many attachments were kept.
+    fn keep_attached(
+        &mut self,
+        built: &[super::BuiltAttachment],
+        signing_key: &SigningKey,
+    ) -> Result<usize, CollectionRealizationError>
+    where
+        Self: Store,
+    {
+        if built.is_empty() {
+            return Ok(0);
+        }
+        let snapshot = self.snapshot().map_err(|error| {
+            CollectionRealizationError::storage("observe the host to keep attachments", error)
+        })?;
+        let scope: BTreeSet<CollectionHandle> = built
+            .iter()
+            .map(super::BuiltAttachment::attached)
+            .collect();
+        let host = crate::collection::CoverageRead::index(&snapshot, &scope)
+            .map_err(|error| CollectionRealizationError::storage("settle coverage index", error))?
+            .host();
+        drop(snapshot);
+        let signer = Inline::new(signing_key.verifying_key().to_bytes());
+        if host != Some(signer) {
+            return Err(CollectionRealizationError::HostMismatch { host, signer });
+        }
+        for kept in built {
+            self.put::<crate::blob::encodings::UnknownBlob, _>(kept.image().clone())
+                .map_err(|error| {
+                    CollectionRealizationError::storage("store a kept attachment", error)
+                })?;
+            self.insert(super::CollectionRecord::Map(super::CollectionMap::sign(
+                signing_key,
+                kept.attached(),
+                kept.node(),
+                kept.attachment(),
+            )))
+            .map_err(|error| {
+                CollectionRealizationError::storage("publish a kept attachment MAP", error)
+            })?;
+        }
+        Ok(built.len())
+    }
+
     /// Ensure one collection for the key: "derive what you wrote".
     ///
     /// A root acquires its admitted commits, whoever wrote them. A derived

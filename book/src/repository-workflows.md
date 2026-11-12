@@ -604,7 +604,17 @@ own, and no policy: every host builds its own attachments, and a store believes
 only the `MAP`s its own host signed, so another host's that reach it stay
 inert. A read's residual -- foundations no usable attachment reaches -- is not
 missing data: `AttachedSnapshot::read` builds their images in memory for the
-view, and names what it cannot build in `AttachedRead::unread`. Maintenance carries the
+view, and names what it cannot build in `AttachedRead::unread`. Those images
+are exactly what maintenance would attach, and `AttachedRead::built` hands them
+back with the foundation each maps: `keep_attached(read.built(), &host)` stores
+them and publishes the host's `MAP`s, so the next read takes them instead of
+building them, and the store's records now name the attached collection. A
+read that must not grow with the lag builds at most a budget of residual input
+(`read_within`, `read_within_with`): smallest foundations first, at least one,
+the rest unread. Using an index this way is what declares it: an attached
+descriptor that no record names is an ordinary blob, and a maintainer that
+finds its targets by `CollectionRead::collections` finds it from its first
+kept `MAP` on. Maintenance carries the
 root first and then attaches the frontier the carry leaves, so a merged node's
 attachment is mapped from the merged node's bytes and nothing is built for a
 node the carry is about to consume. A mapping that reads another attached
