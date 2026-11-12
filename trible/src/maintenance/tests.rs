@@ -732,3 +732,129 @@ async fn native_name_selection_preserves_literal_whitespace() {
     assert_eq!(pass.targets, 1);
     assert_eq!(pass.failures, 0);
 }
+
+/// An attached mapping this crate does not define, onto a representation it
+/// knows: the supersedes id set under its own algorithm id. Minted with
+/// `trible genid` on 2026-11-12 for this test: 05A39DCCB574AE6BE0AF228D4F515AA8.
+const RENAMED_ID_SET: Id = triblespace_core::id::id_hex!("05A39DCCB574AE6BE0AF228D4F515AA8");
+
+struct RenamedIdSetAlgorithm;
+
+impl MetaDescribe for RenamedIdSetAlgorithm {
+    fn describe() -> Fragment {
+        use triblespace_core::macros::entity;
+        let id = RENAMED_ID_SET;
+        entity! {
+            triblespace_core::id::ExclusiveId::force_ref(&id) @
+                metadata::name: "test-renamed-supersedes-id-set",
+                metadata::tag: metadata::KIND_COLLECTION_MAPPING_ALGORITHM,
+        }
+    }
+}
+
+struct RenamedIdSet;
+
+impl MapMapping for RenamedIdSet {
+    type Target = EntityIdSetBlob;
+
+    fn fragment(&self) -> Fragment {
+        use triblespace_core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
+        use triblespace_core::macros::entity;
+        entity! { _ @
+            metadata::tag: KIND_COLLECTION_MAPPING,
+            mapping_algorithm*: <RenamedIdSetAlgorithm as MetaDescribe>::describe(),
+        }
+    }
+
+    fn bind(
+        _parent: &Fragment,
+        attached: &Fragment,
+    ) -> Result<Self, triblespace_core::collection::CollectionOperationError> {
+        match descriptor::mapping_algorithm(attached.facts()) {
+            Ok(Some(algorithm)) if algorithm == RENAMED_ID_SET => Ok(Self),
+            other => Err(triblespace_core::collection::CollectionOperationError::Fatal(
+                format!("not the renamed id set: {other:?}"),
+            )),
+        }
+    }
+
+    fn map<R: StoreRead>(
+        &self,
+        node: &triblespace_core::blob::Blob<SimpleArchive>,
+        siblings: &[triblespace_core::collection::CollectionData],
+        reader: &R,
+    ) -> Result<
+        triblespace_core::blob::Blob<EntityIdSetBlob>,
+        triblespace_core::collection::CollectionOperationError,
+    > {
+        <EntityIdSetBlob as triblespace_core::collection::CollectionAttachment>::map(
+            &metadata::supersedes.id(),
+            node,
+            siblings,
+            reader,
+        )
+    }
+}
+
+/// A Driver runs a registered attached mapping by its algorithm, where the
+/// representation's canonical mapping refuses it; without the registration
+/// the hop fails as before. `registered_targets` finds the index once a MAP
+/// names it.
+#[tokio::test]
+async fn a_registered_attached_mapping_runs_by_its_algorithm() {
+    use triblespace_core::collection::CollectionSnapshotExt;
+    use triblespace_core::macros::entity;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("registered.pile");
+    std::fs::File::create(&path).unwrap();
+    let signer = SigningKey::from_bytes(&[91; 32]);
+    let mut pile = Pile::open_as(&path, signer.verifying_key()).unwrap();
+    let source = pile
+        .collection("registered", direct_policy(signer.verifying_key()))
+        .unwrap();
+    let target = pile.attach_with(source, RenamedIdSet).unwrap();
+    let value = triblespace_core::id::genid();
+    pile.commit(source, &signer, entity! { metadata::supersedes: &value })
+        .unwrap();
+    let registration = AttachedMapping::<RenamedIdSet>::new(RENAMED_ID_SET);
+    assert!(registered_targets(&pile.snapshot().unwrap(), &registration)
+        .unwrap()
+        .is_empty());
+
+    let mut plain = Driver::new([Target::Handle(target.handle())], false, SuccinctBackend::Cpu)
+        .unwrap();
+    let pass = plain.tick(&mut pile, &signer, &mut |_| {}).await.unwrap().unwrap();
+    assert_eq!((pass.maintained, pass.failures), (0, 1));
+    drop(plain);
+
+    let mut driver = Driver::new([Target::Handle(target.handle())], false, SuccinctBackend::Cpu)
+        .unwrap()
+        .with_attached(registration);
+    let mut events = Vec::new();
+    let pass = driver
+        .tick(&mut pile, &signer, &mut |event| events.push(event))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((pass.maintained, pass.failures), (1, 0));
+    assert!(events.iter().any(
+        |event| matches!(event, Event::HopFinished { publications, .. } if publications.maps > 0)
+    ));
+    let snapshot = pile.snapshot().unwrap();
+    assert_eq!(
+        registered_targets(&snapshot, driver.mappings()).unwrap(),
+        vec![target.handle()]
+    );
+    let attached = snapshot.attached(target).unwrap();
+    assert!(attached.residual().is_empty());
+    drop((attached, snapshot));
+
+    // A new commit: the next tick attaches it.
+    pile.commit(source, &signer, entity! { metadata::supersedes: &triblespace_core::id::genid() })
+        .unwrap();
+    let pass = driver.tick(&mut pile, &signer, &mut |_| {}).await.unwrap().unwrap();
+    assert_eq!((pass.maintained, pass.failures), (1, 0));
+    assert!(pile.snapshot().unwrap().attached(target).unwrap().residual().is_empty());
+    drop(driver);
+    pile.close().unwrap();
+}

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- An attached read can keep what it builds. `AttachedRead::built` hands back
+  the image a read built in memory for each residual foundation, and
+  `CollectionStoreExt::keep_attached(built, &host)` stores those images and
+  publishes the host's `MAP`s (refused with `HostMismatch` before anything is
+  stored when the key is not the store's host). The next read takes them, and
+  the records then name the attached collection, so a first read declares
+  its index. `AttachedSnapshot::read_within` / `read_within_with` bound the
+  build: resident residual foundations smallest first while their bytes fit
+  the budget, always at least one, the rest `unread`.
+
+- `trible::maintenance::Driver` runs attached mappings defined downstream:
+  `Driver::with_attached(mappings)` registers an `AttachedMappings` (one
+  `AttachedMapping::<M>::new(algorithm_id)`, or a tuple of them), tried by
+  the descriptor's mapping algorithm before the representation's canonical
+  mapping; an algorithm nothing registered is dispatched as before. No global
+  registry. `registered_targets(snapshot, mappings)` lists the attached
+  collections the records name whose algorithm is registered, and
+  `Driver::retarget` replaces the selection while keeping what earlier
+  passes learned.
+
 - `triblespace-search`: `semantic_wemm::declared_indexes(snapshot)` answers
   which WeMM indexes a store's records name, each with the source and the
   model (collection, root, profile) its own descriptor states, so a
