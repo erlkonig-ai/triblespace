@@ -781,7 +781,6 @@ const CUT_THREADS: usize = 8;
 const SLOW_CUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How often a foundation's embedding logs its progress on stderr.
-#[cfg(feature = "semantic-wemm-cuda")]
 const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// [`cut_windows`] of every text, in the texts' order, on up to
