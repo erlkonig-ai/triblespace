@@ -14,8 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stored when the key is not the store's host). The next read takes them, and
   the records then name the attached collection, so a first read declares
   its index. `AttachedSnapshot::read_within` / `read_within_with` bound the
-  build: resident residual foundations smallest first while their bytes fit
-  the budget, always at least one, the rest `unread`.
+  build: resident residual foundations in the residual's order while their
+  bytes fit the budget, always at least one; the first that does not fit
+  ends the build, and the rest is `unread` without being looked at, so the
+  work is bounded by the budget rather than by the lag.
 
 - `trible::maintenance::Driver` runs attached mappings defined downstream:
   `Driver::with_attached(mappings)` registers an `AttachedMappings` (one

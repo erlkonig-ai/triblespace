@@ -1674,19 +1674,34 @@ fn a_kept_read_is_the_next_reads_cover() {
     let observed = snapshot.attached(attached).unwrap();
     assert_eq!(observed.residual().len(), 3);
 
-    // A budget of nothing still builds the smallest foundation, and only it.
+    // A budget of nothing still builds one foundation, the first in the
+    // residual's order, and looks at nothing else.
+    let order: Vec<CollectionData> = observed.residual().data_members().collect();
     let first = observed
         .read_within_with::<Read, UnionArchive<OrderedUniverse>>(0)
         .unwrap();
     assert_eq!(
         first.built().iter().map(|b| b.node()).collect::<Vec<_>>(),
-        vec![small]
+        vec![order[0]]
     );
     assert_eq!(
-        first.unread().data_members().collect::<BTreeSet<_>>(),
-        BTreeSet::from([middle, large])
+        first.unread().data_members().collect::<Vec<_>>(),
+        order[1..].to_vec()
     );
-    assert_eq!(first.value().iter().collect::<TribleSet>(), row(1, 1, 1));
+    let facts_of_node = |node: CollectionData| {
+        if node == small {
+            row(1, 1, 1)
+        } else if node == middle {
+            row(3, 1, 1) + row(3, 2, 2)
+        } else {
+            assert_eq!(node, large);
+            row(2, 1, 1) + row(2, 2, 2) + row(2, 3, 3)
+        }
+    };
+    assert_eq!(
+        first.value().iter().collect::<TribleSet>(),
+        facts_of_node(order[0])
+    );
     drop((observed, snapshot));
     assert_eq!(store.keep_attached(first.built(), &host()).unwrap(), 1);
 
@@ -1695,22 +1710,27 @@ fn a_kept_read_is_the_next_reads_cover() {
     assert!(snapshot.collections().unwrap().contains(&attached.handle()));
     let observed = snapshot.attached(attached).unwrap();
     assert_eq!(observed.cover().len(), 1);
-    assert_eq!(residual(&observed), BTreeSet::from([middle, large]));
+    assert_eq!(
+        residual(&observed),
+        order[1..].iter().copied().collect::<BTreeSet<_>>()
+    );
 
-    // Smallest first: a budget of the middle one's bytes builds it alone.
-    let middle_length = snapshot
-        .metadata(Handle::<SimpleArchive>::from_hash(middle))
-        .unwrap()
-        .unwrap()
-        .length;
+    // A budget of exactly the next foundation's bytes builds it alone.
+    let length = |node: CollectionData| {
+        snapshot
+            .metadata(Handle::<SimpleArchive>::from_hash(node))
+            .unwrap()
+            .unwrap()
+            .length
+    };
     let second = observed
-        .read_within_with::<Read, UnionArchive<OrderedUniverse>>(middle_length)
+        .read_within_with::<Read, UnionArchive<OrderedUniverse>>(length(order[1]))
         .unwrap();
     assert_eq!(
         second.built().iter().map(|b| b.node()).collect::<Vec<_>>(),
-        vec![middle]
+        vec![order[1]]
     );
-    assert_eq!(second.unread().data_members().collect::<Vec<_>>(), vec![large]);
+    assert_eq!(second.unread().data_members().collect::<Vec<_>>(), vec![order[2]]);
     drop((observed, snapshot));
     store.keep_attached(second.built(), &host()).unwrap();
 

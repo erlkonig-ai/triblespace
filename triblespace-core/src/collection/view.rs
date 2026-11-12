@@ -447,13 +447,15 @@ where
     }
 
     /// [`Self::read_with`], building at most `budget` bytes of residual
-    /// input: the resident residual foundations are mapped smallest first,
-    /// by the length of their own bytes, while the bytes mapped so far and
-    /// the next foundation's fit in `budget`. The smallest foundation that
-    /// maps is built whatever its length, so a read with a residual always
-    /// builds something when anything can be built. The foundations left
-    /// out are [`AttachedRead::unread`] like any other gap, so a caller
-    /// tells a bounded read from a complete one the usual way.
+    /// input: the resident residual foundations are mapped in the
+    /// residual's own order while the bytes mapped so far and the next
+    /// foundation's fit in `budget` (the lengths of the foundations' own
+    /// bytes). The first foundation that maps is built whatever its length,
+    /// so a read with a residual always builds something when anything can
+    /// be built; the first that does not fit ends the build, and the rest of
+    /// the residual is not looked at. What is left out is
+    /// [`AttachedRead::unread`] like any other gap, so a caller tells a
+    /// bounded read from a complete one the usual way.
     ///
     /// This is the read for an operation that should not grow with how far
     /// the attached collection lags its parent, such as a search: what it
@@ -498,12 +500,15 @@ where
         let mut images: HashMap<[u8; 32], Bytes> = HashMap::new();
         let mut built = Vec::new();
         let mut unread = Vec::new();
-        // The residual in the order it is built, each with the length of its
-        // own bytes when a budget needs it: smallest first under a budget.
-        let mut residual = Vec::with_capacity(self.residual.len());
+        // Under a budget the residual is built in its own order until the
+        // next foundation's bytes no longer fit; the rest is unread without
+        // being looked at, so the work is bounded by the budget, never by
+        // how far the attached collection lags.
+        let mut spent: u64 = 0;
+        let mut stopped = false;
         for foundation in self.residual.members() {
             let member = Handle::<SimpleArchive>::to_hash(foundation);
-            if !builds {
+            if !builds || stopped {
                 unread.push(member);
                 continue;
             }
@@ -522,16 +527,9 @@ where
                     }
                 }
             };
-            residual.push((length, foundation));
-        }
-        if budget.is_some() {
-            residual.sort_unstable_by_key(|(length, foundation)| (*length, foundation.raw));
-        }
-        let mut spent: u64 = 0;
-        for (length, foundation) in residual {
-            let member = Handle::<SimpleArchive>::to_hash(foundation);
             if let Some(budget) = budget {
                 if !built.is_empty() && spent.saturating_add(length) > budget {
+                    stopped = true;
                     unread.push(member);
                     continue;
                 }

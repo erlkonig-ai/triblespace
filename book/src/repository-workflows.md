@@ -610,8 +610,8 @@ back with the foundation each maps: `keep_attached(read.built(), &host)` stores
 them and publishes the host's `MAP`s, so the next read takes them instead of
 building them, and the store's records now name the attached collection. A
 read that must not grow with the lag builds at most a budget of residual input
-(`read_within`, `read_within_with`): smallest foundations first, at least one,
-the rest unread. Using an index this way is what declares it: an attached
+(`read_within`, `read_within_with`): in the residual's order until the next
+foundation does not fit, at least one, the rest unread and not looked at. Using an index this way is what declares it: an attached
 descriptor that no record names is an ordinary blob, and a maintainer that
 finds its targets by `CollectionRead::collections` finds it from its first
 kept `MAP` on. Maintenance carries the
