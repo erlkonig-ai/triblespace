@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `triblespace-search`: `semantic_wemm::declared_indexes(snapshot)` answers
+  which WeMM indexes a store's records name, each with the source and the
+  model (collection, root, profile) its own descriptor states, so a
+  maintainer can bind whatever model a descriptor names instead of keeping
+  a list of indexes. It asks `CollectionRead::collections()` and queries each
+  resident descriptor; an index is found from its first record on, and a
+  descriptor no record names (registered only) is not found. The
+  `semantic-wemm` feature compiles again without `semantic-wemm-cuda`.
+
 - `triblespace-net` hydration has one function: `Hydration` starts empty and
   only advances by snapshot difference; evidence that is not an append resets
   it to empty and it advances again through the same steps. `Hydration::derive`

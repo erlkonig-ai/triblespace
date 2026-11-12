@@ -31,7 +31,9 @@ use anybytes::{Bytes, View};
 use triblespace_core::blob::encodings::{rawbytes::RawBytes, simplearchive::SimpleArchive};
 use triblespace_core::blob::{Blob, BlobEncoding, TryFromBlob};
 use triblespace_core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
-use triblespace_core::collection::{CollectionHandle, CollectionOperationError, DeriveMapping};
+use triblespace_core::collection::{
+    CollectionHandle, CollectionOperationError, CollectionRead, DeriveMapping,
+};
 use triblespace_core::id::{id_hex, ExclusiveId, Id};
 use triblespace_core::inline::encodings::{genid::GenId, hash::Handle, iu256::U256BE};
 use triblespace_core::inline::{Inline, IntoInline, TryFromInline};
@@ -333,6 +335,78 @@ pub fn carrying_collection<S>(
 /// `TRIBLESPACE_COLLECTION_*` and `trible pile collection` use.
 pub fn collection_hex(handle: CollectionHandle) -> String {
     handle.raw.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// One WeMM index a store's records name: the index's descriptor handle,
+/// the source collection that descriptor derives from, and the model it is
+/// derived with ([`WemmIdentity`]), all read from the descriptor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeclaredIndex {
+    pub index: CollectionHandle,
+    pub source: CollectionHandle,
+    pub identity: WemmIdentity,
+}
+
+/// Every WeMM index `snapshot`'s records name, each with the source and the
+/// model its own descriptor states: what a maintainer that binds whatever
+/// model a descriptor names maintains, with no list of indexes of its own.
+///
+/// It asks the store which collections its records name
+/// ([`CollectionRead::collections`], an index lookup, not a record walk),
+/// reads each one's descriptor, and matches it against the WeMM mapping.
+/// So an index is found once some record names it: a leaf derived here, or
+/// one replicated from another host. A descriptor that is registered and
+/// named by no record is not found, because a descriptor is an ordinary
+/// blob and nothing indexes blobs by what they describe.
+///
+/// A descriptor that is not resident or does not decode is passed over,
+/// and so is one that does not state all of the source, the collection, the
+/// root and the profile (the shape before the descriptor named its model
+/// collection, which binding refuses too). Facts this does not model are
+/// ignored. The answer is one observation's, recomputed by each caller.
+pub fn declared_indexes<R>(snapshot: &R) -> Result<Vec<DeclaredIndex>, R::RecordsError>
+where
+    R: CollectionRead + BlobStoreGet,
+{
+    use triblespace_core::collection::records::{
+        collection_mapping, collection_source, KIND_COLLECTION_DESCRIPTOR,
+    };
+    use triblespace_core::macros::pattern;
+    let mut declared = Vec::new();
+    for index in snapshot.collections()? {
+        let Ok(facts) = snapshot.get::<TribleSet, SimpleArchive>(index) else {
+            continue;
+        };
+        for (source, collection, root, profile) in find!(
+            (source: CollectionHandle, collection: CollectionHandle, root: Id, profile: Id),
+            pattern!(&facts, [
+                {
+                    metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+                    collection_source: ?source,
+                    collection_mapping: _?mapping,
+                },
+                {
+                    _?mapping @
+                    metadata::tag: KIND_COLLECTION_MAPPING,
+                    mapping_algorithm: WEMM_CONTENT_WINDOWS_TO_NVFP4,
+                    model_collection: ?collection,
+                    model_root: ?root,
+                    wemm_kernel_profile: ?profile,
+                },
+            ])
+        ) {
+            declared.push(DeclaredIndex {
+                index,
+                source,
+                identity: WemmIdentity {
+                    model_collection: collection,
+                    model_root: root,
+                    kernel_profile: profile,
+                },
+            });
+        }
+    }
+    Ok(declared)
 }
 
 /// Retained descriptor selection is a PATCH set, with no cached source rows.
@@ -1531,6 +1605,167 @@ mod tests {
             WemmIndex::<Embedding>::bind(&Fragment::empty(), &older).unwrap(),
             index
         );
+    }
+
+    /// One store with a source, the WeMM indexes of `identities` over it
+    /// registered, and a leaf for those `leafed` says: what a maintainer
+    /// discovers from.
+    fn indexes_with_leaves(
+        identities: &[(WemmIdentity, bool)],
+    ) -> (MemoryRepo, Collection<SimpleArchive>, Vec<CollectionHandle>) {
+        use triblespace_core::collection::{
+            CollectionDerive, CollectionRecord, CollectionStore, SourceLocator,
+        };
+        let mut store = MemoryRepo::default();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        let key = signer.verifying_key();
+        let policy =
+            CollectionPolicy::new(AdmissionPolicy::direct(key), AdmissionPolicy::direct(key));
+        let source = store.collection("source", policy.clone()).unwrap();
+        let mut indexes = Vec::new();
+        for (identity, leafed) in identities {
+            let mapping =
+                WemmIndex::<Embedding>::new([metadata::name.id()], *identity, DEFAULT_WINDOW_CAP)
+                    .unwrap();
+            let target: Collection<NvFp4CosineSet<Embedding>> =
+                store.derive_with(source, mapping, policy.clone()).unwrap();
+            if *leafed {
+                store
+                    .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                        &signer,
+                        target.handle(),
+                        SourceLocator::of([5; 32]),
+                        Inline::new([6; 32]),
+                    )))
+                    .unwrap();
+            }
+            indexes.push(target.handle());
+        }
+        (store, source, indexes)
+    }
+
+    fn other_identity(root: u8, profile: Id) -> WemmIdentity {
+        WemmIdentity {
+            model_collection: Inline::new([1; 32]),
+            model_root: Id::new([root; 16]).unwrap(),
+            kernel_profile: profile,
+        }
+    }
+
+    /// Two indexes over different roots and profiles, each named by a
+    /// record, are both found, each with the model its own descriptor
+    /// names and the source it derives from.
+    #[test]
+    fn declared_indexes_are_found_with_their_own_model() {
+        let first = other_identity(2, GB10_NATIVE_BF16_PROFILE);
+        let second = other_identity(3, GB10_NATIVE_W4A4_PROFILE);
+        let (mut store, source, indexes) = indexes_with_leaves(&[(first, true), (second, true)]);
+        let source = source.handle();
+        let mut found = declared_indexes(&store.snapshot().unwrap()).unwrap();
+        found.sort_by_key(|declared| declared.index);
+        let mut expected = vec![
+            DeclaredIndex {
+                index: indexes[0],
+                source,
+                identity: first,
+            },
+            DeclaredIndex {
+                index: indexes[1],
+                source,
+                identity: second,
+            },
+        ];
+        expected.sort_by_key(|declared| declared.index);
+        assert_eq!(found, expected);
+    }
+
+    /// A registered descriptor no record names is an ordinary blob: it is
+    /// not found. This pins where discovery stops (an index is found from
+    /// its first leaf on); a declaration with no leaf needs something that
+    /// names it.
+    #[test]
+    fn a_declared_index_without_a_record_is_not_found() {
+        let leafed = other_identity(2, GB10_NATIVE_BF16_PROFILE);
+        let bare = other_identity(4, GB10_NATIVE_W4A4_VW4A16_PROFILE);
+        let (mut store, _, indexes) = indexes_with_leaves(&[(leafed, true), (bare, false)]);
+        let found = declared_indexes(&store.snapshot().unwrap()).unwrap();
+        assert_eq!(
+            found.iter().map(|d| d.index).collect::<Vec<_>>(),
+            vec![indexes[0]]
+        );
+    }
+
+    /// Only a WeMM descriptor that states the source, the collection, the
+    /// root and the profile is found. The source collection itself (named
+    /// by its commit), a descriptor without the model collection, and a
+    /// descriptor that is not resident are passed over; a fact this does
+    /// not model changes nothing.
+    #[test]
+    fn only_complete_wemm_descriptors_are_found_and_unknown_facts_are_ignored() {
+        use triblespace_core::collection::{
+            CollectionDerive, CollectionRecord, CollectionStore, CollectionStoreExt,
+            SourceLocator,
+        };
+        use triblespace_core::repo::BlobStorePut;
+        let identity = other_identity(2, GB10_NATIVE_BF16_PROFILE);
+        let (mut store, source_collection, indexes) = indexes_with_leaves(&[(identity, true)]);
+        let source = source_collection.handle();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+        store
+            .commit(
+                source_collection,
+                &signer,
+                entity! { _ @ metadata::name: "a source member" }.into(),
+            )
+            .unwrap();
+        let leaf = |store: &mut MemoryRepo, target: CollectionHandle| {
+            store
+                .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                    &signer,
+                    target,
+                    SourceLocator::of([5; 32]),
+                    Inline::new([6; 32]),
+                )))
+                .unwrap();
+        };
+        let described: TribleSet = store.snapshot().unwrap().get(indexes[0]).unwrap();
+        // The shape before the descriptor named its model collection.
+        let mut older = TribleSet::new();
+        for fact in described.iter() {
+            if fact.a() != &model_collection.id() {
+                older.insert(fact);
+            }
+        }
+        let older = store.put::<SimpleArchive, _>(older).unwrap();
+        leaf(&mut store, older);
+        // The same descriptor with a fact nobody models: another descriptor,
+        // still a complete WeMM one.
+        let mut annotated = described.clone();
+        annotated.insert(&Trible::force(
+            &Id::new([7; 16]).unwrap(),
+            &metadata::name.id(),
+            &Inline::<Handle<RawBytes>>::new([8; 32]),
+        ));
+        let annotated = store.put::<SimpleArchive, _>(annotated).unwrap();
+        leaf(&mut store, annotated);
+        // Named by a record, but its descriptor is not here.
+        leaf(&mut store, Inline::new([9; 32]));
+        let mut found = declared_indexes(&store.snapshot().unwrap()).unwrap();
+        found.sort_by_key(|declared| declared.index);
+        let mut expected = vec![
+            DeclaredIndex {
+                index: indexes[0],
+                source,
+                identity,
+            },
+            DeclaredIndex {
+                index: annotated,
+                source,
+                identity,
+            },
+        ];
+        expected.sort_by_key(|declared| declared.index);
+        assert_eq!(found, expected);
     }
 
     #[test]
