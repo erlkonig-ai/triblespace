@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `triblespace-search` `semantic_wemm`: the scoped runtime is an
+  `Arc<Mutex<WemmRuntime>>` (`with_wemm_runtime` takes one) instead of an
+  `Rc<RefCell<..>>`, so a holder of a bound runtime is `Send + Sync`;
+  `WemmRuntime` is asserted `Send + Sync` at compile time under
+  `semantic-wemm-cuda`. The slot is still per thread and installed only for
+  the closure, so a future that computes with it installs it around each
+  poll.
+
 - An attached read can keep what it builds. `AttachedRead::built` hands back
   the image a read built in memory for each residual foundation, and
   `CollectionStoreExt::keep_attached(built, &host)` stores those images and
@@ -19,16 +27,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ends the build, and the rest is `unread` without being looked at, so the
   work is bounded by the budget rather than by the lag.
 
-- Attached mappings can be registered by their algorithm id
-  (`collection::registration`): `AttachedMappings` (`runs`, `residual`,
-  `maintain`), one `AttachedMapping::<M>::new(algorithm_id)` or a pair of
-  registrations, and `registered_targets(snapshot, mappings)`, the attached
-  collections the records name whose algorithm is registered, each with
-  that algorithm. `trible::maintenance::Driver::with_attached(mappings)`
-  runs a registered algorithm before the representation's canonical
-  mapping; an algorithm nothing registered is dispatched as before. No
-  global registry. `Driver::retarget` replaces the selection while keeping
-  what earlier passes learned.
+- Mappings are registered by their algorithm id (`collection::registration`):
+  one trait, `Mappings` (`runs`, `begin_pass`, `pending`, `maintain`, `due`),
+  for attached and derived collections alike: `AttachedMapping::<M>::new(id)`
+  (pending: the parent foundations no attachment reaches),
+  `DerivedMapping::<M>::new(id)` (pending: the source foundations with no
+  leaf), a registration's own implementation (one that binds a model owns
+  when to bind, what to keep, and when deferred work is `due`), `()` and
+  pairs. `registered_targets(snapshot, mappings)` lists the attached and
+  derived collections the records name whose algorithm is registered, each
+  with that algorithm. `trible::maintenance::Driver::with_registered(mappings)`
+  (replacing `with_attached`) runs a registered algorithm before the
+  representation's own dispatch, calls `begin_pass` at the start of every
+  pass, and passes when `due` has come even if no input changed;
+  `Driver::registered()` returns it. Unregistered algorithms, the NVFP4
+  allowlist among them, are dispatched as before. `Driver::retarget`
+  replaces the selection while keeping what earlier passes learned.
 
 - `triblespace-search`: `semantic_wemm::declared_indexes(snapshot)` answers
   which WeMM indexes a store's records name, each with the source and the

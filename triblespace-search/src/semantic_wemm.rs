@@ -25,7 +25,12 @@
 //! canonical row bytes and final scores cross back to the host.
 
 use std::borrow::Cow;
-use std::{cell::RefCell, fmt, marker::PhantomData, rc::Rc};
+use std::{
+    cell::RefCell,
+    fmt,
+    marker::PhantomData,
+    sync::{Arc, Mutex},
+};
 
 use anybytes::{Bytes, View};
 use triblespace_core::blob::encodings::{rawbytes::RawBytes, simplearchive::SimpleArchive};
@@ -628,7 +633,7 @@ where
                 return false;
             };
             runtime
-                .try_borrow()
+                .try_lock()
                 .is_ok_and(|runtime| runtime.matches(&self.identity))
         })
     }
@@ -1166,7 +1171,7 @@ fn require_gb10(name: &str, major: i32, minor: i32) -> Result<(), CollectionOper
 // One owned lease, not a process-wide model cache. The generic shell permits
 // panic/nesting tests without allocating a model or initializing a GPU.
 struct ScopedSlot<T> {
-    current: RefCell<Option<Rc<RefCell<T>>>>,
+    current: RefCell<Option<Arc<Mutex<T>>>>,
 }
 impl<T> ScopedSlot<T> {
     const fn new() -> Self {
@@ -1174,12 +1179,12 @@ impl<T> ScopedSlot<T> {
             current: RefCell::new(None),
         }
     }
-    fn current(&self) -> Option<Rc<RefCell<T>>> {
+    fn current(&self) -> Option<Arc<Mutex<T>>> {
         self.current.borrow().clone()
     }
     fn run<R>(
         &self,
-        runtime: Rc<RefCell<T>>,
+        runtime: Arc<Mutex<T>>,
         body: impl FnOnce() -> R,
     ) -> Result<R, CollectionOperationError> {
         {
@@ -1190,7 +1195,7 @@ impl<T> ScopedSlot<T> {
             if current.is_some() {
                 return Err(fatal("nested WeMM runtime scope is not allowed"));
             }
-            if runtime.try_borrow_mut().is_err() {
+            if runtime.try_lock().is_err() {
                 return Err(fatal("WeMM runtime is already borrowed"));
             }
             *current = Some(runtime);
@@ -1215,9 +1220,9 @@ thread_local! { static RUNTIME: ScopedSlot<WemmRuntime> = const { ScopedSlot::ne
 /// inherit it; do not return a future and poll it after this scope ends.
 /// Nested scopes refuse instead of silently overwriting. The slot is restored
 /// on both error returns and unwinding; ownership survives only as long as the
-/// caller's `Rc` or an active access does. Alias backing obligations outlive it.
+/// caller's `Arc` or an active access does. Alias backing obligations outlive it.
 pub fn with_wemm_runtime<R>(
-    runtime: Rc<RefCell<WemmRuntime>>,
+    runtime: Arc<Mutex<WemmRuntime>>,
     body: impl FnOnce() -> R,
 ) -> Result<R, CollectionOperationError> {
     RUNTIME.with(|slot| slot.run(runtime, body))
@@ -1231,7 +1236,7 @@ fn with_matching_runtime<R>(
         .with(ScopedSlot::current)
         .ok_or_else(|| fatal("native WeMM computation requires an explicit scoped runtime"))?;
     let mut runtime = runtime
-        .try_borrow_mut()
+        .try_lock()
         .map_err(|_| fatal("native WeMM runtime is already in use"))?;
     if !runtime.matches(identity) {
         return Err(fatal(
@@ -2273,24 +2278,24 @@ mod tests {
     #[test]
     fn owned_scope_refuses_nesting_and_clears_after_result_or_unwind() {
         let slot = ScopedSlot::new();
-        let owned = Rc::new(RefCell::new(7));
-        assert_eq!(Rc::strong_count(&owned), 1);
+        let owned = Arc::new(Mutex::new(7));
+        assert_eq!(Arc::strong_count(&owned), 1);
         let result: Result<Result<(), &str>, _> = slot.run(owned.clone(), || {
-            assert!(Rc::ptr_eq(&slot.current().unwrap(), &owned));
-            assert!(slot.run(Rc::new(RefCell::new(9)), || ()).is_err());
-            assert!(Rc::ptr_eq(&slot.current().unwrap(), &owned));
+            assert!(Arc::ptr_eq(&slot.current().unwrap(), &owned));
+            assert!(slot.run(Arc::new(Mutex::new(9)), || ()).is_err());
+            assert!(Arc::ptr_eq(&slot.current().unwrap(), &owned));
             Err("ordinary error")
         });
         assert_eq!(result.unwrap(), Err("ordinary error"));
         assert!(slot.current().is_none());
-        assert_eq!(Rc::strong_count(&owned), 1);
+        assert_eq!(Arc::strong_count(&owned), 1);
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = slot.run(owned.clone(), || panic!("intentional unwind"));
         }));
         assert!(panic.is_err());
         assert!(slot.current().is_none());
-        assert_eq!(Rc::strong_count(&owned), 1);
-        let guard = owned.borrow_mut();
+        assert_eq!(Arc::strong_count(&owned), 1);
+        let guard = owned.lock().unwrap();
         assert!(slot.run(owned.clone(), || ()).is_err());
         drop(guard);
         assert_eq!(slot.run(owned, || 42).unwrap(), 42);
@@ -2593,7 +2598,7 @@ mod tests {
         };
         let runtime = WemmRuntime::from_native(native, codec.clone(), &model).unwrap();
         assert_eq!(runtime.identity(), identity, "the bound model's own identity");
-        let runtime = Rc::new(RefCell::new(runtime));
+        let runtime = Arc::new(Mutex::new(runtime));
 
         let filler: String = (0..40)
             .map(|i| format!("Entry {i}: the lighthouse keeper trimmed the lamp wick, wound the clockwork that turns the lens and logged each passing ship.\n"))
@@ -2654,7 +2659,7 @@ mod tests {
 
         let reader = store.snapshot().unwrap();
         // The first pass also compiles the kernels; the second is warm.
-        with_wemm_runtime(Rc::clone(&runtime), || {
+        with_wemm_runtime(Arc::clone(&runtime), || {
             for pass in ["cold", "warm"] {
                 for ((name, _, expected), handle) in items.iter().zip(&handles) {
                     let mut facts = TribleSet::new();
@@ -2681,7 +2686,7 @@ mod tests {
 
         let target: Collection<NvFp4CosineSet<Embedding>> =
             store.derive_with(source, mapping.clone(), policy).unwrap();
-        let index: NvFp4CosineIndex<Embedding> = with_wemm_runtime(Rc::clone(&runtime), || {
+        let index: NvFp4CosineIndex<Embedding> = with_wemm_runtime(Arc::clone(&runtime), || {
             let snapshot = futures::executor::block_on(
                 store.maintain_with::<WemmIndex<Embedding>>(target, &key),
             )
@@ -2714,3 +2719,12 @@ mod tests {
         assert!(cosines.cosine(&handles[4]).is_none() && cosines.cosine(&handles[5]).is_none());
     }
 }
+
+/// A bound runtime may move between threads and be shared behind its
+/// mutex: a maintenance registration that holds one is Send and Sync
+/// (`triblespace_core::collection::Mappings`).
+#[cfg(feature = "semantic-wemm-cuda")]
+const _: () = {
+    const fn send_and_sync<T: Send + Sync>() {}
+    send_and_sync::<WemmRuntime>()
+};
