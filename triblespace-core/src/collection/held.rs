@@ -76,10 +76,12 @@
 //! driver ([`HeldStore::drive_held`]) does the reading, in bounded steps
 //! against the latest observed snapshot: it judges proofs, which reads the
 //! collection descriptors they name, and computes closures, which reads
-//! every blob they reach once. A building collection is published once its
-//! first closure is whole and its proofs are judged; a built collection's
-//! set grows as the driver reaches what arrived, so a snapshot's held sets
-//! can lag the records in that snapshot. A changed
+//! every blob they reach once. It extends built collections first, and
+//! building collections take turns, so a small one is published without
+//! waiting for a large one's whole first closure. A building collection is
+//! published once its first closure is whole and its proofs are judged; a
+//! built collection's set grows as the driver reaches what arrived, so a
+//! snapshot's held sets can lag the records in that snapshot. A changed
 //! [`HeldRead::held_generation`] says the sets grew although the store may
 //! not have changed. The driver never holds the index across a read, so
 //! taking a snapshot waits for at most a few in-memory updates, never for a
@@ -374,7 +376,8 @@ struct State<T> {
     misjudged: Handles,
     /// `collection || blob`: peer reports not resolved yet.
     candidates: Pairs,
-    /// Closure computations not finished yet, oldest first.
+    /// Closure computations not finished yet. The driver runs a built
+    /// collection's first and lets building collections take turns.
     jobs: VecDeque<Job>,
     /// Settled collections whose first closure or proof judgement is not
     /// done yet: kept here, published only once built.
@@ -1017,12 +1020,15 @@ impl<T: HeldSource> HeldIndex<T> {
 }
 
 impl<T: HeldSource + Send> Drive for HeldIndex<T> {
-    /// Judge the proofs queued for judging, then run queued jobs, oldest
-    /// first, against the latest observed snapshot, for about `budget`: at
-    /// least one step, then until the budget is spent or another locker
-    /// waits. A building collection is published once its last job finishes
-    /// and its proofs are judged, never in between; a built collection's set
-    /// whenever it grew.
+    /// Judge the proofs queued for judging, then run queued jobs against the
+    /// latest observed snapshot, for about `budget`: at least one step, then
+    /// until the budget is spent or another locker waits. A built
+    /// collection's jobs go first, since they extend a published set; then
+    /// building collections take turns, a paused job going behind the
+    /// others, so a small collection is not held back by a large one's whole
+    /// first closure. A building collection is published once its last job
+    /// finishes and its proofs are judged, never in between; a built
+    /// collection's set whenever it grew.
     ///
     /// Every read happens with the state unlocked: a blob's with its job
     /// parked in [`State::active`], a judgement's with its collections in
@@ -1085,7 +1091,12 @@ impl<T: HeldSource + Send> Drive for HeldIndex<T> {
             pause();
         }
         let more = loop {
-            let Some(mut job) = state.jobs.pop_front() else {
+            let next = state
+                .jobs
+                .iter()
+                .position(|job| state.building.get(&job.collection.raw).is_none())
+                .unwrap_or(0);
+            let Some(mut job) = state.jobs.remove(next) else {
                 break false;
             };
             // The job and whether it is done, or `None` when a reset
@@ -1132,7 +1143,11 @@ impl<T: HeldSource + Send> Drive for HeldIndex<T> {
             match ended {
                 Some((job, true)) => publish |= state.retire(job.collection),
                 Some((job, false)) => {
-                    state.jobs.push_front(job);
+                    if state.building.get(&job.collection.raw).is_some() {
+                        state.jobs.push_back(job);
+                    } else {
+                        state.jobs.push_front(job);
+                    }
                     break true;
                 }
                 None => {}
@@ -2404,6 +2419,97 @@ mod tests {
         assert!(unknown > 10, "{unknown} snapshots before it was whole");
         let counts = store.reads.lock().unwrap().clone();
         assert!(counts.values().all(|count| *count == 1), "{counts:?}");
+    }
+
+    /// Driver steps of zero budget until `c` is published, at most `limit`;
+    /// how many it took, or `None`.
+    fn steps_until_published(
+        store: &mut Store,
+        work: &mut HeldWork,
+        c: CollectionHandle,
+        limit: usize,
+    ) -> Option<usize> {
+        for steps in 1..=limit {
+            assert!(work.step(Duration::ZERO, Duration::ZERO));
+            if store.snapshot().unwrap().held(c).is_some() {
+                return Some(steps);
+            }
+        }
+        None
+    }
+
+    /// Building collections take turns: a small collection tracked after a
+    /// large one is published within a few driver steps, long before the
+    /// large one's first closure is whole.
+    #[test]
+    fn a_small_collection_is_not_held_back_by_a_large_ones_build() {
+        let mut store = Store::default();
+        let large = collection(&mut store, "large, tracked first");
+        let whole = wide(&mut store, large, 20);
+        let small = collection(&mut store, "small, tracked second");
+        let metadata = blob(&mut store, b"small metadata");
+        let data = blob(&mut store, b"small data");
+        commit(&mut store, small, data, metadata);
+        let mut work = store.drive_held().expect("the only driver");
+        store.track_held([large]);
+        store.snapshot().unwrap();
+        assert!(work.step(Duration::ZERO, Duration::ZERO));
+        store.track_held([small]);
+        store.snapshot().unwrap();
+        let steps = steps_until_published(&mut store, &mut work, small, 1_000)
+            .expect("the small collection is published");
+        assert_eq!(
+            held_set(&store.snapshot().unwrap(), small),
+            BTreeSet::from([small.raw, data, metadata])
+        );
+        assert_eq!(
+            store.snapshot().unwrap().held(large),
+            None,
+            "published after {steps} steps, only once the large closure was whole"
+        );
+        assert!(steps < 30, "{steps} steps for three blobs");
+        assert!(work.run_until_idle());
+        assert_eq!(held_set(&store.snapshot().unwrap(), large), whole);
+    }
+
+    /// A built collection's new record is served before an unfinished
+    /// building job continues: its set grows within a few driver steps
+    /// while the large build is still running.
+    #[test]
+    fn a_built_collections_new_record_goes_before_a_build() {
+        let mut store = Store::default();
+        let built = collection(&mut store, "built first");
+        store.track_held([built]);
+        settled(&mut store);
+        let large = collection(&mut store, "large, building");
+        let whole = wide(&mut store, large, 20);
+        let mut work = store.drive_held().expect("the only driver");
+        store.track_held([large]);
+        store.snapshot().unwrap();
+        for _ in 0..5 {
+            assert!(work.step(Duration::ZERO, Duration::ZERO));
+        }
+        let metadata = blob(&mut store, b"built metadata");
+        let leaf = blob(&mut store, b"built leaf");
+        let data = blob_naming(&mut store, b"built payload", &[leaf]);
+        commit(&mut store, built, data, metadata);
+        store.snapshot().unwrap();
+        let mut steps = 0;
+        while !held_set(&store.snapshot().unwrap(), built).contains(&data) {
+            assert!(work.step(Duration::ZERO, Duration::ZERO));
+            steps += 1;
+            assert!(steps < 1_000, "the record never joined");
+        }
+        assert_eq!(
+            store.snapshot().unwrap().held(large),
+            None,
+            "joined after {steps} steps, only once the large closure was whole"
+        );
+        assert!(steps < 20, "{steps} steps for three blobs");
+        assert!(held_set(&store.snapshot().unwrap(), built)
+            .is_superset(&BTreeSet::from([data, leaf, metadata])));
+        assert!(work.run_until_idle());
+        assert_eq!(held_set(&store.snapshot().unwrap(), large), whole);
     }
 
     /// Dropping the work leaves the build where it stood: snapshots compute

@@ -1616,7 +1616,9 @@ collections from their records, and notes whose proofs are to be judged. The
 driver (`HeldWork`, a peer's held-set thread) does every read, in bounded
 steps against the latest observed snapshot and never holding the index across
 a read: it judges proofs, which reads the collection descriptors they name,
-and computes closures, which reads every blob they reach once. A newly
+and computes closures, which reads every blob they reach once. It extends
+built collections first, and building collections take turns in bounded
+slices, so a small collection is not held back by a large one. A newly
 tracked collection is unknown until its first closure is whole and its
 proofs are judged; a built collection's set grows as the driver reaches what
 arrived, so an observation can be handed out ahead of its new records'

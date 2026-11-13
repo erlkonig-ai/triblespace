@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- The held-set driver extends built collections first, and building
+  collections take turns: a paused building job goes behind the others
+  instead of resuming at the front. A small collection tracked after a large
+  one is published within a few driver steps rather than after the large
+  one's whole first closure, and a built collection's new record no longer
+  waits for a build.
+
 - Held-set repair has no snapshot gap any more: every held-set read,
   descriptor reads for proof judging included, runs on a peer's held-set
   thread, which repairs through `Repairing`. A small collection's corrupt blob
