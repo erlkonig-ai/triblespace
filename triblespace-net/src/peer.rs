@@ -671,11 +671,12 @@ where
     /// references tree is not exchanged), and neither landing nor this call
     /// waits for it. The thread ends once the store is gone.
     ///
-    /// That thread, and only it, repairs what it reads through a
+    /// That thread is the only one that reads for the held sets (a snapshot
+    /// reads no blob), and only it repairs what it reads through a
     /// [`Repairing`] store: a blob whose bytes fail validation is fetched,
     /// landed and read back, so it and what is above it join the held set.
-    /// A corrupt blob a snapshot reads first, inline, is not repaired (see
-    /// the module documentation of `peer/repair.rs`).
+    /// If the thread cannot start, or another driver owns the store, nothing
+    /// builds this peer's held sets: they stay unknown until a driver runs.
     pub fn set_replication(
         &mut self,
         mode: ReplicationMode,
@@ -691,8 +692,8 @@ where
             let work = self.store().drive_held();
             if let Some(mut work) = work {
                 let fetch = self.held_repair();
-                // A thread that cannot start drops the work, which hands
-                // the building back to snapshots.
+                // A thread that cannot start drops the work; the queue waits
+                // for the next driver, and the held sets stay unknown.
                 let spawned =
                     std::thread::Builder::new()
                         .name("held-sets".into())
@@ -706,7 +707,7 @@ where
                 match spawned {
                     Ok(_) => self.held_driven = true,
                     Err(error) => {
-                        tracing::warn!(%error, "held sets are built by snapshots: no thread")
+                        tracing::warn!(%error, "held sets stay unknown: no held-set thread")
                     }
                 }
             }
@@ -736,14 +737,6 @@ where
     /// the fetched blob, so what the scan reads is the store's bytes, not the
     /// network's buffer. Holds the peer weakly: the thread keeps no store
     /// alive.
-    ///
-    /// Known gap: only blobs this thread reads are repaired. A corrupt blob
-    /// first read inside a snapshot -- a building collection's inline
-    /// allowance, or the publication barrier that extends every built
-    /// collection -- is marked unknown in that job and not read again. A later
-    /// job (a new record, a peer's report) can retry it once the bytes are
-    /// repaired; without one it stays out until a reset or a reopen (see the
-    /// module documentation of `peer/repair.rs`).
     fn held_repair(&self) -> impl FnMut(RawHash) -> Option<Bytes> + Send + 'static + use<S> {
         let serving = Arc::downgrade(&self.serving);
         let host = Arc::downgrade(&self.host);
@@ -1540,9 +1533,10 @@ mod tests {
         assert!(peer.last_event_at() > before);
     }
 
-    /// A Full selection made while another driver builds the store's held
-    /// sets leaves the peer undriven, and a later one starts its thread once
-    /// that driver is gone: the peer is not left to snapshots for good.
+    /// A Full selection made while another driver owns the store leaves the
+    /// peer undriven (only that driver builds the held sets), and a later one
+    /// starts its thread once that driver is gone: the peer's held sets are
+    /// not left unknown for good.
     #[tokio::test]
     async fn full_replication_drives_held_sets_once_another_driver_is_gone() {
         use triblespace_core::collection::HeldStore;
@@ -1567,9 +1561,9 @@ mod tests {
     }
 
     /// Full replication builds a collection's first closure on the peer's
-    /// held-set thread: wider than a snapshot's allowance, its held set is
-    /// unknown until the thread publishes it whole, while nothing but
-    /// snapshots that build nothing runs here and landing goes on.
+    /// held-set thread: its held set is unknown until the thread publishes
+    /// it whole, while nothing but snapshots that read nothing runs here and
+    /// landing goes on.
     #[tokio::test]
     async fn full_replication_builds_held_sets_on_their_own_thread() {
         use triblespace_core::collection::{

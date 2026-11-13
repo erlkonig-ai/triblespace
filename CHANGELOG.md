@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Held-set repair has no snapshot gap any more: every held-set read,
+  descriptor reads for proof judging included, runs on a peer's held-set
+  thread, which repairs through `Repairing`. A small collection's corrupt blob
+  is now repaired like any other. The "known gap" notes in `peer/repair.rs`,
+  `Peer::set_replication`, `trible pile net sync` and the book are removed.
+
 - Taking a snapshot reads no blob. `HeldIndex::observe` only queues work:
   the seeds of new records, seeds whose bytes arrived, peer reports, and the
   collections whose proofs are to be judged. The inline allowance

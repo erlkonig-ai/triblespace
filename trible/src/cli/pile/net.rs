@@ -37,13 +37,8 @@ fn open_pile(path: &PathBuf, host: Option<ed25519_dalek::VerifyingKey>) -> Resul
 /// a blob it reads whose bytes fail validation: it fetches a verified copy,
 /// lands it beside the corrupt one and reads it back, so the blob and what
 /// is above it join the held set. Every other read, and every read in
-/// Demand, where no held-set thread runs, is exactly a [`Pile`]'s.
-///
-/// Known gap: a corrupt blob that a snapshot reads first -- a building
-/// collection's inline allowance, or the publication barrier that extends a
-/// built collection -- is not repaired there. It stays out of that
-/// collection's held set until a later job retries it (a new record, a
-/// peer's report) or the index resets (`triblespace-net`'s `peer/repair.rs`).
+/// Demand, where no held-set thread runs, is exactly a [`Pile`]'s. A
+/// snapshot reads no blob, so every held-set read is that thread's.
 type Custody = Covered<Repairing<PileFile>>;
 /// One observation of [`Custody`].
 type CustodySnapshot = <Custody as SnapshotSource>::Snapshot;

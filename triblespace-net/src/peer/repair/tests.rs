@@ -1,11 +1,9 @@
 //! The held-set thread repairs what it reads; nothing else does.
 //!
 //! A test capability stands in for a neighbour holding valid bytes and counts
-//! every exact GET it is asked, with the asking thread. A snapshot reads a
-//! building collection's first closure itself only up to an allowance of
-//! 16 MiB (held.rs, `INLINE_BYTES`); a larger blob, and everything the scan
-//! reaches after it, is the held-set thread's. The fixtures use one such
-//! blob to put the reads they test on that thread.
+//! every exact GET it is asked, with the asking thread. A snapshot reads no
+//! blob, so every read of a held set, and every repair, is the held-set
+//! thread's.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Seek, SeekFrom, Write};
@@ -21,7 +19,7 @@ use triblespace_core::collection::{
     CollectionCommit, CollectionHandle, CollectionRecord, CollectionStore, HeldRead,
 };
 use triblespace_core::inline::Inline;
-use triblespace_core::repo::pile::{GetBlobError, PileFile, PileRecordContent, PileRecords};
+use triblespace_core::repo::pile::{PileFile, PileRecordContent, PileRecords};
 use triblespace_core::repo::{BlobStoreGet, BlobStorePut, StorageClose};
 
 use super::Repairing;
@@ -32,7 +30,8 @@ use crate::reconcile::ReplicationMode;
 
 type Store = Covered<Repairing<PileFile>>;
 
-/// More than a snapshot reads of a building collection itself.
+/// A seed larger than the 16 MiB a snapshot once read of a building
+/// collection itself: a large read on the held-set thread.
 const LARGE: usize = (16 << 20) + 4096;
 
 /// A neighbour that holds `blobs` and counts every GET, by handle and by the
@@ -212,7 +211,8 @@ fn holds(
 /// C7. In Shallow, a descendant and a seed whose bytes fail validation are
 /// fetched once each by the held-set thread, land beside the corrupt copies,
 /// and join the held set with every ancestor. An absent seed is never
-/// fetched, and a corrupt blob a snapshot reads itself is never repaired.
+/// fetched. A small collection, which a snapshot once read itself without
+/// repair, is now read and repaired by that thread too.
 #[test]
 fn the_held_thread_repairs_corrupt_blobs_and_only_it() {
     // C: a seed `large` (read by the held thread, corrupt) names `middle`,
@@ -223,7 +223,7 @@ fn the_held_thread_repairs_corrupt_blobs_and_only_it() {
     let large = parent(&[&middle], b"large seed filler ", LARGE);
     let absent = blob(b"repair absent seed".to_vec());
     let descriptor = blob(b"repair descriptor C".to_vec());
-    // C2: small, so the snapshot that settles it reads it whole itself.
+    // C2: small, which a snapshot once read itself without repairing it.
     let inline_leaf = blob(b"repair inline leaf, damaged".to_vec());
     let inline_parent = parent(&[&inline_leaf], b"inline", 80);
     let inline_metadata = blob(b"repair inline metadata".to_vec());
@@ -241,8 +241,6 @@ fn the_held_thread_repairs_corrupt_blobs_and_only_it() {
             &inline_metadata,
         ],
         vec![
-            // Roots are read last first: `large` before `absent`, so both
-            // are the held thread's.
             commit(&descriptor, absent.get_handle().raw, large.get_handle().raw),
             commit(
                 &inline_descriptor,
@@ -263,7 +261,7 @@ fn the_held_thread_repairs_corrupt_blobs_and_only_it() {
     let c = collection(&descriptor);
     let c2 = collection(&inline_descriptor);
 
-    // C2 alone first: this call's snapshot reads all of it, on this thread.
+    // C2 alone first: this call's snapshot reads none of it.
     peer.set_replication(ReplicationMode::Shallow, [c2]);
     peer.set_replication(ReplicationMode::Shallow, [c2, c]);
     let snapshot = built(&mut peer, &[c, c2]);
@@ -272,12 +270,17 @@ fn the_held_thread_repairs_corrupt_blobs_and_only_it() {
         assert!(holds(&snapshot, c, blob), "the repaired closure joins");
     }
     assert!(!holds(&snapshot, c, &absent), "an absent seed stays out");
-    assert!(holds(&snapshot, c2, &inline_descriptor));
-    assert!(holds(&snapshot, c2, &inline_metadata));
-    assert!(
-        !holds(&snapshot, c2, &inline_leaf) && !holds(&snapshot, c2, &inline_parent),
-        "a corrupt blob a snapshot read is not repaired, and nothing above it joins"
-    );
+    for blob in [
+        &inline_descriptor,
+        &inline_metadata,
+        &inline_parent,
+        &inline_leaf,
+    ] {
+        assert!(
+            holds(&snapshot, c2, blob),
+            "the small collection is repaired too"
+        );
+    }
 
     assert_eq!(neighbour.gets(large.get_handle().raw), 1);
     assert_eq!(neighbour.gets(leaf.get_handle().raw), 1);
@@ -286,8 +289,8 @@ fn the_held_thread_repairs_corrupt_blobs_and_only_it() {
         0,
         "absence is not fetched"
     );
-    assert_eq!(neighbour.gets(inline_leaf.get_handle().raw), 0);
-    assert_eq!(neighbour.total(), 2);
+    assert_eq!(neighbour.gets(inline_leaf.get_handle().raw), 1);
+    assert_eq!(neighbour.total(), 3);
     assert_eq!(
         neighbour.threads(),
         BTreeSet::from(["held-sets".to_owned()]),
@@ -297,33 +300,29 @@ fn the_held_thread_repairs_corrupt_blobs_and_only_it() {
     // A second copy of each repaired blob, read and validated from the pile.
     assert_eq!(occurrences(file.path(), &large), 2);
     assert_eq!(occurrences(file.path(), &leaf), 2);
-    assert_eq!(occurrences(file.path(), &inline_leaf), 1);
-    for blob in [&large, &leaf] {
+    assert_eq!(occurrences(file.path(), &inline_leaf), 2);
+    for blob in [&large, &leaf, &inline_leaf] {
         let read: Bytes =
             BlobStoreGet::get::<Bytes, UnknownBlob>(&*snapshot, blob.get_handle()).unwrap();
         assert_eq!(read, blob.bytes);
     }
-    assert!(matches!(
-        BlobStoreGet::get::<Bytes, UnknownBlob>(&*snapshot, inline_leaf.get_handle()),
-        Err(GetBlobError::ValidationError(_))
-    ));
 
     // Later passes ask for nothing more.
     for _ in 0..5 {
         drop(triblespace_core::repo::SnapshotSource::snapshot(&mut peer).unwrap());
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(neighbour.total(), 2);
+    assert_eq!(neighbour.total(), 3);
     drop(snapshot);
     peer.close().unwrap();
 }
 
-/// The repair is gated to the held-set thread because a snapshot reads held
-/// sets with the store mutex held: a repair there would land under the
-/// mutex it already holds. A snapshot that reads a corrupt blob itself
-/// finishes, and fetches nothing.
+/// A snapshot reads no blob, so a snapshot taken with the store mutex held
+/// neither reads nor fetches a corrupt blob: it finishes at once. The
+/// held-set thread reads it, repairs it, and the held set gains it and its
+/// parent. Only that thread asks the neighbour.
 #[test]
-fn a_snapshot_that_reads_a_corrupt_blob_under_the_store_mutex_finishes() {
+fn a_snapshot_under_the_store_mutex_reads_nothing_and_the_held_thread_repairs() {
     let leaf = blob(b"gate leaf, damaged".to_vec());
     let parent_blob = parent(&[&leaf], b"gate", 80);
     let descriptor = blob(b"gate descriptor".to_vec());
@@ -341,26 +340,36 @@ fn a_snapshot_that_reads_a_corrupt_blob_under_the_store_mutex_finishes() {
     let (done, finished) = std::sync::mpsc::channel();
     let path = file.path().to_owned();
     let asked = neighbour.clone();
+    let (leaf_blob, parent_held) = (leaf.clone(), parent_blob.clone());
     let owner = std::thread::Builder::new()
         .name("owner".into())
         .spawn(move || {
             let (mut peer, _wiring) = peer(&path, asked);
             peer.set_replication(ReplicationMode::Shallow, [c]);
-            let snapshot = triblespace_core::repo::SnapshotSource::snapshot(&mut peer).unwrap();
-            let read = snapshot
-                .held(c)
-                .map(|held| held.has_prefix(&leaf.get_handle().raw));
+            drop(triblespace_core::repo::SnapshotSource::snapshot(&mut peer).unwrap());
+            done.send(()).unwrap();
+            let snapshot = built(&mut peer, &[c]);
+            let held = (
+                holds(&snapshot, c, &leaf_blob),
+                holds(&snapshot, c, &parent_held),
+            );
             drop(snapshot);
-            done.send(read).unwrap();
             peer.close().unwrap();
+            held
         })
         .unwrap();
-    let read = finished
+    finished
         .recv_timeout(Duration::from_secs(20))
         .expect("a snapshot under the store mutex did not finish");
-    assert_eq!(read, Some(false), "built inline, without the corrupt leaf");
-    owner.join().unwrap();
-    assert_eq!(neighbour.total(), 0);
+    let held = owner.join().unwrap();
+    assert_eq!(held, (true, true), "the repaired leaf and its parent join");
+    assert_eq!(neighbour.gets(leaf.get_handle().raw), 1);
+    assert_eq!(neighbour.total(), 1);
+    assert_eq!(
+        neighbour.threads(),
+        BTreeSet::from(["held-sets".to_owned()]),
+        "only the held-set thread fetched"
+    );
 }
 
 /// A blob no neighbour holds is tried once per thread, not once per closure
@@ -382,8 +391,7 @@ fn a_blob_no_neighbour_holds_is_tried_once() {
     let neighbour = Neighbour::holding([]);
     let (mut peer, _wiring) = peer(file.path(), neighbour.clone());
     let (one, two) = (collection(&first), collection(&second));
-    // Settled by one snapshot, so the shared seed spends the allowance of
-    // both: each collection's closure reaches the leaf on the held thread.
+    // Each collection's closure reaches the leaf on the held thread.
     peer.set_replication(ReplicationMode::Shallow, [one, two]);
     let snapshot = built(&mut peer, &[one, two]);
     assert!(holds(&snapshot, one, &first));

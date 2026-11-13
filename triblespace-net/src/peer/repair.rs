@@ -16,40 +16,18 @@
 //! A blob that is not resident is never fetched: absence stays absence.
 //!
 //! Only a peer's held-set thread repairs ([`Peer::set_replication`] installs
-//! the repair there). Every other thread reads exactly as the inner store
-//! does, because the held sets are also read *inside* taking a snapshot -- the
-//! publication barrier and a building collection's first allowance -- with the
-//! store mutex held, on the owner's thread or the landing task. Landing a
-//! repair there would take that mutex again and block an async runtime on the
-//! network. The held-set thread holds neither the store mutex nor the held
-//! index while it reads, and nothing waits for it.
+//! the repair there), and it is the only thread that reads for the held sets:
+//! a snapshot reads no blob, it only queues work for that thread, which
+//! judges proofs (reading collection descriptors) and computes closures. Every
+//! other thread reads exactly as the inner store does: the serving
+//! publication and ordinary readers read through the same snapshot type, some
+//! with the store mutex held or inside an async runtime, where landing a
+//! repair would take that mutex again or block the runtime on the network.
+//! The held-set thread holds neither the store mutex nor the held index while
+//! it reads, and nothing waits for it.
 //!
 //! Each thread tries each handle at most once: a blob no neighbour holds costs
 //! one fetch, not one per closure that reaches it.
-//!
-//! # Known gap: what a snapshot reads first is not repaired
-//!
-//! Only blobs the held-set thread reads are repaired, and that thread reads
-//! only a building collection's first closure, past what a snapshot read of it
-//! inline. Two reads run inside a snapshot instead, on a thread that may not
-//! repair:
-//!
-//! - the inline allowance: the snapshot that settles collections reads their
-//!   first closures itself, up to 256 scans or 16 MiB shared by all of them
-//!   (`INLINE_SCANS`/`INLINE_BYTES` in the core's `held.rs`);
-//! - the publication barrier: every extension of a built collection -- a new
-//!   record's closure, an arrived pending seed, a peer's report -- runs inline
-//!   in a snapshot, for the life of the store.
-//!
-//! A corrupt blob first read there is marked unknown in its job, and that job
-//! does not read it again. Unknown is scoped to the job: a later job can
-//! retry it and its ancestors -- a new record naming them, or a peer's report
-//! of a handle the set does not hold -- and if the bytes were repaired
-//! meanwhile, they join then. A bare valid duplicate of the bytes alone starts
-//! no new job, so without such a trigger they stay out until the index resets
-//! or the store reopens. Closing this needs a change in the core's held index
-//! (hand such a job to the driver rather than marking the blob unknown); it
-//! is not made here.
 //!
 //! Bounds and lifetimes: the attempt memo records a handle before its fetch,
 //! so a failed attempt also counts, once per held-set thread, and a held-index
