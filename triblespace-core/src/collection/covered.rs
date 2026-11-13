@@ -249,7 +249,7 @@ where
 
     fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
         let now = self.inner.snapshot()?;
-        Ok(self.observe(now))
+        Ok(self.observe(now, true))
     }
 }
 
@@ -259,13 +259,15 @@ where
     S::Snapshot: HeldSource,
 {
     /// Hand out `now`, an observation of the inner store at or after the
-    /// last one handed out, with the indexes caught up to it.
-    fn observe(&mut self, now: S::Snapshot) -> CoveredSnapshot<S::Snapshot> {
+    /// last one handed out, with the indexes caught up to it. `whole` says
+    /// that it observes the whole store, not a prefix of a climb.
+    fn observe(&mut self, now: S::Snapshot, whole: bool) -> CoveredSnapshot<S::Snapshot> {
         let memo = self.carry_forward(&now);
         // The publication barrier: for every built collection, the closures
         // of what arrived since the last snapshot are computed against this
         // one before it is handed out. Nothing is tracked, nothing is paid.
-        let held = self.held.observe(&now);
+        // No held set is computed before the store was observed whole once.
+        let held = self.held.observe(&now, whole);
         self.last = Some((now.clone(), std::sync::Arc::clone(&memo)));
         CoveredSnapshot {
             inner: now,
@@ -402,8 +404,10 @@ where
     /// says whether this step reached the end of the file it observed.
     ///
     /// Every step is an ordinary snapshot of one lineage: the coverage memo
-    /// and the held sets catch up by difference, as between any two
-    /// snapshots. A prefix is a partial pile, nothing more, so a consumer
+    /// catches up by difference, as between any two snapshots. The held sets
+    /// stay unknown until a step reaches the end once, since a prefix can
+    /// hold a parent without its child; from then on they catch up by
+    /// difference too. A prefix is a partial pile, nothing more, so a consumer
     /// that advances by snapshot difference can climb a large pile in
     /// bounded pieces and reach the same answer as one snapshot of the end.
     /// A step bounds the records replayed, not what a consumer then reads
@@ -413,7 +417,7 @@ where
         max_bytes: u64,
     ) -> Result<(CoveredSnapshot<S::Snapshot>, bool), S::SnapshotError> {
         let (now, reached_end) = self.inner.snapshot_step(max_bytes)?;
-        Ok((self.observe(now), reached_end))
+        Ok((self.observe(now, reached_end), reached_end))
     }
 }
 

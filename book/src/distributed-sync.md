@@ -1618,7 +1618,10 @@ children: a blob joins only once every child the cache names for it has
 joined. A blob that cannot be read, absent or resident and failing to read, is
 unknown on every path, and nothing above it joins. When a collection is first
 tracked, its existing closure is computed by the next snapshot, which reads
-every blob it reaches once; nothing here starts a thread. A collection whose
+every blob it reaches once; nothing here starts a thread. No held set is
+computed before the store has been observed whole once: a step of a climb
+observes a prefix, where a parent can precede its child and would make it a
+late child, so every held set is unknown until a step reaches the end. A collection whose
 records the store cannot select stays unsettled -- absent from the held sets,
 never published short -- and is selected again at the next observation. A
 snapshot that lost a blob its predecessor had resets the index, and every

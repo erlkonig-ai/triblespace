@@ -3111,10 +3111,11 @@ mod tests {
     }
 
     /// Climbing a file-order pile in small steps, with the selection growing
-    /// as collections appear, gives at every prefix the hydration and the
-    /// held sets that a fresh store reading that prefix at once gives, and at
-    /// the end the answer for the whole file. A peer assembled over the
-    /// climbed pile then continues from the climb without rereading a root.
+    /// as collections appear, gives at every prefix the hydration that a
+    /// fresh store reading that prefix at once gives, and at the end the
+    /// answer for the whole file, held sets included; before the end no held
+    /// set is known. A peer assembled over the climbed pile then continues
+    /// from the climb without rereading a root.
     #[tokio::test]
     async fn a_climb_over_a_file_order_pile_equals_reading_its_end() {
         let (path, collections) = file_order_pile();
@@ -3134,14 +3135,20 @@ mod tests {
             let (roots, missing, held) = read_at_once(path.path(), prefix, &collections).await;
             assert_eq!(hydration.roots, roots, "roots at prefix {prefix}");
             assert_eq!(hydration.missing, missing, "missing at prefix {prefix}");
-            assert_eq!(
-                held_sets(&snapshot, &collections),
-                held,
-                "held sets at prefix {prefix}"
-            );
             if reached_end {
+                assert_eq!(
+                    held_sets(&snapshot, &collections),
+                    held,
+                    "held sets at the end"
+                );
                 break;
             }
+            assert!(
+                held_sets(&snapshot, &collections)
+                    .iter()
+                    .all(Option::is_none),
+                "held sets unknown at prefix {prefix}"
+            );
         }
         assert_eq!(pile.replayed_length(), length);
         assert!(steps > 20, "{steps} steps is not a climb");
@@ -3186,6 +3193,63 @@ mod tests {
             (roots.len(), 1)
         );
         peer.into_store().close().unwrap();
+    }
+
+    /// A climb over a pile that holds a child after its parent ends with the
+    /// held set of the whole file. The parent is a COMMIT's payload naming
+    /// the child, and the file holds the child only after the parent and its
+    /// COMMIT. A prefix with the parent and without the child would scan the
+    /// parent without that edge, and the child, which no record names, would
+    /// never join (a late child). So no held set is known before the climb
+    /// first reaches the end of the file.
+    #[tokio::test]
+    async fn a_climb_holds_a_child_written_after_its_parent() {
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut pile = Pile::open(path.path()).unwrap();
+        let descriptor = put_pile(&mut pile, b"late child descriptor".to_vec());
+        let metadata = put_pile(&mut pile, b"late child metadata".to_vec());
+        let child = b"a child written after its parent".to_vec();
+        let child_handle = Blob::<UnknownBlob>::new(Bytes::from_source(child.clone()))
+            .get_handle()
+            .raw;
+        // An aligned word naming the child makes it the parent's child.
+        let parent = put_pile(&mut pile, [&child_handle[..], &[0x5a; 32][..]].concat());
+        pile.insert(commit_record(descriptor, parent, metadata))
+            .unwrap();
+        put_pile(&mut pile, child);
+        pile.close().unwrap();
+        let length = std::fs::metadata(path.path()).unwrap().len();
+        let collections = [Inline::new(descriptor)];
+
+        let mut pile = Pile::open(path.path()).unwrap();
+        pile.track_held(collections);
+        let mut steps = 0;
+        let mut known_before_end = Vec::new();
+        let held = loop {
+            // One record per step.
+            let (snapshot, reached_end) = pile.snapshot_step(1).unwrap();
+            steps += 1;
+            let held = held_sets(&snapshot, &collections);
+            if reached_end {
+                break held;
+            }
+            if held.iter().any(Option::is_some) {
+                known_before_end.push(pile.replayed_length());
+            }
+        };
+        assert_eq!(pile.replayed_length(), length);
+        assert!(steps >= 5, "{steps} steps is not a climb");
+        let set = held[0].as_ref().expect("the held set is known at the end");
+        assert!(set.contains(&parent), "the parent is held");
+        assert!(set.contains(&child_handle), "the child is held");
+        let (_, _, whole) = read_at_once(path.path(), length, &collections).await;
+        assert_eq!(held, whole, "the climb ends with the whole file's held set");
+        assert_eq!(
+            known_before_end,
+            Vec::<u64>::new(),
+            "no held set is known before the end"
+        );
+        pile.close().unwrap();
     }
 
     /// Evidence that is not an append resets the answer to empty, and the

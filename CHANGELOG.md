@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Held sets start only after a whole replay. `Covered::snapshot_step`
+  passes whether the step reached the end of the store to the held index,
+  which computes nothing until the store has been observed whole once
+  (a step that reached the end, or any `snapshot`); before that every held
+  set is unknown. A climb over a pile that holds a child after its parent
+  used to scan the parent without the child, so the child never joined the
+  held set (a late child); now the climb ends with the whole file's held
+  sets.
+
 - `trible::maintenance::Driver`: a registered hop runs when its registration
   says it has work (`Mappings::pending`), not only when an input changed, so
   work a registration deferred (a failed bind, a model waiting a pass) is

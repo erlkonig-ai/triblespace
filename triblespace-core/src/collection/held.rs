@@ -92,6 +92,13 @@
 //! A snapshot that lost a blob its predecessor had (a store that forgets
 //! blobs) resets the index: the edges are forgotten and every collection is
 //! recomputed as if newly tracked.
+//!
+//! Nothing is computed before the store has been observed whole once. A
+//! step of a climb ([`Covered::snapshot_step`](super::covered::Covered::snapshot_step))
+//! observes a prefix, where a parent can be resident before its child; a
+//! parent scanned there would make the child a late child. Until a step
+//! reaches the end of the store, or a whole snapshot is taken, every held set
+//! is unknown.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -170,9 +177,10 @@ fn take_related(pairs: &mut Pairs, first: &Raw) -> Vec<Raw> {
 pub trait HeldRead {
     /// Every blob `collection` holds in this observation: its whole first
     /// closure plus what it gained since. `None` when the store does not
-    /// track it, has not yet been able to select its seeds, or has not yet
-    /// computed its first closure: unknown, not empty. Absence from the set
-    /// is not evidence that a blob is missing.
+    /// track it, has not yet been observed whole, has not yet been able to
+    /// select its seeds, or has not yet computed its first closure: unknown,
+    /// not empty. Absence from the set is not evidence that a blob is
+    /// missing.
     fn held(&self, collection: CollectionHandle) -> Option<HeldBlobs>;
 
     /// Differs between two observations of one store whenever their held sets
@@ -368,6 +376,10 @@ struct State<T> {
     /// The driver's job while it reads a blob with the state unlocked, and
     /// the blob: kept here so that a reset drops it and a clone keeps it.
     active: Option<(Job, Raw)>,
+    /// An observation of the whole store has been seen. Until then a step
+    /// of a climb is only a prefix, in which a parent can precede its child,
+    /// so nothing is settled or fed: every held set stays unknown.
+    replayed: bool,
     /// The last observation fed in.
     fed: Option<T>,
     /// Counts observations fed in: a read made against an older one is
@@ -460,6 +472,7 @@ impl<T> Default for HeldIndex<T> {
             building: Handles::new(),
             driven: false,
             active: None,
+            replayed: false,
             fed: None,
             fed_count: 0,
             generation: 0,
@@ -869,10 +882,20 @@ impl<T: HeldSource> State<T> {
 impl<T: HeldSource> HeldIndex<T> {
     /// Extend the held sets by everything `now` holds that the last observed
     /// snapshot did not, and hand out the result, fixed from here on.
-    pub(crate) fn observe(&self, now: &T) -> Arc<HeldView> {
+    ///
+    /// `whole` says that `now` observes the whole store, not a prefix a
+    /// climb has reached so far. Until one such observation, `now` is not
+    /// fed: a child written after its parent would otherwise be missing
+    /// when the parent is scanned, and never join (a late child). Peer
+    /// reports are kept for the first whole observation.
+    pub(crate) fn observe(&self, now: &T, whole: bool) -> Arc<HeldView> {
         let mut state = self.lock();
+        state.replayed |= whole;
         if state.tracked.is_empty() {
             state.candidates = Pairs::new();
+            return state.view.clone();
+        }
+        if !state.replayed {
             return state.view.clone();
         }
         let mut changed = false;
