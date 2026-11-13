@@ -64,9 +64,10 @@ pub mod walk_stream;
 mod native_index_probe;
 
 /// Take a snapshot of `store`, then run its held-set driver until it has done
-/// what that snapshot queued, as a peer's held-set thread would: snapshots
-/// read no blob, so a test fixture that owns a store without that thread
-/// calls this before the snapshot that should carry the held sets.
+/// what that snapshot queued, as a peer's held-set thread would: store
+/// snapshots read no blob for the held sets, so a test fixture that owns a
+/// store without that thread calls this before the snapshot that should carry
+/// them. It drains what can run; it does not prove a set complete.
 #[cfg(test)]
 pub(crate) fn drive_held_to_idle<S>(store: &mut S)
 where

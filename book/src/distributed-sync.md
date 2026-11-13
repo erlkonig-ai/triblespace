@@ -1608,18 +1608,23 @@ one side holds through a seed or a note reaches the other side's held set by
 its next references push.
 
 Every snapshot carries the held sets as they stood when it was taken, and they
-never change afterwards. Taking a snapshot reads no blob. It queues for the
+never change afterwards. Taking a store snapshot reads no blob for the held
+sets. (A peer's snapshot still reads blobs after it releases the store mutex,
+when it rebuilds the serving view: collection descriptors, configuration and
+capability definitions. Those reads do not repair.) It queues for the
 store's driver what arrived since the previous one -- every seed of a new
 record (one another record already named included), seeds whose bytes
 arrived, notes from references pushes -- selects the seeds of newly tracked
 collections from their records, and notes whose proofs are to be judged. The
-driver (`HeldWork`, a peer's held-set thread) does every read, in bounded
-steps against the latest observed snapshot and never holding the index across
-a read: it judges proofs, which reads the collection descriptors they name,
-and computes closures, which reads every blob they reach once. It extends
-built collections first, and building collections take turns in bounded
-slices, so a small collection is not held back by a large one. A newly
-tracked collection is unknown until its first closure is whole and its
+driver (`HeldWork`, a peer's held-set thread) does every held-set read, in
+steps against the latest observed snapshot, never holding the index across a
+read. Its time budget is cooperative: it is checked between steps, and a blob
+read or a judgement of proofs runs to its end first. It judges proofs, which
+reads the collection descriptors they name, and computes closures, which
+reads every blob they reach once. It extends built collections first, and
+building collections take turns, one budget's worth of steps each, so a small
+collection is not held back by a large one. A newly tracked collection is
+unknown until its first closure is whole and its
 proofs are judged; a built collection's set grows as the driver reaches what
 arrived, so an observation can be handed out ahead of its new records'
 closures. Nothing in sync needs it otherwise: held sets are allowed to lag.
@@ -1648,8 +1653,8 @@ under the store mutex and are read back from the snapshot that lands them, so
 the scan reads the pile's bytes, and the blob and what is above it join the
 held set. An absent blob is never fetched there, each handle is tried at most
 once per held-set thread (a failed attempt counts too, and a held-index reset
-does not clear that record), and no other thread repairs: a snapshot reads no
-blob, and every other reader of the same snapshot type may read with the store
+does not clear that record), and no other thread repairs: a store snapshot
+reads no blob for the held sets, and every other reader of the same snapshot type may read with the store
 mutex held or inside an async runtime, where a landing would take the mutex
 again or block the runtime on the network. The
 fetch deadline bounds the network wait only, not the lock, the put or the

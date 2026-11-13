@@ -17,11 +17,13 @@
 //!
 //! Only a peer's held-set thread repairs ([`Peer::set_replication`] installs
 //! the repair there), and it is the only thread that reads for the held sets:
-//! a snapshot reads no blob, it only queues work for that thread, which
-//! judges proofs (reading collection descriptors) and computes closures. Every
-//! other thread reads exactly as the inner store does: the serving
-//! publication and ordinary readers read through the same snapshot type, some
-//! with the store mutex held or inside an async runtime, where landing a
+//! a store snapshot reads no blob for them, it only queues work for that
+//! thread, which judges proofs (reading collection descriptors) and computes
+//! closures. Every other thread reads exactly as the inner store does: the
+//! serving publication (which a peer's snapshot rebuilds after it releases
+//! the store mutex, reading descriptors, configuration and capability
+//! definitions) and ordinary readers read through the same snapshot type,
+//! some with the store mutex held or inside an async runtime, where landing a
 //! repair would take that mutex again or block the runtime on the network.
 //! The held-set thread holds neither the store mutex nor the held index while
 //! it reads, and nothing waits for it.

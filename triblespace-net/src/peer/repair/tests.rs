@@ -1,9 +1,9 @@
 //! The held-set thread repairs what it reads; nothing else does.
 //!
 //! A test capability stands in for a neighbour holding valid bytes and counts
-//! every exact GET it is asked, with the asking thread. A snapshot reads no
-//! blob, so every read of a held set, and every repair, is the held-set
-//! thread's.
+//! every exact GET it is asked, with the asking thread. A store snapshot
+//! reads no blob for the held sets, so every read of a held set, and every
+//! repair, is the held-set thread's.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Seek, SeekFrom, Write};
@@ -261,7 +261,7 @@ fn the_held_thread_repairs_corrupt_blobs_and_only_it() {
     let c = collection(&descriptor);
     let c2 = collection(&inline_descriptor);
 
-    // C2 alone first: this call's snapshot reads none of it.
+    // C2 alone first: this call's store snapshot reads none of it.
     peer.set_replication(ReplicationMode::Shallow, [c2]);
     peer.set_replication(ReplicationMode::Shallow, [c2, c]);
     let snapshot = built(&mut peer, &[c, c2]);
@@ -317,10 +317,11 @@ fn the_held_thread_repairs_corrupt_blobs_and_only_it() {
     peer.close().unwrap();
 }
 
-/// A snapshot reads no blob, so a snapshot taken with the store mutex held
-/// neither reads nor fetches a corrupt blob: it finishes at once. The
-/// held-set thread reads it, repairs it, and the held set gains it and its
-/// parent. Only that thread asks the neighbour.
+/// A store snapshot reads no blob for the held sets, so the one a peer takes
+/// with the store mutex held neither reads nor fetches the corrupt blob. (The
+/// serving view the peer rebuilds after releasing the mutex may read blobs,
+/// but repairs nothing.) The held-set thread reads it, repairs it, and the
+/// held set gains it and its parent. Only that thread asks the neighbour.
 #[test]
 fn a_snapshot_under_the_store_mutex_reads_nothing_and_the_held_thread_repairs() {
     let leaf = blob(b"gate leaf, damaged".to_vec());

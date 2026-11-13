@@ -671,10 +671,13 @@ where
     /// references tree is not exchanged), and neither landing nor this call
     /// waits for it. The thread ends once the store is gone.
     ///
-    /// That thread is the only one that reads for the held sets (a snapshot
-    /// reads no blob), and only it repairs what it reads through a
-    /// [`Repairing`] store: a blob whose bytes fail validation is fetched,
-    /// landed and read back, so it and what is above it join the held set.
+    /// That thread is the only one that reads for the held sets (a store
+    /// snapshot reads no blob for them), and only it repairs what it reads
+    /// through a [`Repairing`] store: a blob whose bytes fail validation is
+    /// fetched, landed and read back, so it and what is above it join the
+    /// held set. A peer's snapshot still reads blobs after it releases the
+    /// store mutex, when it rebuilds the serving view (descriptors,
+    /// configuration, capability definitions); those reads do not repair.
     /// If the thread cannot start, or another driver owns the store, nothing
     /// builds this peer's held sets: they stay unknown until a driver runs.
     pub fn set_replication(

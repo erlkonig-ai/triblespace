@@ -264,7 +264,7 @@ where
     fn observe(&mut self, now: S::Snapshot, whole: bool) -> CoveredSnapshot<S::Snapshot> {
         let memo = self.carry_forward(&now);
         // The held sets as the driver has computed them; what arrived since
-        // the last snapshot is queued for it, and no blob is read here.
+        // the last snapshot is queued for it, and no blob is read for them.
         // Nothing is tracked, nothing is paid. Nothing is queued before the
         // store was observed whole once.
         let held = self.held.observe(&now, whole);

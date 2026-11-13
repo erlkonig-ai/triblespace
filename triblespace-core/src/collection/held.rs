@@ -68,13 +68,17 @@
 //! is published: a building one's is unknown, as an unsettled one's is, and
 //! [`HeldRead::held`] answers `None` for both.
 //!
-//! Taking a snapshot reads no blob. It queues what arrived since the
-//! previous one -- every seed of a new record (one another record already
+//! Taking a store snapshot reads no blob for the held sets. (That is the
+//! store's own observation; what a consumer builds on a snapshot, such as a
+//! sync host's serving view, may read blobs of its own.) It queues what
+//! arrived since the previous one -- every seed of a new record (one another record already
 //! named included), seeds whose bytes arrived, memberships peers reported --
 //! selects the seeds of newly tracked collections from their records, and
 //! notes whose proofs are to be judged. The [`HeldWork`] of the store's
-//! driver ([`HeldStore::drive_held`]) does the reading, in bounded steps
-//! against the latest observed snapshot: it judges proofs, which reads the
+//! driver ([`HeldStore::drive_held`]) does the reading, in steps against
+//! the latest observed snapshot, checking its time budget between steps:
+//! a blob read or a judgement of proofs runs to its end first, so the budget
+//! is cooperative, not a hard slice. It judges proofs, which reads the
 //! collection descriptors they name, and computes closures, which reads
 //! every blob they reach once. It extends built collections first, and
 //! building collections take turns, so a small one is published without
@@ -204,8 +208,8 @@ pub trait HeldStore {
     /// The work that computes the held sets: every blob read and every proof
     /// judgement, off the snapshot path. It publishes a collection's held set
     /// once its first closure is whole, and extends published sets as it
-    /// reaches what arrived. A snapshot never reads a blob and never waits
-    /// for a read the work makes. Dropping the work leaves what is queued to
+    /// reaches what arrived. A store snapshot reads no blob for the held sets
+    /// and never waits for a read the work makes. Dropping the work leaves what is queued to
     /// the next driver; until one runs, nothing grows.
     ///
     /// One driver at a time: `None` while an earlier work is alive.
@@ -230,9 +234,9 @@ trait Drive: Send + Sync {
 
 impl HeldWork {
     /// Compute for about `budget`, or, when nothing is queued, wait up to
-    /// `idle` for work. `false` once the store is gone. A read in progress
-    /// finishes before the budget is checked again; the index is not held
-    /// meanwhile.
+    /// `idle` for work. `false` once the store is gone. The budget is checked
+    /// between steps only: a blob read or a judgement of proofs in progress
+    /// finishes first; the index is not held meanwhile.
     pub fn step(&mut self, budget: Duration, idle: Duration) -> bool {
         let Some(index) = self.0.upgrade() else {
             return false;
@@ -243,10 +247,15 @@ impl HeldWork {
         true
     }
 
-    /// Compute until nothing queued is left, without waiting for more:
-    /// every closure and proof judgement the snapshots so far queued. `false`
-    /// once the store is gone. A short-lived owner of a store calls this
-    /// after a snapshot, then takes another to see the result.
+    /// Compute until nothing queued can run, without waiting for more: every
+    /// closure and proof judgement the snapshots so far queued. `false` once
+    /// the store is gone. A short-lived owner of a store calls this after a
+    /// snapshot, then takes another to see the result.
+    ///
+    /// Idle is not complete. A judgement whose proofs could not be read
+    /// waits for the next observation, a collection whose records could not
+    /// be selected is not settled, and a blob that is absent or unreadable
+    /// stays out of the set with everything above it.
     pub fn run_until_idle(&mut self) -> bool {
         let Some(index) = self.0.upgrade() else {
             return false;
@@ -1543,7 +1552,7 @@ mod tests {
 
     /// Take a snapshot, run the driver until it has done what that snapshot
     /// queued, and take another: what a store whose driver keeps up hands
-    /// out.
+    /// out. Idle is not complete: each test asserts what joined.
     fn settled<S: SnapshotSource + HeldStore>(store: &mut S) -> S::Snapshot {
         store.snapshot().unwrap();
         let mut work = store.drive_held().expect("nobody else drives the store");
@@ -2257,7 +2266,7 @@ mod tests {
         store.reads.lock().unwrap().values().sum()
     }
 
-    /// Taking a snapshot reads no blob: not a newly tracked collection's
+    /// Taking a store snapshot reads no blob: not a newly tracked collection's
     /// first closure, not the descriptor its proofs are judged by, not a
     /// peer's report, not the closure of a built collection's new record.
     /// The driver reads each blob once (the descriptor once more, to judge

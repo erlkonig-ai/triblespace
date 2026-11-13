@@ -37,8 +37,9 @@ fn open_pile(path: &PathBuf, host: Option<ed25519_dalek::VerifyingKey>) -> Resul
 /// a blob it reads whose bytes fail validation: it fetches a verified copy,
 /// lands it beside the corrupt one and reads it back, so the blob and what
 /// is above it join the held set. Every other read, and every read in
-/// Demand, where no held-set thread runs, is exactly a [`Pile`]'s. A
-/// snapshot reads no blob, so every held-set read is that thread's.
+/// Demand, where no held-set thread runs, is exactly a [`Pile`]'s. A store
+/// snapshot reads no blob for the held sets, so every held-set read is that
+/// thread's.
 type Custody = Covered<Repairing<PileFile>>;
 /// One observation of [`Custody`].
 type CustodySnapshot = <Custody as SnapshotSource>::Snapshot;

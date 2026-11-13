@@ -20,7 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is now repaired like any other. The "known gap" notes in `peer/repair.rs`,
   `Peer::set_replication`, `trible pile net sync` and the book are removed.
 
-- Taking a snapshot reads no blob. `HeldIndex::observe` only queues work:
+- Taking a store snapshot reads no blob for the held sets (a peer's
+  snapshot still reads blobs when it rebuilds its serving view after the
+  store mutex is released). `HeldIndex::observe` only queues work:
   the seeds of new records, seeds whose bytes arrived, peer reports, and the
   collections whose proofs are to be judged. The inline allowance
   (`INLINE_SCANS`/`INLINE_BYTES`) and the publication barrier are gone, and
@@ -30,7 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are judged, and a built collection's set grows as the driver reaches what
   arrived, so held sets can lag the records in a snapshot. Without a driver
   nothing is built; dropping `HeldWork` leaves the queue to the next driver.
-  New `HeldWork::run_until_idle` runs the driver until nothing queued is left.
+  New `HeldWork::run_until_idle` runs the driver until nothing queued can
+  run; idle is not complete (a judgement that could not read the proofs waits
+  for the next observation, and absent or unreadable blobs stay out).
 
 - Held sets start only after a whole replay. `Covered::snapshot_step`
   passes whether the step reached the end of the store to the held index,

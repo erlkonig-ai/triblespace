@@ -267,10 +267,10 @@ fn removed_parent_with_resident_child_invalidates_disconnected_inventory() {
     );
 }
 
-/// A snapshot reads no blob: the observation that first serves a new record
-/// does not serve its closure yet. Once the held-set driver has reached the
-/// record, the next observation serves the whole closure. No walk runs here;
-/// none is needed.
+/// A store snapshot reads no blob for the held sets: the observation that
+/// first serves a new record does not serve its closure yet. Once the
+/// held-set driver has reached the record, the next observation serves the
+/// whole closure. No walk runs here; none is needed.
 #[test]
 fn a_new_records_closure_is_served_once_the_driver_reaches_it() {
     let mut fixture = Fixture::new(Bytes::from_source(b"first payload".to_vec()));
