@@ -68,25 +68,23 @@
 //! is published: a building one's is unknown, as an unsettled one's is, and
 //! [`HeldRead::held`] answers `None` for both.
 //!
-//! Taking a snapshot first extends the sets of built collections by the
-//! closures of what arrived since the previous one -- every seed of a new
-//! record (one another record already named included), seeds whose bytes
-//! arrived, memberships peers reported -- computed against that snapshot.
-//! That is the publication barrier: for a built collection, an observation
-//! is never handed out ahead of its new records' closures. A changed
+//! Taking a snapshot reads no blob. It queues what arrived since the
+//! previous one -- every seed of a new record (one another record already
+//! named included), seeds whose bytes arrived, memberships peers reported --
+//! selects the seeds of newly tracked collections from their records, and
+//! notes whose proofs are to be judged. The [`HeldWork`] of the store's
+//! driver ([`HeldStore::drive_held`]) does the reading, in bounded steps
+//! against the latest observed snapshot: it judges proofs, which reads the
+//! collection descriptors they name, and computes closures, which reads
+//! every blob they reach once. A building collection is published once its
+//! first closure is whole and its proofs are judged; a built collection's
+//! set grows as the driver reaches what arrived, so a snapshot's held sets
+//! can lag the records in that snapshot. A changed
 //! [`HeldRead::held_generation`] says the sets grew although the store may
-//! not have changed, as a report does.
-//!
-//! A building collection's closure is computed by the snapshot that settles
-//! it, reading every blob it reaches once -- unless the store's held sets are
-//! *driven* ([`HeldStore::drive_held`]). Then that snapshot reads only a small
-//! allowance of it -- enough to publish a small collection at once -- and the
-//! [`HeldWork`] the driver holds computes the rest in bounded steps against
-//! the latest observed snapshot, publishing each collection when its closure
-//! is whole, so small collections become known first. The driver never holds
-//! the index across a blob read, so taking a snapshot waits for at most a few
-//! in-memory updates, never for the build. What arrives for a building
-//! collection queues behind its build. Nothing here starts a thread: the
+//! not have changed. The driver never holds the index across a read, so
+//! taking a snapshot waits for at most a few in-memory updates, never for a
+//! read. Without a driver nothing is read and nothing grows: a tracked
+//! collection stays unknown until one runs. Nothing here starts a thread: the
 //! driver's thread is its caller's.
 //!
 //! A snapshot that lost a blob its predecessor had (a store that forgets
@@ -190,38 +188,32 @@ pub trait HeldRead {
 
 /// Tracking and routing evidence for a store's held sets.
 pub trait HeldStore {
-    /// Keep held sets for `collections` from the next snapshot on.
+    /// Keep held sets for `collections` from the next snapshot on. Only a
+    /// driver ([`Self::drive_held`]) computes them: in a store nobody drives
+    /// they stay unknown.
     fn track_held(&mut self, collections: impl IntoIterator<Item = CollectionHandle>);
 
     /// A peer reported `handle` in its held set of `collection`. If the blob
-    /// is resident when the next snapshot is taken, it and everything it
-    /// reaches join `held(collection)`; a report of a blob that is not
-    /// resident is dropped. Kept in memory only.
+    /// is resident when the next snapshot is taken, the driver adds it and
+    /// everything it reaches to `held(collection)`; a report of a blob that
+    /// is not resident is dropped. Kept in memory only.
     fn note_held(&mut self, collection: CollectionHandle, handle: Inline<Handle<UnknownBlob>>);
 
-    /// Build the first closures of tracked collections off the snapshot
-    /// path: from now on a snapshot reads only a small allowance of a
-    /// building collection's closure, and the returned work computes the
-    /// rest, publishing each collection's held set once its first closure is
-    /// whole; until then the set is unknown. A snapshot never waits for a
-    /// blob read the work makes. Dropping the work hands the building back to
-    /// snapshots.
+    /// The work that computes the held sets: every blob read and every proof
+    /// judgement, off the snapshot path. It publishes a collection's held set
+    /// once its first closure is whole, and extends published sets as it
+    /// reaches what arrived. A snapshot never reads a blob and never waits
+    /// for a read the work makes. Dropping the work leaves what is queued to
+    /// the next driver; until one runs, nothing grows.
     ///
     /// One driver at a time: `None` while an earlier work is alive.
     fn drive_held(&mut self) -> Option<HeldWork>;
 }
 
-/// What a snapshot of a building collection reads itself in a driven store
-/// before leaving the rest of the closure to the driver: whichever of these
-/// runs out first. A small collection is published whole, as in a store
-/// nobody drives.
-const INLINE_SCANS: usize = 256;
-const INLINE_BYTES: usize = 16 << 20;
-
-/// The closure work a driven store's snapshots leave
-/// ([`HeldStore::drive_held`]), the only one for its store while it lives.
-/// It refers to the store's index weakly, so it keeps nothing alive;
-/// dropping it hands the building back to snapshots.
+/// The reads a store's snapshots queue ([`HeldStore::drive_held`]), the
+/// only driver of its store while it lives. It refers to the store's index
+/// weakly, so it keeps nothing alive; dropping it leaves the queued work for
+/// the next driver.
 pub struct HeldWork(Weak<dyn Drive>);
 
 /// What [`HeldWork`] asks of the index it drives.
@@ -230,7 +222,7 @@ trait Drive: Send + Sync {
     fn advance(&self, budget: Duration) -> bool;
     /// Return once work is queued, or after `timeout`.
     fn wait(&self, timeout: Duration);
-    /// Snapshots build first closures themselves again.
+    /// The work is gone; another may drive the index.
     fn undrive(&self);
 }
 
@@ -246,6 +238,18 @@ impl HeldWork {
         if !index.advance(budget) {
             index.wait(idle);
         }
+        true
+    }
+
+    /// Compute until nothing queued is left, without waiting for more:
+    /// every closure and proof judgement the snapshots so far queued. `false`
+    /// once the store is gone. A short-lived owner of a store calls this
+    /// after a snapshot, then takes another to see the result.
+    pub fn run_until_idle(&mut self) -> bool {
+        let Some(index) = self.0.upgrade() else {
+            return false;
+        };
+        while index.advance(Duration::MAX) {}
         true
     }
 }
@@ -357,21 +361,25 @@ struct State<T> {
     /// `blob || collection`: seeds whose bytes were not readable yet, and the
     /// collections waiting for them.
     pending: Pairs,
-    /// Collection and resource descriptors that were not resident when
-    /// proofs were judged; the arrival of one judges the proofs again.
+    /// Collection descriptors that were not resident when proofs were
+    /// judged; the arrival of one judges its collection's proofs again.
     unrouted: Handles,
-    /// Proof seeds are recomputed at the next observation: reading the proofs
-    /// failed, or a descriptor arrived.
-    proofs_stale: bool,
+    /// Settled collections whose proofs the driver is to judge.
+    unjudged: Handles,
+    /// The collections the driver judges with the state unlocked: kept here
+    /// so that a reset drops them and a clone judges them again.
+    judging: Option<Handles>,
+    /// Collections whose proofs could not be read: judged again after the
+    /// next observation.
+    misjudged: Handles,
     /// `collection || blob`: peer reports not resolved yet.
     candidates: Pairs,
     /// Closure computations not finished yet, oldest first.
     jobs: VecDeque<Job>,
-    /// Settled collections whose first closure a driver is still computing:
-    /// kept here, published only once built.
+    /// Settled collections whose first closure or proof judgement is not
+    /// done yet: kept here, published only once built.
     building: Handles,
-    /// A driver computes building collections' closures
-    /// ([`HeldStore::drive_held`]).
+    /// A driver exists ([`HeldStore::drive_held`]).
     driven: bool,
     /// The driver's job while it reads a blob with the state unlocked, and
     /// the blob: kept here so that a reset drops it and a clone keeps it.
@@ -466,7 +474,9 @@ impl<T> Default for HeldIndex<T> {
             edges: Pairs::new(),
             pending: Pairs::new(),
             unrouted: Handles::new(),
-            proofs_stale: false,
+            unjudged: Handles::new(),
+            judging: None,
+            misjudged: Handles::new(),
             candidates: Pairs::new(),
             jobs: VecDeque::new(),
             building: Handles::new(),
@@ -484,11 +494,15 @@ impl<T> Default for HeldIndex<T> {
 impl<T: Clone> Clone for HeldIndex<T> {
     fn clone(&self) -> Self {
         let mut state = self.lock().clone();
-        // The driver drives the original; the copy's snapshots build, the
-        // job the driver is reading for included, from that read on.
+        // The driver drives the original; the copy keeps its queue, the job
+        // and the judgement the driver is reading for included, for a driver
+        // of its own.
         state.driven = false;
         if let Some((job, handle)) = state.active.take() {
             state.jobs.push_front(job.reread(handle));
+        }
+        if let Some(judging) = state.judging.take() {
+            state.unjudged.union(judging);
         }
         Self::with_state(state)
     }
@@ -532,8 +546,8 @@ impl<T> HeldIndex<T> {
         }
     }
 
-    /// From now on a driver computes building collections' closures;
-    /// `false` if one already does.
+    /// From now on a driver computes the held sets; `false` if one already
+    /// does.
     pub(crate) fn drive(&self) -> bool {
         let mut state = self.lock();
         !std::mem::replace(&mut state.driven, true)
@@ -617,12 +631,11 @@ fn proof_seeds<T: HeldSource>(
     Ok(found)
 }
 
-/// One blob's scan: its resident children, the edges to them ready to join
-/// the cache, and its length. Built without the index state.
+/// One blob's scan: its resident children and the edges to them, ready to
+/// join the cache. Built without the index state.
 struct Scan {
     children: Vec<Raw>,
     edges: Pairs,
-    bytes: usize,
 }
 
 /// Read one blob and list its resident children, or `None` if it is not
@@ -647,28 +660,7 @@ fn scan<T: HeldSource>(snapshot: &T, handle: &Raw) -> Option<Scan> {
     for child in &children {
         edges.insert(&Entry::new(&pair(handle, child)));
     }
-    Some(Scan {
-        children,
-        edges,
-        bytes: body.len(),
-    })
-}
-
-/// Blob reads a snapshot may still make for building collections.
-struct Allowance {
-    scans: usize,
-    bytes: usize,
-}
-
-impl Allowance {
-    fn spent(&self) -> bool {
-        self.scans == 0 || self.bytes == 0
-    }
-
-    fn spend(&mut self, bytes: usize) {
-        self.scans = self.scans.saturating_sub(1);
-        self.bytes = self.bytes.saturating_sub(bytes);
-    }
+    Some(Scan { children, edges })
 }
 
 impl<T> State<T> {
@@ -682,6 +674,9 @@ impl<T> State<T> {
         self.jobs = VecDeque::new();
         self.building = Handles::new();
         self.active = None;
+        self.unjudged = Handles::new();
+        self.judging = None;
+        self.misjudged = Handles::new();
     }
 
     /// Hand out the held sets of every built collection. A building
@@ -716,15 +711,22 @@ impl<T> State<T> {
         }
     }
 
-    /// A building collection with no job left, queued or being read for, is
-    /// built; whether this made it so.
+    /// A building collection with no job left, queued or being read for, and
+    /// its proofs judged, is built; whether this made it so.
     fn retire(&mut self, collection: CollectionHandle) -> bool {
-        let built = self.building.get(&collection.raw).is_some()
+        let raw = &collection.raw;
+        let built = self.building.get(raw).is_some()
             && !self.jobs.iter().any(|job| job.collection == collection)
             && !self
                 .active
                 .as_ref()
-                .is_some_and(|(job, _)| job.collection == collection);
+                .is_some_and(|(job, _)| job.collection == collection)
+            && self.unjudged.get(raw).is_none()
+            && self.misjudged.get(raw).is_none()
+            && !self
+                .judging
+                .as_ref()
+                .is_some_and(|judging| judging.get(raw).is_some());
         if built {
             self.building.remove(&collection.raw);
         }
@@ -800,88 +802,25 @@ impl<T> State<T> {
 }
 
 impl<T: HeldSource> State<T> {
-    /// Run the queued jobs a snapshot runs, against it: every job of a
-    /// collection that is not building, or when nobody drives; a building
-    /// collection's only if it settled in this snapshot, and only within
-    /// `allowance`. Whether a held set grew.
-    fn run_jobs(
-        &mut self,
-        now: &T,
-        settled_now: &BTreeSet<CollectionHandle>,
-        allowance: &mut Allowance,
-    ) -> bool {
-        let mut grew = false;
-        let mut finished = Vec::new();
-        for mut job in std::mem::take(&mut self.jobs) {
-            let building = self.driven && self.building.get(&job.collection.raw).is_some();
-            if building && (allowance.spent() || !settled_now.contains(&job.collection)) {
-                self.jobs.push_back(job);
-                continue;
-            }
-            let done = loop {
-                let (step, more) = self.follow(&mut job, &mut || building && allowance.spent());
-                grew |= more;
-                match step {
-                    Step::Done => break true,
-                    Step::Paused => break false,
-                    Step::Read(handle) => {
-                        if building {
-                            // A blob larger than what is left is the driver's:
-                            // the allowance bounds bytes read, not just scans.
-                            let length = now
-                                .blob_info(Inline::<Handle<UnknownBlob>>::new(handle))
-                                .ok()
-                                .flatten()
-                                .map_or(0, |info| info.length);
-                            if length > allowance.bytes as u64 {
-                                allowance.bytes = 0;
-                                job = job.reread(handle);
-                                break false;
-                            }
-                        }
-                        let read = scan(now, &handle);
-                        if building {
-                            allowance.spend(read.as_ref().map_or(0, |scan| scan.bytes));
-                        }
-                        self.read(&mut job, handle, read);
-                    }
-                }
-            };
-            if done {
-                finished.push(job.collection);
-            } else {
-                self.jobs.push_back(job);
-            }
-        }
-        for collection in finished {
-            grew |= self.retire(collection);
-        }
-        grew
-    }
-
-    /// Add proof seeds to their collections and queue the new ones as roots.
-    fn add_proof_seeds(
-        &mut self,
-        found: ProofSeeds,
-        roots: &mut BTreeMap<CollectionHandle, Vec<Raw>>,
-    ) {
-        for descriptor in found.unrouted {
-            self.unrouted.insert(&Entry::new(&descriptor));
-        }
-        for (collection, seed) in found.seeds {
+    /// Add judged proof seeds to their settled collections and queue the new
+    /// ones as roots.
+    fn add_proof_seeds(&mut self, seeds: Vec<(CollectionHandle, Raw)>) {
+        for (collection, seed) in seeds {
             let key = pair(&collection.raw, &seed);
-            if self.tracked.get(&collection.raw).is_none() || self.seeds.get(&key).is_some() {
+            if self.held.get(&collection.raw).is_none() || self.seeds.get(&key).is_some() {
                 continue;
             }
             self.seeds.insert(&Entry::new(&key));
-            roots.entry(collection).or_default().push(seed);
+            self.enqueue(collection, [seed]);
         }
     }
 }
 
 impl<T: HeldSource> HeldIndex<T> {
-    /// Extend the held sets by everything `now` holds that the last observed
-    /// snapshot did not, and hand out the result, fixed from here on.
+    /// Queue for the driver everything `now` holds that the last observed
+    /// snapshot did not, and hand out the held sets as they stand, fixed from
+    /// here on. Reads no blob: the records, the proofs' presence and the
+    /// store's index only.
     ///
     /// `whole` says that `now` observes the whole store, not a prefix a
     /// climb has reached so far. Until one such observation, `now` is not
@@ -931,9 +870,8 @@ impl<T: HeldSource> HeldIndex<T> {
                     let Some(named) = seeds_of(record) else {
                         return;
                     };
-                    // Every seed of a new record is a root, known or not: the
-                    // record is published with its whole closure. A held seed
-                    // costs one lookup.
+                    // Every seed of a new record is a root, known or not. A
+                    // held seed costs the driver one lookup.
                     for seed in named {
                         seeds.insert(&Entry::new(&pair(&collection.raw, &seed)));
                         roots.entry(collection).or_default().push(seed);
@@ -943,9 +881,10 @@ impl<T: HeldSource> HeldIndex<T> {
             if changes.contains(StoreChanges::BLOBS)
                 && !(state.pending.is_empty() && state.unrouted.is_empty())
             {
-                // Seeds whose bytes arrived since, and descriptors that may
-                // let a proof be judged. A store without an indexed
-                // difference lists every blob; entries still match once.
+                // Seeds whose bytes arrived since, and descriptors whose
+                // collections' proofs can be judged now. A store without an
+                // indexed difference lists every blob; entries still match
+                // once.
                 for info in now.blobs_diff(&fed).flatten() {
                     let raw = info.handle.raw;
                     for collection in take_related(&mut state.pending, &raw) {
@@ -953,30 +892,24 @@ impl<T: HeldSource> HeldIndex<T> {
                     }
                     if state.unrouted.get(&raw).is_some() {
                         state.unrouted.remove(&raw);
-                        state.proofs_stale = true;
+                        if state.held.get(&raw).is_some() {
+                            state.unjudged.insert(&Entry::new(&raw));
+                        }
                     }
                 }
             }
-            if changes.contains(StoreChanges::CAPABILITY_PROOFS) || state.proofs_stale {
-                let settled: BTreeSet<CollectionHandle> = state
-                    .held
-                    .iter()
-                    .map(|collection| Inline::new(*collection))
-                    .collect();
-                match proof_seeds(now, &settled) {
-                    Ok(found) => {
-                        state.proofs_stale = false;
-                        state.add_proof_seeds(found, &mut roots);
-                    }
-                    // Retried at the next observation.
-                    Err(_) => state.proofs_stale = true,
+            if changes.contains(StoreChanges::CAPABILITY_PROOFS) {
+                let settled: Vec<Raw> = state.held.iter().copied().collect();
+                for collection in settled {
+                    state.unjudged.insert(&Entry::new(&collection));
                 }
             }
         }
+        // A judgement that could not read the proofs is tried again now.
+        let misjudged = std::mem::replace(&mut state.misjudged, Handles::new());
+        state.unjudged.union(misjudged);
 
-        // Scratch: the tracked collections not settled yet, and those this
-        // observation settles.
-        let mut settled_now: BTreeSet<CollectionHandle> = BTreeSet::new();
+        // Scratch: the tracked collections not settled yet.
         let fresh: BTreeSet<CollectionHandle> = state
             .tracked
             .iter()
@@ -991,9 +924,7 @@ impl<T: HeldSource> HeldIndex<T> {
             // A collection is settled only from a complete selection. When the
             // store cannot answer, it stays unsettled -- absent from the view,
             // not short in it -- and is selected again at the next observation.
-            if let (Ok(records), Ok(proofs)) =
-                (now.select_records(&selectors), proof_seeds(now, &fresh))
-            {
+            if let Ok(records) = now.select_records(&selectors) {
                 let mut seeds: BTreeMap<CollectionHandle, Vec<Raw>> = fresh
                     .iter()
                     .map(|collection| (*collection, vec![collection.raw]))
@@ -1005,42 +936,28 @@ impl<T: HeldSource> HeldIndex<T> {
                         list.extend(named);
                     }
                 }
-                for descriptor in proofs.unrouted {
-                    state.unrouted.insert(&Entry::new(&descriptor));
-                }
-                for (collection, seed) in proofs.seeds {
-                    seeds.get_mut(&collection).expect("fresh").push(seed);
-                }
-                for (collection, mut list) in seeds {
+                for (collection, list) in seeds {
                     for seed in &list {
                         state
                             .seeds
                             .insert(&Entry::new(&pair(&collection.raw, seed)));
                     }
+                    // Every seed known, a proof's judged before a reset
+                    // included, and every peer report.
+                    let mut list = related(&state.seeds, &collection.raw);
                     list.extend(related(&state.routes, &collection.raw));
                     state
                         .held
                         .replace(&Entry::with_value(&collection.raw, HeldBlobs::new()));
-                    if state.driven {
-                        state.building.insert(&Entry::new(&collection.raw));
-                    }
-                    settled_now.insert(collection);
+                    state.building.insert(&Entry::new(&collection.raw));
+                    state.unjudged.insert(&Entry::new(&collection.raw));
                     roots.entry(collection).or_default().extend(list);
                 }
-                changed = true;
             }
         }
-
-        // What a building collection settled here may read now; the driver
-        // computes the rest.
-        let mut allowance = Allowance {
-            scans: INLINE_SCANS,
-            bytes: INLINE_BYTES,
-        };
         for (collection, list) in roots {
             state.enqueue(collection, list);
         }
-        changed |= state.run_jobs(now, &settled_now, &mut allowance);
 
         // Scratch for this observation: the reports to resolve.
         let candidates: Vec<(CollectionHandle, Raw)> = std::mem::take(&mut state.candidates)
@@ -1078,13 +995,12 @@ impl<T: HeldSource> HeldIndex<T> {
             state.routes.insert(&Entry::new(&key));
             state.enqueue(collection, [handle]);
         }
-        changed |= state.run_jobs(now, &settled_now, &mut allowance);
         state.fed = Some(now.clone());
         state.fed_count += 1;
         if changed {
             state.publish_view();
         }
-        if state.driven && !state.jobs.is_empty() {
+        if state.driven && !(state.jobs.is_empty() && state.unjudged.is_empty()) {
             self.queued.notify_all();
         }
         state.view.clone()
@@ -1101,20 +1017,21 @@ impl<T: HeldSource> HeldIndex<T> {
 }
 
 impl<T: HeldSource + Send> Drive for HeldIndex<T> {
-    /// Run queued jobs, oldest first, against the latest observed snapshot,
-    /// for about `budget`: at least one step, then until the budget is spent
-    /// or another locker waits. A collection is published when its last job
-    /// finishes, never in between.
+    /// Judge the proofs queued for judging, then run queued jobs, oldest
+    /// first, against the latest observed snapshot, for about `budget`: at
+    /// least one step, then until the budget is spent or another locker
+    /// waits. A building collection is published once its last job finishes
+    /// and its proofs are judged, never in between; a built collection's set
+    /// whenever it grew.
     ///
-    /// A blob is read with the state unlocked, the job parked in
-    /// [`State::active`]: a reset meanwhile drops it (the reset requeued its
-    /// collection from scratch), and a clone keeps it. Snapshots may be fed
-    /// in meanwhile, so the read is reconciled with them when it returns: a
-    /// blob someone else scanned since keeps the cached edges, which were
-    /// probed against a snapshot no older than this read's; and a blob this
-    /// read missed because it was absent, but that is resident now, is read
-    /// again, since the snapshot that saw it arrive found nothing waiting
-    /// for it.
+    /// Every read happens with the state unlocked: a blob's with its job
+    /// parked in [`State::active`], a judgement's with its collections in
+    /// [`State::judging`]. A reset meanwhile drops them (it requeued their
+    /// collections from scratch), and a clone keeps them. Snapshots may be
+    /// fed in meanwhile, so a read is reconciled with them when it returns:
+    /// a blob or a descriptor the read missed because it was absent, but that
+    /// is resident now, is read again, since the snapshot that saw it arrive
+    /// found nothing waiting for it.
     fn advance(&self, budget: Duration) -> bool {
         let started = Instant::now();
         let mut stepped = false;
@@ -1125,7 +1042,48 @@ impl<T: HeldSource + Send> Drive for HeldIndex<T> {
             pause
         };
         let mut state = self.lock_driver();
-        let mut built = false;
+        let mut publish = false;
+        if let (false, Some(snapshot)) = (state.unjudged.is_empty(), state.fed.clone()) {
+            let judging = std::mem::replace(&mut state.unjudged, Handles::new());
+            let read_at = state.fed_count;
+            state.judging = Some(judging.clone());
+            drop(state);
+            let collections: BTreeSet<CollectionHandle> = judging
+                .iter()
+                .map(|collection| Inline::new(*collection))
+                .collect();
+            let found = proof_seeds(&snapshot, &collections);
+            drop(snapshot);
+            state = self.lock_driver();
+            if state.judging.take().is_some() {
+                match found {
+                    Ok(found) => {
+                        for descriptor in found.unrouted {
+                            let arrived = state.fed_count != read_at
+                                && state.fed.as_ref().is_some_and(|fed| {
+                                    fed.contains_blob(Inline::<Handle<UnknownBlob>>::new(
+                                        descriptor,
+                                    ))
+                                    .unwrap_or(false)
+                                });
+                            if arrived {
+                                state.unjudged.insert(&Entry::new(&descriptor));
+                            } else {
+                                state.unrouted.insert(&Entry::new(&descriptor));
+                            }
+                        }
+                        state.add_proof_seeds(found.seeds);
+                    }
+                    // Judged again after the next observation.
+                    Err(_) => state.misjudged.union(judging),
+                }
+                for collection in collections {
+                    publish |= state.retire(collection);
+                }
+            }
+            // The judgement is this call's first step.
+            pause();
+        }
         let more = loop {
             let Some(mut job) = state.jobs.pop_front() else {
                 break false;
@@ -1133,7 +1091,9 @@ impl<T: HeldSource + Send> Drive for HeldIndex<T> {
             // The job and whether it is done, or `None` when a reset
             // dropped it.
             let ended = loop {
-                let (step, _) = state.follow(&mut job, &mut pause);
+                let (step, grew) = state.follow(&mut job, &mut pause);
+                // A built collection's set is published as it grows.
+                publish |= grew && state.building.get(&job.collection.raw).is_none();
                 match step {
                     Step::Done => break Some((job, true)),
                     Step::Paused => break Some((job, false)),
@@ -1155,11 +1115,7 @@ impl<T: HeldSource + Send> Drive for HeldIndex<T> {
                             break None;
                         };
                         job = back;
-                        if state.scanned.get(&handle).is_some() {
-                            let held = state.held.get(&job.collection.raw).cloned();
-                            let children = related(&state.edges, &handle);
-                            job.descend(handle, children, held.as_ref());
-                        } else if absent
+                        if absent
                             && state.fed_count != read_at
                             && state.fed.as_ref().is_some_and(|fed| {
                                 fed.contains_blob(Inline::<Handle<UnknownBlob>>::new(handle))
@@ -1174,7 +1130,7 @@ impl<T: HeldSource + Send> Drive for HeldIndex<T> {
                 }
             };
             match ended {
-                Some((job, true)) => built |= state.retire(job.collection),
+                Some((job, true)) => publish |= state.retire(job.collection),
                 Some((job, false)) => {
                     state.jobs.push_front(job);
                     break true;
@@ -1182,7 +1138,8 @@ impl<T: HeldSource + Send> Drive for HeldIndex<T> {
                 None => {}
             }
         };
-        if built {
+        let more = more || !state.unjudged.is_empty();
+        if publish {
             state.publish_view();
         }
         drop(state);
@@ -1195,7 +1152,7 @@ impl<T: HeldSource + Send> Drive for HeldIndex<T> {
 
     fn wait(&self, timeout: Duration) {
         let state = self.lock_driver();
-        if state.jobs.is_empty() {
+        if state.jobs.is_empty() && state.unjudged.is_empty() {
             drop(
                 self.queued
                     .wait_timeout(state, timeout)
@@ -1569,6 +1526,17 @@ mod tests {
         }
     }
 
+    /// Take a snapshot, run the driver until it has done what that snapshot
+    /// queued, and take another: what a store whose driver keeps up hands
+    /// out.
+    fn settled<S: SnapshotSource + HeldStore>(store: &mut S) -> S::Snapshot {
+        store.snapshot().unwrap();
+        let mut work = store.drive_held().expect("nobody else drives the store");
+        assert!(work.run_until_idle());
+        drop(work);
+        store.snapshot().unwrap()
+    }
+
     fn reads(store: &Store, handle: &Raw) -> usize {
         store
             .reads
@@ -1591,7 +1559,7 @@ mod tests {
         let metadata = blob_naming(&mut store, b"metadata", &[described]);
         commit(&mut store, c, data, metadata);
         store.track_held([c]);
-        let snapshot = store.snapshot().unwrap();
+        let snapshot = settled(&mut store);
         assert_eq!(
             held_set(&snapshot, c),
             BTreeSet::from([c.raw, data, child, grandchild, metadata, described])
@@ -1635,7 +1603,7 @@ mod tests {
             )))
             .unwrap();
         store.track_held([c, derived]);
-        let snapshot = store.snapshot().unwrap();
+        let snapshot = settled(&mut store);
         let held = held_set(&snapshot, c);
         assert_eq!(held, BTreeSet::from([c.raw, data, metadata]));
         for never in [result, under_merge, attachment] {
@@ -1673,7 +1641,7 @@ mod tests {
                 .unwrap();
         }
         store.track_held([parent, attached]);
-        let snapshot = store.snapshot().unwrap();
+        let snapshot = settled(&mut store);
         assert_eq!(
             held_set(&snapshot, parent),
             BTreeSet::from([parent.raw, data, metadata])
@@ -1692,7 +1660,7 @@ mod tests {
                 Inline::new(later),
             )))
             .unwrap();
-        let after = store.snapshot().unwrap();
+        let after = settled(&mut store);
         assert_eq!(held_set(&after, attached), BTreeSet::from([attached.raw]));
         assert_eq!(
             held_set(&after, parent),
@@ -1708,20 +1676,20 @@ mod tests {
         store.track_held([c]);
         let child = blob(&mut store, b"early child");
         let early = blob_naming(&mut store, b"early", &[child]);
-        let before = store.snapshot().unwrap();
+        let before = settled(&mut store);
         assert!(!held_set(&before, c).contains(&early));
         commit(&mut store, c, early, metadata);
-        let after = store.snapshot().unwrap();
+        let after = settled(&mut store);
         assert!(held_set(&after, c).is_superset(&BTreeSet::from([early, child])));
 
         let late_child = blob(&mut store, b"late payload child");
         let late = unresident_naming(b"late payload", &[late_child]);
         let late_handle = handle_of(&late);
         commit(&mut store, c, late_handle, metadata);
-        let waiting = store.snapshot().unwrap();
+        let waiting = settled(&mut store);
         assert!(!held_set(&waiting, c).contains(&late_handle));
         store.put::<UnknownBlob, _>(late).unwrap();
-        let arrived = store.snapshot().unwrap();
+        let arrived = settled(&mut store);
         assert!(held_set(&arrived, c).is_superset(&BTreeSet::from([late_handle, late_child])));
         assert_eq!(
             reads(&store, &late_handle),
@@ -1744,12 +1712,12 @@ mod tests {
         let p = blob_naming(&mut store, b"parent", &[h]);
         commit(&mut store, c1, p, metadata);
         store.track_held([c1, c2]);
-        let first = store.snapshot().unwrap();
+        let first = settled(&mut store);
         assert!(held_set(&first, c1).contains(&p));
 
         store.put::<UnknownBlob, _>(h_bytes).unwrap();
         commit(&mut store, c2, h, metadata);
-        let second = store.snapshot().unwrap();
+        let second = settled(&mut store);
         assert!(held_set(&second, c2).contains(&h));
         assert!(
             !held_set(&second, c1).contains(&h),
@@ -1759,7 +1727,7 @@ mod tests {
         // A report for a blob that is not resident is dropped, not kept.
         store.note_held(c1, Inline::new([5; 32]));
         store.note_held(c1, Inline::new(h));
-        let reported = store.snapshot().unwrap();
+        let reported = settled(&mut store);
         assert!(held_set(&reported, c1).contains(&h));
         assert!(!held_set(&reported, c1).contains(&[5; 32]));
         assert_eq!(reads(&store, &h), 1, "H was read once, as C2's seed");
@@ -1783,11 +1751,11 @@ mod tests {
         let r = blob_naming(&mut store, b"root payload", &[p]);
         commit(&mut store, c, r, metadata);
         store.track_held([c]);
-        let first = store.snapshot().unwrap();
+        let first = settled(&mut store);
         assert!(held_set(&first, c).contains(&p));
         store.put::<UnknownBlob, _>(h_bytes).unwrap();
         for _ in 0..3 {
-            let snapshot = store.snapshot().unwrap();
+            let snapshot = settled(&mut store);
             assert!(!held_set(&snapshot, c).contains(&h), "no arrival rescans P");
             assert!(BlobStoreGet::get::<Bytes, UnknownBlob>(&snapshot, Inline::new(h)).is_ok());
         }
@@ -1800,7 +1768,7 @@ mod tests {
             .filter(|handle| handle.raw != forgotten)
             .collect();
         (*store).inner.blobs.keep(kept);
-        let reset = store.snapshot().unwrap();
+        let reset = settled(&mut store);
         assert!(held_set(&reset, c).contains(&h));
         assert!(
             !held_set(&first, c).contains(&h),
@@ -1819,12 +1787,12 @@ mod tests {
         let first_payload = blob_naming(&mut store, b"first payload", &[p]);
         commit(&mut store, c1, first_payload, metadata);
         store.track_held([c1, c2]);
-        let first = store.snapshot().unwrap();
+        let first = settled(&mut store);
         assert!(held_set(&first, c1).is_superset(&BTreeSet::from([p, q])));
         assert!(!held_set(&first, c2).contains(&p));
         let second_payload = blob_naming(&mut store, b"second payload", &[p]);
         commit(&mut store, c2, second_payload, metadata);
-        let second = store.snapshot().unwrap();
+        let second = settled(&mut store);
         assert!(held_set(&second, c2).is_superset(&BTreeSet::from([second_payload, p, q])));
         assert_eq!(reads(&store, &p), 1);
         assert_eq!(reads(&store, &q), 1);
@@ -1850,8 +1818,8 @@ mod tests {
                 payloads.push((payload, own));
                 store.note_held(*collection, Inline::new(shared));
             }
-            store.snapshot().unwrap();
-            store.snapshot().unwrap();
+            settled(&mut store);
+            settled(&mut store);
         }
         let counts = store.reads.lock().unwrap().clone();
         assert!(counts.values().all(|count| *count == 1), "{counts:?}");
@@ -1866,7 +1834,7 @@ mod tests {
         let definition_bytes = unresident_naming(b"capability definition", &[]);
         let definition: Inline<Handle<SimpleArchive>> = Inline::new(handle_of(&definition_bytes));
         store.track_held([c]);
-        store.snapshot().unwrap();
+        settled(&mut store);
         store
             .insert_proof(CapabilityProof::new(
                 CapabilityResource::from(c),
@@ -1875,10 +1843,10 @@ mod tests {
                 delegate.verifying_key(),
             ))
             .unwrap();
-        let proven = store.snapshot().unwrap();
+        let proven = settled(&mut store);
         assert!(!held_set(&proven, c).contains(&definition.raw));
         store.put::<UnknownBlob, _>(definition_bytes).unwrap();
-        let arrived = store.snapshot().unwrap();
+        let arrived = settled(&mut store);
         assert!(held_set(&arrived, c).contains(&definition.raw));
     }
 
@@ -1892,7 +1860,7 @@ mod tests {
         let data = blob_naming(&mut store, b"data", &[parent]);
         commit(&mut store, c, data, metadata);
         store.track_held([c]);
-        let before = store.snapshot().unwrap();
+        let before = settled(&mut store);
         assert!(held_set(&before, c).contains(&child));
         let kept: Vec<_> = before
             .inner()
@@ -1901,7 +1869,7 @@ mod tests {
             .filter(|handle| handle.raw != parent)
             .collect();
         (*store).inner.blobs.keep(kept);
-        let after = store.snapshot().unwrap();
+        let after = settled(&mut store);
         let held = held_set(&after, c);
         assert!(!held.contains(&parent));
         assert!(!held.contains(&child), "the child lost its only path");
@@ -1920,23 +1888,23 @@ mod tests {
         let data = blob(&mut pile, b"unrelated payload");
         commit(&mut pile, c, data, metadata);
         pile.track_held([c]);
-        pile.snapshot().unwrap();
+        settled(&mut pile);
         pile.note_held(c, Inline::new(reported));
-        assert!(held_set(&pile.snapshot().unwrap(), c).contains(&reported));
+        assert!(held_set(&settled(&mut pile), c).contains(&reported));
         pile.close().unwrap();
 
         let mut pile = crate::repo::pile::Pile::open(file.path()).unwrap();
         pile.track_held([c]);
-        assert!(!held_set(&pile.snapshot().unwrap(), c).contains(&reported));
+        assert!(!held_set(&settled(&mut pile), c).contains(&reported));
         let reaching = blob_naming(&mut pile, b"a payload naming it", &[reported]);
         commit(&mut pile, c, reaching, metadata);
-        assert!(held_set(&pile.snapshot().unwrap(), c).contains(&reported));
+        assert!(held_set(&settled(&mut pile), c).contains(&reported));
         pile.close().unwrap();
 
         let mut pile = crate::repo::pile::Pile::open(file.path()).unwrap();
         pile.track_held([c]);
         assert!(
-            held_set(&pile.snapshot().unwrap(), c).contains(&reported),
+            held_set(&settled(&mut pile), c).contains(&reported),
             "a record reaches it now"
         );
         pile.close().unwrap();
@@ -1954,18 +1922,18 @@ mod tests {
         commit(&mut store, c, data, metadata);
         store.faults.select.store(true, Ordering::SeqCst);
         store.track_held([c]);
-        let failed = store.snapshot().unwrap();
+        let failed = settled(&mut store);
         assert_eq!(failed.held(c), None);
         store.faults.select.store(false, Ordering::SeqCst);
-        let settled = store.snapshot().unwrap();
+        let settled = settled(&mut store);
         assert_eq!(
             held_set(&settled, c),
             BTreeSet::from([c.raw, data, metadata])
         );
     }
 
-    /// A failed read of the proofs is retried at the next snapshot, even
-    /// when the store has not changed since.
+    /// A judgement that could not read the proofs is tried again after the
+    /// next snapshot, even when the store has not changed since.
     #[test]
     fn a_failed_proof_read_is_retried_at_the_next_snapshot() {
         let mut store = Store::default();
@@ -1974,7 +1942,7 @@ mod tests {
         let definition: Inline<Handle<SimpleArchive>> =
             Inline::new(blob(&mut store, b"definition"));
         store.track_held([c]);
-        store.snapshot().unwrap();
+        settled(&mut store);
         store.faults.proofs.store(true, Ordering::SeqCst);
         store
             .insert_proof(CapabilityProof::new(
@@ -1984,10 +1952,10 @@ mod tests {
                 SigningKey::from_bytes(&[47; 32]).verifying_key(),
             ))
             .unwrap();
-        let failed = store.snapshot().unwrap();
+        let failed = settled(&mut store);
         assert!(!held_set(&failed, c).contains(&definition.raw));
         store.faults.proofs.store(false, Ordering::SeqCst);
-        let retried = store.snapshot().unwrap();
+        let retried = settled(&mut store);
         assert_eq!(retried.changes_since(&failed), StoreChanges::NONE);
         assert!(held_set(&retried, c).contains(&definition.raw));
     }
@@ -2003,12 +1971,12 @@ mod tests {
         let data = blob_naming(&mut store, b"data", &[child]);
         commit(&mut store, c, data, metadata);
         store.track_held([c]);
-        store.snapshot().unwrap();
+        settled(&mut store);
         let before = store.reads.lock().unwrap().clone();
         for index in 0..16_u8 {
             blob_naming(&mut store, &[b'u', index], &[data, child]);
             blob(&mut store, &[b'v', index]);
-            store.snapshot().unwrap();
+            settled(&mut store);
         }
         assert_eq!(*store.reads.lock().unwrap(), before);
     }
@@ -2078,7 +2046,7 @@ mod tests {
         } else {
             store.track_held([c]);
         }
-        let held = held_set(&store.snapshot().unwrap(), c);
+        let held = held_set(&settled(&mut store), c);
         assert!(
             held.contains(&exact.raw),
             "a proof over C from C's root seeds C (resource tracked: {track_resource})"
@@ -2123,14 +2091,14 @@ mod tests {
         commit(&mut store, c, data, metadata);
         store.faults.unreadable.lock().unwrap().insert(z);
         store.track_held([c]);
-        let settled = store.snapshot().unwrap();
-        assert!(held_set(&settled, c).is_superset(&BTreeSet::from([c.raw, metadata])));
-        assert_closed(&settled, c);
-        assert!(!held_set(&settled, c).contains(&data));
+        let first = settled(&mut store);
+        assert!(held_set(&first, c).is_superset(&BTreeSet::from([c.raw, metadata])));
+        assert_closed(&first, c);
+        assert!(!held_set(&first, c).contains(&data));
         store.faults.unreadable.lock().unwrap().remove(&z);
-        assert!(!held_set(&store.snapshot().unwrap(), c).contains(&data));
+        assert!(!held_set(&settled(&mut store), c).contains(&data));
         store.note_held(c, Inline::new(data));
-        let reported = store.snapshot().unwrap();
+        let reported = settled(&mut store);
         assert!(held_set(&reported, c).is_superset(&BTreeSet::from([data, z])));
     }
 
@@ -2229,7 +2197,7 @@ mod tests {
                 .unwrap();
         }
         store.track_held([c]);
-        let held = held_set(&store.snapshot().unwrap(), c);
+        let held = held_set(&settled(&mut store), c);
         assert!(
             held.contains(&own.raw),
             "positive control: a proof over C from C's root seeds C"
@@ -2241,8 +2209,8 @@ mod tests {
     }
 
     /// One payload naming `fanout` intermediates that each name `fanout`
-    /// leaves, committed to `c`: wider than a snapshot's allowance for a
-    /// building collection. Every blob `c` holds once built.
+    /// leaves, committed to `c`: a closure the driver computes in many
+    /// steps. Every blob `c` holds once built.
     fn wide(store: &mut Store, c: CollectionHandle, fanout: u8) -> BTreeSet<Raw> {
         let metadata = blob(store, b"wide metadata");
         let (data, mut all) = wide_payload(store, fanout);
@@ -2267,8 +2235,143 @@ mod tests {
         all.extend(&mids);
         let data = blob_naming(store, b"wide payload", &mids);
         all.insert(data);
-        assert!(all.len() > INLINE_SCANS);
         (data, all)
+    }
+
+    fn total_reads(store: &Store) -> usize {
+        store.reads.lock().unwrap().values().sum()
+    }
+
+    /// Taking a snapshot reads no blob: not a newly tracked collection's
+    /// first closure, not the descriptor its proofs are judged by, not a
+    /// peer's report, not the closure of a built collection's new record.
+    /// The driver reads each blob once (the descriptor once more, to judge
+    /// the proof) and publishes the whole set.
+    #[test]
+    fn a_snapshot_reads_no_blob() {
+        let mut store = Store::default();
+        let root = SigningKey::from_bytes(&[48; 32]);
+        let c = governed(&mut store, "observed only", &root);
+        let definition: Inline<Handle<SimpleArchive>> =
+            Inline::new(blob(&mut store, b"definition read by the driver"));
+        store
+            .insert_proof(CapabilityProof::new(
+                CapabilityResource::from(c),
+                &root,
+                definition,
+                SigningKey::from_bytes(&[49; 32]).verifying_key(),
+            ))
+            .unwrap();
+        let metadata = blob(&mut store, b"metadata");
+        let child = blob(&mut store, b"child");
+        let data = blob_naming(&mut store, b"data", &[child]);
+        commit(&mut store, c, data, metadata);
+        let reported = blob(&mut store, b"reported by a peer");
+        store.track_held([c]);
+        store.note_held(c, Inline::new(reported));
+        let mut expected = BTreeSet::from([c.raw, definition.raw, metadata, child, data, reported]);
+        for round in 0..3_u8 {
+            let snapshot = store.snapshot().unwrap();
+            assert_eq!(total_reads(&store), 0, "snapshot {round} read a blob");
+            assert_eq!(snapshot.held(c), None, "nobody computed it yet");
+            let leaf = blob(&mut store, &[b'r', round]);
+            let payload = blob_naming(&mut store, &[b'p', round], &[leaf]);
+            commit(&mut store, c, payload, metadata);
+            expected.extend([leaf, payload]);
+        }
+        store.snapshot().unwrap();
+        assert_eq!(total_reads(&store), 0, "a snapshot read a blob");
+
+        let mut work = store.drive_held().expect("the only driver");
+        assert!(work.run_until_idle());
+        let built = store.snapshot().unwrap();
+        let held = held_set(&built, c);
+        assert!(held.is_superset(&expected), "the whole set is published");
+        assert_closed(&built, c);
+        let counts = store.reads.lock().unwrap().clone();
+        for (blob, count) in &counts {
+            let once = if *blob == c.raw { 2 } else { 1 };
+            assert_eq!(*count, once, "{:02x?} read {count} times", &blob[..4]);
+        }
+
+        // A built collection's new record: the snapshot reads nothing and
+        // publishes the set as it stood; the driver extends it.
+        let leaf = blob(&mut store, b"leaf of a built collection's record");
+        let payload = blob_naming(&mut store, b"payload of it", &[leaf]);
+        commit(&mut store, c, payload, metadata);
+        let after = store.snapshot().unwrap();
+        assert_eq!(
+            *store.reads.lock().unwrap(),
+            counts,
+            "a snapshot read a blob"
+        );
+        assert_eq!(held_set(&after, c), held, "published as it stood");
+        assert!(work.run_until_idle());
+        let extended = store.snapshot().unwrap();
+        assert!(held_set(&extended, c).is_superset(&BTreeSet::from([payload, leaf])));
+        assert!(extended.held_generation() > after.held_generation());
+    }
+
+    /// After the first whole replay, a parent arrives in one refresh and its
+    /// child, which no record names, in a later one (as a sync can land
+    /// them). Whether the child joins depends on when its parent is scanned,
+    /// not on the replay latch. When the driver reaches the parent after the
+    /// child arrived, the child joins. When it scanned the parent before,
+    /// the child is a late child, the stated limitation: it stays out until a
+    /// peer reports it in the collection (or the index resets, or the store
+    /// reopens).
+    #[test]
+    fn a_child_appended_after_its_parent_joins_unless_the_parent_was_scanned_first() {
+        for scanned_between in [false, true] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let mut pile = crate::repo::pile::Pile::open(file.path()).unwrap();
+            let c = collection(&mut pile, "appended in two refreshes");
+            let metadata = blob(&mut pile, b"metadata");
+            pile.track_held([c]);
+            settled(&mut pile);
+            let child = unresident_naming(b"a child appended after its parent", &[]);
+            let q = handle_of(&child);
+            let p = blob_naming(&mut pile, b"a parent appended first", &[q]);
+            commit(&mut pile, c, p, metadata);
+            if scanned_between {
+                settled(&mut pile);
+            } else {
+                pile.snapshot().unwrap();
+            }
+            pile.put::<UnknownBlob, _>(child).unwrap();
+            let held = held_set(&settled(&mut pile), c);
+            assert!(held.contains(&p), "the parent is held");
+            assert_eq!(
+                held.contains(&q),
+                !scanned_between,
+                "the child joins exactly when its parent was scanned after it arrived \
+                 (scanned between: {scanned_between})"
+            );
+            if scanned_between {
+                pile.note_held(c, Inline::new(q));
+                assert!(
+                    held_set(&settled(&mut pile), c).contains(&q),
+                    "a peer's report brings the late child in"
+                );
+            }
+            pile.close().unwrap();
+        }
+    }
+
+    /// A store nobody drives computes nothing: a tracked collection stays
+    /// unknown, whatever is taken.
+    #[test]
+    fn without_a_driver_nothing_is_built() {
+        let mut store = Store::default();
+        let c = collection(&mut store, "undriven");
+        let metadata = blob(&mut store, b"metadata");
+        let data = blob(&mut store, b"data");
+        commit(&mut store, c, data, metadata);
+        store.track_held([c]);
+        for _ in 0..3 {
+            assert_eq!(store.snapshot().unwrap().held(c), None);
+        }
+        assert_eq!(total_reads(&store), 0);
     }
 
     /// A driven store publishes nothing for a building collection until its
@@ -2281,7 +2384,11 @@ mod tests {
         let whole = wide(&mut store, c, 20);
         let mut work = store.drive_held().expect("the only driver");
         store.track_held([c]);
-        assert_eq!(store.snapshot().unwrap().held(c), None, "the allowance left work");
+        assert_eq!(
+            store.snapshot().unwrap().held(c),
+            None,
+            "the snapshot read nothing"
+        );
         let mut unknown = 1;
         let mut published = None;
         for _ in 0..100_000 {
@@ -2299,55 +2406,53 @@ mod tests {
         assert!(counts.values().all(|count| *count == 1), "{counts:?}");
     }
 
-    /// Dropping the work hands the building back: the next snapshot
-    /// computes the rest itself and publishes it whole.
+    /// Dropping the work leaves the build where it stood: snapshots compute
+    /// nothing, and the next driver finishes it and publishes it whole.
     #[test]
-    fn a_dropped_driver_hands_the_build_back_to_snapshots() {
+    fn a_dropped_driver_leaves_the_build_to_the_next_driver() {
         let mut store = Store::default();
         let c = collection(&mut store, "abandoned");
         let whole = wide(&mut store, c, 20);
-        let work = store.drive_held().expect("the only driver");
+        let mut work = store.drive_held().expect("the only driver");
         store.track_held([c]);
         assert_eq!(store.snapshot().unwrap().held(c), None);
         assert!(store.drive_held().is_none(), "one driver at a time");
+        assert!(work.step(Duration::ZERO, Duration::ZERO));
+        let read = total_reads(&store);
         drop(work);
+        assert_eq!(
+            store.snapshot().unwrap().held(c),
+            None,
+            "nobody finishes it"
+        );
+        assert_eq!(total_reads(&store), read, "a snapshot read a blob");
+        let mut next = store.drive_held().expect("the store can be driven again");
+        assert!(next.run_until_idle());
         assert_eq!(held_set(&store.snapshot().unwrap(), c), whole);
-        assert!(store.drive_held().is_some(), "the store can be driven again");
+        let counts = store.reads.lock().unwrap().clone();
+        assert!(counts.values().all(|count| *count == 1), "{counts:?}");
     }
 
-    /// While the driver waits on a blob read, a snapshot neither waits for
-    /// it nor loses its barrier: a built collection's new record is
-    /// published with its closure, and the building one stays unknown. Then
-    /// the build completes and is published whole.
+    /// While the driver waits on a blob read, a snapshot does not wait for
+    /// it, and a building collection stays unknown. A built collection's new
+    /// record joins once the driver reaches it; the build completes and is
+    /// published whole.
     #[test]
     fn a_snapshot_never_waits_for_a_read_the_driver_makes() {
         let mut store = Store::default();
         let built = collection(&mut store, "built beside");
         store.track_held([built]);
-        store.snapshot().unwrap();
+        settled(&mut store);
         let c = collection(&mut store, "slow");
         let whole = wide(&mut store, c, 20);
-        let mut work = store.drive_held().expect("the only driver");
+        let work = store.drive_held().expect("the only driver");
         store.track_held([c]);
         assert_eq!(store.snapshot().unwrap().held(c), None);
         let unread = *whole
             .iter()
             .find(|blob| reads(&store, blob) == 0)
-            .expect("the allowance left blobs unread");
-        let (entered, entered_rx) = std::sync::mpsc::channel();
-        let (release, release_rx) = std::sync::mpsc::channel();
-        *store.faults.gate.lock().unwrap() = Some(Gate {
-            blob: unread,
-            entered,
-            release: release_rx,
-        });
-        // The driver's thread: it ends once the store is gone.
-        let driver = std::thread::spawn(move || {
-            while work.step(Duration::from_secs(60), Duration::from_millis(10)) {}
-        });
-        entered_rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("the driver reads the gated blob");
+            .expect("the snapshot left blobs unread");
+        let (release, driver) = block_driver_in(&mut store, work, unread);
 
         let metadata = blob(&mut store, b"metadata beside");
         let leaf = blob(&mut store, b"leaf beside");
@@ -2359,24 +2464,23 @@ mod tests {
             started.elapsed() < Duration::from_secs(10),
             "the snapshot waited for the read"
         );
-        assert!(held_set(&during, built).is_superset(&BTreeSet::from([data, leaf, metadata])));
+        assert!(
+            during.held(built).is_some(),
+            "a built collection stays known"
+        );
         assert_eq!(during.held(c), None, "a building collection is unknown");
 
         release.send(()).unwrap();
-        let mut held = None;
+        assert_eq!(published(&mut store, c), whole);
+        let mut beside = BTreeSet::new();
         for _ in 0..1000 {
-            held = store.snapshot().unwrap().held(c);
-            if held.is_some() {
+            beside = held_set(&store.snapshot().unwrap(), built);
+            if beside.contains(&data) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let held: BTreeSet<Raw> = held
-            .expect("the driver publishes the whole closure")
-            .iter_ordered()
-            .copied()
-            .collect();
-        assert_eq!(held, whole);
+        assert!(beside.is_superset(&BTreeSet::from([data, leaf, metadata])));
         drop(store);
         driver.join().unwrap();
     }
@@ -2427,8 +2531,6 @@ mod tests {
         let c: CollectionHandle = Inline::new(handle_of(&descriptor));
         let (payload, mut whole) = wide_payload(&mut store, 20);
         let data = blob(&mut store, b"small data");
-        // The payload, as metadata, is reached first and spends the
-        // allowance; the descriptor, the first seed, is reached last.
         commit(&mut store, c, data, payload);
         whole.extend([c.raw, data]);
         let work = store.drive_held().expect("the only driver");
@@ -2446,42 +2548,53 @@ mod tests {
         driver.join().unwrap();
     }
 
-    /// A blob the driver reads against an older snapshot while a snapshot
-    /// scans it for a built collection against a newer one keeps the
-    /// snapshot's cached edges: the building collection's published set is
-    /// closed under the edge cache, the child that arrived included.
+    /// A collection descriptor the driver finds absent while it judges the
+    /// collection's proofs, which arrives during that read, judges them
+    /// again: the snapshot that saw it arrive found no judgement waiting for
+    /// it, so nothing else would.
     #[test]
-    fn a_blob_scanned_during_the_drivers_read_keeps_the_cached_edges() {
+    fn a_descriptor_arriving_during_the_drivers_judgement_judges_again() {
+        let root = SigningKey::from_bytes(&[56; 32]);
+        let mut elsewhere = Store::default();
+        let c = governed(&mut elsewhere, "judged late", &root);
+        let descriptor: Bytes = BlobStoreGet::get::<Bytes, UnknownBlob>(
+            &elsewhere.snapshot().unwrap(),
+            Inline::new(c.raw),
+        )
+        .unwrap();
         let mut store = Store::default();
-        let built = collection(&mut store, "built");
-        store.track_held([built]);
-        store.snapshot().unwrap();
-        let c = collection(&mut store, "building");
-        let q_bytes = unresident_naming(b"arrives during the read", &[]);
-        let q = handle_of(&q_bytes);
-        let p = blob_naming(&mut store, b"shared parent", &[q]);
-        let (payload, mut whole) = wide_payload(&mut store, 20);
-        commit(&mut store, c, p, payload);
-        whole.extend([c.raw, p, q]);
+        let definition: Inline<Handle<SimpleArchive>> =
+            Inline::new(blob(&mut store, b"definition judged late"));
+        store
+            .insert_proof(CapabilityProof::new(
+                CapabilityResource::from(c),
+                &root,
+                definition,
+                SigningKey::from_bytes(&[57; 32]).verifying_key(),
+            ))
+            .unwrap();
         let work = store.drive_held().expect("the only driver");
         store.track_held([c]);
         assert_eq!(store.snapshot().unwrap().held(c), None);
-        assert_eq!(reads(&store, &p), 0, "the driver reads the parent");
-        let (release, driver) = block_driver_in(&mut store, work, p);
-        store.put::<UnknownBlob, _>(q_bytes).unwrap();
-        let metadata = blob(&mut store, b"built metadata");
-        commit(&mut store, built, p, metadata);
-        let during = store.snapshot().unwrap();
-        assert!(held_set(&during, built).is_superset(&BTreeSet::from([p, q])));
+        // The judgement is the driver's first read, and finds no descriptor.
+        let (release, driver) = block_driver_in(&mut store, work, c.raw);
+        store.put::<UnknownBlob, _>(descriptor).unwrap();
+        // This snapshot consumes the arrival while the judgement is in flight.
+        store.snapshot().unwrap();
         release.send(()).unwrap();
-        assert_eq!(published(&mut store, c), whole);
+        let held = published(&mut store, c);
+        assert!(held.contains(&c.raw), "the descriptor is held");
+        assert!(
+            held.contains(&definition.raw),
+            "the proof was judged again once its descriptor arrived"
+        );
         drop(store);
         driver.join().unwrap();
     }
 
-    /// A clone taken while the driver reads keeps that job: the copy,
-    /// driven by nobody, builds the collection whole itself, and the
-    /// original's driver still publishes it whole.
+    /// A clone taken while the driver reads keeps that job: the copy, driven
+    /// by nobody, stays unknown until a driver of its own builds it whole,
+    /// and the original's driver still publishes it whole.
     #[test]
     fn a_clone_taken_during_a_read_keeps_the_drivers_job() {
         let mut store = Store::default();
@@ -2493,11 +2606,13 @@ mod tests {
         let unread = *whole
             .iter()
             .find(|blob| reads(&store, blob) == 0)
-            .expect("the allowance left blobs unread");
+            .expect("the snapshot left blobs unread");
         let (release, driver) = block_driver_in(&mut store, work, unread);
         let mut copy = store.clone();
+        assert_eq!(copy.snapshot().unwrap().held(c), None, "nobody drives the copy");
+        let mut own = copy.drive_held().expect("nobody drives the copy");
+        assert!(own.run_until_idle());
         assert_eq!(held_set(&copy.snapshot().unwrap(), c), whole);
-        assert!(copy.drive_held().is_some(), "nobody drives the copy");
         release.send(()).unwrap();
         assert_eq!(published(&mut store, c), whole);
         drop(store);

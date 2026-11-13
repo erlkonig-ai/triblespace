@@ -3099,6 +3099,7 @@ mod tests {
     ) {
         let mut fresh = Pile::open_prefix(path, length).unwrap();
         fresh.track_held(collections.iter().copied());
+        crate::drive_held_to_idle(&mut fresh);
         let snapshot = fresh.snapshot().unwrap();
         let hydration = Hydration::new()
             .advance(&snapshot, &written(&snapshot, collections))
@@ -3136,8 +3137,15 @@ mod tests {
             assert_eq!(hydration.roots, roots, "roots at prefix {prefix}");
             assert_eq!(hydration.missing, missing, "missing at prefix {prefix}");
             if reached_end {
+                // Unknown in the step itself: the driver computes them.
+                assert!(
+                    held_sets(&snapshot, &collections)
+                        .iter()
+                        .all(Option::is_none)
+                );
+                crate::drive_held_to_idle(&mut pile);
                 assert_eq!(
-                    held_sets(&snapshot, &collections),
+                    held_sets(&pile.snapshot().unwrap(), &collections),
                     held,
                     "held sets at the end"
                 );
@@ -3231,7 +3239,9 @@ mod tests {
             steps += 1;
             let held = held_sets(&snapshot, &collections);
             if reached_end {
-                break held;
+                // The driver computes the sets this last step queued.
+                crate::drive_held_to_idle(&mut pile);
+                break held_sets(&pile.snapshot().unwrap(), &collections);
             }
             if held.iter().any(Option::is_some) {
                 known_before_end.push(pile.replayed_length());

@@ -71,6 +71,13 @@ impl Fixture {
         }
     }
 
+    /// The store as the host observes it once the held-set driver has done
+    /// what the store's changes queued.
+    fn snapshot(&mut self) -> MemoryRepoSnapshot {
+        crate::drive_held_to_idle(&mut self.store);
+        self.store.snapshot().unwrap()
+    }
+
     fn active(&self) -> ActiveCollections {
         let mut active = ActiveCollections::new();
         active.insert(&PatchEntry::new(&self.collection.raw));
@@ -133,12 +140,12 @@ fn a_blob_only_child_is_held_after_a_report_not_by_its_arrival() {
     let child_handle = child.get_handle();
     let mut fixture = Fixture::new(Bytes::from_source(child_handle.raw.to_vec()));
     let active = fixture.active();
-    let before = fixture.store.snapshot().unwrap();
+    let before = fixture.snapshot();
     let old = observe(&before, &active, fixture.local, None);
     assert!(!held(&old, fixture.collection, &child_handle.raw));
 
     fixture.store.put::<UnknownBlob, _>(child).unwrap();
-    let arrived = fixture.store.snapshot().unwrap();
+    let arrived = fixture.snapshot();
     assert_eq!(arrived.changes_since(&before), StoreChanges::BLOBS);
     let unreported = observe(&arrived, &active, fixture.local, Some((&before, &old)));
     assert!(!held(&unreported, fixture.collection, &child_handle.raw));
@@ -149,7 +156,7 @@ fn a_blob_only_child_is_held_after_a_report_not_by_its_arrival() {
     );
 
     fixture.store.note_held(fixture.collection, child_handle);
-    let reported = fixture.store.snapshot().unwrap();
+    let reported = fixture.snapshot();
     let new = observe(
         &reported,
         &active,
@@ -183,10 +190,10 @@ fn a_large_body_is_held_whole_in_the_first_observation() {
     let mut fixture = Fixture::new(Bytes::from_source(body));
     fixture.store.put::<UnknownBlob, _>(child).unwrap();
     let active = fixture.active();
-    let snapshot = fixture.store.snapshot().unwrap();
+    let snapshot = fixture.snapshot();
     let serving = observe(&snapshot, &active, fixture.local, None);
     assert!(held(&serving, fixture.collection, &child_handle.raw));
-    let again = fixture.store.snapshot().unwrap();
+    let again = fixture.snapshot();
     assert_eq!(again.changes_since(&snapshot), StoreChanges::NONE);
     let unchanged = observe(&again, &active, fixture.local, Some((&snapshot, &serving)));
     assert_eq!(
@@ -202,7 +209,7 @@ fn deselection_discards_inventory_and_reactivation_observes_current_residency() 
     let mut fixture = Fixture::new(Bytes::from_source(child_handle.raw.to_vec()));
     fixture.store.put::<UnknownBlob, _>(child).unwrap();
     let active = fixture.active();
-    let snapshot = fixture.store.snapshot().unwrap();
+    let snapshot = fixture.snapshot();
     let old = observe(&snapshot, &active, fixture.local, None);
     assert!(held(&old, fixture.collection, &child_handle.raw));
     let off = observe(
@@ -229,7 +236,7 @@ fn removed_parent_with_resident_child_invalidates_disconnected_inventory() {
     fixture.store.put::<UnknownBlob, _>(parent).unwrap();
     fixture.store.put::<UnknownBlob, _>(child).unwrap();
     let active = fixture.active();
-    let before = fixture.store.snapshot().unwrap();
+    let before = fixture.snapshot();
     let old = observe(&before, &active, fixture.local, None);
     assert!(held(&old, fixture.collection, &child_handle.raw));
     // Deliberately bypass root-preserving repository GC to model a backing
@@ -240,7 +247,7 @@ fn removed_parent_with_resident_child_invalidates_disconnected_inventory() {
         .filter(|handle| *handle != parent_handle)
         .collect();
     fixture.store.blobs.keep(kept);
-    let after = fixture.store.snapshot().unwrap();
+    let after = fixture.snapshot();
     assert!(after.get::<Bytes, UnknownBlob>(child_handle).is_ok());
     assert!(after.get::<Bytes, UnknownBlob>(parent_handle).is_err());
     let new = observe(&after, &active, fixture.local, Some((&before, &old)));
@@ -260,13 +267,15 @@ fn removed_parent_with_resident_child_invalidates_disconnected_inventory() {
     );
 }
 
-/// The publication barrier: the observation that first serves a new record
-/// already serves its whole closure. No walk runs here; none is needed.
+/// A snapshot reads no blob: the observation that first serves a new record
+/// does not serve its closure yet. Once the held-set driver has reached the
+/// record, the next observation serves the whole closure. No walk runs here;
+/// none is needed.
 #[test]
-fn a_new_records_closure_is_served_by_the_observation_that_carries_it() {
+fn a_new_records_closure_is_served_once_the_driver_reaches_it() {
     let mut fixture = Fixture::new(Bytes::from_source(b"first payload".to_vec()));
     let active = fixture.active();
-    let before = fixture.store.snapshot().unwrap();
+    let before = fixture.snapshot();
     let old = observe(&before, &active, fixture.local, None);
     let grandchild = fixture
         .store
@@ -291,10 +300,18 @@ fn a_new_records_closure_is_served_by_the_observation_that_carries_it() {
         metadata,
     ));
     fixture.store.insert(record).unwrap();
-    let after = fixture.store.snapshot().unwrap();
-    let new = observe(&after, &active, fixture.local, Some((&before, &old)));
-    let served = new.collection(fixture.collection).unwrap();
+    let carried = fixture.store.snapshot().unwrap();
+    let first = observe(&carried, &active, fixture.local, Some((&before, &old)));
+    let served = first.collection(fixture.collection).unwrap();
     assert!(served.repair.records().get(record.fingerprint()).is_some());
+    for handle in [data, child, grandchild] {
+        assert!(
+            !held(&first, fixture.collection, &handle.raw),
+            "the snapshot read nothing"
+        );
+    }
+    let after = fixture.snapshot();
+    let new = observe(&after, &active, fixture.local, Some((&carried, &first)));
     for handle in [data, child, grandchild] {
         assert!(held(&new, fixture.collection, &handle.raw));
     }

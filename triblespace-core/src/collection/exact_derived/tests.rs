@@ -6442,6 +6442,9 @@ mod lattice_v2 {
         block_on(store.ensure(first, &key(41))).unwrap();
         block_on(store.ensure(second, &key(41))).unwrap();
         store.track_held([second.handle()]);
+        store.snapshot().unwrap();
+        let mut work = store.drive_held().expect("the only driver");
+        assert!(work.run_until_idle());
         let snapshot = store.snapshot().unwrap();
         let held: BTreeSet<[u8; 32]> = snapshot
             .held(second.handle())

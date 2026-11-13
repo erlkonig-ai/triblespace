@@ -1608,25 +1608,34 @@ one side holds through a seed or a note reaches the other side's held set by
 its next references push.
 
 Every snapshot carries the held sets as they stood when it was taken, and they
-never change afterwards. Taking a snapshot first extends the sets by the
-closures of what arrived since the previous one -- every seed of a new record
-(one another record already named included), seeds whose bytes arrived, notes
-from references pushes -- computed against that snapshot. That is the
-publication barrier: an observation is never handed out ahead of its new
-records' closures. A held set is closed under the edge cache for readable
-children: a blob joins only once every child the cache names for it has
-joined. A blob that cannot be read, absent or resident and failing to read, is
-unknown on every path, and nothing above it joins. When a collection is first
-tracked, its existing closure is computed by the next snapshot, which reads
-every blob it reaches once; nothing here starts a thread. No held set is
-computed before the store has been observed whole once: a step of a climb
-observes a prefix, where a parent can precede its child and would make it a
-late child, so every held set is unknown until a step reaches the end. A collection whose
-records the store cannot select stays unsettled -- absent from the held sets,
-never published short -- and is selected again at the next observation. A
-snapshot that lost a blob its predecessor had resets the index, and every
-collection is recomputed as if newly tracked. Short-lived readers of the same
-pile track nothing.
+never change afterwards. Taking a snapshot reads no blob. It queues for the
+store's driver what arrived since the previous one -- every seed of a new
+record (one another record already named included), seeds whose bytes
+arrived, notes from references pushes -- selects the seeds of newly tracked
+collections from their records, and notes whose proofs are to be judged. The
+driver (`HeldWork`, a peer's held-set thread) does every read, in bounded
+steps against the latest observed snapshot and never holding the index across
+a read: it judges proofs, which reads the collection descriptors they name,
+and computes closures, which reads every blob they reach once. A newly
+tracked collection is unknown until its first closure is whole and its
+proofs are judged; a built collection's set grows as the driver reaches what
+arrived, so an observation can be handed out ahead of its new records'
+closures. Nothing in sync needs it otherwise: held sets are allowed to lag.
+A store nobody drives builds nothing, and its tracked collections stay
+unknown. A held set is closed under the edge cache for readable children: a
+blob joins only once every child the cache names for it has joined. A blob
+that cannot be read, absent or resident and failing to read, is unknown on
+every path, and nothing above it joins. No held set is computed before the
+store has been observed whole once: a step of a climb observes a prefix,
+where a parent can precede its child and would make it a late child, so every
+held set is unknown until a step reaches the end. Because the driver scans a
+blob against the latest snapshot rather than the one that brought it, a child
+that lands after its parent but before the driver reaches the parent is not a
+late child. A collection whose records the store cannot select stays
+unsettled -- absent from the held sets, never published short -- and is
+selected again at the next observation. A snapshot that lost a blob its
+predecessor had resets the index, and every collection is recomputed as if
+newly tracked. Short-lived readers of the same pile track nothing.
 
 `pile net sync` repairs what its held-set thread reads. Its store is
 `Covered<Repairing<PileFile>>` (`triblespace_net::peer::Repairing`), and in

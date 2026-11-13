@@ -263,10 +263,10 @@ where
     /// that it observes the whole store, not a prefix of a climb.
     fn observe(&mut self, now: S::Snapshot, whole: bool) -> CoveredSnapshot<S::Snapshot> {
         let memo = self.carry_forward(&now);
-        // The publication barrier: for every built collection, the closures
-        // of what arrived since the last snapshot are computed against this
-        // one before it is handed out. Nothing is tracked, nothing is paid.
-        // No held set is computed before the store was observed whole once.
+        // The held sets as the driver has computed them; what arrived since
+        // the last snapshot is queued for it, and no blob is read here.
+        // Nothing is tracked, nothing is paid. Nothing is queued before the
+        // store was observed whole once.
         let held = self.held.observe(&now, whole);
         self.last = Some((now.clone(), std::sync::Arc::clone(&memo)));
         CoveredSnapshot {

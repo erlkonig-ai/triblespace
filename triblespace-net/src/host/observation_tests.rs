@@ -842,6 +842,7 @@ fn arriving_read_definition_refreshes_admission_with_same_wake_root_and_record_l
     store.insert_proof(proof.clone()).unwrap();
     let enumerations = Arc::new(AtomicUsize::new(0));
     let active = active(collection);
+    crate::drive_held_to_idle(&mut store);
     let before = CountedSnapshot::new(store.snapshot().unwrap(), &enumerations);
     assert!(!before.contains_blob(read_capability()).unwrap());
     let serving_before = StoreSnapshot::from_store_changes(
@@ -869,6 +870,7 @@ fn arriving_read_definition_refreshes_admission_with_same_wake_root_and_record_l
         .put::<SimpleArchive, _>(entity! { capability_action: ACTION_READ }.facts().clone())
         .unwrap();
     assert_eq!(definition, read_capability());
+    crate::drive_held_to_idle(&mut store);
     let after = CountedSnapshot::new(store.snapshot().unwrap(), &enumerations);
     let changes = after.changes_since(&before);
     assert_eq!(changes, StoreChanges::BLOBS);
@@ -996,6 +998,7 @@ impl ScopedFixture {
         CountedSnapshot<PileSnapshot>,
         StoreSnapshot<CountedSnapshot<PileSnapshot>>,
     ) {
+        crate::drive_held_to_idle(&mut self.store);
         let snapshot = CountedSnapshot {
             inner: self.store.snapshot().unwrap(),
             enumerations: self.enumerations.clone(),

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Taking a snapshot reads no blob. `HeldIndex::observe` only queues work:
+  the seeds of new records, seeds whose bytes arrived, peer reports, and the
+  collections whose proofs are to be judged. The inline allowance
+  (`INLINE_SCANS`/`INLINE_BYTES`) and the publication barrier are gone, and
+  proof judging, which reads collection descriptors, moved to the driver,
+  including a descriptor that arrives while the driver judges. Every newly
+  settled collection is building until its closure is whole and its proofs
+  are judged, and a built collection's set grows as the driver reaches what
+  arrived, so held sets can lag the records in a snapshot. Without a driver
+  nothing is built; dropping `HeldWork` leaves the queue to the next driver.
+  New `HeldWork::run_until_idle` runs the driver until nothing queued is left.
+
 - Held sets start only after a whole replay. `Covered::snapshot_step`
   passes whether the step reached the end of the store to the held index,
   which computes nothing until the store has been observed whole once

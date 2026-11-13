@@ -62,3 +62,19 @@ pub mod walk;
 pub mod walk_stream;
 #[cfg(test)]
 mod native_index_probe;
+
+/// Take a snapshot of `store`, then run its held-set driver until it has done
+/// what that snapshot queued, as a peer's held-set thread would: snapshots
+/// read no blob, so a test fixture that owns a store without that thread
+/// calls this before the snapshot that should carry the held sets.
+#[cfg(test)]
+pub(crate) fn drive_held_to_idle<S>(store: &mut S)
+where
+    S: triblespace_core::repo::SnapshotSource + triblespace_core::collection::HeldStore,
+{
+    store.snapshot().unwrap();
+    let mut work = store
+        .drive_held()
+        .expect("nobody else drives the fixture's store");
+    assert!(work.run_until_idle());
+}

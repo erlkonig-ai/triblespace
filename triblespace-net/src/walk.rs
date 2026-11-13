@@ -2509,6 +2509,7 @@ pub(crate) mod tests {
             }
 
             pub(crate) fn observe(&mut self) {
+                crate::drive_held_to_idle(&mut self.store);
                 let snapshot = StoreSnapshot::from_store_changes(
                     self.store.snapshot().unwrap(),
                     &self.active,
@@ -2784,8 +2785,9 @@ pub(crate) mod tests {
         node.store.track_held([collection]);
         let peer = Node::new(114).id();
         let observe = |node: &mut Node, full: &ActiveCollections| {
+            crate::drive_held_to_idle(&mut node.store);
             let store = node.store.snapshot().unwrap();
-            assert!(store.held(collection).is_some(), "the store built the set");
+            assert!(store.held(collection).is_some(), "the driver built the set");
             let snapshot = StoreSnapshot::from_store_changes(
                 store,
                 &node.active,

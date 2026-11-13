@@ -2814,6 +2814,7 @@ mod tests {
         store.insert_proof(proof).unwrap();
         let mut active = super::ActiveCollections::new();
         active.insert(&super::PatchEntry::new(&collection.raw));
+        crate::drive_held_to_idle(&mut store);
         let before = store.snapshot().unwrap();
         let serving_before = super::StoreSnapshot::from_store_changes(
             before.clone(),
@@ -2830,6 +2831,7 @@ mod tests {
         store
             .put::<SimpleArchive, _>(entity! { capability_action: ACTION_READ }.facts().clone())
             .unwrap();
+        crate::drive_held_to_idle(&mut store);
         let after = store.snapshot().unwrap();
         let changes = after.changes_since(&before);
         assert!(changes.contains(StoreChanges::BLOBS));
