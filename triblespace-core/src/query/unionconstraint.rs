@@ -99,6 +99,15 @@ where
             .reduce(|acc, e| acc + e)
     }
 
+    /// Returns the **sum** of volumes across all variants, as for
+    /// [`estimate`](Self::estimate).
+    fn estimate_volume(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+        self.constraints
+            .iter()
+            .filter_map(|c| c.estimate_volume(variable, binding))
+            .reduce(|acc, e| acc + e)
+    }
+
     /// Collects proposals from every variant that is satisfied *for a
     /// given row*, then sorts and deduplicates per row. Dead variants
     /// (where [`satisfied`](Constraint::satisfied) returns `false`) are

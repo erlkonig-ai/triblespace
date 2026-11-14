@@ -900,6 +900,28 @@ pub trait Constraint<'a> {
     /// relevance off the batch.
     fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize>;
 
+    /// Estimates how much search binding `variable` next would lead into:
+    /// the number of rows this constraint holds under the current partial
+    /// `binding`, rather than the number of distinct values `variable` can
+    /// take.
+    ///
+    /// The two differ when `variable` has few distinct values but each of
+    /// them fans out widely. In a triple pattern `{ ?s @ a: ?o }` whose
+    /// objects are 29 classes over a million subjects, `estimate(?o)` is 29
+    /// and `estimate_volume(?o)` is a million. Ordering by `estimate` alone
+    /// binds `?o` first and then revisits every subject once per class.
+    ///
+    /// Only the variable ordering reads this, as its primary key, with
+    /// [`estimate`](Self::estimate) breaking ties within a magnitude bucket.
+    /// Proposer choice and confirm order keep using `estimate`, because a
+    /// proposal is a set of distinct values. The default returns
+    /// `estimate`, which is right for any constraint whose candidates are
+    /// its rows (sets, ranges, constants). The same `Some`/`None` contract
+    /// as `estimate` applies.
+    fn estimate_volume(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+        self.estimate(variable, binding)
+    }
+
     /// Enumerates candidate values for `variable`, for every row of
     /// `frontier`, into `proposals`.
     ///
@@ -989,6 +1011,11 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.estimate(variable, binding)
     }
 
+    fn estimate_volume(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+        let inner: &T = self;
+        inner.estimate_volume(variable, binding)
+    }
+
     fn propose(
         &self,
         variable: VariableId,
@@ -1024,6 +1051,11 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
     fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
         let inner: &T = self;
         inner.estimate(variable, binding)
+    }
+
+    fn estimate_volume(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+        let inner: &T = self;
+        inner.estimate_volume(variable, binding)
     }
 
     fn propose(
@@ -1132,6 +1164,32 @@ impl Default for LevelValues {
 ///
 /// Tune per query with [`Query::with_frontier_width`].
 pub const DEFAULT_FRONTIER_WIDTH: usize = 16384;
+
+/// Magnitude bucket of an estimate: 0 for zero, otherwise `ilog2 + 1`.
+fn magnitude(estimate: usize) -> usize {
+    estimate
+        .checked_ilog2()
+        .map(|bits| bits as usize + 1)
+        .unwrap_or(0)
+}
+
+/// The per-row, per-variable key `plan` minimises: the magnitude of
+/// [`Constraint::estimate_volume`] first, the magnitude of
+/// [`Constraint::estimate`] to break ties. Both fit in eight bits, so the
+/// pair packs into one `usize` and orders lexicographically.
+fn order_key<'a, C: Constraint<'a> + ?Sized>(
+    constraint: &C,
+    variable: VariableId,
+    binding: &Binding,
+) -> usize {
+    let estimate = constraint
+        .estimate(variable, binding)
+        .expect("unconstrained variable in query");
+    let volume = constraint
+        .estimate_volume(variable, binding)
+        .unwrap_or(estimate);
+    (magnitude(volume) << 8) | magnitude(estimate)
+}
 
 /// Width of the *first* chunk a level draws. Later chunks grow by
 /// [`FRONTIER_RAMP_BASE`] up to [`DEFAULT_FRONTIER_WIDTH`] (or whatever
@@ -1334,14 +1392,15 @@ impl DepthPlan {
 }
 
 /// One frontier: the index matrix of the rows sitting at one point of the
-/// search, their per-row estimates, and an exact generated-or-split plan.
+/// search, their per-row ordering keys, and an exact generated-or-split plan.
 #[derive(Clone, Debug, Default)]
 struct Depth {
     /// Row-major index matrix, `rows * slots` entries.
     block: Arc<Vec<u32>>,
     rows: usize,
-    /// Row-major estimate matrix, `rows * slots` entries.
-    estimates: Arc<Vec<usize>>,
+    /// Row-major [`order_key`] matrix, `rows * slots` entries. `plan` is
+    /// its only reader.
+    order_keys: Arc<Vec<usize>>,
     plan: DepthPlan,
     /// Next group to expand.
     group: usize,
@@ -1633,12 +1692,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         });
         let bindings = BindingStore::new();
         let slots = variables.find_last_set().map(|v| v + 1).unwrap_or(0);
-        let estimates: Vec<usize> = (0..slots)
+        let order_keys: Vec<usize> = (0..slots)
             .map(|v| {
                 if variables.is_set(v) {
-                    constraint
-                        .estimate(v, &bindings.view())
-                        .expect("unconstrained variable in query")
+                    order_key(&constraint, v, &bindings.view())
                 } else {
                     usize::MAX
                 }
@@ -1662,7 +1719,7 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         let root = Depth {
             block: Arc::new(vec![0u32; slots]),
             rows: 1,
-            estimates: Arc::new(estimates),
+            order_keys: Arc::new(order_keys),
             plan: DepthPlan::Unplanned,
             group: 0,
             group_limit: 0,
@@ -1723,9 +1780,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
 
     /// Partitions the top frontier by each row's preferred variable.
     ///
-    /// The preference is the same adaptive, magnitude-bucketed choice the
-    /// engine has always made — smallest estimate magnitude, most
-    /// influence — evaluated per row, against that row's own estimates.
+    /// The preference is an adaptive, magnitude-bucketed choice evaluated
+    /// per row, against that row's own [`order_key`]s: smallest volume
+    /// magnitude ([`Constraint::estimate_volume`]), then smallest estimate
+    /// magnitude ([`Constraint::estimate`]), then most influence.
     /// Rows are never moved onto a variable they did not choose:
     /// [`propose`](Constraint::propose) owns candidate support and
     /// first-seen order, and the protocol supplies no cross-variable
@@ -1750,20 +1808,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         u32::try_from(rows - 1).expect("frontier row ordinal exceeds u32");
 
         let preferred = |row: usize| {
-            let row_estimates = &depth.estimates[row * slots..(row + 1) * slots];
+            let row_keys = &depth.order_keys[row * slots..(row + 1) * slots];
             unbound
                 .into_iter()
-                .max_by_key(|&v| {
-                    (
-                        Reverse(
-                            row_estimates[v]
-                                .checked_ilog2()
-                                .map(|magnitude| magnitude + 1)
-                                .unwrap_or(0),
-                        ),
-                        influences[v].count(),
-                    )
-                })
+                .max_by_key(|&v| (Reverse(row_keys[v]), influences[v].count()))
                 .expect("non-empty unbound")
         };
 
@@ -2025,14 +2073,14 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
 
         let inplace = reusable
             && Arc::get_mut(&mut source.block).is_some()
-            && Arc::get_mut(&mut source.estimates).is_some();
+            && Arc::get_mut(&mut source.order_keys).is_some();
 
         if inplace {
             // Hand the matrices down and take the child's retired
             // allocations in exchange, so the next 1:1 descent finds a
             // uniquely-owned block again and the chain stays copy-free.
             std::mem::swap(&mut source.block, &mut child.block);
-            std::mem::swap(&mut source.estimates, &mut child.estimates);
+            std::mem::swap(&mut source.order_keys, &mut child.order_keys);
             let block = Arc::get_mut(&mut child.block).expect("unique across the swap");
             for (row, &entry) in self.drawn.iter().enumerate() {
                 block[row * slots + variable] = entry;
@@ -2052,18 +2100,18 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
                     block[base + variable] = entry;
                 }
             }
-            // Inherit each child row's estimates from its parent; the
+            // Inherit each child row's ordering keys from its parent; the
             // refresh below then updates exactly the ones binding
             // `variable` can have changed — the same influence-driven
             // refresh the single-binding engine did, now once per row of
             // the batch. Nothing else can have gone stale: a row's
-            // estimates were computed against its own binding, so
+            // keys were computed against its own binding, so
             // backtracking never invalidates them.
-            let estimates = reset_shared(&mut child.estimates, rows * slots);
+            let order_keys = reset_shared(&mut child.order_keys, rows * slots);
             for &parent_row in self.parents.iter() {
                 let parent_row = parent_row as usize;
-                estimates.extend_from_slice(
-                    &source.estimates[parent_row * slots..(parent_row + 1) * slots],
+                order_keys.extend_from_slice(
+                    &source.order_keys[parent_row * slots..(parent_row + 1) * slots],
                 );
             }
             self.stats.copied_descents.fetch_add(1, Ordering::Relaxed);
@@ -2076,22 +2124,19 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
 
         let stale = self.influences[variable].intersect(self.unbound);
         // With one unbound variable left, `plan` picks it whatever its
-        // estimate says, and `plan` is the only reader of the estimates, so
+        // estimate says, and `plan` is the only reader of the keys, so
         // refreshing them would be work nobody reads.
         if !stale.is_empty() && self.unbound.count() > 1 {
             let child = &mut self.depths[parent + 1];
             let block = Arc::clone(&child.block);
-            let estimates = Arc::make_mut(&mut child.estimates);
+            let order_keys = Arc::make_mut(&mut child.order_keys);
             let batch =
                 self.bindings
                     .batch(&block, RowSelection::identity(rows), slots, self.parallel);
             for row in 0..rows {
                 let binding = batch.row(row);
                 for v in stale {
-                    estimates[row * slots + v] = self
-                        .constraint
-                        .estimate(v, &binding)
-                        .expect("unconstrained variable in query");
+                    order_keys[row * slots + v] = order_key(&self.constraint, v, &binding);
                 }
             }
         }

@@ -3789,6 +3789,22 @@ where
             .unwrap_or(0)
     }
 
+    /// Returns the number of keys with the given prefix.
+    ///
+    /// This is the cached `leaf_count` of the shallowest subtree covering
+    /// `prefix`, so it costs one descent, like [`PATCH::segmented_len`],
+    /// but counts keys instead of distinct segments.
+    pub fn prefix_len<const PREFIX_LEN: usize>(&self, prefix: &[u8; PREFIX_LEN]) -> u64 {
+        const {
+            assert!(PREFIX_LEN <= KEY_LEN);
+        }
+        self.root
+            .as_ref()
+            .and_then(|root| root.locate_prefix(0, prefix))
+            .map(|head| head.count())
+            .unwrap_or(0)
+    }
+
     /// Returns the number of unique segments in keys with the given prefix.
     pub fn segmented_len<const PREFIX_LEN: usize>(&self, prefix: &[u8; PREFIX_LEN]) -> u64 {
         const {

@@ -732,22 +732,32 @@ impl TribleSetConstraint {
     }
 }
 
-impl<'a> Constraint<'a> for TribleSetConstraint {
-    /// Returns the set of variable positions (constant positions are
-    /// invisible to the engine).
-    fn variables(&self) -> VariableSet {
-        let mut variables = VariableSet::new_empty();
-        self.term_e.add_to(&mut variables);
-        self.term_a.add_to(&mut variables);
-        self.term_v.add_to(&mut variables);
-        variables
-    }
+/// What [`TribleSetConstraint::estimate_by`] counts under the covering index.
+#[derive(Clone, Copy)]
+enum Measure {
+    /// Distinct values of the queried position.
+    Distinct,
+    /// Tribles under the bound prefix.
+    Rows,
+}
 
-    /// Uses the covering indexes (EAV, EVA, AEV, AVE, VEA, VAE) to
-    /// count matching entries via `segmented_len`. The index chosen
-    /// depends on which of the other two positions are already bound,
-    /// giving tight estimates regardless of access pattern.
-    fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+impl TribleSetConstraint {
+    fn estimate_by(
+        &self,
+        variable: VariableId,
+        binding: &Binding,
+        measure: Measure,
+    ) -> Option<usize> {
+        // Distinct values of the queried position (`segmented_len`), or the
+        // tribles under the bound prefix (`prefix_len`).
+        macro_rules! count {
+            ($index:ident, $prefix:expr) => {
+                match measure {
+                    Measure::Distinct => self.set.$index.segmented_len($prefix),
+                    Measure::Rows => self.set.$index.prefix_len($prefix),
+                }
+            };
+        }
         let e_var = self.term_e.is_var(variable);
         let a_var = self.term_a.is_var(variable);
         let v_var = self.term_v.is_var(variable);
@@ -776,39 +786,41 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
 
         Some(match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             // Legal distinct-position combinations (queried var
-            // appears in exactly one trible position).
-            (None, None, None, true, false, false) => self.set.eav.segmented_len(&[0; 0]),
-            (None, None, None, false, true, false) => self.set.aev.segmented_len(&[0; 0]),
-            (None, None, None, false, false, true) => self.set.vea.segmented_len(&[0; 0]),
+            // appears in exactly one trible position). These are the cases
+            // where the queried variable's partner position is unbound, the
+            // only ones in which distinct values and rows differ.
+            (None, None, None, true, false, false) => count!(eav, &[0; 0]),
+            (None, None, None, false, true, false) => count!(aev, &[0; 0]),
+            (None, None, None, false, false, true) => count!(vea, &[0; 0]),
             (Some(e), None, None, false, true, false) => {
                 let mut prefix = [0u8; ID_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e[..]);
-                self.set.eav.segmented_len(&prefix)
+                count!(eav, &prefix)
             }
             (Some(e), None, None, false, false, true) => {
                 let mut prefix = [0u8; ID_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e[..]);
-                self.set.eva.segmented_len(&prefix)
+                count!(eva, &prefix)
             }
             (None, Some(a), None, true, false, false) => {
                 let mut prefix = [0u8; ID_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&a[..]);
-                self.set.aev.segmented_len(&prefix)
+                count!(aev, &prefix)
             }
             (None, Some(a), None, false, false, true) => {
                 let mut prefix = [0u8; ID_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&a[..]);
-                self.set.ave.segmented_len(&prefix)
+                count!(ave, &prefix)
             }
             (None, None, Some(v), true, false, false) => {
                 let mut prefix = [0u8; INLINE_LEN];
                 prefix[0..INLINE_LEN].copy_from_slice(&v[..]);
-                self.set.vea.segmented_len(&prefix)
+                count!(vea, &prefix)
             }
             (None, None, Some(v), false, true, false) => {
                 let mut prefix = [0u8; INLINE_LEN];
                 prefix[0..INLINE_LEN].copy_from_slice(&v[..]);
-                self.set.vae.segmented_len(&prefix)
+                count!(vae, &prefix)
             }
             (None, Some(a), Some(v), true, false, false) => {
                 let mut prefix = [0u8; ID_LEN + INLINE_LEN];
@@ -873,6 +885,34 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
             }
             _ => panic!("TribleSetConstraint: unreachable position-bound combo"),
         } as usize)
+    }
+}
+
+impl<'a> Constraint<'a> for TribleSetConstraint {
+    /// Returns the set of variable positions (constant positions are
+    /// invisible to the engine).
+    fn variables(&self) -> VariableSet {
+        let mut variables = VariableSet::new_empty();
+        self.term_e.add_to(&mut variables);
+        self.term_a.add_to(&mut variables);
+        self.term_v.add_to(&mut variables);
+        variables
+    }
+
+    /// Uses the covering indexes (EAV, EVA, AEV, AVE, VEA, VAE) to
+    /// count matching entries via `segmented_len`. The index chosen
+    /// depends on which of the other two positions are already bound,
+    /// giving tight estimates regardless of access pattern.
+    fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+        self.estimate_by(variable, binding, Measure::Distinct)
+    }
+
+    /// The tribles under the bound prefix: while the queried variable's
+    /// partner position is unbound this counts every row the variable's
+    /// values lead to, not the values themselves. Where both other
+    /// positions are bound the two agree.
+    fn estimate_volume(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+        self.estimate_by(variable, binding, Measure::Rows)
     }
 
     /// Enumerates matching values for every row of the batch: N covering

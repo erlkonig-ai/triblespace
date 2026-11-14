@@ -107,6 +107,15 @@ where
             .min()
     }
 
+    /// The tightest child's volume: every row the intersection reaches lies
+    /// under each child's rows, so the smallest bounds them all.
+    fn estimate_volume(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+        self.constraints
+            .iter()
+            .filter_map(|c| c.estimate_volume(variable, binding))
+            .min()
+    }
+
     /// Lets each row's tightest child propose, then confirms through the
     /// rest — kills land in the region's liveness words; nothing is
     /// compacted. Children that return `None` for this variable are
