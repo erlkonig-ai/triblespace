@@ -27,6 +27,11 @@ const WASM_OUTPUT_BYTES: usize = 8 * 1024;
 const WASM_STACK_SIZE_BYTES: usize = 128 * 1024;
 const WASM_INITIAL_MEMORY_BYTES: usize = 8 * 64 * 1024;
 const WASM_MAX_MEMORY_BYTES: usize = 8 * 64 * 1024;
+/// The one path every formatter's private build directory is remapped to, so
+/// the compiled bytes are the same on every host and in every target dir.
+/// It is also mixed into the cache key: an artifact cached before this path
+/// was fixed embeds its build path and must not be reused.
+const FORMATTER_SOURCE_ROOT: &str = "/triblespace/value_formatter";
 
 pub fn value_formatter_impl(attr: TokenStream2, item: TokenStream2) -> syn::Result<TokenStream2> {
     let args: ValueFormatterArgs = syn::parse2(attr)?;
@@ -344,16 +349,11 @@ fn compile_wasm_formatter(item_fn: &ItemFn) -> syn::Result<PathBuf> {
 fn compile_wasm_formatter_in(item_fn: &ItemFn, out_dir: &Path) -> syn::Result<PathBuf> {
     let stem = format!("{}_{}", item_fn.sig.ident, formatter_hash(item_fn));
     cache_wasm_formatter(out_dir, &stem, |src_path, wasm_path| {
-        compile_wasm_source(item_fn, src_path, wasm_path, out_dir)
+        compile_wasm_source(item_fn, src_path, wasm_path)
     })
 }
 
-fn compile_wasm_source(
-    item_fn: &ItemFn,
-    src_path: &Path,
-    wasm_path: &Path,
-    out_dir: &Path,
-) -> syn::Result<()> {
+fn compile_wasm_source(item_fn: &ItemFn, src_path: &Path, wasm_path: &Path) -> syn::Result<()> {
     let source = wasm_crate_source(item_fn);
     std::fs::write(src_path, source).map_err(|err| {
         syn::Error::new(
@@ -362,15 +362,18 @@ fn compile_wasm_source(
         )
     })?;
 
-    // Keep file!(), diagnostics and embedded source paths independent of the
-    // private build directory. The basename also preserves the old crate name.
+    // A formatter's bytes are content: they are stored as a blob and named by
+    // hash in every commit's metadata. So file!(), panic locations and other
+    // embedded source paths must not depend on where it was built. The
+    // private build directory maps to one fixed path, never to `out_dir`,
+    // which follows CARGO_TARGET_DIR and differs per host and per lane.
     let mut remap = src_path
         .parent()
         .expect("formatter source has a parent")
         .as_os_str()
         .to_os_string();
     remap.push("=");
-    remap.push(out_dir);
+    remap.push(FORMATTER_SOURCE_ROOT);
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     let output = Command::new(rustc)
         .arg("--crate-type=cdylib")
@@ -496,6 +499,7 @@ impl Drop for FormatterBuildDir {
 fn formatter_hash(item_fn: &ItemFn) -> String {
     let tokens = item_fn.to_token_stream().to_string();
     let mut hasher = DefaultHasher::new();
+    FORMATTER_SOURCE_ROOT.hash(&mut hasher);
     tokens.hash(&mut hasher);
     format!("{:016X}", hasher.finish())
 }
@@ -799,13 +803,28 @@ mod tests {
         let stem = format!("{}_{}", item.sig.ident, formatter_hash(&item));
         let direct_source = dir.0.join(format!("{stem}.rs"));
         let direct_output = dir.0.join("direct.wasm");
-        compile_wasm_source(&item, &direct_source, &direct_output, &dir.0).unwrap();
+        compile_wasm_source(&item, &direct_source, &direct_output).unwrap();
         let expected = fs::read(&direct_output).unwrap();
         assert!(expected.starts_with(b"\0asm"));
-        let source_name = direct_source.to_string_lossy();
-        assert!(expected
-            .windows(source_name.len())
-            .any(|bytes| bytes == source_name.as_bytes()));
+        let contains = |bytes: &[u8], needle: &str| {
+            bytes
+                .windows(needle.len())
+                .any(|window| window == needle.as_bytes())
+        };
+        // The embedded source path is the fixed root, never the build dir.
+        assert!(contains(
+            &expected,
+            &format!("{FORMATTER_SOURCE_ROOT}/{stem}.rs")
+        ));
+        assert!(!contains(&expected, &dir.0.to_string_lossy()));
+        // Another build directory, as another host or lane would have, gives
+        // the same bytes.
+        let elsewhere = test_dir();
+        let other_source = elsewhere.0.join(format!("{stem}.rs"));
+        let other_output = elsewhere.0.join("direct.wasm");
+        compile_wasm_source(&item, &other_source, &other_output).unwrap();
+        assert_eq!(fs::read(&other_output).unwrap(), expected);
+        drop(elsewhere);
         fs::remove_file(direct_source).unwrap();
         fs::remove_file(direct_output).unwrap();
         // Force two real compiler invocations into the publication race.
@@ -820,7 +839,7 @@ mod tests {
                     scope.spawn(move || {
                         let item = syn::parse_str(&tokens).unwrap();
                         cache_wasm_formatter(cache, stem, |source, output| {
-                            let result = compile_wasm_source(&item, source, output, cache);
+                            let result = compile_wasm_source(&item, source, output);
                             barrier.wait();
                             result
                         })
