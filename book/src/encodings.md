@@ -236,11 +236,22 @@ includes the facts of its value encoding's `describe()` output, with the blobs
 they reference (`attribute::encoding_description`): `attributes!` adds them to
 the declaration record, and `Attribute::anchored`, `named` and `iri` add them
 to the identity fragment's metafacts. `entity!` carries both into the fragment's
-metafacts, and a commit writes them into its metadata archive. So a pile that
-holds `value_encoding: <Handle<T> id>` also holds the facts that say this
-encoding is a handle (`metadata::blob_encoding`) and which blob encoding it
-points at. Metafacts do not take part in identity, so attribute ids and entity
-roots are the same as without them.
+metafacts, and a commit writes them into its metadata archive. So a commit
+built this way that holds `value_encoding: <Handle<T> id>` also holds the facts
+that say this encoding is a handle (`metadata::blob_encoding`) and which blob
+encoding it points at. Metafacts do not take part in identity, so attribute ids
+and entity roots are the same as without them.
+
+This is a property of fragments built through these paths, not a guarantee
+about every pile. Attributes made with `from_fragment_unchecked` (the JSON
+importer does this), facts written without `entity!`, and commits from before
+this change carry no encoding description, and some carry no `value_encoding`
+at all. Those are legitimate, not malformed: a reader that needs the facts and
+finds them missing should treat the encoding as unknown. The metadata
+attributes used inside a description (`metadata::blob_encoding`,
+`metadata::value_formatter`, ...) are not themselves described this way, so
+the metadata is not recursively self-describing; readers know those attributes
+directly.
 
 ### Grow-only entity-ID sets
 
