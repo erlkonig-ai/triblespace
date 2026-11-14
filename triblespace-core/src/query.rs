@@ -2075,7 +2075,10 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
         child.emit = 0;
 
         let stale = self.influences[variable].intersect(self.unbound);
-        if !stale.is_empty() {
+        // With one unbound variable left, `plan` picks it whatever its
+        // estimate says, and `plan` is the only reader of the estimates, so
+        // refreshing them would be work nobody reads.
+        if !stale.is_empty() && self.unbound.count() > 1 {
             let child = &mut self.depths[parent + 1];
             let block = Arc::clone(&child.block);
             let estimates = Arc::make_mut(&mut child.estimates);
