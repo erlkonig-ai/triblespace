@@ -186,13 +186,19 @@ fn source_prefix_compacts_a_prefix_while_a_writer_appends() {
     }
     // Witness that the appends really overlap a compaction: without the
     // prefix the same growing source is refused, by a length check or by the
-    // lock-free header census reading an append still in flight.
+    // lock-free header census reading an append still in flight. Which
+    // refusal fires depends on where the race lands. Every growth refusal in
+    // compact.rs says "source pile changed ..." (preflight, inventory freeze,
+    // compaction, exclusion preflight) except the census one, which names the
+    // path: "source pile <path> changed while being read". So accept both
+    // shapes.
     let unbounded = dir.path().join("unbounded.pile");
     compact(&source, &unbounded, None, false)
         .assert()
         .failure()
         .stderr(
-            predicate::str::contains("source pile changed")
+            predicate::str::is_match(r"source pile (\S+ )?changed")
+                .unwrap()
                 .and(predicate::str::contains("amputate").not()),
         );
     stop.store(true, Ordering::Relaxed);
