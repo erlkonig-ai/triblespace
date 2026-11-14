@@ -484,9 +484,7 @@ pub fn pattern_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Resul
             #local_tokens
             #attr_tokens
             #entity_tokens
-            ::std::sync::Arc::new(
-                #base_path::query::intersectionconstraint::IntersectionConstraint::new(constraints)
-            )
+            #base_path::query::intersectionconstraint::IntersectionConstraint::arc_or_single(constraints)
         }
     };
 
@@ -972,9 +970,7 @@ pub fn pattern_changes_impl(
                 let mut constraints: ::std::vec::Vec<Box<dyn #base_path::query::Constraint + Send + Sync>> = ::std::vec::Vec::new();
                 #[allow(unused_imports)] use #base_path::query::TriblePattern;
                 #triple_tokens
-                ::std::sync::Arc::new(
-                    #base_path::query::intersectionconstraint::IntersectionConstraint::new(constraints)
-                )
+                #base_path::query::intersectionconstraint::IntersectionConstraint::arc_or_single(constraints)
             }
         };
         case_exprs.push(case);
@@ -1001,9 +997,7 @@ pub fn pattern_changes_impl(
             #[allow(unused_imports)] use #base_path::query::TriblePattern;
             #entity_const_tokens
             constraints.push(Box::new(#union_expr));
-            ::std::sync::Arc::new(
-                #base_path::query::intersectionconstraint::IntersectionConstraint::new(constraints)
-            )
+            #base_path::query::intersectionconstraint::IntersectionConstraint::arc_or_single(constraints)
         }
     };
 

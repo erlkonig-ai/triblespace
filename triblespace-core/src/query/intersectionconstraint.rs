@@ -68,6 +68,23 @@ where
     }
 }
 
+impl<'a> IntersectionConstraint<Box<dyn Constraint<'a> + Send + Sync + 'a>> {
+    /// What `pattern!` returns: the intersection of its clauses, or the one
+    /// clause itself when there is only one. An intersection of one child
+    /// would still estimate that child on every row to choose a proposer
+    /// that cannot differ, so it is not built at all. The relevance check
+    /// in `propose` stays wherever an intersection really chooses.
+    pub fn arc_or_single(
+        mut constraints: Vec<Box<dyn Constraint<'a> + Send + Sync + 'a>>,
+    ) -> std::sync::Arc<dyn Constraint<'a> + Send + Sync + 'a> {
+        if constraints.len() == 1 {
+            std::sync::Arc::from(constraints.pop().expect("exactly one constraint"))
+        } else {
+            std::sync::Arc::new(IntersectionConstraint::new(constraints))
+        }
+    }
+}
+
 impl<'a, C> Constraint<'a> for IntersectionConstraint<C>
 where
     C: Constraint<'a> + 'a,
@@ -296,6 +313,9 @@ macro_rules! and {
     // this macro already satisfies Send + Sync; non-thread-safe constraint
     // types (e.g. `Rc`-backed ContainsConstraint variants) can still be
     // used via direct `IntersectionConstraint::new` construction.
+    // A single constraint needs no intersection: wrapping it would only
+    // re-estimate it on every row to pick the proposer it already is.
+    ($c:expr $(,)?) => (::std::sync::Arc::new($c));
     ($($c:expr),+ $(,)?) => (
         ::std::sync::Arc::new(
             $crate::query::intersectionconstraint::IntersectionConstraint::new(vec![
