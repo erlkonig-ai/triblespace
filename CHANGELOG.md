@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Fragments now carry each attribute's value-encoding description in their
+  metafacts, so a commit's metadata archive says what an encoding is, not
+  only its id. For a `Handle<T>` that includes the
+  `metadata::blob_encoding` fact that marks values as handles. The
+  `attributes!` description record adds `<S as MetaDescribe>::describe()`,
+  and `Attribute::anchored`, `named` and `iri` add it to their identity
+  fragment's metafacts, both through `attribute::encoding_description`.
+  It takes only the facts of the description and the blobs they reference:
+  its metafacts would depend on which attribute records the process had
+  already cached, and so would the metadata archive and the COMMIT
+  (`tests/encoding_description_order.rs`). Attribute ids and entity roots
+  are unchanged (`tests/encoding_descriptions.rs` pins them against values
+  from `c0b4ba08`). For representative faculty fragments a metadata archive
+  grows by 7 to 26 tribles (448 B to 1.6 KiB).
+
 - The held-set driver extends built collections first, and building
   collections take turns: a paused building job goes behind the others
   instead of resuming at the front. A small collection tracked after a large

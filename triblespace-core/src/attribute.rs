@@ -85,6 +85,21 @@ impl Drop for MetaDepthGuard {
     }
 }
 
+/// The description of a value encoding that attribute descriptions carry:
+/// the facts of `<S as MetaDescribe>::describe()` and the blobs they reference.
+///
+/// Only the facts. `describe()` builds its facts with `entity!`, so its
+/// metafacts and blobs also hold the descriptions of the metadata attributes
+/// it uses. Inside a guarded record build those come from whichever records
+/// happen to be cached already, so they depend on what the process built
+/// before. The facts do not. Keeping only them makes every attribute record,
+/// and so every commit's metadata archive, a function of the fragment alone.
+pub fn encoding_description<S: crate::metadata::MetaDescribe>() -> Fragment {
+    let (_, facts, _, mut blobs) = <S as crate::metadata::MetaDescribe>::describe().into_parts();
+    blobs.keep(crate::repo::potential_handles(&facts));
+    Fragment::from_facts_and_blobs(facts, blobs)
+}
+
 /// Lazily cached description for one attribute declared by `attributes!`.
 ///
 /// The builder is deferred because its value encoding may itself be described
@@ -191,7 +206,7 @@ impl<S: InlineEncoding + crate::metadata::MetaDescribe> Attribute<S> {
     /// ::anchored(ANCHOR)` is an ordinary generic call, so one anchor yields a
     /// distinct id per element type.
     pub fn anchored(anchor: Id) -> Self {
-        Self::from_fragment_unchecked(crate::macros::entity! {
+        Self::from_identity(crate::macros::entity! {
             crate::metadata::anchor:
                 crate::inline::encodings::genid::GenId::inline_from(anchor),
             crate::metadata::value_encoding: <S as crate::metadata::MetaDescribe>::id(),
@@ -205,7 +220,7 @@ impl<S: InlineEncoding + crate::metadata::MetaDescribe> Attribute<S> {
     /// parties agree on — not for a local Rust identifier, which belongs in
     /// usage facts.
     pub fn named(name: &str) -> Self {
-        Self::from_fragment_unchecked(crate::macros::entity! {
+        Self::from_identity(crate::macros::entity! {
             crate::metadata::name: name.to_owned(),
             crate::metadata::value_encoding: <S as crate::metadata::MetaDescribe>::id(),
             crate::metadata::tag: crate::metadata::KIND_ATTRIBUTE,
@@ -216,11 +231,28 @@ impl<S: InlineEncoding + crate::metadata::MetaDescribe> Attribute<S> {
     ///
     /// Identity is `(iri, S)`.
     pub fn iri(iri: &str) -> Self {
-        Self::from_fragment_unchecked(crate::macros::entity! {
+        Self::from_identity(crate::macros::entity! {
             crate::metadata::iri: iri.to_owned(),
             crate::metadata::value_encoding: <S as crate::metadata::MetaDescribe>::id(),
             crate::metadata::tag: crate::metadata::KIND_ATTRIBUTE,
         })
+    }
+
+    /// Wraps an identity fragment built from `S`, adding `S`'s own
+    /// description to its metafacts.
+    ///
+    /// The identity facts name the encoding only by id. Its description (for a
+    /// `Handle<T>`, the `metadata::blob_encoding` fact that says the value is a
+    /// handle) is what lets a reader of the pile type the value without this
+    /// Rust type. [`Attribute::meta`] returns this fragment for runtime
+    /// attributes, so `entity!` carries the description into every fragment
+    /// that uses the attribute, and a commit into its metadata archive.
+    ///
+    /// Metafacts are not part of identity: the root, and so the attribute id,
+    /// is the one the identity facts derive.
+    fn from_identity(mut fragment: Fragment) -> Self {
+        fragment.describe_with(encoding_description::<S>());
+        Self::from_fragment_unchecked(fragment)
     }
 }
 
@@ -251,6 +283,9 @@ impl<S: InlineEncoding> Attribute<S> {
     /// Declared attributes use their cached declaration record. Runtime-minted
     /// attributes fall back to their identity fragment, which contains the
     /// IRI/name, value encoding, and any blobs used to derive that identity.
+    /// Both also carry the value encoding's own description
+    /// (`<S as MetaDescribe>::describe()`), except for attributes wrapped by
+    /// [`Attribute::from_fragment_unchecked`], which carry what the caller gave.
     pub fn meta(&self) -> &Fragment {
         self.meta
             .and_then(AttributeMeta::get)
@@ -355,9 +390,10 @@ where
         // `metadata::value_encoding: S::id()` from construction —
         // exactly the facts a registry queries on. The schema's own
         // facts (the human-readable name, description, hash protocol,
-        // …) belong to the schema, not the attribute; consumers
-        // wanting them ask `<S as MetaDescribe>::describe()`
-        // separately. Pure accessor.
+        // …) belong to the schema, not the attribute, so they are not
+        // among these facts. The derived constructors put them in the
+        // fragment's metafacts instead, which is how `entity!` carries
+        // them into the pile. Pure accessor.
         self.fragment.clone()
     }
 }

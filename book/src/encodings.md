@@ -231,6 +231,17 @@ whose facts tag the encoding entity with `metadata::KIND_INLINE_ENCODING` or
 `metadata::description` (UTF8String handles). Persist the description blobs
 alongside the metadata tribles if you want the text to remain readable.
 
+You rarely need to persist these by hand. Every attribute's description
+includes the facts of its value encoding's `describe()` output, with the blobs
+they reference (`attribute::encoding_description`): `attributes!` adds them to
+the declaration record, and `Attribute::anchored`, `named` and `iri` add them
+to the identity fragment's metafacts. `entity!` carries both into the fragment's
+metafacts, and a commit writes them into its metadata archive. So a pile that
+holds `value_encoding: <Handle<T> id>` also holds the facts that say this
+encoding is a handle (`metadata::blob_encoding`) and which blob encoding it
+points at. Metafacts do not take part in identity, so attribute ids and entity
+roots are the same as without them.
+
 ### Grow-only entity-ID sets
 
 `blob::encodings::entity_id_set::encode` sorts and deduplicates authored `Id`

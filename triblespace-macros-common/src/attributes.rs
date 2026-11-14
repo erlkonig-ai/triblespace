@@ -307,6 +307,12 @@ pub fn attributes_impl(input: TokenStream2, base_path: &TokenStream2) -> syn::Re
                     let __attr_ref = #base_path::id::ExclusiveId::force_ref(&__attr_id);
                     __fragment += #attribute_core_tokens;
 
+                    // The value encoding's own description. `value_encoding`
+                    // above names the encoding only by id; these facts say
+                    // what it is (for a `Handle<T>`, its `blob_encoding`), so a
+                    // reader of the pile can type values without this crate.
+                    __fragment += #base_path::attribute::encoding_description::<#ty>();
+
                     // Usage identity is derived only from attribute + source
                     // module. Human-facing name and docs are annotations on it.
                     let mut __usage = #usage_core_tokens;

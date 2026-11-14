@@ -211,7 +211,8 @@ identifier.
 A self-contained bundle of exported IDs, content facts, descriptive metafacts,
 and one content-addressed blob store shared by both fact sets. `entity!` and
 import pipelines return fragments; `entity!` carries descriptions for the
-attributes that actually emitted facts. Fragments compose via `+=` without
+attributes that actually emitted facts, and for those attributes' value
+encodings. Fragments compose via `+=` without
 mixing descriptions into ordinary queries. Use `Fragment::root()` to extract
 derived IDs, `Fragment::empty()` to start accumulation, and spread (`*`) to pass
 child fragments into parent entities, giving Merkle trees for free.
