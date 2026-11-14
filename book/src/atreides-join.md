@@ -57,9 +57,10 @@ what differs is **what** quantity they approximate:
   perform.
 - **Distinct-value Join (Paul)** narrows the focus to a single variable at a
   time. It returns the smallest proposal buffer the constraint could produce for
-  any still-unbound variable, ignoring later confirmation filters. This is the
-  behaviour exercised by [`Query::new`](triblespace::core::query::Query::new) today, which
-  keeps the tightest candidate list on hand while the search walks forward.
+  any still-unbound variable, ignoring later confirmation filters. This is
+  what [`Constraint::estimate`](triblespace::core::query::Constraint::estimate)
+  reports today, and what an intersection uses to choose each row's proposer
+  and to order its confirmers, because a proposal is a set of distinct values.
 - **Partial-binding Join (Ghanima)** goes further by measuring the size of the
   actual proposal the composite constraint can deliver for the current binding
   and chosen variable. For an `and` constraint this corresponds to the
@@ -74,6 +75,19 @@ All four share the same implementation machinery; the difference lies in how
 aggressively `estimate` compresses the constraint's knowledge. Even when only
 partial information is available the search still functions, but better
 estimates steer the traversal directly toward the surviving tuples.
+
+The engine uses two of these rungs at once, for two different decisions.
+Which variable to bind next is ordered by Jessica, through
+[`Constraint::estimate_volume`](triblespace::core::query::Constraint::estimate_volume),
+with Paul breaking ties: a variable with few distinct values but a large fanout
+no longer looks cheap. Which constraint proposes is still chosen by Paul. Paul
+alone misleads on a join such as `{ ?s @ formerStreamTitle: ?t, rdf_type: ?c }`
+over DBLP: rdf:type has only 29 classes over 949,069 tribles, so ?c looked
+smallest and every formerStreamTitle subject was re-proposed under every class
+(16,853 proposals for 2,048 results). Jessica alone misleads on a lone pattern
+`{ ?s @ a: ?o }`, where both variables carry the same row count and the tie no
+longer knows which side has fewer values. Ordering by Jessica and breaking ties
+with Paul avoids both (measured in the SPARQLoscope DBLP benchmark, 2026-11-14).
 
 Every constraint can decide which rung of this ladder it occupies. Simple
 wrappers that only track total counts behave like Jessica, those that surface
@@ -93,9 +107,10 @@ The solver then repeats one negotiation per binding:
    the `influence` sets of the variables bound since the last refresh, minus
    the ones already bound.
 2. Re-sort the unbound variables and take the most specific one. The ordering
-   is by candidate-count *bit length* (smaller first), so counts in the same
-   power-of-two bucket are deliberately treated as equally specific; ties go to
-   the variable that influences the most others.
+   is by the *bit length* of the volume estimate (smaller first), then by the
+   bit length of the distinct-value estimate, so counts in the same
+   power-of-two bucket are deliberately treated as equally specific; remaining
+   ties go to the variable that influences the most others.
 3. Ask the constraint tree to propose for that variable. An intersection lets
    its tightest child propose and runs the remaining children as confirmers
    over that child's output, most selective first, so what reaches the engine
@@ -113,8 +128,9 @@ engine can stream results as soon as they are found.
 
 Consider a query that relates `?person` to `?parent` and `?city`. The search
 begins with all three variables unbound. If `?city` only has a handful of
-possibilities, its estimate will be the smallest, so the engine binds `?city`
-first. Each city candidate is checked against the parent and person constraints
+possibilities and each holds few people, its volume will be the smallest, so the
+engine binds `?city` first. (If each of those few cities held millions of
+people, the volume would steer the engine to start elsewhere.) Each city candidate is checked against the parent and person constraints
 before the search continues, quickly rejecting infeasible branches before the
 higher-cardinality relationships are explored.
 

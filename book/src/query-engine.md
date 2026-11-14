@@ -15,12 +15,13 @@ what buys a property the engine does provide.
 
 A constraint restricts the values that query variables may take. It is not a
 node in a plan; it is a participant the engine interrogates. The whole
-interface is six methods, and the engine calls them in a fixed rhythm:
+interface is seven methods, and the engine calls them in a fixed rhythm:
 
 | Method | Role | Called |
 |---|---|---|
 | `variables` | Declares which variables the constraint touches. | Once, at query start. |
-| `estimate` | Predicts the candidate count for one variable under one binding. | Before each binding decision. |
+| `estimate` | Predicts the candidate count for one variable under one binding: how many distinct values a proposal would hold. | Before each binding decision, and by an intersection to choose its proposer and order its confirmers. |
+| `estimate_volume` | Predicts how many rows binding that variable next would lead into. | Before each binding decision, as the primary key of the variable order; `estimate` breaks ties. |
 | `propose` | Enumerates candidate values for a variable, for a whole batch of bindings, into a buffer. | On the tightest constraint for that variable — an intersection picks it among its children. |
 | `confirm` | Kills candidates that violate this constraint under their own binding. | On every *other* constraint touching that variable. |
 | `satisfied` | Reports whether the constraint is still consistent with the binding. | Once at query start on the whole tree; then by a union before it proposes or confirms, to skip dead arms. |
@@ -34,8 +35,10 @@ Whether the answer is `Some` or `None` must depend only on which variables are
 bound, never on their values — a batch shares one bound set, and composites
 read relevance off the batch.
 
-Only four of the six need an implementation: `satisfied` defaults to `true` and
-`influence` defaults to "every variable I touch except this one". A new data
+Only four of the seven need an implementation: `satisfied` defaults to `true`,
+`influence` defaults to "every variable I touch except this one", and
+`estimate_volume` defaults to `estimate`, which is right for any source whose
+candidates are its rows (sets, ranges, constants). A new data
 source therefore joins the engine with `variables`, `estimate`, `propose`, and
 `confirm` — iteration and point queries, nothing more. That minimum is what
 keeps hash maps, PATCHes, succinct archives and device-resident structures all
