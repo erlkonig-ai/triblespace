@@ -397,8 +397,9 @@ fn a_blob_no_neighbour_holds_is_tried_once() {
     let snapshot = built(&mut peer, &[one, two]);
     assert!(holds(&snapshot, one, &first));
     assert!(holds(&snapshot, two, &second));
+    // An unreadable blob stays out; its readable parent joins.
     for collection in [one, two] {
-        assert!(!holds(&snapshot, collection, &shared));
+        assert!(holds(&snapshot, collection, &shared));
         assert!(!holds(&snapshot, collection, &leaf));
     }
     assert_eq!(neighbour.gets(leaf.get_handle().raw), 1, "tried once");

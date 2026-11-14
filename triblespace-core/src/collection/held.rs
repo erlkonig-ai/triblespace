@@ -8,20 +8,49 @@
 //!
 //! # Membership
 //!
-//! `held(C)` is every resident blob reachable from C's *seeds*, plus the
-//! memberships peers reported (below). The seeds are the blobs C's replicated
-//! records name: the descriptor, each COMMIT's data and metadata archive, each
-//! DERIVE's output, and the capability definitions named by the proofs C's
-//! authorization evidence keeps ([`validate_proof_evidence`], the predicate
-//! the sync host applies: over C from one of C's policy roots; a proof whose
-//! collection descriptor arrives later is judged on its arrival). A proof
-//! over any other resource, and a valid proof irrelevant to C, seeds
-//! nothing. A MERGE never replicates, so its result is never a seed,
-//! and a blob no record names (an attachment, a scratch archive) is never
-//! one either.
+//! `held(C)` is every readable blob reachable from C's *roots*: its *seeds*
+//! and the memberships peers reported (below). The seeds are the blobs C's
+//! replicated records name: the descriptor, each COMMIT's data and metadata
+//! archive, each DERIVE's output, and the capability definitions named by the
+//! proofs C's authorization evidence keeps ([`validate_proof_evidence`], the
+//! predicate the sync host applies: over C from one of C's policy roots; a
+//! proof whose collection descriptor arrives later is judged on its arrival).
+//! A proof over any other resource, and a valid proof irrelevant to C, seeds
+//! nothing. A MERGE never replicates, so its result is never a seed, and a
+//! blob no record names (an attachment, a scratch archive) is never one
+//! either.
 //!
 //! Reachability is the conservative closure: an aligned 32-byte word of a
 //! blob is a child when it names a resident blob. Nothing here knows schemas.
+//!
+//! A blob that cannot be read -- absent, or resident and failing to read --
+//! stays out of `held(C)`, and its parents may join. So a held set is not
+//! closed under children: a held blob's unreadable child is missing from it.
+//! No consumer relies on that closure. The walk, the host, the References
+//! exchange and exact-H serving all read a held set as positive inventory
+//! (Astra's review, 2026-11-14).
+//!
+//! # A semi-naive fixpoint
+//!
+//! The held sets are maintained as a fixpoint, extended by differences. Every
+//! input only grows under concatenation-as-merge -- records, proofs, tracked
+//! collections and, between resets, residency -- so each observation adds
+//! what is new and nothing is taken back:
+//!
+//! - the seeds of every new record, and the root set of a newly tracked
+//!   collection (its difference from empty), enter C's *frontier*, unless C
+//!   holds them already;
+//! - a blob reached in C is applied once: readable, it joins `held(C)` and
+//!   its children not held in C enter the frontier; not readable, it moves to
+//!   C's *unknown* set;
+//! - an unknown blob returns to the frontier only on positive new evidence:
+//!   it became resident (its handle is in the residency difference), or a
+//!   peer reported it, or a parent of it, resident in C. Nothing else retries
+//!   it, so persistent corruption costs one read per collection, not a loop.
+//!
+//! The frontier is a set, not a queue: an entry stays in it until the driver
+//! applies it, so a step cut off by the time budget, a dropped driver or a
+//! clone of the index loses nothing.
 //!
 //! # Scanning each blob once
 //!
@@ -32,19 +61,23 @@
 //! already scanned for one collection joins another without being read again.
 //!
 //! The price of scanning once is the late child: a child that becomes
-//! resident after its parent was scanned is not an edge. Two things catch it:
+//! resident after its parent was scanned is not an edge. Three things catch
+//! it:
 //!
 //! - it is itself a seed (a record names it): seeds are scanned on arrival;
 //! - a peer holding it advertises it in C ([`HeldStore::note_held`]): a
 //!   resident blob a peer reports in C joins `held(C)` however it arrived.
 //!   This is routing evidence, kept in memory only; a reopened store forgets
-//!   it unless one of C's own records reaches the blob by then.
+//!   it unless one of C's own records reaches the blob by then;
+//! - a reset of the index recomputes every closure from the roots.
 //!
 //! Otherwise it stays out of `held(C)` until the index resets or the store is
 //! reopened, though it stays readable by its hash. Sync states this as a
 //! limitation (design 2.9, Astra's R2): between two neighbours that replicate
 //! C in full, the one holding the late child through a seed or a report
-//! reports it to the other.
+//! reports it to the other. A report of the late child's parent does not
+//! bring it in: the parent is not read again, and its cached edges do not
+//! name the child.
 //!
 //! # Snapshots
 //!
@@ -53,39 +86,31 @@
 //! whole first closure plus what the collection gained since; it is never a
 //! part of one.
 //!
-//! A held set is closed under the edge cache for readable children: a blob
-//! joins only once every child the cache names for it has joined. So every
-//! closure computed later stops at a held blob without missing anything
-//! readable the cache knows below it, and a closure computation can pause
-//! between any two steps without leaving the set open. A blob that cannot be
-//! read -- absent, or resident and failing to read -- is unknown on every
-//! path: nothing above it joins. A seed is read again when its bytes arrive,
-//! a reported blob when a peer reports it again.
-//!
 //! A tracked collection is *settled* once its seeds are selected. Until its
-//! first closure (since tracking began, or since a reset) is whole, it is
-//! *building*; afterwards it is *built*. Only a built collection's held set
-//! is published: a building one's is unknown, as an unsettled one's is, and
-//! [`HeldRead::held`] answers `None` for both.
+//! first closure (since tracking began, or since a reset) is whole -- its
+//! frontier empty and its proofs judged -- it is *building*; afterwards it is
+//! *built*. Only a built collection's held set is published: a building
+//! one's is unknown, as an unsettled one's is, and [`HeldRead::held`]
+//! answers `None` for both.
 //!
 //! Taking a store snapshot reads no blob for the held sets. (That is the
 //! store's own observation; what a consumer builds on a snapshot, such as a
-//! sync host's serving view, may read blobs of its own.) It queues what
-//! arrived since the previous one -- every seed of a new record (one another record already
-//! named included), seeds whose bytes arrived, memberships peers reported --
-//! selects the seeds of newly tracked collections from their records, and
-//! notes whose proofs are to be judged. The [`HeldWork`] of the store's
-//! driver ([`HeldStore::drive_held`]) does the reading, in steps against
-//! the latest observed snapshot, checking its time budget between steps:
-//! a blob read or a judgement of proofs runs to its end first, so the budget
-//! is cooperative, not a hard slice. It judges proofs, which reads the
-//! collection descriptors they name, and computes closures, which reads
-//! every blob they reach once. It extends built collections first, and
+//! sync host's serving view, may read blobs of its own.) It writes what
+//! arrived since the previous one into the frontier -- every seed of a new
+//! record (one another record already named included), unknown blobs whose
+//! bytes arrived, memberships peers reported -- selects the seeds of newly
+//! tracked collections from their records, and notes whose proofs are to be
+//! judged. The [`HeldWork`] of the store's driver
+//! ([`HeldStore::drive_held`]) does the reading, in steps against the latest
+//! observed snapshot, checking its time budget between steps: a blob read or
+//! a judgement of proofs runs to its end first, so the budget is
+//! cooperative, not a hard slice. It judges proofs, which reads the
+//! collection descriptors they name, and drains the frontier, which reads
+//! every blob it reaches once. It extends built collections first, and
 //! building collections take turns, so a small one is published without
-//! waiting for a large one's whole first closure. A building collection is
-//! published once its first closure is whole and its proofs are judged; a
-//! built collection's set grows as the driver reaches what arrived, so a
-//! snapshot's held sets can lag the records in that snapshot. A changed
+//! waiting for a large one's whole first closure. A built collection's set
+//! grows as the driver reaches what arrived, so a snapshot's held sets can
+//! lag the records in that snapshot. A changed
 //! [`HeldRead::held_generation`] says the sets grew although the store may
 //! not have changed. The driver never holds the index across a read, so
 //! taking a snapshot waits for at most a few in-memory updates, never for a
@@ -94,8 +119,9 @@
 //! driver's thread is its caller's.
 //!
 //! A snapshot that lost a blob its predecessor had (a store that forgets
-//! blobs) resets the index: the edges are forgotten and every collection is
-//! recomputed as if newly tracked.
+//! blobs) resets the index: the edges, the frontier and the unknown sets are
+//! forgotten and every collection is recomputed from its roots as if newly
+//! tracked.
 //!
 //! Nothing is computed before the store has been observed whole once. A
 //! step of a climb ([`Covered::snapshot_step`](super::covered::Covered::snapshot_step))
@@ -104,7 +130,7 @@
 //! reaches the end of the store, or a whole snapshot is taken, every held set
 //! is unknown.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
@@ -136,8 +162,8 @@ mod pair_key {
 
 /// A relation between two 32-byte handles, keyed `first || second`: a
 /// prefix scan on `first` enumerates its seconds. Every state the index
-/// keeps across observations is one of these, a set of handles, or the held
-/// sets themselves.
+/// keeps across observations is one of these, a set of handles, the
+/// frontier, the judgements or the held sets themselves.
 type Pairs = PATCH<64, pair_key::Schema, ()>;
 
 /// A set of 32-byte handles.
@@ -145,6 +171,32 @@ type Handles = PATCH<32, IdentitySchema, ()>;
 
 /// `collection -> held set`, for every settled collection.
 type HeldSets = PATCH<32, IdentitySchema, HeldBlobs>;
+
+/// When a frontier entry last entered the frontier, and why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Wake {
+    /// The observation ([`State::fed_count`]) that put the entry in, or last
+    /// woke it with positive evidence. A read made against an older
+    /// observation did not see that evidence.
+    at: u64,
+    /// A peer reported the blob in the collection: when it is applied, its
+    /// cached children that wait in unknown are tried again.
+    report: bool,
+}
+
+/// `collection || blob -> wake`: blobs reached in the collection and not yet
+/// applied. The semi-naive worklist (Δreach), a set: unordered and
+/// idempotent.
+type Frontier = PATCH<64, pair_key::Schema, Wake>;
+
+/// `collection -> observation`: settled collections whose proofs are to be
+/// judged, from that observation ([`State::fed_count`]) on.
+/// [`AWAITING_DESCRIPTOR`] waits for the descriptor to become resident.
+type Judgements = PATCH<32, IdentitySchema, u64>;
+
+/// The judgement of a collection whose descriptor was not resident: judged
+/// once it arrives.
+const AWAITING_DESCRIPTOR: u64 = u64::MAX;
 
 fn pair(first: &Raw, second: &Raw) -> [u8; 64] {
     let mut key = [0u8; 64];
@@ -162,19 +214,14 @@ fn split(key: &[u8; 64]) -> (Raw, Raw) {
 }
 
 /// Every `second` related to `first`.
-fn related(pairs: &Pairs, first: &Raw) -> Vec<Raw> {
+fn related<V>(pairs: &PATCH<64, pair_key::Schema, V>, first: &Raw) -> Vec<Raw> {
     let mut seconds = Vec::new();
     pairs.infixes(first, |second: &Raw| seconds.push(*second));
     seconds
 }
 
-/// Remove and return every `second` related to `first`.
-fn take_related(pairs: &mut Pairs, first: &Raw) -> Vec<Raw> {
-    let seconds = related(pairs, first);
-    for second in &seconds {
-        pairs.remove(&pair(first, second));
-    }
-    seconds
+fn handle(raw: Raw) -> Inline<Handle<UnknownBlob>> {
+    Inline::new(raw)
 }
 
 /// The held sets of one immutable observation.
@@ -201,42 +248,43 @@ pub trait HeldStore {
 
     /// A peer reported `handle` in its held set of `collection`. If the blob
     /// is resident when the next snapshot is taken, the driver adds it and
-    /// everything it reaches to `held(collection)`; a report of a blob that
-    /// is not resident is dropped. Kept in memory only.
+    /// everything it reaches to `held(collection)`, and tries again its
+    /// children that could not be read; a report of a blob that is not
+    /// resident is dropped. Kept in memory only.
     fn note_held(&mut self, collection: CollectionHandle, handle: Inline<Handle<UnknownBlob>>);
 
     /// The work that computes the held sets: every blob read and every proof
     /// judgement, off the snapshot path. It publishes a collection's held set
     /// once its first closure is whole, and extends published sets as it
     /// reaches what arrived. A store snapshot reads no blob for the held sets
-    /// and never waits for a read the work makes. Dropping the work leaves what is queued to
-    /// the next driver; until one runs, nothing grows.
+    /// and never waits for a read the work makes. Dropping the work leaves
+    /// the frontier to the next driver; until one runs, nothing grows.
     ///
     /// One driver at a time: `None` while an earlier work is alive.
     fn drive_held(&mut self) -> Option<HeldWork>;
 }
 
-/// The reads a store's snapshots queue ([`HeldStore::drive_held`]), the
-/// only driver of its store while it lives. It refers to the store's index
-/// weakly, so it keeps nothing alive; dropping it leaves the queued work for
-/// the next driver.
+/// The reads a store's snapshots leave in the frontier
+/// ([`HeldStore::drive_held`]), the only driver of its store while it lives.
+/// It refers to the store's index weakly, so it keeps nothing alive;
+/// dropping it leaves the frontier for the next driver.
 pub struct HeldWork(Weak<dyn Drive>);
 
 /// What [`HeldWork`] asks of the index it drives.
 trait Drive: Send + Sync {
     /// Compute for about `budget`; whether work remains.
     fn advance(&self, budget: Duration) -> bool;
-    /// Return once work is queued, or after `timeout`.
+    /// Return once there is work, or after `timeout`.
     fn wait(&self, timeout: Duration);
     /// The work is gone; another may drive the index.
     fn undrive(&self);
 }
 
 impl HeldWork {
-    /// Compute for about `budget`, or, when nothing is queued, wait up to
-    /// `idle` for work. `false` once the store is gone. The budget is checked
-    /// between steps only: a blob read or a judgement of proofs in progress
-    /// finishes first; the index is not held meanwhile.
+    /// Compute for about `budget`, or, when there is nothing to do, wait up
+    /// to `idle` for work. `false` once the store is gone. The budget is
+    /// checked between steps only: a blob read or a judgement of proofs in
+    /// progress finishes first; the index is not held meanwhile.
     pub fn step(&mut self, budget: Duration, idle: Duration) -> bool {
         let Some(index) = self.0.upgrade() else {
             return false;
@@ -247,15 +295,15 @@ impl HeldWork {
         true
     }
 
-    /// Compute until nothing queued can run, without waiting for more: every
-    /// closure and proof judgement the snapshots so far queued. `false` once
-    /// the store is gone. A short-lived owner of a store calls this after a
-    /// snapshot, then takes another to see the result.
+    /// Compute until nothing can run, without waiting for more: the whole
+    /// frontier and every proof judgement the snapshots so far left. `false`
+    /// once the store is gone. A short-lived owner of a store calls this
+    /// after a snapshot, then takes another to see the result.
     ///
     /// Idle is not complete. A judgement whose proofs could not be read
     /// waits for the next observation, a collection whose records could not
     /// be selected is not settled, and a blob that is absent or unreadable
-    /// stays out of the set with everything above it.
+    /// stays out of the set until positive evidence for it arrives.
     pub fn run_until_idle(&mut self) -> bool {
         let Some(index) = self.0.upgrade() else {
             return false;
@@ -350,7 +398,7 @@ impl HeldView {
 
 /// Everything the index keeps across observations. A tracked collection is
 /// *settled* once its seeds are selected: then it has a held set, until a
-/// reset makes it unsettled again.
+/// reset makes it unsettled again. Every set and relation is a PATCH.
 #[derive(Clone)]
 struct State<T> {
     /// The collections held sets are kept for.
@@ -358,44 +406,34 @@ struct State<T> {
     /// The held set of every settled collection.
     held: HeldSets,
     /// `collection || blob`: every blob C's records and proofs name,
-    /// resident or not.
+    /// resident or not. Roots that survive a reset.
     seeds: Pairs,
-    /// `collection || blob`: resident blobs peers reported in C that were not
-    /// already held.
+    /// `collection || blob`: resident blobs peers reported in C. Roots that
+    /// survive a reset.
     routes: Pairs,
-    /// Every blob scanned since the last reset, whether it has children or
-    /// not.
+    /// Every blob scanned (read and readable) since the last reset, whether
+    /// it has children or not.
     scanned: Handles,
     /// `parent || child`: each scanned blob and every child resident when it
     /// was scanned.
     edges: Pairs,
-    /// `blob || collection`: seeds whose bytes were not readable yet, and the
-    /// collections waiting for them.
-    pending: Pairs,
-    /// Collection descriptors that were not resident when proofs were
-    /// judged; the arrival of one judges its collection's proofs again.
-    unrouted: Handles,
+    /// `collection || blob`: reached in C and not applied yet.
+    frontier: Frontier,
+    /// `blob || collection`: reached in C and not readable when applied --
+    /// absent, or resident and failing to read. Keyed by the blob first, so
+    /// the evidence that wakes a blob finds every collection it waits in.
+    unknown: Pairs,
     /// Settled collections whose proofs the driver is to judge.
-    unjudged: Handles,
-    /// The collections the driver judges with the state unlocked: kept here
-    /// so that a reset drops them and a clone judges them again.
-    judging: Option<Handles>,
-    /// Collections whose proofs could not be read: judged again after the
-    /// next observation.
-    misjudged: Handles,
+    unjudged: Judgements,
+    /// Settled collections whose first closure is whole and whose proofs are
+    /// judged: their held sets are published.
+    built: Handles,
     /// `collection || blob`: peer reports not resolved yet.
     candidates: Pairs,
-    /// Closure computations not finished yet. The driver runs a built
-    /// collection's first and lets building collections take turns.
-    jobs: VecDeque<Job>,
-    /// Settled collections whose first closure or proof judgement is not
-    /// done yet: kept here, published only once built.
-    building: Handles,
+    /// The building collection that had the driver's last turn.
+    turn: Option<Raw>,
     /// A driver exists ([`HeldStore::drive_held`]).
     driven: bool,
-    /// The driver's job while it reads a blob with the state unlocked, and
-    /// the blob: kept here so that a reset drops it and a clone keeps it.
-    active: Option<(Job, Raw)>,
     /// An observation of the whole store has been seen. Until then a step
     /// of a climb is only a prefix, in which a parent can precede its child,
     /// so nothing is settled or fed: every held set stays unknown.
@@ -403,72 +441,19 @@ struct State<T> {
     /// The last observation fed in.
     fed: Option<T>,
     /// Counts observations fed in: a read made against an older one is
-    /// reconciled with what arrived since.
+    /// reconciled with the evidence that arrived since.
     fed_count: u64,
+    /// Counts resets: a read that began before one is dropped.
+    epoch: u64,
     generation: u64,
     view: Arc<HeldView>,
-}
-
-/// One closure computation: roots to add to one collection's held set and
-/// the depth-first scratch following them, kept so that the computation can
-/// pause between any two steps.
-#[derive(Clone)]
-struct Job {
-    collection: CollectionHandle,
-    /// Depth first, a blob's children before it: a blob still to enter, or
-    /// one entered with its children, decided once they are.
-    stack: Vec<(Raw, Option<Vec<Raw>>)>,
-    entered: HashSet<Raw>,
-    /// Blobs that cannot be read, and every blob above one.
-    unknown: HashSet<Raw>,
-}
-
-impl Job {
-    fn new(collection: CollectionHandle, roots: impl IntoIterator<Item = Raw>) -> Self {
-        Self {
-            collection,
-            stack: roots.into_iter().map(|root| (root, None)).collect(),
-            entered: HashSet::new(),
-            unknown: HashSet::new(),
-        }
-    }
-
-    /// The job as it was before `handle` was entered, so it is read again.
-    fn reread(mut self, handle: Raw) -> Self {
-        self.entered.remove(&handle);
-        self.stack.push((handle, None));
-        self
-    }
-
-    /// Enter `handle`: its children not `held` are decided before it.
-    fn descend(&mut self, handle: Raw, children: Vec<Raw>, held: Option<&HeldBlobs>) {
-        let unheld: Vec<(Raw, Option<Vec<Raw>>)> = children
-            .iter()
-            .filter(|child| !held.is_some_and(|held| held.has_prefix(*child)))
-            .map(|child| (*child, None))
-            .collect();
-        // Popped after every child below it has been decided.
-        self.stack.push((handle, Some(children)));
-        self.stack.extend(unheld);
-    }
-}
-
-/// Where [`State::follow`] stopped.
-enum Step {
-    /// The job is done.
-    Done,
-    /// The job needs this blob read, scanned and fed back through
-    /// [`State::read`].
-    Read(Raw),
-    /// The job was told to pause.
-    Paused,
 }
 
 /// The shared held-blob index of one store. Its own lock: holding it never
 /// blocks a coverage read. A clone is an independent copy, driven by nobody.
 pub(crate) struct HeldIndex<T> {
     state: Mutex<State<T>>,
-    /// Notified when jobs are left for the driver.
+    /// Notified when work is left for the driver.
     queued: Condvar,
     /// Lockers other than the driver waiting for the state: the driver
     /// pauses for them.
@@ -484,19 +469,17 @@ impl<T> Default for HeldIndex<T> {
             routes: Pairs::new(),
             scanned: Handles::new(),
             edges: Pairs::new(),
-            pending: Pairs::new(),
-            unrouted: Handles::new(),
-            unjudged: Handles::new(),
-            judging: None,
-            misjudged: Handles::new(),
+            frontier: Frontier::new(),
+            unknown: Pairs::new(),
+            unjudged: Judgements::new(),
+            built: Handles::new(),
             candidates: Pairs::new(),
-            jobs: VecDeque::new(),
-            building: Handles::new(),
+            turn: None,
             driven: false,
-            active: None,
             replayed: false,
             fed: None,
             fed_count: 0,
+            epoch: 0,
             generation: 0,
             view: Arc::new(HeldView::default()),
         })
@@ -506,16 +489,10 @@ impl<T> Default for HeldIndex<T> {
 impl<T: Clone> Clone for HeldIndex<T> {
     fn clone(&self) -> Self {
         let mut state = self.lock().clone();
-        // The driver drives the original; the copy keeps its queue, the job
-        // and the judgement the driver is reading for included, for a driver
-        // of its own.
+        // The driver drives the original. The copy has the same frontier and
+        // judgements, the entries the driver is reading for included, since
+        // an entry leaves them only once applied.
         state.driven = false;
-        if let Some((job, handle)) = state.active.take() {
-            state.jobs.push_front(job.reread(handle));
-        }
-        if let Some(judging) = state.judging.take() {
-            state.unjudged.union(judging);
-        }
         Self::with_state(state)
     }
 }
@@ -652,51 +629,48 @@ struct Scan {
 
 /// Read one blob and list its resident children, or `None` if it is not
 /// readable. Children are probed in the store's index without reading them.
-fn scan<T: HeldSource>(snapshot: &T, handle: &Raw) -> Option<Scan> {
-    let body: Bytes = snapshot
-        .get::<Bytes, UnknownBlob>(Inline::<Handle<UnknownBlob>>::new(*handle))
-        .ok()?;
+fn scan<T: HeldSource>(snapshot: &T, blob: &Raw) -> Option<Scan> {
+    let body: Bytes = snapshot.get::<Bytes, UnknownBlob>(handle(*blob)).ok()?;
     let mut children: Vec<Raw> = body
         .as_ref()
         .chunks_exact(32)
         .map(|chunk| <Raw>::try_from(chunk).expect("32-byte chunk"))
-        .filter(|word| {
-            snapshot
-                .contains_blob(Inline::<Handle<UnknownBlob>>::new(*word))
-                .unwrap_or(false)
-        })
+        .filter(|word| snapshot.contains_blob(handle(*word)).unwrap_or(false))
         .collect();
     children.sort_unstable();
     children.dedup();
     let mut edges = Pairs::new();
     for child in &children {
-        edges.insert(&Entry::new(&pair(handle, child)));
+        edges.insert(&Entry::new(&pair(blob, child)));
     }
     Some(Scan { children, edges })
 }
 
 impl<T> State<T> {
-    /// Forget every edge and held set; every collection is recomputed as if
-    /// newly tracked. Seeds and peer reports are kept as roots.
+    /// Forget every edge, scan, held set, frontier and unknown blob, and
+    /// every judgement: every collection is unsettled, and the next
+    /// observation recomputes it from its roots, seeds and peer reports,
+    /// which are kept. A read that began before this is dropped.
     fn reset(&mut self) {
-        self.scanned = Handles::new();
-        self.edges = Pairs::new();
-        self.pending = Pairs::new();
         self.held = HeldSets::new();
-        self.jobs = VecDeque::new();
-        self.building = Handles::new();
-        self.active = None;
-        self.unjudged = Handles::new();
-        self.judging = None;
-        self.misjudged = Handles::new();
+        self.frontier = Frontier::new();
+        self.unknown = Pairs::new();
+        self.edges = Pairs::new();
+        self.scanned = Handles::new();
+        self.built = Handles::new();
+        self.unjudged = Judgements::new();
+        self.turn = None;
+        self.epoch += 1;
     }
 
     /// Hand out the held sets of every built collection. A building
     /// collection's set is unknown until its first closure is whole.
     fn publish_view(&mut self) {
-        let mut sets = self.held.clone();
-        for building in self.building.iter() {
-            sets.remove(building);
+        let mut sets = HeldSets::new();
+        for collection in self.built.iter() {
+            if let Some(held) = self.held.get(collection) {
+                sets.replace(&Entry::with_value(collection, held.clone()));
+            }
         }
         self.generation += 1;
         self.view = Arc::new(HeldView {
@@ -706,130 +680,240 @@ impl<T> State<T> {
     }
 
     /// Record one scan: the blob, and an edge to each resident child.
-    fn record_scan(&mut self, handle: Raw, edges: Pairs) {
-        self.scanned.insert(&Entry::new(&handle));
+    fn record_scan(&mut self, blob: Raw, edges: Pairs) {
+        self.scanned.insert(&Entry::new(&blob));
         self.edges.union(edges);
     }
 
-    /// Queue everything reachable from `roots` for `collection`'s held set,
-    /// in the last job if that one is the collection's and has entered
-    /// nothing yet.
-    fn enqueue(&mut self, collection: CollectionHandle, roots: impl IntoIterator<Item = Raw>) {
-        match self.jobs.back_mut() {
-            Some(last) if last.collection == collection && last.entered.is_empty() => {
-                last.stack.extend(roots.into_iter().map(|root| (root, None)));
-            }
-            _ => self.jobs.push_back(Job::new(collection, roots)),
+    /// `blob` is reached in `collection` (at observation `at`): it enters the
+    /// frontier, unless the collection holds it already, or it waits in
+    /// unknown for evidence. Reaching it is no evidence about its bytes.
+    fn reach(&mut self, collection: &Raw, blob: Raw, at: u64) {
+        let held = self
+            .held
+            .get(collection)
+            .is_some_and(|held| held.has_prefix(&blob));
+        if held || self.unknown.get(&pair(&blob, collection)).is_some() {
+            return;
         }
+        self.frontier.insert(&Entry::with_value(
+            &pair(collection, &blob),
+            Wake { at, report: false },
+        ));
     }
 
-    /// A building collection with no job left, queued or being read for, and
-    /// its proofs judged, is built; whether this made it so.
-    fn retire(&mut self, collection: CollectionHandle) -> bool {
-        let raw = &collection.raw;
-        let built = self.building.get(raw).is_some()
-            && !self.jobs.iter().any(|job| job.collection == collection)
-            && !self
-                .active
-                .as_ref()
-                .is_some_and(|(job, _)| job.collection == collection)
-            && self.unjudged.get(raw).is_none()
-            && self.misjudged.get(raw).is_none()
-            && !self
-                .judging
-                .as_ref()
-                .is_some_and(|judging| judging.get(raw).is_some());
-        if built {
-            self.building.remove(&collection.raw);
+    /// Positive evidence for `blob` in `collection`: it leaves unknown and
+    /// enters the frontier, stamped with the evidence, even when held there.
+    fn wake(&mut self, collection: &Raw, blob: Raw, mut wake: Wake) {
+        let key = pair(collection, &blob);
+        self.unknown.remove(&pair(&blob, collection));
+        if let Some(earlier) = self.frontier.get(&key) {
+            wake.report |= earlier.report;
         }
-        built
+        self.frontier.replace(&Entry::with_value(&key, wake));
     }
 
-    /// Follow `job` until it is done, needs a blob read, or `pause` (asked
-    /// before every step) says to stop; and whether the held set grew.
-    ///
-    /// A blob joins only after every resident child it has joined, so a held
-    /// blob's whole closure is held, at every step, and a later closure stops
-    /// at it. A blob never scanned is read ([`Step::Read`]); one that cannot
-    /// be read, resident or not, is unknown, and so is everything above it.
-    fn follow(&mut self, job: &mut Job, pause: &mut dyn FnMut() -> bool) -> (Step, bool) {
-        let Some(mut held) = self.held.get(&job.collection.raw).cloned() else {
-            // Not settled (any more): its selection computes it.
-            return (Step::Done, false);
+    /// Apply the frontier entry `blob` of `collection`, readable with
+    /// `children`: it joins the collection's held set, and every child not
+    /// held there enters the frontier. A child waiting in unknown is tried
+    /// again only when a peer reported `blob`. Whether the held set grew.
+    fn apply_readable(&mut self, collection: &Raw, blob: Raw, children: &[Raw]) -> bool {
+        let key = pair(collection, &blob);
+        let Some(wake) = self.frontier.get(&key).copied() else {
+            return false;
         };
-        let mut grew = false;
-        let step = loop {
-            if pause() {
-                break Step::Paused;
-            }
-            let Some((handle, visited)) = job.stack.pop() else {
-                break Step::Done;
-            };
-            if let Some(children) = visited {
-                if children.iter().any(|child| job.unknown.contains(child)) {
-                    job.unknown.insert(handle);
-                } else {
-                    held.insert(&Entry::new(&handle));
-                    grew = true;
-                }
-                continue;
-            }
-            if held.has_prefix(&handle) || !job.entered.insert(handle) {
-                continue;
-            }
-            if self.scanned.get(&handle).is_none() {
-                break Step::Read(handle);
-            }
-            job.descend(handle, related(&self.edges, &handle), Some(&held));
+        self.frontier.remove(&key);
+        let Some(mut held) = self.held.get(collection).cloned() else {
+            return false;
         };
+        let grew = !held.has_prefix(&blob);
         if grew {
-            self.held
-                .replace(&Entry::with_value(&job.collection.raw, held));
+            held.insert(&Entry::new(&blob));
+            self.held.replace(&Entry::with_value(collection, held));
         }
-        (step, grew)
+        let at = self.fed_count;
+        for child in children {
+            if wake.report && self.unknown.get(&pair(child, collection)).is_some() {
+                self.wake(collection, *child, Wake { at, report: false });
+            } else {
+                self.reach(collection, *child, at);
+            }
+        }
+        grew
     }
 
-    /// Feed `job` the read [`Self::follow`] asked for: the children of a
-    /// readable blob, or `None` for one that is not.
-    fn read(&mut self, job: &mut Job, handle: Raw, read: Option<Scan>) {
-        match read {
-            Some(Scan {
-                children, edges, ..
-            }) => {
-                self.record_scan(handle, edges);
-                let held = self.held.get(&job.collection.raw).cloned();
-                job.descend(handle, children, held.as_ref());
-            }
-            None => {
-                if self.seeds.get(&pair(&job.collection.raw, &handle)).is_some() {
-                    self.pending
-                        .insert(&Entry::new(&pair(&handle, &job.collection.raw)));
-                }
-                // Not readable: absent, or resident and failing to read.
-                // Either way nothing above it joins.
-                job.unknown.insert(handle);
+    /// A settled collection whose frontier is empty and whose proofs are
+    /// judged, or wait for a descriptor that is not resident, is built;
+    /// whether this made it so.
+    fn retire(&mut self, collection: &Raw) -> bool {
+        if self.built.get(collection).is_some()
+            || self.held.get(collection).is_none()
+            || self.frontier.has_prefix(collection)
+            || self
+                .unjudged
+                .get(collection)
+                .is_some_and(|from| *from != AWAITING_DESCRIPTOR)
+        {
+            return false;
+        }
+        self.built.insert(&Entry::new(collection));
+        true
+    }
+
+    /// Whether the driver can judge `collection`'s proofs now.
+    fn judgeable(&self, collection: &Raw) -> bool {
+        self.unjudged
+            .get(collection)
+            .is_some_and(|from| *from <= self.fed_count)
+    }
+
+    /// Whether the driver has anything to do now.
+    fn has_work(&self) -> bool {
+        !self.frontier.is_empty()
+            || self
+                .unjudged
+                .iter()
+                .any(|collection| self.judgeable(collection))
+    }
+
+    /// The frontier entry to apply next, as `(collection, blob)`: a built
+    /// collection's first, since it extends a published set; then the
+    /// building collections', in turns. `new_turn` says the last turn is
+    /// over, so the next building collection after it goes; otherwise that
+    /// one continues while its frontier lasts.
+    fn next(&mut self, new_turn: &mut bool) -> Option<(Raw, Raw)> {
+        let first = |frontier: &Frontier, collection: &Raw| {
+            frontier.first_infix_range(collection, &[0; 32], &[u8::MAX; 32])
+        };
+        for collection in self.built.iter() {
+            if let Some(blob) = first(&self.frontier, collection) {
+                return Some((*collection, blob));
             }
         }
+        // The building collection whose turn it is continues while it has
+        // work.
+        if let (false, Some(turn)) = (*new_turn, self.turn) {
+            if self.built.get(&turn).is_none() && self.held.get(&turn).is_some() {
+                if let Some(blob) = first(&self.frontier, &turn) {
+                    return Some((turn, blob));
+                }
+            }
+        }
+        // Scratch: the building collections with work, in key order.
+        let building: Vec<Raw> = self
+            .held
+            .iter_ordered()
+            .filter(|collection| {
+                self.built.get(*collection).is_none() && self.frontier.has_prefix(*collection)
+            })
+            .copied()
+            .collect();
+        let after = |turn: Raw| {
+            building
+                .iter()
+                .find(|collection| **collection > turn)
+                .or(building.first())
+                .copied()
+        };
+        let collection = match self.turn {
+            Some(turn) => after(turn)?,
+            None => *building.first()?,
+        };
+        *new_turn = false;
+        self.turn = Some(collection);
+        Some((collection, first(&self.frontier, &collection)?))
     }
 }
 
 impl<T: HeldSource> State<T> {
-    /// Add judged proof seeds to their settled collections and queue the new
-    /// ones as roots.
-    fn add_proof_seeds(&mut self, seeds: Vec<(CollectionHandle, Raw)>) {
-        for (collection, seed) in seeds {
-            let key = pair(&collection.raw, &seed);
-            if self.held.get(&collection.raw).is_none() || self.seeds.get(&key).is_some() {
-                continue;
+    /// Apply the frontier entry `blob` of `collection`, which a read made
+    /// against observation `read_at` could not read (`absent`: not even
+    /// resident there). It moves to unknown, always, unless positive
+    /// evidence for it arrived after that observation: it was woken since,
+    /// or it was absent then and is resident now. Then it stays in the
+    /// frontier for one more read. Residency alone is no evidence: it cannot
+    /// tell persistent corruption from a new valid copy.
+    fn apply_unreadable(&mut self, collection: &Raw, blob: Raw, read_at: u64, absent: bool) {
+        let key = pair(collection, &blob);
+        let Some(wake) = self.frontier.get(&key).copied() else {
+            return;
+        };
+        let arrived = absent
+            && self.fed_count != read_at
+            && self
+                .fed
+                .as_ref()
+                .is_some_and(|fed| fed.contains_blob(handle(blob)).unwrap_or(false));
+        if wake.at > read_at || arrived {
+            return;
+        }
+        self.frontier.remove(&key);
+        self.unknown.insert(&Entry::new(&pair(&blob, collection)));
+    }
+
+    /// Apply a judgement of `judged` made against observation `read_at`. A
+    /// collection woken again since is judged again, whatever this found.
+    fn apply_judgement(
+        &mut self,
+        judged: &BTreeSet<CollectionHandle>,
+        read_at: u64,
+        found: Result<ProofSeeds, T::ProofsError>,
+    ) {
+        let woken = |state: &Self, collection: &Raw| {
+            state
+                .unjudged
+                .get(collection)
+                .is_some_and(|from| *from > read_at)
+        };
+        match found {
+            Ok(found) => {
+                for collection in judged {
+                    let raw = &collection.raw;
+                    if woken(self, raw) {
+                        continue;
+                    }
+                    if !found.unrouted.contains(raw) {
+                        self.unjudged.remove(raw);
+                        continue;
+                    }
+                    // Not resident when judged; arrived since, or awaited.
+                    let arrived = self.fed_count != read_at
+                        && self
+                            .fed
+                            .as_ref()
+                            .is_some_and(|fed| fed.contains_blob(handle(*raw)).unwrap_or(false));
+                    let from = if arrived {
+                        self.fed_count
+                    } else {
+                        AWAITING_DESCRIPTOR
+                    };
+                    self.unjudged.replace(&Entry::with_value(raw, from));
+                }
+                let at = self.fed_count;
+                for (collection, seed) in found.seeds {
+                    let key = pair(&collection.raw, &seed);
+                    if self.held.get(&collection.raw).is_none() || self.seeds.get(&key).is_some() {
+                        continue;
+                    }
+                    self.seeds.insert(&Entry::new(&key));
+                    self.reach(&collection.raw, seed, at);
+                }
             }
-            self.seeds.insert(&Entry::new(&key));
-            self.enqueue(collection, [seed]);
+            // Judged again after the next observation.
+            Err(_) => {
+                for collection in judged {
+                    if !woken(self, &collection.raw) {
+                        self.unjudged
+                            .replace(&Entry::with_value(&collection.raw, read_at + 1));
+                    }
+                }
+            }
         }
     }
 }
 
 impl<T: HeldSource> HeldIndex<T> {
-    /// Queue for the driver everything `now` holds that the last observed
+    /// Write into the frontier everything `now` holds that the last observed
     /// snapshot did not, and hand out the held sets as they stand, fixed from
     /// here on. Reads no blob: the records, the proofs' presence and the
     /// store's index only.
@@ -867,59 +951,69 @@ impl<T: HeldSource> HeldIndex<T> {
             state.reset();
             changed = true;
         }
+        // The observation this one becomes: what it adds or wakes is stamped
+        // with it.
+        let at = state.fed_count + 1;
 
-        // Scratch for this observation: what to reach, per collection.
-        let mut roots: BTreeMap<CollectionHandle, Vec<Raw>> = BTreeMap::new();
         if let Some(fed) = state.fed.take() {
             if changes.contains(StoreChanges::COLLECTION_RECORDS) {
-                let State { held, seeds, .. } = &mut *state;
+                // Scratch: the seeds of the new records of settled
+                // collections, with their collections.
+                let mut named: Vec<(Raw, Raw)> = Vec::new();
+                let held = &state.held;
                 now.for_each_record_since(Some(&fed), &mut |record| {
                     let collection = record.collection();
                     // Untracked, or not settled: its selection reads it.
                     if held.get(&collection.raw).is_none() {
                         return;
                     }
-                    let Some(named) = seeds_of(record) else {
+                    let Some(seeds) = seeds_of(record) else {
                         return;
                     };
-                    // Every seed of a new record is a root, known or not. A
-                    // held seed costs the driver one lookup.
-                    for seed in named {
-                        seeds.insert(&Entry::new(&pair(&collection.raw, &seed)));
-                        roots.entry(collection).or_default().push(seed);
-                    }
+                    named.extend(seeds.into_iter().map(|seed| (collection.raw, seed)));
                 });
+                // Every seed of a new record is a root, known or not. One
+                // held already, or waiting in unknown, costs a lookup.
+                for (collection, seed) in named {
+                    state.seeds.insert(&Entry::new(&pair(&collection, &seed)));
+                    state.reach(&collection, seed, at);
+                }
             }
+            let awaited = |state: &State<T>| {
+                state
+                    .unjudged
+                    .iter()
+                    .any(|collection| state.unjudged.get(collection) == Some(&AWAITING_DESCRIPTOR))
+            };
             if changes.contains(StoreChanges::BLOBS)
-                && !(state.pending.is_empty() && state.unrouted.is_empty())
+                && (!state.unknown.is_empty() || awaited(&*state))
             {
-                // Seeds whose bytes arrived since, and descriptors whose
-                // collections' proofs can be judged now. A store without an
-                // indexed difference lists every blob; entries still match
-                // once.
+                // Unknown blobs whose bytes arrived since, and descriptors
+                // whose collections' proofs can be judged now. A store
+                // without an indexed difference lists every blob; only one
+                // the last observation did not have is evidence.
                 for info in now.blobs_diff(&fed).flatten() {
                     let raw = info.handle.raw;
-                    for collection in take_related(&mut state.pending, &raw) {
-                        roots.entry(Inline::new(collection)).or_default().push(raw);
-                    }
-                    if state.unrouted.get(&raw).is_some() {
-                        state.unrouted.remove(&raw);
-                        if state.held.get(&raw).is_some() {
-                            state.unjudged.insert(&Entry::new(&raw));
+                    if state.unknown.has_prefix(&raw)
+                        && !fed.contains_blob(info.handle).unwrap_or(false)
+                    {
+                        for collection in related(&state.unknown, &raw) {
+                            state.wake(&collection, raw, Wake { at, report: false });
                         }
+                    }
+                    if state.unjudged.get(&raw) == Some(&AWAITING_DESCRIPTOR) {
+                        state.unjudged.replace(&Entry::with_value(&raw, at));
                     }
                 }
             }
             if changes.contains(StoreChanges::CAPABILITY_PROOFS) {
+                // Scratch: every settled collection.
                 let settled: Vec<Raw> = state.held.iter().copied().collect();
                 for collection in settled {
-                    state.unjudged.insert(&Entry::new(&collection));
+                    state.unjudged.replace(&Entry::with_value(&collection, at));
                 }
             }
         }
-        // A judgement that could not read the proofs is tried again now.
-        let misjudged = std::mem::replace(&mut state.misjudged, Handles::new());
-        state.unjudged.union(misjudged);
 
         // Scratch: the tracked collections not settled yet.
         let fresh: BTreeSet<CollectionHandle> = state
@@ -937,6 +1031,7 @@ impl<T: HeldSource> HeldIndex<T> {
             // store cannot answer, it stays unsettled -- absent from the view,
             // not short in it -- and is selected again at the next observation.
             if let Ok(records) = now.select_records(&selectors) {
+                // Scratch: each fresh collection's seeds, itself included.
                 let mut seeds: BTreeMap<CollectionHandle, Vec<Raw>> = fresh
                     .iter()
                     .map(|collection| (*collection, vec![collection.raw]))
@@ -949,70 +1044,59 @@ impl<T: HeldSource> HeldIndex<T> {
                     }
                 }
                 for (collection, list) in seeds {
+                    let raw = collection.raw;
                     for seed in &list {
-                        state
-                            .seeds
-                            .insert(&Entry::new(&pair(&collection.raw, seed)));
+                        state.seeds.insert(&Entry::new(&pair(&raw, seed)));
                     }
-                    // Every seed known, a proof's judged before a reset
-                    // included, and every peer report.
-                    let mut list = related(&state.seeds, &collection.raw);
-                    list.extend(related(&state.routes, &collection.raw));
                     state
                         .held
-                        .replace(&Entry::with_value(&collection.raw, HeldBlobs::new()));
-                    state.building.insert(&Entry::new(&collection.raw));
-                    state.unjudged.insert(&Entry::new(&collection.raw));
-                    roots.entry(collection).or_default().extend(list);
+                        .replace(&Entry::with_value(&raw, HeldBlobs::new()));
+                    state.unjudged.replace(&Entry::with_value(&raw, at));
+                    // The difference from empty: every root -- every seed
+                    // known, a proof's judged before a reset included, and
+                    // every peer report.
+                    let mut roots = related(&state.seeds, &raw);
+                    roots.extend(related(&state.routes, &raw));
+                    for root in roots {
+                        state.reach(&raw, root, at);
+                    }
                 }
             }
         }
-        for (collection, list) in roots {
-            state.enqueue(collection, list);
-        }
 
         // Scratch for this observation: the reports to resolve.
-        let candidates: Vec<(CollectionHandle, Raw)> = std::mem::take(&mut state.candidates)
+        let candidates: Vec<(Raw, Raw)> = std::mem::take(&mut state.candidates)
             .iter()
-            .map(|key| {
-                let (collection, handle) = split(key);
-                (Inline::new(collection), handle)
-            })
+            .map(split)
             .collect();
-        for (collection, handle) in candidates {
-            if state.tracked.get(&collection.raw).is_none() {
+        for (collection, blob) in candidates {
+            if state.tracked.get(&collection).is_none() {
                 continue;
             }
-            let settled = state
-                .held
-                .get(&collection.raw)
-                .map(|held| held.has_prefix(&handle));
             // A report of a blob that is not resident is dropped, so a failed
             // fetch stays in the next difference.
-            if settled == Some(true)
-                || !now
-                    .contains_blob(Inline::<Handle<UnknownBlob>>::new(handle))
-                    .unwrap_or(false)
-            {
+            if !now.contains_blob(handle(blob)).unwrap_or(false) {
                 continue;
             }
-            let key = pair(&collection.raw, &handle);
-            if settled.is_none() {
+            let key = pair(&collection, &blob);
+            if state.held.get(&collection).is_none() {
                 // The observation that settles the collection resolves it.
                 state.candidates.insert(&Entry::new(&key));
                 continue;
             }
-            // A route even if something under it cannot be read yet: a later
-            // report of it reads it again.
+            // A route even if it is held, or something under it cannot be
+            // read yet: it is positive evidence for the blob and its
+            // children, so even a held blob's cached children that wait in
+            // unknown are tried again.
             state.routes.insert(&Entry::new(&key));
-            state.enqueue(collection, [handle]);
+            state.wake(&collection, blob, Wake { at, report: true });
         }
         state.fed = Some(now.clone());
-        state.fed_count += 1;
+        state.fed_count = at;
         if changed {
             state.publish_view();
         }
-        if state.driven && !(state.jobs.is_empty() && state.unjudged.is_empty()) {
+        if state.driven && state.has_work() {
             self.queued.notify_all();
         }
         state.view.clone()
@@ -1029,140 +1113,98 @@ impl<T: HeldSource> HeldIndex<T> {
 }
 
 impl<T: HeldSource + Send> Drive for HeldIndex<T> {
-    /// Judge the proofs queued for judging, then run queued jobs against the
-    /// latest observed snapshot, for about `budget`: at least one step, then
-    /// until the budget is spent or another locker waits. A built
-    /// collection's jobs go first, since they extend a published set; then
-    /// building collections take turns, a paused job going behind the
-    /// others, so a small collection is not held back by a large one's whole
-    /// first closure. A building collection is published once its last job
-    /// finishes and its proofs are judged, never in between; a built
-    /// collection's set whenever it grew.
+    /// Judge the proofs that can be judged, then drain the frontier against
+    /// the latest observed snapshot, for about `budget`: at least one step,
+    /// then until the budget is spent or another locker waits. A built
+    /// collection's entries go first, since they extend a published set; then
+    /// building collections take turns, one call each, so a small collection
+    /// is not held back by a large one's whole first closure. A building
+    /// collection is published once its frontier is empty and its proofs are
+    /// judged, never in between; a built collection's set whenever it grew.
     ///
-    /// Every read happens with the state unlocked: a blob's with its job
-    /// parked in [`State::active`], a judgement's with its collections in
-    /// [`State::judging`]. A reset meanwhile drops them (it requeued their
-    /// collections from scratch), and a clone keeps them. Snapshots may be
-    /// fed in meanwhile, so a read is reconciled with them when it returns:
-    /// a blob or a descriptor the read missed because it was absent, but that
-    /// is resident now, is read again, since the snapshot that saw it arrive
-    /// found nothing waiting for it.
+    /// Every read happens with the state unlocked, and the entry it reads for
+    /// stays in the frontier, or in the judgements, until the read is
+    /// applied. A reset meanwhile drops the read (the reset recomputes
+    /// everything from the roots), and a clone keeps the entry. Snapshots may
+    /// be fed in meanwhile, so a read is applied against the evidence that
+    /// arrived since: an entry that could not be read but was woken since, or
+    /// was absent and is resident now, is read again, since the snapshot that
+    /// saw the evidence found it in the frontier, not in unknown.
     fn advance(&self, budget: Duration) -> bool {
         let started = Instant::now();
         let mut stepped = false;
         let mut pause = || {
-            let pause = stepped
-                && (started.elapsed() >= budget || self.waiting.load(Ordering::SeqCst) > 0);
+            let pause =
+                stepped && (started.elapsed() >= budget || self.waiting.load(Ordering::SeqCst) > 0);
             stepped = true;
             pause
         };
         let mut state = self.lock_driver();
         let mut publish = false;
-        if let (false, Some(snapshot)) = (state.unjudged.is_empty(), state.fed.clone()) {
-            let judging = std::mem::replace(&mut state.unjudged, Handles::new());
-            let read_at = state.fed_count;
-            state.judging = Some(judging.clone());
+        // Scratch: the collections whose proofs can be judged now.
+        let judging: BTreeSet<CollectionHandle> = state
+            .unjudged
+            .iter()
+            .filter(|collection| state.judgeable(collection))
+            .map(|collection| Inline::new(*collection))
+            .collect();
+        if let (false, Some(snapshot)) = (judging.is_empty(), state.fed.clone()) {
+            let (read_at, epoch) = (state.fed_count, state.epoch);
             drop(state);
-            let collections: BTreeSet<CollectionHandle> = judging
-                .iter()
-                .map(|collection| Inline::new(*collection))
-                .collect();
-            let found = proof_seeds(&snapshot, &collections);
+            let found = proof_seeds(&snapshot, &judging);
             drop(snapshot);
             state = self.lock_driver();
-            if state.judging.take().is_some() {
-                match found {
-                    Ok(found) => {
-                        for descriptor in found.unrouted {
-                            let arrived = state.fed_count != read_at
-                                && state.fed.as_ref().is_some_and(|fed| {
-                                    fed.contains_blob(Inline::<Handle<UnknownBlob>>::new(
-                                        descriptor,
-                                    ))
-                                    .unwrap_or(false)
-                                });
-                            if arrived {
-                                state.unjudged.insert(&Entry::new(&descriptor));
-                            } else {
-                                state.unrouted.insert(&Entry::new(&descriptor));
-                            }
-                        }
-                        state.add_proof_seeds(found.seeds);
-                    }
-                    // Judged again after the next observation.
-                    Err(_) => state.misjudged.union(judging),
-                }
-                for collection in collections {
-                    publish |= state.retire(collection);
+            if state.epoch == epoch {
+                state.apply_judgement(&judging, read_at, found);
+                for collection in &judging {
+                    publish |= state.retire(&collection.raw);
                 }
             }
             // The judgement is this call's first step.
             pause();
         }
-        let more = loop {
-            let next = state
-                .jobs
-                .iter()
-                .position(|job| state.building.get(&job.collection.raw).is_none())
-                .unwrap_or(0);
-            let Some(mut job) = state.jobs.remove(next) else {
-                break false;
-            };
-            // The job and whether it is done, or `None` when a reset
-            // dropped it.
-            let ended = loop {
-                let (step, grew) = state.follow(&mut job, &mut pause);
-                // A built collection's set is published as it grows.
-                publish |= grew && state.building.get(&job.collection.raw).is_none();
-                match step {
-                    Step::Done => break Some((job, true)),
-                    Step::Paused => break Some((job, false)),
-                    Step::Read(handle) => {
-                        let Some(snapshot) = state.fed.clone() else {
-                            break Some((job.reread(handle), false));
-                        };
-                        let read_at = state.fed_count;
-                        state.active = Some((job, handle));
-                        drop(state);
-                        let read = scan(&snapshot, &handle);
-                        let absent = read.is_none()
-                            && !snapshot
-                                .contains_blob(Inline::<Handle<UnknownBlob>>::new(handle))
-                                .unwrap_or(false);
-                        drop(snapshot);
-                        state = self.lock_driver();
-                        let Some((back, _)) = state.active.take() else {
-                            break None;
-                        };
-                        job = back;
-                        if absent
-                            && state.fed_count != read_at
-                            && state.fed.as_ref().is_some_and(|fed| {
-                                fed.contains_blob(Inline::<Handle<UnknownBlob>>::new(handle))
-                                    .unwrap_or(false)
-                            })
-                        {
-                            job = job.reread(handle);
-                        } else {
-                            state.read(&mut job, handle, read);
-                        }
-                    }
-                }
-            };
-            match ended {
-                Some((job, true)) => publish |= state.retire(job.collection),
-                Some((job, false)) => {
-                    if state.building.get(&job.collection.raw).is_some() {
-                        state.jobs.push_back(job);
-                    } else {
-                        state.jobs.push_front(job);
-                    }
-                    break true;
-                }
-                None => {}
+        let mut new_turn = true;
+        loop {
+            if pause() {
+                break;
             }
-        };
-        let more = more || !state.unjudged.is_empty();
+            let Some((collection, blob)) = state.next(&mut new_turn) else {
+                break;
+            };
+            let grew = if state.scanned.get(&blob).is_some() {
+                // Scanned already: its children come from the edge cache.
+                let children = related(&state.edges, &blob);
+                state.apply_readable(&collection, blob, &children)
+            } else {
+                let Some(snapshot) = state.fed.clone() else {
+                    break;
+                };
+                let (read_at, epoch) = (state.fed_count, state.epoch);
+                drop(state);
+                let read = scan(&snapshot, &blob);
+                let absent =
+                    read.is_none() && !snapshot.contains_blob(handle(blob)).unwrap_or(false);
+                drop(snapshot);
+                state = self.lock_driver();
+                if state.epoch != epoch {
+                    continue;
+                }
+                match read {
+                    Some(Scan { children, edges }) => {
+                        state.record_scan(blob, edges);
+                        state.apply_readable(&collection, blob, &children)
+                    }
+                    None => {
+                        state.apply_unreadable(&collection, blob, read_at, absent);
+                        false
+                    }
+                }
+            };
+            // A built collection's set is published as it grows.
+            publish |= grew && state.built.get(&collection).is_some();
+            publish |= state.retire(&collection);
+        }
+        let more = state.has_work();
         if publish {
             state.publish_view();
         }
@@ -1176,7 +1218,7 @@ impl<T: HeldSource + Send> Drive for HeldIndex<T> {
 
     fn wait(&self, timeout: Duration) {
         let state = self.lock_driver();
-        if state.jobs.is_empty() && state.unjudged.is_empty() {
+        if !state.has_work() {
             drop(
                 self.queued
                     .wait_timeout(state, timeout)
@@ -1224,12 +1266,17 @@ mod tests {
         /// Resident blobs whose reads fail (an indexed blob every copy of
         /// which fails validation).
         unreadable: Mutex<std::collections::HashSet<Raw>>,
+        /// `blobs_diff` lists every blob, as a store without an indexed
+        /// difference does.
+        list_all: AtomicBool,
         /// A blob whose next read blocks until released.
         gate: Mutex<Option<Gate>>,
     }
 
     /// The read of `blob` says it began on `entered`, then waits on
-    /// `release`, for at most half a minute so a stuck test fails.
+    /// `release`, for at most half a minute so a stuck test fails. Whether
+    /// the read fails is decided before it waits, as for a read that found
+    /// every copy invalid and returns late.
     struct Gate {
         blob: Raw,
         entered: std::sync::mpsc::Sender<()>,
@@ -1328,13 +1375,7 @@ mod tests {
             V: TryFromBlob<S>,
             Handle<S>: InlineEncoding,
         {
-            if self.faults.unreadable.lock().unwrap().contains(&handle.raw) {
-                return Err(crate::blob::MemoryStoreGetError::NotFound(
-                    crate::repo::MissingBlob {
-                        handle: handle.transmute(),
-                    },
-                ));
-            }
+            let unreadable = self.faults.unreadable.lock().unwrap().contains(&handle.raw);
             let gate = {
                 let mut gate = self.faults.gate.lock().unwrap();
                 if gate.as_ref().is_some_and(|gate| gate.blob == handle.raw) {
@@ -1345,9 +1386,19 @@ mod tests {
             };
             if let Some(gate) = gate {
                 gate.entered.send(()).unwrap();
-                let _ = gate.release.recv_timeout(std::time::Duration::from_secs(30));
+                let _ = gate
+                    .release
+                    .recv_timeout(std::time::Duration::from_secs(30));
             }
+            // Every attempt counts, a failed one too.
             *self.reads.lock().unwrap().entry(handle.raw).or_default() += 1;
+            if unreadable {
+                return Err(crate::blob::MemoryStoreGetError::NotFound(
+                    crate::repo::MissingBlob {
+                        handle: handle.transmute(),
+                    },
+                ));
+            }
             self.inner.get(handle)
         }
     }
@@ -1377,6 +1428,9 @@ mod tests {
         }
 
         fn blobs_diff<'a>(&'a self, old: &Self) -> Self::Iter<'a> {
+            if self.faults.list_all.load(Ordering::SeqCst) {
+                return self.inner.blobs();
+            }
             self.inner.blobs_diff(&old.inner)
         }
     }
@@ -1523,21 +1577,23 @@ mod tests {
             .collect()
     }
 
-    /// Every resident child of a blob `snapshot` holds in `c` is held too:
-    /// a held set is closed under the conservative closure, so a reader may
-    /// stop at a held blob.
+    /// Every resident readable child of a blob `snapshot` holds in `c` is
+    /// held too, once the driver is idle: the frontier is drained. A child
+    /// that cannot be read stays out while its parent joins.
     fn assert_closed(snapshot: &<Store as SnapshotSource>::Snapshot, c: CollectionHandle) {
         let held = held_set(snapshot, c);
         let blobs = &snapshot.inner().inner;
+        let unreadable = snapshot.inner().faults.unreadable.lock().unwrap().clone();
         for parent in &held {
             let Ok(body) = blobs.get::<Bytes, UnknownBlob>(Inline::new(*parent)) else {
                 continue;
             };
             for word in body.as_ref().chunks_exact(32) {
                 let child: Raw = word.try_into().expect("32-byte word");
-                if blobs
-                    .contains_blob(Inline::<Handle<UnknownBlob>>::new(child))
-                    .unwrap()
+                if !unreadable.contains(&child)
+                    && blobs
+                        .contains_blob(Inline::<Handle<UnknownBlob>>::new(child))
+                        .unwrap()
                 {
                     assert!(
                         held.contains(&child),
@@ -1606,7 +1662,8 @@ mod tests {
                 CollectionMerge::sign(
                     &key(),
                     c,
-                    std::iter::once(Inline::new(data)).chain((3..10).map(|byte| Inline::new([byte; 32]))),
+                    std::iter::once(Inline::new(data))
+                        .chain((3..10).map(|byte| Inline::new([byte; 32]))),
                     Inline::new(result),
                 )
                 .unwrap(),
@@ -2102,11 +2159,15 @@ mod tests {
         assert_ne!(view([2; 32]), view([3; 32]));
     }
 
-    /// A resident blob that cannot be read holds back everything above it,
-    /// so no held set lacks a resident child. Once it reads again, nothing
-    /// reads it by itself; a peer's report of the blob above it holds both.
+    /// An unreadable blob stays out; its parents may join (the closure rule
+    /// since 2026-11-14, design open question 1). A resident blob that cannot
+    /// be read stays out of the held set, and the blob above it joins: a held
+    /// set is closed under readable children only. Once it reads again,
+    /// nothing reads it by itself, since residency is no evidence; a peer's
+    /// report of it holds it. (Before: it held back everything above it, and
+    /// only a report of the parent brought both in.)
     #[test]
-    fn an_unreadable_resident_child_holds_back_its_parent_until_a_report() {
+    fn an_unreadable_resident_child_stays_out_and_its_parent_joins() {
         let mut store = Store::default();
         let c = collection(&mut store, "unreadable child");
         let metadata = blob(&mut store, b"metadata");
@@ -2116,14 +2177,19 @@ mod tests {
         store.faults.unreadable.lock().unwrap().insert(z);
         store.track_held([c]);
         let first = settled(&mut store);
-        assert!(held_set(&first, c).is_superset(&BTreeSet::from([c.raw, metadata])));
+        assert_eq!(
+            held_set(&first, c),
+            BTreeSet::from([c.raw, metadata, data]),
+            "the parent joins, the unreadable child stays out"
+        );
         assert_closed(&first, c);
-        assert!(!held_set(&first, c).contains(&data));
         store.faults.unreadable.lock().unwrap().remove(&z);
-        assert!(!held_set(&settled(&mut store), c).contains(&data));
-        store.note_held(c, Inline::new(data));
+        assert!(!held_set(&settled(&mut store), c).contains(&z));
+        assert_eq!(reads(&store, &z), 1, "readable again, but nothing said so");
+        store.note_held(c, Inline::new(z));
         let reported = settled(&mut store);
         assert!(held_set(&reported, c).is_superset(&BTreeSet::from([data, z])));
+        assert_eq!(reads(&store, &z), 2);
     }
 
     #[test]
@@ -2504,7 +2570,11 @@ mod tests {
         commit(&mut store, built, data, metadata);
         store.snapshot().unwrap();
         let mut steps = 0;
-        while !held_set(&store.snapshot().unwrap(), built).contains(&data) {
+        // The record's whole new closure: a built collection's set grows
+        // from its roots down, so the payload joins before its leaf.
+        while !held_set(&store.snapshot().unwrap(), built)
+            .is_superset(&BTreeSet::from([data, leaf, metadata]))
+        {
             assert!(work.step(Duration::ZERO, Duration::ZERO));
             steps += 1;
             assert!(steps < 1_000, "the record never joined");
@@ -2724,7 +2794,11 @@ mod tests {
             .expect("the snapshot left blobs unread");
         let (release, driver) = block_driver_in(&mut store, work, unread);
         let mut copy = store.clone();
-        assert_eq!(copy.snapshot().unwrap().held(c), None, "nobody drives the copy");
+        assert_eq!(
+            copy.snapshot().unwrap().held(c),
+            None,
+            "nobody drives the copy"
+        );
         let mut own = copy.drive_held().expect("nobody drives the copy");
         assert!(own.run_until_idle());
         assert_eq!(held_set(&copy.snapshot().unwrap(), c), whole);
@@ -2732,5 +2806,243 @@ mod tests {
         assert_eq!(published(&mut store, c), whole);
         drop(store);
         driver.join().unwrap();
+    }
+
+    /// Zero-budget driver steps until the driver has nothing left to do, at
+    /// most `limit`: how many it took, the last included, or `None`.
+    fn steps_to_idle(work: &HeldWork, limit: usize) -> Option<usize> {
+        let index = work.0.upgrade().expect("the store is alive");
+        (1..=limit).find(|_| !index.advance(Duration::ZERO))
+    }
+
+    /// Semi-naive growth (design B1/B3): a built collection's new commit adds
+    /// exactly the new closure of its roots. The blobs it names that are held
+    /// already are not read or walked again, so the driver's steps count the
+    /// new blobs, not the collection's size.
+    #[test]
+    fn a_new_commit_adds_exactly_its_new_closure() {
+        let mut store = Store::default();
+        let c = collection(&mut store, "grows by difference");
+        let whole = wide(&mut store, c, 20);
+        store.track_held([c]);
+        let before = settled(&mut store);
+        assert_eq!(held_set(&before, c), whole);
+        let counts = store.reads.lock().unwrap().clone();
+
+        let old: Vec<Raw> = whole
+            .iter()
+            .filter(|held| **held != c.raw)
+            .take(3)
+            .copied()
+            .collect();
+        let leaf = blob(&mut store, b"a new leaf");
+        let data = blob_naming(&mut store, b"a new payload", &[leaf, old[0], old[1]]);
+        let metadata = blob_naming(&mut store, b"new metadata", &[old[2]]);
+        commit(&mut store, c, data, metadata);
+        let work = store.drive_held().expect("the only driver");
+        store.snapshot().unwrap();
+        assert_eq!(
+            steps_to_idle(&work, 10_000),
+            Some(3),
+            "one step per new blob: the payload, the metadata and the leaf"
+        );
+        let after = store.snapshot().unwrap();
+        let mut expected = whole.clone();
+        expected.extend([data, metadata, leaf]);
+        assert_eq!(held_set(&after, c), expected);
+        let now = store.reads.lock().unwrap().clone();
+        for (blob, count) in &counts {
+            assert_eq!(now.get(blob), Some(count), "a held blob was read again");
+        }
+        for new in [data, metadata, leaf] {
+            assert_eq!(reads(&store, &new), 1);
+        }
+    }
+
+    /// The one retry rule (design B4.2): a blob that cannot be read moves to
+    /// unknown and stays there, read once, until positive evidence for it
+    /// arrives. Residency is no evidence, so persistent corruption neither
+    /// loops nor keeps the first closure from being built, and neither do
+    /// arrivals of other blobs or a new record naming it -- also in a store
+    /// whose residency difference lists every blob.
+    #[test]
+    fn persistent_corruption_is_read_once_without_evidence() {
+        for list_all in [false, true] {
+            let mut store = Store::default();
+            store.faults.list_all.store(list_all, Ordering::SeqCst);
+            let c = collection(&mut store, "persistently corrupt");
+            let metadata = blob(&mut store, b"metadata");
+            let z = blob(&mut store, b"every copy invalid, for good");
+            let data = blob_naming(&mut store, b"names the corrupt blob", &[z]);
+            commit(&mut store, c, data, metadata);
+            store.faults.unreadable.lock().unwrap().insert(z);
+            store.track_held([c]);
+            let work = store.drive_held().expect("the only driver");
+            store.snapshot().unwrap();
+            assert!(
+                steps_to_idle(&work, 1_000).is_some(),
+                "the first closure ends (all blobs listed: {list_all})"
+            );
+            let built = store.snapshot().unwrap();
+            assert_eq!(held_set(&built, c), BTreeSet::from([c.raw, metadata, data]));
+            for round in 0..5_u8 {
+                blob(&mut store, &[b'x', round]);
+                commit(&mut store, c, z, metadata);
+                store.snapshot().unwrap();
+                assert!(steps_to_idle(&work, 1_000).is_some());
+            }
+            assert!(!held_set(&store.snapshot().unwrap(), c).contains(&z));
+            assert_eq!(
+                reads(&store, &z),
+                1,
+                "read once, and never again without evidence (all blobs listed: {list_all})"
+            );
+        }
+    }
+
+    /// The ordering condition (Astra, design B4.2): a read that fails while
+    /// positive evidence for its blob arrives is not the blob's last. Here
+    /// the read has already failed when the blob is repaired and a peer
+    /// reports it, and the snapshot that takes the report finds the blob in
+    /// the frontier, not in unknown. The read is applied after that, so it
+    /// keeps the blob for one more read instead of losing the evidence.
+    #[test]
+    fn a_report_arriving_during_a_failed_read_reads_it_again() {
+        let mut store = Store::default();
+        let c = collection(&mut store, "reported mid-read");
+        let metadata = blob(&mut store, b"metadata");
+        let z = blob(&mut store, b"fails, then is reported while failing");
+        commit(&mut store, c, z, metadata);
+        store.faults.unreadable.lock().unwrap().insert(z);
+        let work = store.drive_held().expect("the only driver");
+        store.track_held([c]);
+        assert_eq!(store.snapshot().unwrap().held(c), None);
+        let (release, driver) = block_driver_in(&mut store, work, z);
+        store.faults.unreadable.lock().unwrap().remove(&z);
+        store.note_held(c, Inline::new(z));
+        // This snapshot consumes the report while the failed read is in
+        // flight.
+        store.snapshot().unwrap();
+        release.send(()).unwrap();
+        let held = published(&mut store, c);
+        assert_eq!(held, BTreeSet::from([c.raw, metadata, z]));
+        assert_eq!(reads(&store, &z), 2, "the failed read, then the read again");
+        drop(store);
+        driver.join().unwrap();
+    }
+
+    /// Astra's recovery trace (review of the design, 2026-11-14): P is
+    /// readable and names Z, which is resident and cannot be read. P joins,
+    /// Z stays out. Z is then repaired in place, which no residency
+    /// difference shows, and a peer reports P, which is held already. The
+    /// report still expands P's cached edges (design C11) and tries Z again,
+    /// so both end up held, with P not read again.
+    #[test]
+    fn astras_trace_a_report_of_a_held_parent_retries_its_repaired_child() {
+        let mut store = Store::default();
+        let c = collection(&mut store, "astra's trace");
+        let metadata = blob(&mut store, b"metadata");
+        let z = blob(&mut store, b"Z, unreadable, then repaired in place");
+        let p = blob_naming(&mut store, b"P, readable, names Z", &[z]);
+        commit(&mut store, c, p, metadata);
+        store.faults.unreadable.lock().unwrap().insert(z);
+        store.track_held([c]);
+        let first = settled(&mut store);
+        assert!(held_set(&first, c).contains(&p));
+        assert!(!held_set(&first, c).contains(&z));
+        store.faults.unreadable.lock().unwrap().remove(&z);
+        let repaired = settled(&mut store);
+        assert!(!held_set(&repaired, c).contains(&z), "no evidence yet");
+        store.note_held(c, Inline::new(p));
+        let reported = settled(&mut store);
+        assert!(held_set(&reported, c).is_superset(&BTreeSet::from([p, z])));
+        assert_eq!(reads(&store, &z), 2);
+        assert_eq!(
+            reads(&store, &p),
+            1,
+            "P's children come from the edge cache"
+        );
+    }
+
+    /// A lost blob resets the index (design B5): the held sets, the frontier,
+    /// the unknown sets and the edge cache are forgotten, and every
+    /// collection is recomputed from its roots, its seeds and the peer
+    /// reports, which are kept. A blob that waited in unknown is read again
+    /// on the way, and joins if it reads now.
+    #[test]
+    fn a_reset_recomputes_from_seeds_and_reports_and_forgets_unknown() {
+        let mut store = Store::default();
+        let c = collection(&mut store, "reset");
+        let metadata = blob(&mut store, b"metadata");
+        let forgotten = blob(&mut store, b"forgotten by the store");
+        let reported = blob(&mut store, b"reached only by a report");
+        let z = blob(&mut store, b"unreadable until after the reset");
+        let data = blob_naming(&mut store, b"payload naming Z", &[z]);
+        commit(&mut store, c, data, metadata);
+        store.faults.unreadable.lock().unwrap().insert(z);
+        store.track_held([c]);
+        settled(&mut store);
+        store.note_held(c, Inline::new(reported));
+        let first = settled(&mut store);
+        assert_eq!(
+            held_set(&first, c),
+            BTreeSet::from([c.raw, metadata, data, reported])
+        );
+        store.faults.unreadable.lock().unwrap().remove(&z);
+        assert!(!held_set(&settled(&mut store), c).contains(&z));
+        let kept: Vec<_> = store
+            .snapshot()
+            .unwrap()
+            .inner()
+            .blobs()
+            .map(|info| info.unwrap().handle)
+            .filter(|handle| handle.raw != forgotten)
+            .collect();
+        (*store).inner.blobs.keep(kept);
+        let after = settled(&mut store);
+        assert_eq!(
+            held_set(&after, c),
+            BTreeSet::from([c.raw, metadata, data, reported, z])
+        );
+        assert_eq!(reads(&store, &z), 2, "unknown is forgotten by the reset");
+        assert_eq!(reads(&store, &data), 2, "so is the edge cache");
+        assert!(
+            !held_set(&first, c).contains(&z),
+            "an existing snapshot never changes"
+        );
+    }
+
+    /// The late child stays a known limitation (design decision,
+    /// 2026-11-14, Astra's R2): H becomes resident after its parent P, which
+    /// C holds, was scanned. No arrival, no new record naming P and no
+    /// report of P brings H in, since P is not read again and its cached
+    /// edges do not name H. A report of H itself does, as does a reset
+    /// (`a_nested_late_local_child_stays_out_until_a_reset`).
+    #[test]
+    fn a_late_child_stays_out_even_when_its_parent_is_reported() {
+        let mut store = Store::default();
+        let c = collection(&mut store, "late child");
+        let metadata = blob(&mut store, b"metadata");
+        let h_bytes = unresident_naming(b"a child resident after its parent's scan", &[]);
+        let h = handle_of(&h_bytes);
+        let p = blob_naming(&mut store, b"a parent scanned first", &[h]);
+        commit(&mut store, c, p, metadata);
+        store.track_held([c]);
+        let first = settled(&mut store);
+        assert!(held_set(&first, c).contains(&p));
+        store.put::<UnknownBlob, _>(h_bytes).unwrap();
+        let other_metadata = blob(&mut store, b"another metadata");
+        commit(&mut store, c, p, other_metadata);
+        store.note_held(c, Inline::new(p));
+        let still = settled(&mut store);
+        assert!(
+            !held_set(&still, c).contains(&h),
+            "the known limitation: nothing rescans P"
+        );
+        assert_eq!(reads(&store, &p), 1);
+        store.note_held(c, Inline::new(h));
+        let reported = settled(&mut store);
+        assert!(held_set(&reported, c).contains(&h));
+        assert_eq!(reads(&store, &h), 1);
     }
 }

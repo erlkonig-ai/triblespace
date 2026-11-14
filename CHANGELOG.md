@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- The held-set driver is a semi-naive fixpoint instead of a job queue
+  (heldset design, 2026-11-14). Each snapshot writes what arrived into a
+  per-collection *frontier*, a PATCH set of blobs reached and not yet
+  applied, and the driver drains it: a readable blob joins and its children
+  not held enter the frontier, an unreadable one moves to an *unknown* set.
+  `Job` (a depth-first stack with two `HashSet`s), the `VecDeque` of jobs,
+  `active`/`judging` parking, `pending`, `misjudged`, `unrouted` and
+  `building` are gone; all retained state is PATCH. An entry stays in the
+  frontier until it is applied, so a step cut off by the budget, a dropped
+  driver or a clone loses nothing.
+  The closure rule is relaxed: an unreadable blob stays out of `held(C)`,
+  and its parents may join (before, it held back everything above it). An
+  unknown blob is read again only on positive evidence: it became resident,
+  or a peer reported it or a parent of it, a held parent included. A read
+  that fails while such evidence arrives reads the blob once more. A reset
+  also forgets the unknown sets.
+  The late child stays a known limitation, and building collections still
+  take turns behind built ones.
+
 - Fragments now carry each attribute's value-encoding description in their
   metafacts, so a commit's metadata archive says what an encoding is, not
   only its id. For a `Handle<T>` that includes the

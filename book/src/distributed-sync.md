@@ -1602,8 +1602,9 @@ child -- resident only after its parent was scanned -- is caught two ways:
   the next snapshot is taken is dropped.
 
 Otherwise it stays out of held(C) until the index resets or the store is
-reopened, though it stays readable by its hash. That is a stated limitation:
-there is no periodic rescan. Between two Full neighbours, a late child that
+reopened, though it stays readable by its hash. A note of its parent does
+not bring it in: the parent is not read again, and its cached edges do not
+name the child. That is a stated limitation: there is no periodic rescan. Between two Full neighbours, a late child that
 one side holds through a seed or a note reaches the other side's held set by
 its next references push.
 
@@ -1611,11 +1612,14 @@ Every snapshot carries the held sets as they stood when it was taken, and they
 never change afterwards. Taking a store snapshot reads no blob for the held
 sets. (A peer's snapshot still reads blobs after it releases the store mutex,
 when it rebuilds the serving view: collection descriptors, configuration and
-capability definitions. Those reads do not repair.) It queues for the
-store's driver what arrived since the previous one -- every seed of a new
-record (one another record already named included), seeds whose bytes
-arrived, notes from references pushes -- selects the seeds of newly tracked
-collections from their records, and notes whose proofs are to be judged. The
+capability definitions. Those reads do not repair.) The held sets are a
+semi-naive fixpoint over the roots (seeds and notes), kept by differences:
+each snapshot writes what arrived since the previous one into the
+collection's *frontier*, the set of blobs reached and not yet applied --
+every seed of a new record that C does not hold yet, blobs that could not
+be read and have become resident, notes from references pushes -- selects
+the seeds of newly tracked collections from their records, and notes whose
+proofs are to be judged. The
 driver (`HeldWork`, a peer's held-set thread) does every held-set read, in
 steps against the latest observed snapshot, never holding the index across a
 read. Its time budget is cooperative: it is checked between steps, and a blob
@@ -1629,10 +1633,20 @@ proofs are judged; a built collection's set grows as the driver reaches what
 arrived, so an observation can be handed out ahead of its new records'
 closures. Nothing in sync needs it otherwise: held sets are allowed to lag.
 A store nobody drives builds nothing, and its tracked collections stay
-unknown. A held set is closed under the edge cache for readable children: a
-blob joins only once every child the cache names for it has joined. A blob
-that cannot be read, absent or resident and failing to read, is unknown on
-every path, and nothing above it joins. No held set is computed before the
+unknown. The driver applies each frontier entry once: a readable blob joins
+and its children not held enter the frontier; a blob that cannot be read,
+absent or resident and failing to read, stays out, and its parents may join.
+So a held set is closed under readable children only, and no consumer of it
+relies on more (the walk, the host, the References exchange and exact-H
+serving read it as positive inventory). A blob that could not be read is
+read again only on positive new evidence: it became resident, or a note
+names it or a parent of it, a held parent included. Residency alone is not
+evidence, since it cannot tell persistent corruption from a new valid copy,
+so a corrupt blob costs one read per collection and never a loop; a valid
+copy that lands beside a corrupt one by any path but the held-set thread's
+own repair waits for such a note. A read that fails while evidence for its
+blob arrives is applied after that evidence and reads the blob once more. No
+held set is computed before the
 store has been observed whole once: a step of a climb observes a prefix,
 where a parent can precede its child and would make it a late child, so every
 held set is unknown until a step reaches the end. Because the driver scans a
@@ -1641,8 +1655,9 @@ that lands after its parent but before the driver reaches the parent is not a
 late child. A collection whose records the store cannot select stays
 unsettled -- absent from the held sets, never published short -- and is
 selected again at the next observation. A snapshot that lost a blob its
-predecessor had resets the index, and every collection is recomputed as if
-newly tracked. Short-lived readers of the same pile track nothing.
+predecessor had resets the index: the held sets, frontiers, edges and the
+blobs that could not be read are forgotten, and every collection is
+recomputed from its seeds and notes as if newly tracked. Short-lived readers of the same pile track nothing.
 
 `pile net sync` repairs what its held-set thread reads. Its store is
 `Covered<Repairing<PileFile>>` (`triblespace_net::peer::Repairing`), and in
@@ -1650,7 +1665,7 @@ newly tracked. Short-lived readers of the same pile track nothing.
 but has no copy that validates fetches the blob by hash, waiting at most the
 interactive fetch deadline. The verified bytes land beside the corrupt copy
 under the store mutex and are read back from the snapshot that lands them, so
-the scan reads the pile's bytes, and the blob and what is above it join the
+the scan reads the pile's bytes, and the blob joins the
 held set. An absent blob is never fetched there, each handle is tried at most
 once per held-set thread (a failed attempt counts too, and a held-index reset
 does not clear that record), and no other thread repairs: a store snapshot

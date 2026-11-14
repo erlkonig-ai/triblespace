@@ -389,3 +389,16 @@ prioritized for efficient zero-copy access.
   document refused halfway (syntax, lone surrogate, depth) leaves the blobs of
   its parsed prefix in that store. The returned fragment already carries every
   blob; deciding whether the importer needs a store at all would remove this.
+- Held sets (heldset design, 2026-11-14, open question 2): two optional
+  differences the semi-naive driver does not need yet. `proofs_diff(&old)`
+  on `CapabilityProofRead` (the pile keeps proofs in a PATCH) would let a
+  proof change re-judge only the collections whose proofs changed, instead of
+  every settled one. An occurrence difference on `BlobStoreList` (the pile's
+  `blobs_diff` without its filter on hashes `old` already had) would be the
+  missing positive evidence for a valid copy landed beside a corrupt one by
+  any path but the held-set thread's own repair; today such a blob waits in
+  `unknown` for a peer report. Each needs a default that lists everything,
+  as `blobs_diff` has.
+- Held sets: a report of a held blob retries only its direct cached children
+  that wait in `unknown`. An unreadable grandchild below a held intermediate
+  waits for a report of the intermediate or of itself.
