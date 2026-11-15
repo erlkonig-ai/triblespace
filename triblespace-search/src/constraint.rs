@@ -268,6 +268,71 @@ fn above_floor(acc: std::collections::HashMap<RawInline, f32>, score_floor: f32)
     out
 }
 
+/// Documents that appear in the posting list of EVERY term in `terms`: the
+/// conjunctive (AND) reading of a term set, where [`aggregate_above`] is the
+/// disjunctive, scored one.
+///
+/// Returns [`None`] for an empty `terms`. The intersection of no posting
+/// lists is the whole corpus, which a posting interface cannot enumerate, and
+/// "no term to require" is a different question from "no document matches":
+/// a caller that derived its terms from a pattern (say a regex's required
+/// trigrams) must fall back to an unindexed plan rather than bind nothing.
+///
+/// Repeated terms are harmless (intersection is idempotent). The result is
+/// distinct, in the first term's posting order.
+fn intersect_postings<I: BM25Queryable + ?Sized>(
+    index: &I,
+    terms: &[RawInline],
+) -> Option<Vec<RawInline>> {
+    let (first, rest) = terms.split_first()?;
+    let mut docs: Vec<RawInline> = index.query_term_boxed(first).map(|(d, _)| d).collect();
+    for term in rest {
+        if docs.is_empty() {
+            break;
+        }
+        let present: HashSet<RawInline> = index.query_term_boxed(term).map(|(d, _)| d).collect();
+        docs.retain(|d| present.contains(d));
+    }
+    Some(docs)
+}
+
+impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::InlineEncoding>
+    BM25Index<D, T>
+{
+    /// Documents containing every one of `terms` (posting-list
+    /// intersection), or [`None`] when `terms` is empty. See
+    /// [`Self::matches_all`] for the constraint form.
+    pub fn docs_with_all(&self, terms: &[Inline<T>]) -> Option<Vec<Inline<D>>> {
+        let raw: Vec<RawInline> = terms.iter().map(|t| t.raw).collect();
+        intersect_postings(self, &raw).map(|v| v.into_iter().map(Inline::new).collect())
+    }
+
+    /// Conjunctive filter: binds `doc` to documents whose posting lists
+    /// contain every one of `terms`. [`None`] when `terms` is empty, because
+    /// requiring nothing is not a constraint this index can propose from.
+    pub fn matches_all(&self, doc: Variable<D>, terms: &[Inline<T>]) -> Option<BM25Filter<D>> {
+        let raw: Vec<RawInline> = terms.iter().map(|t| t.raw).collect();
+        intersect_postings(self, &raw).map(|v| BM25Filter::from_entries(doc, v))
+    }
+}
+
+#[cfg(feature = "succinct")]
+impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::InlineEncoding>
+    crate::succinct::SuccinctBM25Index<D, T>
+{
+    /// Succinct-side sibling of [`BM25Index::docs_with_all`].
+    pub fn docs_with_all(&self, terms: &[Inline<T>]) -> Option<Vec<Inline<D>>> {
+        let raw: Vec<RawInline> = terms.iter().map(|t| t.raw).collect();
+        intersect_postings(self, &raw).map(|v| v.into_iter().map(Inline::new).collect())
+    }
+
+    /// Succinct-side sibling of [`BM25Index::matches_all`].
+    pub fn matches_all(&self, doc: Variable<D>, terms: &[Inline<T>]) -> Option<BM25Filter<D>> {
+        let raw: Vec<RawInline> = terms.iter().map(|t| t.raw).collect();
+        intersect_postings(self, &raw).map(|v| BM25Filter::from_entries(doc, v))
+    }
+}
+
 impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::InlineEncoding>
     crate::portable_bm25::PortableBM25Query<'_, D, T>
 {
@@ -886,6 +951,44 @@ mod tests {
         fn try_from_inline(_: &Inline<Handle<Embedding>>) -> Result<Self, Self::Error> {
             Ok(Self)
         }
+    }
+
+    #[cfg(feature = "succinct")]
+    #[test]
+    fn matches_all_is_the_posting_intersection_on_both_backends() {
+        let mut b: BM25Builder = BM25Builder::new();
+        b.insert(id(1), hash_tokens("the quick brown fox"));
+        b.insert(id(2), hash_tokens("the lazy brown dog"));
+        b.insert(id(3), hash_tokens("quick silver fox jumps"));
+        let naive = b.clone().build_naive();
+        let succinct = b.build();
+        let mut want: Vec<Id> = vec![id(1), id(3)];
+        want.sort();
+        for terms in [hash_tokens("quick fox"), hash_tokens("fox quick fox")] {
+            let mut got_n: Vec<Id> =
+                triblespace_core::find!((d: Id), naive.matches_all(d, &terms).unwrap())
+                    .map(|(d,)| d)
+                    .collect();
+            let mut got_s: Vec<Id> =
+                triblespace_core::find!((d: Id), succinct.matches_all(d, &terms).unwrap())
+                    .map(|(d,)| d)
+                    .collect();
+            got_n.sort();
+            got_s.sort();
+            assert_eq!(got_n, want);
+            assert_eq!(got_s, want);
+        }
+        assert_eq!(
+            naive.docs_with_all(&hash_tokens("quick dog")).unwrap(),
+            vec![]
+        );
+        assert_eq!(
+            succinct.docs_with_all(&hash_tokens("absent fox")).unwrap(),
+            vec![]
+        );
+        // Requiring nothing is not "nothing matches".
+        assert!(naive.matches_all(Variable::new(0), &[]).is_none());
+        assert!(succinct.docs_with_all(&[]).is_none());
     }
 
     fn sample_index() -> BM25Index {
