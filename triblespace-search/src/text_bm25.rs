@@ -53,7 +53,9 @@ use triblespace_core::repo::StoreRead;
 use triblespace_core::trible::{Fragment, A_START, TRIBLE_LEN, V_START};
 
 use crate::portable_bm25::{PortableBM25Blob, PortableBM25Index};
-use crate::tokens::{bigram_tokens, code_tokens, hash_tokens, BigramHash, WordHash};
+use crate::tokens::{
+    bigram_tokens, code_tokens, hash_tokens, ngram_tokens, BigramHash, NgramHash, WordHash,
+};
 
 /// Stable identity of the text-attribute-to-BM25 mapping, whose documents are
 /// the attribute's text payloads keyed by handle. Minted with `trible genid`
@@ -65,7 +67,7 @@ pub const TEXT_ATTRIBUTE_TO_BM25: Id = id_hex!("97085CF14F12761AB804555FEE8F00E5
 
 attributes! {
     /// Which tokenizer one concrete BM25 mapping cuts its texts with, by name:
-    /// `word`, `bigram` or `code`. Part of the mapping instance, so two
+    /// `word`, `bigram`, `code` or `trigram`. Part of the mapping instance, so two
     /// tokenizers over one attribute are two collections.
     ///
     /// Anchor minted with `trible genid` on 2026-09-10.
@@ -82,6 +84,17 @@ pub enum Bm25Tokenizer {
     Bigram,
     /// Identifiers split on case and punctuation, for source code: [`code_tokens`].
     Code,
+    /// Character 3-grams inside lowercased alphanumeric runs:
+    /// [`ngram_tokens`]`(text, 3)`. A substring prefilter: every text
+    /// containing a literal holds each of that literal's trigrams, so the
+    /// intersection of their postings (`docs_with_all`) is a superset of the
+    /// texts containing it.
+    ///
+    /// Adding this variant leaves the mapping recipe, and so every existing
+    /// `word`/`bigram`/`code` collection's descriptor, unchanged: the
+    /// tokenizer name is a mapping-instance argument, and only a `trigram`
+    /// mapping carries this name.
+    Trigram,
 }
 
 impl Bm25Tokenizer {
@@ -90,6 +103,7 @@ impl Bm25Tokenizer {
             Self::Word => "word",
             Self::Bigram => "bigram",
             Self::Code => "code",
+            Self::Trigram => "trigram",
         }
     }
 
@@ -98,6 +112,7 @@ impl Bm25Tokenizer {
             "word" => Some(Self::Word),
             "bigram" => Some(Self::Bigram),
             "code" => Some(Self::Code),
+            "trigram" => Some(Self::Trigram),
             _ => None,
         }
     }
@@ -106,7 +121,7 @@ impl Bm25Tokenizer {
     /// the name as `UTF8String` text, and a loaded descriptor carries no
     /// blobs, so the closed set of names is matched by handle.
     pub fn from_name_handle(handle: Inline<Handle<UTF8String>>) -> Option<Self> {
-        [Self::Word, Self::Bigram, Self::Code]
+        [Self::Word, Self::Bigram, Self::Code, Self::Trigram]
             .into_iter()
             .find(|tokenizer| handle == tokenizer.name().to_inline())
     }
@@ -117,6 +132,7 @@ impl Bm25Tokenizer {
             Self::Word => hash_tokens(text).into_iter().map(|t| t.raw).collect(),
             Self::Bigram => bigram_tokens(text).into_iter().map(|t| t.raw).collect(),
             Self::Code => code_tokens(text).into_iter().map(|t| t.raw).collect(),
+            Self::Trigram => ngram_tokens(text, 3).into_iter().map(|t| t.raw).collect(),
         }
     }
 }
@@ -277,6 +293,17 @@ impl CollectionAttachment for PortableBM25Blob {
                 .bytes()
                 .clone()
             }
+            Bm25Tokenizer::Trigram => {
+                PortableBM25Index::<Handle<UTF8String>, NgramHash>::from_exact_counts(
+                    documents,
+                    counts.into_iter().map(|(document, term, frequency)| {
+                        (document, Inline::<NgramHash>::new(term), frequency)
+                    }),
+                )
+                .map_err(|source| fatal(source.to_string()))?
+                .bytes()
+                .clone()
+            }
             Bm25Tokenizer::Word | Bm25Tokenizer::Code => {
                 PortableBM25Index::<Handle<UTF8String>, WordHash>::from_exact_counts(
                     documents,
@@ -371,6 +398,168 @@ mod tests {
                 .unwrap();
         assert_eq!(index.doc_count(), 1);
         assert_eq!(index.term_count(), 3);
+    }
+
+    #[test]
+    fn tokenizer_names_round_trip_including_trigram() {
+        for tokenizer in [
+            Bm25Tokenizer::Word,
+            Bm25Tokenizer::Bigram,
+            Bm25Tokenizer::Code,
+            Bm25Tokenizer::Trigram,
+        ] {
+            assert_eq!(Bm25Tokenizer::from_name(tokenizer.name()), Some(tokenizer));
+            assert_eq!(
+                Bm25Tokenizer::from_name_handle(tokenizer.name().to_inline()),
+                Some(tokenizer)
+            );
+        }
+        assert_eq!(Bm25Tokenizer::Trigram.name(), "trigram");
+        assert_eq!(Bm25Tokenizer::from_name("ngram"), None);
+    }
+
+    /// Adding a tokenizer must not re-mint existing BM25 collections: a
+    /// collection is the handle of its descriptor blob, which embeds the
+    /// recipe's name and description and the mapping's arguments. These
+    /// handles were computed from the descriptor at 327eb584, before the
+    /// `trigram` variant existed.
+    #[test]
+    fn existing_tokenizer_descriptors_keep_their_identity() {
+        use ed25519_dalek::SigningKey;
+        use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+        let authority = SigningKey::from_bytes(&[41; 32]);
+        let root = authority.verifying_key();
+        let policy =
+            CollectionPolicy::new(AdmissionPolicy::direct(root), AdmissionPolicy::direct(root));
+        let attribute = Attribute::<Handle<UTF8String>>::named("bm25-identity-pin");
+        let mut store = MemoryRepo::for_host(root);
+        let source = store.collection("bm25-identity-pin", policy).unwrap();
+        let mut got = Vec::new();
+        for tokenizer in [
+            Bm25Tokenizer::Word,
+            Bm25Tokenizer::Bigram,
+            Bm25Tokenizer::Code,
+        ] {
+            let target = store
+                .attach::<PortableBM25Blob>(
+                    source,
+                    TextAttributeToBm25 {
+                        attribute: attribute.id(),
+                        tokenizer,
+                    },
+                )
+                .unwrap();
+            let hex: String = target
+                .handle()
+                .raw
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect();
+            got.push(format!("{}={hex}", tokenizer.name()));
+        }
+        assert_eq!(
+            got,
+            [
+                "word=8675D95C8FE54C952A91E5078060F536110AC084FF0D9A0DB4BE5073648ADF89",
+                "bigram=90E23A5C4645944CE882C0F7C67BD4D632E7D06C711CE5CB99588FC27AF8EB8E",
+                "code=21FBBCE907285ADD28454AA4CADDF6BC71359C812CBC7984B6258CEBEBC2BBF1",
+            ]
+        );
+    }
+
+    /// The trigram tokenizer through a store: maintenance maps a node's
+    /// texts, the attached carrier is read as an `NgramHash` view, and the
+    /// posting intersection is a superset of the texts containing a literal.
+    #[test]
+    fn trigram_attachment_answers_substring_candidates() {
+        use ed25519_dalek::SigningKey;
+        use futures::executor::block_on;
+        use triblespace_core::collection::{
+            AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
+        };
+        use triblespace_core::repo::BlobStoreGet;
+
+        let authority = SigningKey::from_bytes(&[42; 32]);
+        let root = authority.verifying_key();
+        let policy =
+            CollectionPolicy::new(AdmissionPolicy::direct(root), AdmissionPolicy::direct(root));
+        let attribute = Attribute::<Handle<UTF8String>>::named("bm25-trigram");
+        let argument = TextAttributeToBm25 {
+            attribute: attribute.id(),
+            tokenizer: Bm25Tokenizer::Trigram,
+        };
+        let mut store = MemoryRepo::for_host(root);
+        let texts: Vec<Inline<Handle<UTF8String>>> = [
+            "Computer Science",
+            "e-commerce",
+            "Combinatorics",
+            "telecom",
+            "no match here",
+        ]
+        .into_iter()
+        .map(|t| store.put::<UTF8String, _>(String::from(t)).unwrap())
+        .collect();
+        let source = store.collection("bm25-trigram-texts", policy).unwrap();
+        let target = store.attach::<PortableBM25Blob>(source, argument).unwrap();
+        store
+            .commit(
+                source,
+                &authority,
+                Fragment::from(text_facts(
+                    attribute.id(),
+                    texts.iter().enumerate().map(|(i, t)| (i as u8 + 1, *t)),
+                )),
+            )
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let descriptor: Blob<SimpleArchive> = snapshot.get(target.handle()).unwrap();
+        let descriptor = Fragment::from(TribleSet::try_from_blob(descriptor).unwrap());
+        assert_eq!(
+            PortableBM25Blob::bind(&Fragment::empty(), &descriptor).unwrap(),
+            argument
+        );
+        drop(snapshot);
+
+        let snapshot = block_on(store.maintain_attached(target, &authority)).unwrap();
+        let attached = snapshot.attached(target).unwrap();
+        assert!(attached.residual().is_empty());
+        let view: crate::portable_bm25::PortableBM25View<Handle<UTF8String>, NgramHash> =
+            attached.view().unwrap();
+        let query = view.query().unwrap();
+        assert_eq!(query.doc_count(), 5);
+        let sorted = |mut v: Vec<RawInline>| {
+            v.sort();
+            v
+        };
+        let want = |idx: &[usize]| sorted(idx.iter().map(|&i| texts[i].raw).collect());
+        let got = |lit: &str| {
+            sorted(
+                query
+                    .docs_with_all(&ngram_tokens(lit, 3))
+                    .unwrap()
+                    .unwrap()
+                    .into_iter()
+                    .map(|d| d.raw)
+                    .collect(),
+            )
+        };
+        assert_eq!(got("com"), want(&[0, 1, 2, 3]));
+        assert_eq!(got("comm"), want(&[1]));
+        assert_eq!(got("Comb"), want(&[2]));
+        assert_eq!(got("comx"), want(&[]));
+        assert!(query.docs_with_all(&[]).unwrap().is_none());
+        let rows: Vec<RawInline> = sorted(
+            triblespace_core::find!(
+                (d: Inline<Handle<UTF8String>>),
+                query
+                    .matches_all(d, &ngram_tokens("telecom", 3))
+                    .unwrap()
+                    .unwrap()
+            )
+            .map(|(d,)| d.raw)
+            .collect(),
+        );
+        assert_eq!(rows, want(&[3]));
     }
 
     /// A node whose text is not here has no attachment: it is the reader's

@@ -261,7 +261,7 @@ pub enum Command {
         /// bm25: the attribute carrying UTF8String text blobs
         #[arg(long)]
         text: Option<String>,
-        /// bm25: how to cut the texts: word, bigram or code
+        /// bm25: how to cut the texts: word, bigram, code or trigram
         #[arg(long, default_value = "word")]
         tokenizer: String,
         /// path: the regular path expression over attribute ids. Juxtaposition
@@ -2617,7 +2617,7 @@ fn run_attach(
                 let tokenizer =
                     Bm25Tokenizer::from_name(&arguments.tokenizer).ok_or_else(|| {
                         anyhow!(
-                            "--tokenizer {:?} is not one of word, bigram, code",
+                            "--tokenizer {:?} is not one of word, bigram, code, trigram",
                             arguments.tokenizer
                         )
                     })?;
@@ -2850,7 +2850,7 @@ fn run_search(
     use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25View};
     use triblespace_search::text_bm25::Bm25Tokenizer;
     use triblespace_search::tokens::{
-        bigram_tokens, code_tokens, hash_tokens, BigramHash, WordHash,
+        bigram_tokens, code_tokens, hash_tokens, ngram_tokens, BigramHash, NgramHash, WordHash,
     };
 
     // Only the host's MAPs are believed: opened as the key it would sign
@@ -2907,6 +2907,16 @@ fn run_search(
                     .query()
                     .map_err(|error| anyhow!("prepare BM25 scoring: {error}"))?
                     .query_multi(&bigram_tokens(&query))
+                    .map_err(|error| anyhow!("BM25 scoring: {error}"))?
+            }
+            Bm25Tokenizer::Trigram => {
+                let index: PortableBM25View<Handle<UTF8String>, NgramHash> = view
+                    .view()
+                    .map_err(|error| anyhow!("read carriers: {error}"))?;
+                index
+                    .query()
+                    .map_err(|error| anyhow!("prepare BM25 scoring: {error}"))?
+                    .query_multi(&ngram_tokens(&query, 3))
                     .map_err(|error| anyhow!("BM25 scoring: {error}"))?
             }
             Bm25Tokenizer::Word | Bm25Tokenizer::Code => {

@@ -354,6 +354,42 @@ impl<D: triblespace_core::inline::InlineEncoding, T: triblespace_core::inline::I
         Ok(BM25Filter::from_entries(doc, above_floor(acc, score_floor)))
     }
 
+    /// Documents containing every one of `terms` (posting-list
+    /// intersection) across this corpus, or `Ok(None)` when `terms` is
+    /// empty: see [`BM25Index::docs_with_all`].
+    ///
+    /// Fails when a query term's postings are out of bounds.
+    pub fn docs_with_all(
+        &self,
+        terms: &[Inline<T>],
+    ) -> Result<Option<Vec<Inline<D>>>, crate::portable_bm25::PortableBM25Error> {
+        let Some((first, rest)) = terms.split_first() else {
+            return Ok(None);
+        };
+        let mut docs: Vec<Inline<D>> = self.query_term(first)?.map(|(d, _)| d).collect();
+        for term in rest {
+            if docs.is_empty() {
+                break;
+            }
+            let present: HashSet<RawInline> = self.query_term(term)?.map(|(d, _)| d.raw).collect();
+            docs.retain(|d| present.contains(&d.raw));
+        }
+        Ok(Some(docs))
+    }
+
+    /// Conjunctive filter over this corpus: see [`BM25Index::matches_all`].
+    ///
+    /// Fails when a query term's postings are out of bounds.
+    pub fn matches_all(
+        &self,
+        doc: Variable<D>,
+        terms: &[Inline<T>],
+    ) -> Result<Option<BM25Filter<D>>, crate::portable_bm25::PortableBM25Error> {
+        Ok(self
+            .docs_with_all(terms)?
+            .map(|docs| BM25Filter::from_entries(doc, docs.into_iter().map(|d| d.raw))))
+    }
+
     /// Summed BM25 score for one document across the supplied typed terms.
     ///
     /// Fails when a query term's postings are out of bounds.
