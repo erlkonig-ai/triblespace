@@ -99,13 +99,16 @@ where
             .reduce(|acc, e| acc + e)
     }
 
-    /// Returns the **sum** of volumes across all variants, as for
+    /// Returns the componentwise **sum** across all variants, as for
     /// [`estimate`](Self::estimate).
-    fn estimate_volume(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+    fn cardinality(&self, variable: VariableId, binding: &Binding) -> Option<Cardinality> {
         self.constraints
             .iter()
-            .filter_map(|c| c.estimate_volume(variable, binding))
-            .reduce(|acc, e| acc + e)
+            .filter_map(|c| c.cardinality(variable, binding))
+            .reduce(|acc, c| Cardinality {
+                distinct: acc.distinct + c.distinct,
+                rows: acc.rows + c.rows,
+            })
     }
 
     /// Collects proposals from every variant that is satisfied *for a

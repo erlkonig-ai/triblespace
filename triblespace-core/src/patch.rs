@@ -2374,23 +2374,30 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash> Head<KEY_LEN,
         }
     }
 
-    pub(crate) fn segmented_len<const PREFIX_LEN: usize>(
+    /// `(segments, keys)` under `prefix`; a leaf is one key and, when it
+    /// matches, one segment.
+    pub(crate) fn prefix_counts<const PREFIX_LEN: usize>(
         &self,
         at_depth: usize,
         prefix: &[u8; PREFIX_LEN],
-    ) -> u64 {
+    ) -> (u64, u64) {
         match self.body_ref() {
-            BodyRef::Leaf(leaf) => leaf.segmented_len::<O, PREFIX_LEN>(at_depth, prefix),
-            BodyRef::LocalLeaf(bytes) => {
-                leaf::key_ops::segmented_len::<KEY_LEN, PREFIX_LEN, O>(bytes, at_depth, prefix)
+            BodyRef::Leaf(leaf) => {
+                let n = leaf.segmented_len::<O, PREFIX_LEN>(at_depth, prefix);
+                (n, n)
             }
-            BodyRef::Branch(branch) => branch.segmented_len::<PREFIX_LEN>(at_depth, prefix),
+            BodyRef::LocalLeaf(bytes) => {
+                let n =
+                    leaf::key_ops::segmented_len::<KEY_LEN, PREFIX_LEN, O>(bytes, at_depth, prefix);
+                (n, n)
+            }
+            BodyRef::Branch(branch) => branch.prefix_counts::<PREFIX_LEN>(at_depth, prefix),
         }
     }
 
     /// Locate the shallowest subtree whose keys all share `prefix`.
     ///
-    /// Unlike composing [`Self::segmented_len`] with [`Self::infixes`], this
+    /// Unlike composing [`Self::prefix_counts`] with [`Self::infixes`], this
     /// returns the already-located head so a caller can inspect its cached
     /// segment count and then enumerate that same subtree without descending
     /// the fixed prefix a second time.
@@ -3789,24 +3796,16 @@ where
             .unwrap_or(0)
     }
 
-    /// Returns the number of keys with the given prefix.
-    ///
-    /// This is the cached `leaf_count` of the shallowest subtree covering
-    /// `prefix`, so it costs one descent, like [`PATCH::segmented_len`],
-    /// but counts keys instead of distinct segments.
-    pub fn prefix_len<const PREFIX_LEN: usize>(&self, prefix: &[u8; PREFIX_LEN]) -> u64 {
-        const {
-            assert!(PREFIX_LEN <= KEY_LEN);
-        }
-        self.root
-            .as_ref()
-            .and_then(|root| root.locate_prefix(0, prefix))
-            .map(|head| head.count())
-            .unwrap_or(0)
-    }
-
     /// Returns the number of unique segments in keys with the given prefix.
     pub fn segmented_len<const PREFIX_LEN: usize>(&self, prefix: &[u8; PREFIX_LEN]) -> u64 {
+        self.prefix_counts(prefix).0
+    }
+
+    /// Returns `(segments, keys)` for the given prefix: the number of unique
+    /// segments after it, as [`PATCH::segmented_len`], and the number of
+    /// keys under it. Both come from the cached counts of the shallowest
+    /// subtree covering the prefix, so one descent answers both.
+    pub fn prefix_counts<const PREFIX_LEN: usize>(&self, prefix: &[u8; PREFIX_LEN]) -> (u64, u64) {
         const {
             assert!(PREFIX_LEN <= KEY_LEN);
             if PREFIX_LEN > 0 && PREFIX_LEN < KEY_LEN {
@@ -3820,9 +3819,9 @@ where
             }
         }
         if let Some(root) = &self.root {
-            root.segmented_len(0, prefix)
+            root.prefix_counts(0, prefix)
         } else {
-            0
+            (0, 0)
         }
     }
 

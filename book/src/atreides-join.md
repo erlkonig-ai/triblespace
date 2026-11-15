@@ -77,9 +77,9 @@ partial information is available the search still functions, but better
 estimates steer the traversal directly toward the surviving tuples.
 
 The engine uses two of these rungs at once, for two different decisions.
-Which variable to bind next is ordered by Jessica, through
-[`Constraint::estimate_volume`](triblespace::core::query::Constraint::estimate_volume),
-with Paul breaking ties: a variable with few distinct values but a large fanout
+Which variable to bind next is ordered by Jessica, the `rows` of
+[`Constraint::cardinality`](triblespace::core::query::Constraint::cardinality),
+with Paul, its `distinct`, breaking ties: a variable with few distinct values but a large fanout
 no longer looks cheap. Which constraint proposes is still chosen by Paul. Paul
 alone misleads on a join such as `{ ?s @ formerStreamTitle: ?t, rdf_type: ?c }`
 over DBLP: rdf:type has only 29 classes over 949,069 tribles, so ?c looked

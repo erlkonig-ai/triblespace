@@ -107,13 +107,17 @@ where
             .min()
     }
 
-    /// The tightest child's volume: every row the intersection reaches lies
-    /// under each child's rows, so the smallest bounds them all.
-    fn estimate_volume(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+    /// The componentwise minimum over the children that constrain
+    /// `variable`: every value and every row the intersection reaches lies
+    /// within each child's, so the smallest bounds them all.
+    fn cardinality(&self, variable: VariableId, binding: &Binding) -> Option<Cardinality> {
         self.constraints
             .iter()
-            .filter_map(|c| c.estimate_volume(variable, binding))
-            .min()
+            .filter_map(|c| c.cardinality(variable, binding))
+            .reduce(|acc, c| Cardinality {
+                distinct: acc.distinct.min(c.distinct),
+                rows: acc.rows.min(c.rows),
+            })
     }
 
     /// Lets each row's tightest child propose, then confirms through the

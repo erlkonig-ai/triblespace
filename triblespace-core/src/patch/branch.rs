@@ -1408,11 +1408,14 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
         None
     }
 
-    pub fn segmented_len<const PREFIX_LEN: usize>(
+    /// `(segments, keys)` under `prefix`: the number of distinct segments
+    /// after the prefix and the number of keys, both read from the cached
+    /// counts of the shallowest branch covering the prefix.
+    pub fn prefix_counts<const PREFIX_LEN: usize>(
         &self,
         at_depth: usize,
         prefix: &[u8; PREFIX_LEN],
-    ) -> u64 {
+    ) -> (u64, u64) {
         let node_end_depth = self.end_depth as usize;
         let limit = std::cmp::min(PREFIX_LEN, node_end_depth);
         if !super::leaf::key_ops::has_prefix::<KEY_LEN, O>(
@@ -1420,19 +1423,20 @@ impl<const KEY_LEN: usize, O: KeySchema<KEY_LEN>, V, H: PatchHash>
             at_depth,
             &prefix[..limit],
         ) {
-            return 0;
+            return (0, 0);
         }
         if PREFIX_LEN <= node_end_depth {
-            if !O::same_segment_tree(PREFIX_LEN, node_end_depth) {
-                return 1;
+            let segments = if !O::same_segment_tree(PREFIX_LEN, node_end_depth) {
+                1
             } else {
-                return self.segment_count;
-            }
+                self.segment_count
+            };
+            return (segments, self.leaf_count);
         }
         if let Some(child) = self.child_table.table_get(prefix[node_end_depth]) {
-            child.segmented_len::<PREFIX_LEN>(node_end_depth, prefix)
+            child.prefix_counts::<PREFIX_LEN>(node_end_depth, prefix)
         } else {
-            0
+            (0, 0)
         }
     }
 

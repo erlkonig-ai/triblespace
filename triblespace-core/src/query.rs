@@ -900,26 +900,32 @@ pub trait Constraint<'a> {
     /// relevance off the batch.
     fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize>;
 
-    /// Estimates how much search binding `variable` next would lead into:
-    /// the number of rows this constraint holds under the current partial
-    /// `binding`, rather than the number of distinct values `variable` can
-    /// take.
+    /// Estimates both counts the variable order needs for `variable` under
+    /// the current partial `binding`, in one call: the distinct values a
+    /// proposal would hold ([`Cardinality::distinct`], which must equal
+    /// [`estimate`](Self::estimate)) and the rows this constraint holds that
+    /// binding `variable` next would lead into ([`Cardinality::rows`]).
     ///
     /// The two differ when `variable` has few distinct values but each of
     /// them fans out widely. In a triple pattern `{ ?s @ a: ?o }` whose
-    /// objects are 29 classes over a million subjects, `estimate(?o)` is 29
-    /// and `estimate_volume(?o)` is a million. Ordering by `estimate` alone
-    /// binds `?o` first and then revisits every subject once per class.
+    /// objects are 29 classes over a million subjects, `?o` has 29 distinct
+    /// values and a million rows. Ordering by distinct values alone binds
+    /// `?o` first and then revisits every subject once per class.
     ///
-    /// Only the variable ordering reads this, as its primary key, with
-    /// [`estimate`](Self::estimate) breaking ties within a magnitude bucket.
-    /// Proposer choice and confirm order keep using `estimate`, because a
-    /// proposal is a set of distinct values. The default returns
-    /// `estimate`, which is right for any constraint whose candidates are
-    /// its rows (sets, ranges, constants). The same `Some`/`None` contract
-    /// as `estimate` applies.
-    fn estimate_volume(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+    /// Only the variable ordering reads this, with `rows` as its primary
+    /// key and `distinct` breaking ties within a magnitude bucket. Proposer
+    /// choice and confirm order keep using `estimate`, because a proposal
+    /// is a set of distinct values. One call returns both so that a source
+    /// can answer them from one lookup. The default reports `estimate` for
+    /// both, which is right for any constraint whose candidates are its
+    /// rows (sets, ranges, constants). The same `Some`/`None` contract as
+    /// `estimate` applies.
+    fn cardinality(&self, variable: VariableId, binding: &Binding) -> Option<Cardinality> {
         self.estimate(variable, binding)
+            .map(|estimate| Cardinality {
+                distinct: estimate,
+                rows: estimate,
+            })
     }
 
     /// Enumerates candidate values for `variable`, for every row of
@@ -1000,6 +1006,18 @@ pub trait Constraint<'a> {
     }
 }
 
+/// What [`Constraint::cardinality`] reports for one variable: the distinct
+/// values a proposal would hold and the rows binding the variable would
+/// lead into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cardinality {
+    /// Distinct candidate values, the same number as
+    /// [`Constraint::estimate`].
+    pub distinct: usize,
+    /// Rows under the current binding that those values lead into.
+    pub rows: usize,
+}
+
 impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
     fn variables(&self) -> VariableSet {
         let inner: &T = self;
@@ -1011,9 +1029,9 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for Box<T> {
         inner.estimate(variable, binding)
     }
 
-    fn estimate_volume(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+    fn cardinality(&self, variable: VariableId, binding: &Binding) -> Option<Cardinality> {
         let inner: &T = self;
-        inner.estimate_volume(variable, binding)
+        inner.cardinality(variable, binding)
     }
 
     fn propose(
@@ -1053,9 +1071,9 @@ impl<'a, T: Constraint<'a> + ?Sized> Constraint<'a> for std::sync::Arc<T> {
         inner.estimate(variable, binding)
     }
 
-    fn estimate_volume(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
+    fn cardinality(&self, variable: VariableId, binding: &Binding) -> Option<Cardinality> {
         let inner: &T = self;
-        inner.estimate_volume(variable, binding)
+        inner.cardinality(variable, binding)
     }
 
     fn propose(
@@ -1174,21 +1192,18 @@ fn magnitude(estimate: usize) -> usize {
 }
 
 /// The per-row, per-variable key `plan` minimises: the magnitude of
-/// [`Constraint::estimate_volume`] first, the magnitude of
-/// [`Constraint::estimate`] to break ties. Both fit in eight bits, so the
-/// pair packs into one `usize` and orders lexicographically.
+/// [`Cardinality::rows`] first, the magnitude of [`Cardinality::distinct`]
+/// to break ties. Both fit in eight bits, so the pair packs into one
+/// `usize` and orders lexicographically.
 fn order_key<'a, C: Constraint<'a> + ?Sized>(
     constraint: &C,
     variable: VariableId,
     binding: &Binding,
 ) -> usize {
-    let estimate = constraint
-        .estimate(variable, binding)
+    let cardinality = constraint
+        .cardinality(variable, binding)
         .expect("unconstrained variable in query");
-    let volume = constraint
-        .estimate_volume(variable, binding)
-        .unwrap_or(estimate);
-    (magnitude(volume) << 8) | magnitude(estimate)
+    (magnitude(cardinality.rows) << 8) | magnitude(cardinality.distinct)
 }
 
 /// Width of the *first* chunk a level draws. Later chunks grow by
@@ -1781,9 +1796,9 @@ impl<'a, C: Constraint<'a>, P: Fn(&Binding<'_>) -> Option<R>, R> Query<C, P, R> 
     /// Partitions the top frontier by each row's preferred variable.
     ///
     /// The preference is an adaptive, magnitude-bucketed choice evaluated
-    /// per row, against that row's own [`order_key`]s: smallest volume
-    /// magnitude ([`Constraint::estimate_volume`]), then smallest estimate
-    /// magnitude ([`Constraint::estimate`]), then most influence.
+    /// per row, against that row's own [`order_key`]s: smallest row
+    /// magnitude ([`Cardinality::rows`]), then smallest distinct-value
+    /// magnitude ([`Cardinality::distinct`]), then most influence.
     /// Rows are never moved onto a variable they did not choose:
     /// [`propose`](Constraint::propose) owns candidate support and
     /// first-seen order, and the protocol supplies no cross-variable

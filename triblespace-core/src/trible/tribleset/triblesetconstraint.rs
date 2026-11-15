@@ -12,6 +12,7 @@ use crate::inline::RawInline;
 use crate::inline::INLINE_LEN;
 use crate::query::Binding;
 use crate::query::Candidates;
+use crate::query::Cardinality;
 use crate::query::Constraint;
 use crate::query::Frontier;
 use crate::query::ProposalBuffer;
@@ -732,32 +733,20 @@ impl TribleSetConstraint {
     }
 }
 
-/// What [`TribleSetConstraint::estimate_by`] counts under the covering index.
-#[derive(Clone, Copy)]
-enum Measure {
-    /// Distinct values of the queried position.
-    Distinct,
-    /// Tribles under the bound prefix.
-    Rows,
-}
-
 impl TribleSetConstraint {
-    fn estimate_by(
-        &self,
-        variable: VariableId,
-        binding: &Binding,
-        measure: Measure,
-    ) -> Option<usize> {
-        // Distinct values of the queried position (`segmented_len`), or the
-        // tribles under the bound prefix (`prefix_len`).
+    /// Distinct values of the queried position and tribles under the bound
+    /// prefix, read from the covering index in one descent.
+    fn counts(&self, variable: VariableId, binding: &Binding) -> Option<Cardinality> {
+        // The covering subtree's cached segment and leaf counts, from one
+        // walk (`PATCH::prefix_counts`).
         macro_rules! count {
             ($index:ident, $prefix:expr) => {
-                match measure {
-                    Measure::Distinct => self.set.$index.segmented_len($prefix),
-                    Measure::Rows => self.set.$index.prefix_len($prefix),
-                }
+                self.set.$index.prefix_counts($prefix)
             };
         }
+        // Where both other positions are bound, or the variable repeats,
+        // the distinct-value count stands for both.
+        let same = |n: u64| (n, n);
         let e_var = self.term_e.is_var(variable);
         let a_var = self.term_a.is_var(variable);
         let v_var = self.term_v.is_var(variable);
@@ -768,7 +757,10 @@ impl TribleSetConstraint {
 
         let e_bound = if let Some(e) = self.term_e.position_value(binding) {
             let Some(e) = id_from_value(e) else {
-                return Some(0);
+                return Some(Cardinality {
+                    distinct: 0,
+                    rows: 0,
+                });
             };
             Some(e)
         } else {
@@ -776,7 +768,10 @@ impl TribleSetConstraint {
         };
         let a_bound = if let Some(a) = self.term_a.position_value(binding) {
             let Some(a) = id_from_value(a) else {
-                return Some(0);
+                return Some(Cardinality {
+                    distinct: 0,
+                    rows: 0,
+                });
             };
             Some(a)
         } else {
@@ -784,7 +779,7 @@ impl TribleSetConstraint {
         };
         let v_bound = self.term_v.position_value(binding);
 
-        Some(match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
+        let (distinct, rows) = match (e_bound, a_bound, v_bound, e_var, a_var, v_var) {
             // Legal distinct-position combinations (queried var
             // appears in exactly one trible position). These are the cases
             // where the queried variable's partner position is unbound, the
@@ -826,19 +821,19 @@ impl TribleSetConstraint {
                 let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&a);
                 prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(v);
-                self.set.ave.segmented_len(&prefix)
+                same(self.set.ave.segmented_len(&prefix))
             }
             (Some(e), None, Some(v), false, true, false) => {
                 let mut prefix = [0u8; ID_LEN + INLINE_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e);
                 prefix[ID_LEN..ID_LEN + INLINE_LEN].copy_from_slice(v);
-                self.set.eva.segmented_len(&prefix)
+                same(self.set.eva.segmented_len(&prefix))
             }
             (Some(e), Some(a), None, false, false, true) => {
                 let mut prefix = [0u8; ID_LEN + ID_LEN];
                 prefix[0..ID_LEN].copy_from_slice(&e);
                 prefix[ID_LEN..ID_LEN + ID_LEN].copy_from_slice(&a);
-                self.set.eav.segmented_len(&prefix)
+                same(self.set.eav.segmented_len(&prefix))
             }
 
             // Same-Variable in two positions. Conservative upper
@@ -851,40 +846,44 @@ impl TribleSetConstraint {
                 // e == v (self-edge), attribute bound.
                 let mut prefix = [0u8; ID_LEN];
                 prefix.copy_from_slice(&a[..]);
-                self.set.aev.segmented_len(&prefix)
+                same(self.set.aev.segmented_len(&prefix))
             }
             (_, None, _, true, false, true) => {
                 // e == v, attribute free.
-                self.set.eav.segmented_len(&[0; 0])
+                same(self.set.eav.segmented_len(&[0; 0]))
             }
             (_, _, Some(v), true, true, false) => {
                 // e == a, value bound.
                 let mut prefix = [0u8; INLINE_LEN];
                 prefix.copy_from_slice(&v[..]);
-                self.set.vae.segmented_len(&prefix)
+                same(self.set.vae.segmented_len(&prefix))
             }
             (_, _, None, true, true, false) => {
                 // e == a, value free.
-                self.set.aev.segmented_len(&[0; 0])
+                same(self.set.aev.segmented_len(&[0; 0]))
             }
             (Some(e), _, _, false, true, true) => {
                 // a == v, entity bound.
                 let mut prefix = [0u8; ID_LEN];
                 prefix.copy_from_slice(&e[..]);
-                self.set.eav.segmented_len(&prefix)
+                same(self.set.eav.segmented_len(&prefix))
             }
             (None, _, _, false, true, true) => {
                 // a == v, entity free.
-                self.set.aev.segmented_len(&[0; 0])
+                same(self.set.aev.segmented_len(&[0; 0]))
             }
             (_, _, _, true, true, true) => {
                 // pattern(x, x, x) — all three positions share one
                 // Variable. Conservative upper bound: distinct
                 // entities in the set.
-                self.set.eav.segmented_len(&[0; 0])
+                same(self.set.eav.segmented_len(&[0; 0]))
             }
             _ => panic!("TribleSetConstraint: unreachable position-bound combo"),
-        } as usize)
+        };
+        Some(Cardinality {
+            distinct: distinct as usize,
+            rows: rows as usize,
+        })
     }
 }
 
@@ -904,15 +903,15 @@ impl<'a> Constraint<'a> for TribleSetConstraint {
     /// depends on which of the other two positions are already bound,
     /// giving tight estimates regardless of access pattern.
     fn estimate(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
-        self.estimate_by(variable, binding, Measure::Distinct)
+        self.counts(variable, binding).map(|c| c.distinct)
     }
 
-    /// The tribles under the bound prefix: while the queried variable's
-    /// partner position is unbound this counts every row the variable's
-    /// values lead to, not the values themselves. Where both other
-    /// positions are bound the two agree.
-    fn estimate_volume(&self, variable: VariableId, binding: &Binding) -> Option<usize> {
-        self.estimate_by(variable, binding, Measure::Rows)
+    /// `rows` is the tribles under the bound prefix: while the queried
+    /// variable's partner position is unbound it counts every row the
+    /// variable's values lead to, not the values themselves. Where both
+    /// other positions are bound the two counts agree.
+    fn cardinality(&self, variable: VariableId, binding: &Binding) -> Option<Cardinality> {
+        self.counts(variable, binding)
     }
 
     /// Enumerates matching values for every row of the batch: N covering
