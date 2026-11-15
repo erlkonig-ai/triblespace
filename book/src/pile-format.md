@@ -204,6 +204,11 @@ legacy marker this reader no longer decodes reports
 `ReadError::UnsupportedRecord { offset, marker }`, which `amputate`
 deliberately refuses to truncate: the remedy there is `reframe`, not deletion.
 
+Neither error is ever turned into a skip on the read path. Stepping over a
+damaged region is a separate, explicit offline tool, `trible pile repair`,
+described under [Recovery](#recovery); it writes a new pile and leaves the
+damaged one as it was.
+
 ## Design Rationale
 
 This format emphasizes **simplicity** over sophisticated on-disk structures.
@@ -244,6 +249,9 @@ refreshing state.
    The reader compares that offset and calls `set_len` while holding the same
    exclusive file lock, so an intervening repair cannot move the boundary
    between validation and mutation.
+   To keep the valid records *after* a damaged region instead, use
+   `trible pile repair <path> --into <new>`, which copies them into a fresh
+   pile and modifies nothing (see [Recovery](#recovery)).
 4. **Append new records.** `put` (through the `BlobStorePut` trait),
    `CollectionStore::insert`, and `WantStore`
    operations extend the file. Each
@@ -1066,6 +1074,67 @@ part of opening. The CLI refuses a boundary that differs from the current
 reader's result. Hash
 verification happens lazily only when individual blobs are loaded so that
 opening a large pile remains fast.
+
+### Repair: copying around a damaged region
+
+Amputation is right for the case it was built for, a torn append at the end
+of the file. When the damage sits in the *middle*, truncating at it also
+destroys every good record written after it. `trible pile repair <PILE>
+--into <NEW>` keeps them: it writes a new pile holding every record that
+validates, in source order and byte for byte, and reports every byte range it
+stepped over. The source is opened read-only and never modified, the
+destination must not exist, and nothing is published unless the copy reads
+back cleanly through the ordinary reader.
+
+The walk is `ResyncingRecords` in `triblespace-core/src/repo/pile/repair.rs`.
+It has no parser of its own: a record counts when the same `decode_record`
+that replay uses accepts it, and for a blob also when its payload matches the
+hash in its header, by the same check a blob read performs. That second check
+matters more here than on the read path. A torn blob whose 256-byte header
+survived declares a span that the bytes appended after the crash happen to
+fill, so the decoder alone accepts it, and the walk would continue in the
+middle of the next record.
+
+After a defect at byte `p`, the walk scans forward from `p + 1` for the next
+occurrence of the 28-byte frame magic where a whole record validates, and
+resumes there. Every byte offset is a candidate, because an append after a
+torn record starts wherever the torn bytes ended, not on a block boundary. A
+magic match alone is never enough: a blob may contain the magic, and a pile
+stored as a blob is full of complete frames. Once a record validates, its
+declared extent is taken whole, as the reader would take it, and its inside is
+never searched, so frames embedded in a payload stay payload. The earliest
+validating frame wins. Only the current frame magic, the 32-byte recovery
+prefix, can end a damaged region; a legacy unenveloped record is copied when
+the walk reaches it in sequence, but its 16-byte marker carries no span and is
+not trusted to resynchronise.
+
+Each skipped range is printed as
+`skipped start=<BYTE> end=<BYTE> bytes=<N> defect=<KIND>`, where the defect at
+`start` is `corrupt` (a malformed or torn frame), `blob-hash` (a frame whose
+payload does not match its hash) or `unsupported-marker:<HEX>` (sixteen bytes
+that name no marker this reader knows: usually garbage, possibly a newer
+format, which is one more reason to keep the source). Totals follow on
+`copied records=...` and `total ranges=...` lines. The command exits 0 when
+nothing was skipped, 3 when the new pile was written but ranges were skipped,
+and 1 on any error, including an empty source or one with no valid record at
+all; then no destination is written.
+
+Nothing is reconstructed. Blobs are content-addressed, so one lost in a
+skipped range can be fetched again by sync from any peer that holds it, and a
+blob recovered from inside a damaged region is true wherever it was found,
+because its hash validates. Signed records are checked structurally, as replay
+checks them; run `trible pile verify` on the result to recheck signatures.
+Opaque records carry no checksum and are copied by their declared span; the
+summary counts them.
+
+Which to use:
+
+- **`amputate`** for a torn tail, where everything past the boundary is the
+  interrupted append. It edits the pile in place and needs the exact boundary.
+- **`repair`** when the damage is followed by records worth keeping, or when
+  you are not sure. It never touches the source; compare the result, then
+  replace the damaged pile yourself. For a torn tail the two agree: repair's
+  output holds exactly the records amputation keeps.
 
 For more details on interacting with a pile see the [`Pile` struct
 documentation](https://docs.rs/triblespace/latest/triblespace/repo/pile/struct.Pile.html).

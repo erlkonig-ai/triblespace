@@ -86,11 +86,13 @@ mod append_visibility_tests;
 mod prefix_tests;
 mod record_kind;
 mod record_index;
+mod repair;
 mod turnstile;
 #[cfg(test)]
 mod turnstile_tests;
 use record_index::CollectionRecordIndex;
 pub use record_kind::{described_kinds, description_blobs, RecordKind, KIND_PILE_RECORD};
+pub use repair::{RepairDefect, RepairStep, ResyncingRecords, SkippedRange};
 
 /// Self-description handle of the physical pile frame used for `record`.
 ///

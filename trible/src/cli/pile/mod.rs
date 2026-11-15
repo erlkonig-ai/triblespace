@@ -13,6 +13,7 @@ mod diagnose;
 pub mod migrate;
 pub mod net;
 mod path_text;
+mod repair;
 mod signing;
 mod subtract;
 mod verify;
@@ -216,7 +217,9 @@ pub enum PileCommand {
     /// surgery for a torn append left by a crashed write: back the file up
     /// first, inspect the reported boundary with `trible pile diagnose
     /// record-at`, confirm the tail is genuinely torn, and only then run this
-    /// by hand with that exact boundary.
+    /// by hand with that exact boundary. To keep the valid records that follow
+    /// a damaged region, use `trible pile repair` instead: it writes them into
+    /// a fresh pile and leaves this one untouched.
     Amputate {
         /// Path to the pile file to amputate (TRUNCATED in place)
         path: PathBuf,
@@ -227,6 +230,49 @@ pub enum PileCommand {
         /// from becoming an unexamined destructive command.
         #[arg(long, value_name = "BYTE_OFFSET")]
         truncate_to: usize,
+    },
+    /// Copy every valid record of a damaged pile into a fresh pile, stepping
+    /// over each torn or invalid region and reporting it.
+    ///
+    /// Where `amputate` cuts the file at its first malformed record and loses
+    /// everything after it, repair keeps what follows: after each defect it
+    /// scans forward for the next position where a complete frame validates
+    /// by the reader's own rules (frame magic, span and bounds, and for a
+    /// blob its payload hash), and resumes there. A magic match alone is
+    /// never enough, and the inside of a record that validates is never
+    /// searched, so frames embedded in a blob payload stay payload. Only the
+    /// current frame magic ends a damaged region.
+    ///
+    /// SOURCE is opened read-only and never modified; quiesce writers first,
+    /// since appends made after it is opened are not read. DESTINATION must
+    /// not exist; it is written to a hidden sibling, read back with the
+    /// ordinary reader, synced, and published without replacing anything, so
+    /// a failed run leaves no destination. Records are copied byte-for-byte
+    /// in source order; nothing is reconstructed. Opaque records (unknown
+    /// kinds in a valid frame) are copied by their declared span and counted,
+    /// since nothing about their content can be checked. Signatures are not
+    /// rechecked either; run `trible pile verify` on DESTINATION for that.
+    ///
+    /// Every skipped range is printed on stdout as
+    /// `skipped start=<BYTE> end=<BYTE> bytes=<N> defect=<KIND>`, with KIND
+    /// one of `corrupt`, `blob-hash` or `unsupported-marker:<HEX>`, followed by
+    /// `copied records=<N> opaque=<N> bytes=<N>` and
+    /// `total ranges=<N> skipped_bytes=<N> source_bytes=<N>`.
+    ///
+    /// Blobs are content-addressed, so a blob lost in a skipped range can be
+    /// fetched again by sync from any peer that holds it.
+    ///
+    /// Exit status: 0 when nothing was skipped; 3 when DESTINATION was written
+    /// but ranges were skipped; 1 on any error (an I/O failure, an empty
+    /// SOURCE, or a SOURCE with no valid record), in which case nothing is
+    /// written. Ordinary reading of a damaged pile keeps failing loudly;
+    /// repair is never used implicitly.
+    Repair {
+        /// Damaged pile to read without modifying.
+        source: PathBuf,
+        /// Fresh destination pile to create; must not exist.
+        #[arg(long = "into", value_name = "DESTINATION")]
+        into: PathBuf,
     },
     /// Distributed pile sync over iroh (p2p QUIC connections).
     Net {
@@ -251,7 +297,10 @@ pub(crate) fn pile_read_error(path: &Path, err: ReadError) -> anyhow::Error {
              unchanged. Inspect the reported boundary with `trible pile diagnose record-at {} \
              <BYTE_OFFSET>`. Only after making a backup and independently confirming that every \
              byte from that boundary onward may be destroyed, run `trible pile amputate {} \
-             --truncate-to <BYTE_OFFSET>`",
+             --truncate-to <BYTE_OFFSET>`. To keep the valid records after the damage instead, \
+             `trible pile repair {} --into <NEW_PILE>` copies them into a fresh pile without \
+             modifying this one",
+            path.display(),
             path.display(),
             path.display(),
             path.display()
@@ -438,6 +487,13 @@ pub fn run(cmd: PileCommand) -> Result<()> {
         PileCommand::Net { cmd } => net::run(cmd),
         PileCommand::Diagnose { cmd } => diagnose::run(cmd),
         PileCommand::Verify { pile } => verify::run(&pile),
+        PileCommand::Repair { source, into } => {
+            let status = repair::run(&source, &into)?;
+            if status != 0 {
+                std::process::exit(status);
+            }
+            Ok(())
+        }
         PileCommand::Amputate { path, truncate_to } => {
             let mut pile = Pile::open(&path)?;
             // Boundary comparison and truncation happen under the same

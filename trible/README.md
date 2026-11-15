@@ -95,6 +95,13 @@ Run `trible <COMMAND>` to invoke a subcommand.
   in a fresh copy, not authority revocation or semantic retraction. Sync may
   restore excluded records. Existing `--drop-drained RETIRED=CURRENT` may be
   combined and retains its drain-validation rules.
+- `pile repair <SOURCE> --into <DESTINATION>` — copy every valid record of a
+  damaged pile into a fresh one, stepping over each torn or invalid region and
+  printing it as `skipped start=<BYTE> end=<BYTE> bytes=<N> defect=<KIND>`.
+  The source is never modified. Exits 0 when nothing was skipped and 3 when
+  the destination was written with ranges skipped. Unlike
+  `pile amputate <PILE> --truncate-to <BYTE_OFFSET>`, which truncates in place
+  at the first malformed record, it keeps the records after the damage.
 Migration lives in a separate binary, `trible-migrate`, built from this package
 alongside `trible`:
 
