@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `pile capture SOURCE --into DESTINATION` copies one record-complete native
+  snapshot byte-for-byte into a fresh private Unix file while later appends may
+  continue. It syncs the file and no-clobber publication directory, then emits a
+  JSON receipt with captured length/BLAKE3 and local source device/inode. Exit 0
+  accepts the capture; failures leave any published output explicitly unaccepted.
+  This checks framing, not payload hashes, signatures or reference completeness.
+
 - `pile net sync` speaks `/triblespace/pile-sync/36`, which resumes a cut-off
   two-way data walk from the cells the receiver already holds.
 

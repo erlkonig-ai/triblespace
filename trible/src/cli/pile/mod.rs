@@ -7,6 +7,7 @@ use ed25519_dalek::VerifyingKey;
 use triblespace_core::repo::pile::{Pile, ReadError};
 
 pub mod blob;
+mod capture;
 pub mod collection;
 mod compact;
 mod diagnose;
@@ -49,6 +50,27 @@ pub enum PileCommand {
     Create {
         /// Path to the pile file to create
         path: PathBuf,
+    },
+    /// Capture one record-complete raw prefix into a fresh private file.
+    ///
+    /// Reads one native snapshot and copies its exact bytes, preserving order
+    /// and duplicates while later appends may continue. SOURCE is never
+    /// modified. This does not verify payload hashes, signatures or reference
+    /// completeness, and is not an atomic capture of several piles.
+    ///
+    /// Unix only: DESTINATION's existing parent must be owned by this user
+    /// with no group/other permissions. The fresh file starts at mode 0600
+    /// (or stricter), is synced, published without replacing anything, and
+    /// its directory is synced before one JSON receipt is printed. Exit 0
+    /// accepts the capture. On any error, output is unaccepted: a published
+    /// file may remain after a directory-sync or receipt failure; keep it
+    /// for inspection, never assume that existence alone means success.
+    Capture {
+        /// Source pile to read without modifying or loading a signing key.
+        source: PathBuf,
+        /// Fresh destination in an existing private staging directory.
+        #[arg(long = "into", value_name = "DESTINATION")]
+        into: PathBuf,
     },
     /// Repack one pile into a fresh file; preserve all blobs by default.
     ///
@@ -450,6 +472,7 @@ pub fn run(cmd: PileCommand) -> Result<()> {
             pile.close().map_err(|e| anyhow::anyhow!("{e:?}"))?;
             Ok(())
         }
+        PileCommand::Capture { source, into } => capture::run(&source, &into),
         PileCommand::Compact {
             source,
             into,

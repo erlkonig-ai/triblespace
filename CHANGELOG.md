@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `trible pile capture` exports the exact raw prefix of one native snapshot,
+  retaining byte order and duplicate records without stopping later appends.
+  Unix private staging, file/directory sync and no-clobber publication precede
+  its JSON receipt; a failed command never accepts or deletes a published
+  output. This is a capture boundary, not a payload or backup-completeness audit.
+
 - The held-set driver is a semi-naive fixpoint instead of a job queue
   (heldset design, 2026-11-14). Each snapshot writes what arrived into a
   per-collection *frontier*, a PATCH set of blobs reached and not yet

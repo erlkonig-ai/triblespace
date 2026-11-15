@@ -1045,6 +1045,46 @@ V1 had no want records.
 
 ## Recovery
 
+### Capturing a record-complete prefix
+
+`trible pile capture SOURCE --into DESTINATION` copies the exact bytes of one
+native snapshot. Its `raw_records().bytes()` comes from the same mapping that
+replay accepted, not a reopened pathname or a later file length. Later appends
+may continue; they need not appear in the captured prefix. Every captured byte,
+including duplicate, legacy and opaque record order, is preserved. The command
+does not load a signing key, repair the source, or synchronize several piles
+into an atomic observation. Invalid or unsupported framing fails before output
+creation; an empty valid source is capturable.
+
+The initial implementation requires Unix and an existing private staging
+directory owned by the effective user with no group/other permissions. It never
+changes permissions. The hidden output uses `create_new` with mode 0600 (or
+stricter), is written and BLAKE3-hashed in bounded chunks, then synced. A hard
+link publishes it without replacing any existing file, including a symlink;
+the hidden name is removed and the resolved parent directory is synced. A bare
+relative destination resolves its parent to the current directory before this
+sequence. The staging directory is trusted, not protected against hostile
+concurrent mutation by the same user.
+
+Only after publication/sync does stdout receive one JSON receipt: `status` is
+`captured`; `source` contains the display path and local `device`/`inode`;
+`destination` is the resolved display path; `bytes` and `blake3` describe the
+captured bytes; `record_complete` is true and `integrity_checked` is false.
+Device/inode identify the pinned local source observation, not a permanent or
+global content identity. Display paths may be lossy for non-Unicode filenames.
+Framing acceptance does not verify every blob hash/signature or establish
+reference residency, collection completeness or offsite recoverability.
+
+Exit 0 is acceptance, including a written/flushed receipt. Any error exits 1
+and leaves the source unchanged. Cleanup attempts remove only the command's
+hidden output, reporting cleanup errors. If publication already happened,
+unlink, directory-sync or receipt failure may leave a complete final file;
+the error explicitly calls it unaccepted and never removes it. Preserve it for
+inspection; existence alone is not a successful capture. No prior destination
+is overwritten, and no historical source or yard generation is reclaimed.
+
+### Ordinary reading and explicit amputation
+
 `refresh` scans an existing file to ensure every record fits. It does not verify
 blob hashes. A malformed or truncated known or enveloped record reports the
 number of bytes that were valid so far using `ReadError::CorruptPile`. A
