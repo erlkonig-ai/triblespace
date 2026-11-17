@@ -75,6 +75,10 @@ use crate::trible::{build_intrinsic_entity, Fragment, IntrinsicEntityRow, Trible
 #[path = "reactive/collection.rs"]
 pub mod collection;
 
+/// A polling driver that re-steps one collection environment when its read-set changes.
+#[path = "reactive/driver.rs"]
+pub mod driver;
+
 /// Exact fact-set text projection and explicit native rule authoring.
 #[path = "reactive/text.rs"]
 pub mod text;

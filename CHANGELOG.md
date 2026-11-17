@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `reactive::driver::CollectionDriver` polls one `CollectionEnvironment`
+  against a store. It re-steps only when the last settled step's raw read-set
+  (records and blobs, misses included) may have changed, so late content wakes
+  it without a new fact. Each step is bounded by firings and time, checked
+  between chunks, and publishes chunks as the signer's COMMITs. No
+  notifications, scheduling or effects.
+
 - `trible pile capture` exports the exact raw prefix of one native snapshot,
   retaining byte order and duplicate records without stopping later appends.
   Unix private staging, file/directory sync and no-clobber publication precede

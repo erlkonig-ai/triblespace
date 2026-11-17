@@ -242,6 +242,28 @@ fact in commit A with a fever fact in commit B can produce an alert from
 output union is not the foundation-local homomorphism required by DERIVE.
 The adapter instead publishes computed conclusions as authored COMMIT facts.
 
+### Driving an environment
+
+`reactive::driver::CollectionDriver` keeps one environment running against a
+store. Stores do not notify; a snapshot only compares itself with an earlier one
+(`StoreSnapshot::changes_for`). So the driver is polled. `poll(&mut store)`
+first retries any unsettled publication, then takes a snapshot. If nothing in
+the last settled step's raw read-set may have changed, it returns `Unchanged`
+without work. Otherwise it observes through an `ObservedStore`, advances in
+chunks, and publishes each chunk as the driver signer's COMMIT.
+
+The read-set records misses too. A step blocked on a missing content blob
+returns `Blocked`, and the blob's later arrival wakes the next poll although no
+fact changed. How precisely a backend narrows that comparison is its own
+property; `MemoryRepo` reports any blob change.
+
+`Bounds` limit each step by firings and by time, both checked between chunks.
+One chunk's query search is not interrupted. A step stopped by a bound returns
+`Bounded` and never settles, so the next poll continues it. The driver's own
+publication wakes one more quiet step. A restarted driver may fire again;
+conclusions it already holds publish nothing, and content-derived cores name
+the same entities. The driver owns no notifications and performs no effects.
+
 
 ## Author native rules as text
 
