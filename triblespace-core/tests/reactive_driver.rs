@@ -270,3 +270,53 @@ fn restart_over_a_temporary_pile_publishes_nothing_new() {
     let found = find!(e: Id, after.pattern::<GenId>(e, about.to_inline(), x.to_inline())).count();
     assert_eq!(found, 1);
 }
+
+#[test]
+fn on_a_pile_only_the_missing_blob_wakes_a_blocked_driver() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("driver.pile");
+    std::fs::File::create(&path).unwrap();
+    let key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let mut store = triblespace_core::repo::pile::Pile::open(&path).unwrap();
+    let policy = AdmissionPolicy::direct(key.verifying_key());
+    let root = store
+        .collection(
+            "driver precision",
+            CollectionPolicy::new(policy.clone(), policy),
+        )
+        .unwrap();
+    let (anchor, rule, attr, about, item, constraint, needle) =
+        (id(), id(), id(), id(), id(), id(), id());
+    let mut facts = TribleSet::new();
+    let text = conclude_rule(&mut facts, rule, attr, about);
+    edge(&mut facts, rule, r::constraints.id(), constraint);
+    edge(
+        &mut facts,
+        constraint,
+        r::operation.id(),
+        r::STRING_CONTAINS,
+    );
+    edge(&mut facts, constraint, r::container.id(), text);
+    edge(&mut facts, constraint, r::needle.id(), needle);
+    let wanted = store.put::<UTF8String, _>("red").unwrap();
+    facts.insert(&Trible::force(&needle, &r::literal.id(), &wanted));
+    let late: Inline<Handle<UTF8String>> = "red lantern".to_inline();
+    facts.insert(&Trible::force(&item, &attr, &late));
+    store
+        .commit(root, &key, Fragment::from(facts) + reading(anchor, &[rule]))
+        .unwrap();
+    let mut d = CollectionDriver::new(root, anchor, key.clone(), Bounds::default());
+    assert!(matches!(
+        d.poll(&mut store).unwrap().outcome,
+        Outcome::Blocked(_)
+    ));
+    store.put::<UTF8String, _>("an unrelated blob").unwrap();
+    assert!(matches!(
+        d.poll(&mut store).unwrap().outcome,
+        Outcome::Unchanged
+    ));
+    store.put::<UTF8String, _>("red lantern").unwrap();
+    let step = d.poll(&mut store).unwrap();
+    assert!(matches!(step.outcome, Outcome::Quiescent));
+    assert_eq!((step.firings, step.commits.len()), (1, 1));
+}
