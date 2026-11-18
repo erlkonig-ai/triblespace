@@ -210,6 +210,11 @@ pub enum Command {
         /// is opened; wgpu still renders, on whatever adapter it is given.
         #[arg(long, value_name = "DIR", conflicts_with_all = ["gui", "tui", "once"])]
         capture: Option<PathBuf>,
+        /// Read health from this existing collection (descriptor handle), as
+        /// `net sync --health-collection` writes it, instead of the key's own
+        /// `swarm-health` generation.
+        #[arg(long, value_name = "HANDLE")]
+        health_collection: Option<String>,
     },
     /// Sync the collections this pile selects with peers.
     ///
@@ -292,6 +297,7 @@ pub fn run(command: Command) -> Result<()> {
             lattice,
             focus,
             capture,
+            health_collection,
         } => dashboard::run(dashboard::Options {
             pile,
             key,
@@ -308,6 +314,9 @@ pub fn run(command: Command) -> Result<()> {
                 .map(|value| parse_collection(&value).map(|handle| handle.raw))
                 .transpose()?,
             capture,
+            health_collection: health_collection
+                .map(|value| parse_collection(&value))
+                .transpose()?,
         }),
         Command::Sync {
             pile,
@@ -1566,6 +1575,26 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn dashboard_reads_a_named_health_collection() {
+        // A colony writes health under a shared quorum policy, whose
+        // descriptor the reading key alone cannot derive. Naming it is the
+        // only way to read it, as `net health --collection` already allows.
+        let handle = "2dad132a452ef0632718500f1b0945fc3f10a6a8fa9b21a57931d6a12e89a7d8";
+        let Command::Dashboard {
+            health_collection, ..
+        } = Command::try_parse_from(["net", "dashboard", "test.pile", "--health-collection", handle])
+            .unwrap()
+        else {
+            panic!("dashboard expected")
+        };
+        assert_eq!(health_collection.as_deref(), Some(handle));
+        assert!(matches!(
+            Command::try_parse_from(["net", "dashboard", "test.pile"]).unwrap(),
+            Command::Dashboard { health_collection: None, .. }
+        ));
     }
 
     #[test]

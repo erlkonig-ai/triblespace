@@ -47,6 +47,11 @@ pub(super) struct Options {
     pub focus: Option<[u8; 32]>,
     /// Render one observation's cards into this directory and exit.
     pub capture: Option<PathBuf>,
+    /// Read health from this existing collection (`--health-collection`)
+    /// rather than the reading key's own `swarm-health` generation. A colony
+    /// whose health is written under a shared quorum policy has a different
+    /// descriptor, so deriving one from the key cannot find it.
+    pub health_collection: Option<CollectionHandle>,
 }
 
 pub(super) fn run(mut options: Options) -> Result<()> {
@@ -230,8 +235,12 @@ impl Reader {
         // other's. Without one it believes none, and every believed
         // foundation stays on its collection's frontier.
         let host = host(options)?;
-        let health = match host {
-            Some(authority) => {
+        let health = match (options.health_collection, host) {
+            // Named: read exactly that generation, which is what the producer
+            // was told to write (`net sync --health-collection`). Opening it
+            // is the first observation; nothing is derived or created.
+            (Some(handle), _) => Some(SelectedSource::new(handle)),
+            (None, Some(authority)) => {
                 let mut descriptors = MemoryRepo::default();
                 let collection: Collection<SimpleArchive> = descriptors
                     .collection(
@@ -244,7 +253,7 @@ impl Reader {
                     .map_err(|_| ReadFailure::HealthDescriptor)?;
                 Some(SelectedSource::new(collection.handle()))
             }
-            None => {
+            (None, None) => {
                 setup_warnings.push(
                     "No signing key loads: no health fallback, and no MERGE is believed, so a \
                      member lattice draws every member unjoined"
@@ -455,7 +464,18 @@ struct LatticeCollection {
     name: Option<String>,
     /// The collection this one derives from, or the parent it is attached
     /// to. `None` is what being a root means; it is not a failure to read one.
+    /// [`Self::kind`] says which of the two edges it is.
     source: Option<[u8; 32]>,
+    /// Root, derived (a full lattice fed by DERIVEs) or attached (an index
+    /// with no lattice of its own, fed by the host's MAPs). Different kinds,
+    /// not one kind with a source: counting them together reported every
+    /// BM25 and Succinct index as a derivation.
+    kind: CollectionKind,
+    /// The `metadata::name` the descriptor's mapping algorithm describes
+    /// itself with -- `simple-to-succinct-v1`, `latest-states-mapping-v1` --
+    /// when the descriptor carries one. What the collection IS, where a
+    /// derived or attached descriptor has no name of its own.
+    mapping: Option<String>,
     /// Whether this collection's descriptor archive is resident and decodable
     /// in this observation.
     descriptor_resident: bool,
@@ -492,7 +512,33 @@ struct LatticeCollection {
     unadmitted: u64,
 }
 
+/// What a collection descriptor declares itself to be.
+///
+/// Read from the descriptor's own edge attribute, never inferred from records:
+/// an attached collection nothing has mapped yet is still attached.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CollectionKind {
+    /// Named by its descriptor, or a descriptor not resident here: with no
+    /// bytes there is no edge to read, so it stands alone.
+    Root,
+    /// `collection_source`: a full lattice of its own, mapped by DERIVEs.
+    Derived,
+    /// `collection_parent`: an index over its parent's nodes, mapped by MAPs.
+    Attached,
+}
+
 impl LatticeCollection {
+    /// What a reader calls it: the root's name, else the mapping's name
+    /// beside a short handle (two indexes of one kind on one parent must stay
+    /// apart), else the bare handle.
+    fn label(&self) -> String {
+        match (&self.name, &self.mapping) {
+            (Some(name), _) => name.clone(),
+            (None, Some(mapping)) => format!("{mapping} {}", short(&self.handle)),
+            (None, None) => short(&self.handle),
+        }
+    }
+
     /// The records that replicate: COMMITs and DERIVEs.
     fn foundations(&self) -> u64 {
         self.commits.saturating_add(self.derives)
@@ -559,16 +605,20 @@ fn observe_lattice<R: triblespace_core::repo::StoreRead>(
         }
         let handle = CollectionHandle::new(raw);
         let facts: Option<TribleSet> = snapshot.get(handle).ok();
-        let source = facts
+        let derived_from = facts
             .as_ref()
-            .and_then(|facts| {
-                descriptor::source(facts).ok().flatten().or_else(|| {
-                    descriptor::parents(facts)
-                        .ok()
-                        .and_then(|parents| parents.first().copied())
-                })
-            })
-            .map(|source| source.raw);
+            .and_then(|facts| descriptor::source(facts).ok().flatten());
+        let attached_to = facts.as_ref().and_then(|facts| {
+            descriptor::parents(facts)
+                .ok()
+                .and_then(|parents| parents.first().copied())
+        });
+        let (kind, source) = match (derived_from, attached_to) {
+            (Some(source), _) => (CollectionKind::Derived, Some(source.raw)),
+            (None, Some(parent)) => (CollectionKind::Attached, Some(parent.raw)),
+            (None, None) => (CollectionKind::Root, None),
+        };
+        let mapping = facts.as_ref().and_then(|facts| mapping_name(snapshot, facts));
         let name = facts.as_ref().and_then(|facts| {
             let named = descriptor::name(facts).ok().flatten()?;
             let blob: Blob<UTF8String> = snapshot.get(named).ok()?;
@@ -594,6 +644,8 @@ fn observe_lattice<R: triblespace_core::repo::StoreRead>(
             handle: raw,
             name,
             source,
+            kind,
+            mapping,
             descriptor_resident: facts.is_some(),
             commits,
             merges,
@@ -637,6 +689,28 @@ fn observe_lattice<R: triblespace_core::repo::StoreRead>(
         ))
     });
     Ok(out)
+}
+
+/// The self-described name of a descriptor's mapping algorithm.
+///
+/// The algorithm entity is spread into the descriptor archive by
+/// `MetaDescribe`, so its `metadata::name` lives in the same facts; the name's
+/// bytes are a blob stored beside the descriptor. Anything missing is `None`:
+/// an algorithm this build has never heard of still names itself.
+fn mapping_name<R: triblespace_core::repo::StoreRead>(
+    snapshot: &R,
+    facts: &TribleSet,
+) -> Option<String> {
+    use triblespace_core::macros::{find, pattern};
+    use triblespace_core::metadata;
+    let algorithm = descriptor::mapping_algorithm(facts).ok().flatten()?;
+    let named = find!(
+        v: Inline<Handle<UTF8String>>,
+        pattern!(facts, [{ algorithm @ metadata::name: ?v }])
+    )
+    .next()?;
+    let blob: Blob<UTF8String> = snapshot.get(named).ok()?;
+    std::str::from_utf8(&blob.bytes).ok().map(str::to_owned)
 }
 
 /// A node's label: the host its own daemons declare, beside the short handle.
@@ -1026,7 +1100,12 @@ fn observe_attached<R: triblespace_core::repo::StoreRead>(
     for depth in 1..=ATTACHED_DEPTH_LIMIT {
         let mut next = Vec::new();
         for parent in &frontier {
-            for child in lattice.iter().filter(|c| c.source == Some(*parent)) {
+            // Attached only: a derived child is a lattice of its own, fed by
+            // DERIVEs, and has no MAPs to overlay on this one.
+            for child in lattice
+                .iter()
+                .filter(|c| c.kind == CollectionKind::Attached && c.source == Some(*parent))
+            {
                 // A cycle in the descriptors is an open-world possibility, not
                 // a reason to loop.
                 if placed.contains_key(&child.handle) {
@@ -1572,12 +1651,15 @@ fn render_terminal(frame: &Frame) -> String {
             "COLLECTION LATTICE · sampled; this pile references no collections.\n\n",
         ),
         Some(collections) => {
-            let derived = collections.iter().filter(|c| c.source.is_some()).count();
+            let count = |kind| collections.iter().filter(|c| c.kind == kind).count();
             let absent = collections.iter().filter(|c| !c.descriptor_resident).count();
             let _ = writeln!(
                 out,
-                "COLLECTION LATTICE · {} collections, {derived} derived, {absent} with no resident descriptor",
-                collections.len()
+                "COLLECTION LATTICE · {} collections: {} root, {} derived, {} attached; {absent} with no resident descriptor",
+                collections.len(),
+                count(CollectionKind::Root),
+                count(CollectionKind::Derived),
+                count(CollectionKind::Attached),
             );
             out.push_str(
                 "  Resident is COMMIT payloads and DERIVE outputs here over the COMMITs and DERIVEs naming the collection; MERGEs and MAPs never replicate and are counted beside it.\n",
@@ -1585,32 +1667,35 @@ fn render_terminal(frame: &Frame) -> String {
             // Derived descriptors carry no name of their own, so they sort
             // last; a flat cut then hides every derivation behind the roots,
             // which are the least interesting rows here. Sample both.
-            let (derived_rows, root_rows): (Vec<_>, Vec<_>) =
-                collections.iter().partition(|c| c.source.is_some());
-            for (rows, kind) in [(&root_rows, "root"), (&derived_rows, "derived")] {
+            for (kind, word) in [
+                (CollectionKind::Root, "root"),
+                (CollectionKind::Derived, "derived"),
+                (CollectionKind::Attached, "attached"),
+            ] {
+                let rows: Vec<_> = collections.iter().filter(|c| c.kind == kind).collect();
                 for collection in rows.iter().take(12) {
                     let _ = writeln!(
                         out,
                         "  {} {} · {} commit / {} derive · {} of {} resident · {} merge / {} map stored{}",
                         if collection.descriptor_resident { "+" } else { "?" },
-                        collection
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| short(&collection.handle)),
+                        collection.label(),
                         collection.commits,
                         collection.derives,
                         collection.foundations_resident,
                         collection.foundations(),
                         collection.merges,
                         collection.maps,
-                        match collection.source {
-                            Some(source) => format!(" · derives from {}", short(&source)),
-                            None => String::new(),
+                        match (collection.kind, collection.source) {
+                            (CollectionKind::Derived, Some(source)) =>
+                                format!(" · derives from {}", short(&source)),
+                            (CollectionKind::Attached, Some(parent)) =>
+                                format!(" · attached to {}", short(&parent)),
+                            _ => String::new(),
                         }
                     );
                 }
                 if rows.len() > 12 {
-                    let _ = writeln!(out, "  ... {} more {kind} not listed", rows.len() - 12);
+                    let _ = writeln!(out, "  ... {} more {word} not listed", rows.len() - 12);
                 }
             }
             out.push('\n');
@@ -1830,6 +1915,37 @@ mod tests {
         );
         assert_eq!(root.name.as_deref(), Some("facts"));
         assert_eq!(root.commits, 1);
+    }
+
+    #[test]
+    fn an_attached_index_is_not_counted_as_a_derivation_and_names_its_mapping() {
+        // An attached collection names a parent and a mapping, has no lattice
+        // of its own, and is fed by MAPs. It used to share `source` with a
+        // derivation and nothing else, so every Succinct and BM25 index read
+        // as "derived" and drew under a hex handle. The descriptor says which
+        // edge it is; the mapping algorithm names itself.
+        let (mut store, source, target) = lattice_fixture();
+        let snapshot = store.snapshot().unwrap();
+        let lattice = observe_lattice(&snapshot, [target.raw]).unwrap();
+        let attached = lattice
+            .iter()
+            .find(|collection| collection.handle == target.raw)
+            .expect("the attached collection is projected");
+        assert_eq!(attached.kind, CollectionKind::Attached);
+        assert_eq!(attached.source, Some(source.raw));
+        assert_eq!(attached.mapping.as_deref(), Some("simple-to-succinct-v1"));
+        assert!(
+            attached.label().starts_with("simple-to-succinct-v1 "),
+            "an index is labelled by what it is, then which one: {}",
+            attached.label()
+        );
+        let root = lattice
+            .iter()
+            .find(|collection| collection.handle == source.raw)
+            .expect("the root is projected");
+        assert_eq!(root.kind, CollectionKind::Root);
+        assert_eq!(root.mapping, None, "a root maps nothing");
+        assert_eq!(root.label(), "facts");
     }
 
     #[test]
@@ -2705,6 +2821,7 @@ mod tests {
             lattice: false,
             focus: None,
             capture: None,
+            health_collection: None,
         };
         // Observed as no key; the refusal of a named key that does not load
         // is `disposable_reader_does_not_append_or_create_a_pile`'s.
@@ -2793,6 +2910,7 @@ mod tests {
             lattice: false,
             focus: None,
             capture: None,
+            health_collection: None,
         };
         let failure = match Reader::open(&options) {
             Err(error) => error,
@@ -2860,6 +2978,7 @@ mod tests {
             lattice: false,
             focus: None,
             capture: None,
+            health_collection: None,
         };
         // Observed as no key; the refusal of a named key that does not load
         // is `disposable_reader_does_not_append_or_create_a_pile`'s.
@@ -2969,6 +3088,7 @@ mod tests {
             lattice: false,
             focus: None,
             capture: None,
+            health_collection: None,
         };
         // Observed as no key; the refusal of a named key that does not load
         // is `disposable_reader_does_not_append_or_create_a_pile`'s.
@@ -3058,6 +3178,7 @@ mod tests {
             lattice: false,
             focus: None,
             capture: None,
+            health_collection: None,
         };
         // Observed as no key; the refusal of a named key that does not load
         // is `disposable_reader_does_not_append_or_create_a_pile`'s.
@@ -3134,6 +3255,7 @@ mod tests {
             lattice: false,
             focus: None,
             capture: None,
+            health_collection: None,
         };
         let before = std::fs::read(&path).unwrap();
         // A key named on the command line must load: a mistyped one is
@@ -3184,6 +3306,7 @@ mod tests {
             lattice: false,
             focus: None,
             capture: None,
+            health_collection: None,
         };
         let mut reader = Reader::open(&options).unwrap();
         let host = reader

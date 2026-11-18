@@ -260,6 +260,7 @@ fn generated_frame(directory: &Path) -> Result<(Frame, i128)> {
         lattice: true,
         focus: None,
         capture: None,
+        health_collection: None,
     })?;
     // Stand in for a viewer's click, so the capture also exercises the member
     // lattice the renderer requests through the sampler.

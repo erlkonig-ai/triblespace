@@ -12,6 +12,60 @@ use GORBIE::{
 #[path = "gui_capture_tests.rs"]
 mod capture_tests;
 
+#[cfg(test)]
+mod family_tests {
+    use super::*;
+
+    fn collection(byte: u8, kind: CollectionKind, source: Option<u8>) -> LatticeCollection {
+        LatticeCollection {
+            handle: [byte; 32],
+            name: None,
+            source: source.map(|byte| [byte; 32]),
+            kind,
+            mapping: None,
+            descriptor_resident: true,
+            commits: 0,
+            merges: 0,
+            derives: 0,
+            maps: 0,
+            foundations_resident: 0,
+            unadmitted: 0,
+        }
+    }
+
+    #[test]
+    fn a_family_is_a_root_and_everything_whose_chain_reaches_it() {
+        // The lattice card draws one family. Two unrelated roots must never
+        // land in one picture, and a derivation of a derivation, or an index
+        // attached to a derivation, belongs to the root at the end of its chain.
+        let collections = vec![
+            collection(1, CollectionKind::Root, None),
+            collection(2, CollectionKind::Derived, Some(1)),
+            collection(3, CollectionKind::Derived, Some(2)),
+            collection(4, CollectionKind::Attached, Some(3)),
+            collection(5, CollectionKind::Root, None),
+            collection(6, CollectionKind::Attached, Some(5)),
+            // Its source is not in the observation: it stands as its own root.
+            collection(7, CollectionKind::Derived, Some(99)),
+        ];
+        assert_eq!(families(&collections), vec![0, 0, 0, 0, 4, 4, 6]);
+    }
+
+    #[test]
+    fn a_descriptor_loop_is_one_family_rather_than_none() {
+        // Open world: descriptors may name each other. Every member of the
+        // loop, and what hangs off it, must still reach the picker.
+        let collections = vec![
+            collection(1, CollectionKind::Derived, Some(2)),
+            collection(2, CollectionKind::Derived, Some(1)),
+            collection(3, CollectionKind::Attached, Some(2)),
+        ];
+        let families = families(&collections);
+        assert_eq!(families, vec![0, 0, 0]);
+        assert_eq!(families[0], 0, "the loop's root is its own family's root");
+    }
+}
+
 /// One read-only part of the colony. The lattice is deliberately NOT here:
 /// it owns the selection, so it is a `state` card rather than a `view` one.
 ///
@@ -436,7 +490,21 @@ fn render_mesh(ui: &mut egui::Ui, frame: &Frame) {
         nodes.extend(worker.peers.iter().copied());
     }
     let nodes: Vec<[u8; 32]> = nodes.into_iter().collect();
+    // The heading is drawn before the early return: a card that draws nothing
+    // at all is a 24-pixel strip nobody can tell from a failed render.
+    ui.label(
+        egui::RichText::new(Section::Mesh.title())
+            .strong()
+            .size(19.0),
+    );
     if nodes.len() < 2 {
+        ui.small(match nodes.len() {
+            0 => "No nodes observed: no worker telemetry is selected and no readable health \
+                  report names a peer. That is no evidence, not an empty colony.",
+            _ => "One node observed and no peer named, so there is no mesh to draw. A peer \
+                  nobody reported is not a peer that is absent.",
+        });
+        ui.separator();
         return;
     }
     let index = |handle: &[u8; 32]| nodes.iter().position(|node| node == handle);
@@ -583,18 +651,19 @@ fn render_mesh(ui: &mut egui::Ui, frame: &Frame) {
     ui.separator();
 }
 
-/// The collection lattice, and the one panel in this dashboard you can walk.
+/// The collection lattice, one family at a time, and the panel you can walk.
 ///
-/// Every other panel answers "how is it going". This one answers "what is
-/// there, what is not, and where did it come from" — the three questions the
-/// cluster view was wanted for. They are one picture because they come from
-/// one frozen observation: a node is a collection, a left-to-right edge is a
-/// derivation, a short arc is foundations whose bytes have not replicated
-/// here yet, and a dashed mark is a collection this store knows only by name.
+/// A family is a root and everything derived from it. The whole store is not
+/// one picture: on sky's pile it is 128 collections, nearly all of them
+/// unrelated roots and the indexes attached to them, and laid out together
+/// they were one rank of overlapping labels. The order this panel exists to
+/// show -- what derives from what -- only runs WITHIN a family, so a family is
+/// the population (JP's design, 2026-09-21: "one collection family at a
+/// time"). The picker names the families; the graph draws the chosen one.
 ///
-/// Clicking a node dims everything off its chain and prints that chain in full
-/// underneath, which is how a derived collection gets walked back to the root
-/// it was computed from.
+/// Attached collections are not drawn here. They have no lattice of their
+/// own; they stand over the member lattice in depth, and the attached
+/// collections card is where they are listed and chosen.
 fn render_lattice(ui: &mut egui::Ui, frame: &Frame, selected: &mut Option<[u8; 32]>) {
     use GORBIE::widgets::{
         LatticeAdmission, LatticeEdge, LatticeGraph, LatticeMark, LatticeNode, LatticePresence,
@@ -616,131 +685,215 @@ fn render_lattice(ui: &mut egui::Ui, frame: &Frame, selected: &mut Option<[u8; 3
         return;
     }
 
-    let label = |collection: &LatticeCollection| {
-        collection
-            .name
-            .clone()
-            .unwrap_or_else(|| short(&collection.handle))
-    };
     let position = |handle: [u8; 32]| collections.iter().position(|c| c.handle == handle);
-
-    let nodes: Vec<LatticeNode> = collections
-        .iter()
-        .map(|collection| LatticeNode {
-            label: label(collection),
-            // A root is authored — someone named it. A derivation is
-            // computed, and could in principle be rebuilt from its source.
-            mark: match collection.source {
-                Some(_) => LatticeMark::Computed,
-                None => LatticeMark::Authored,
-            },
-            presence: match collection.descriptor_resident {
-                true => LatticePresence::Present,
-                false => LatticePresence::Absent,
-            },
-            // No COMMIT or DERIVE naming it means nothing to divide, which
-            // draws as an empty track. That is absence of evidence, not full
-            // residency.
-            // Deliberately not the admission channel. A collection is not
-            // itself admitted or waiting; some of its MEMBERS are, and that
-            // count already has a home in the text below. Spending one channel
-            // on "this element is waiting" and "this element contains
-            // something waiting" would make the mark mean two things.
-            admission: LatticeAdmission::Unknown,
-            // Over the foundations alone: a MERGE never replicates, so its
-            // result being absent is nothing a peer will send.
-            coverage: (collection.foundations() > 0)
-                .then(|| collection.foundations_resident as f32 / collection.foundations() as f32),
-            // A collection is named or derived, so something produced it by
-            // construction; "reached only as an input" is a fact about members,
-            // not about collections.
-            produced: true,
-            // Not claimed. The widget can draw "this label is a stand-in for a
-            // name whose bytes are missing", but this observation cannot tell
-            // that apart from "this collection has no name at all" —
-            // `LatticeCollection::name` is `None` for both. Asserting either
-            // would be inventing a fact, so it asserts neither until the
-            // sampler carries whether a name attribute was present.
-            label_known: true,
-        })
-        .collect();
-
-    let edges: Vec<LatticeEdge> = collections
-        .iter()
-        .enumerate()
-        .filter_map(|(to, collection)| {
-            let from = position(collection.source?)?;
-            Some(LatticeEdge {
-                from,
-                to,
-                // The descriptor declares the derivation or attachment; a
-                // DERIVE or MAP record is what performs it. Declared but never
-                // performed is exactly the missing step this view exists to
-                // show, so it draws as a dashed edge rather than as an
-                // ordinary one.
-                endorsed: collection.derives > 0 || collection.maps > 0,
-            })
-        })
-        .collect();
-
-    // The selection is stored as a handle, not as an index: the projection is
-    // re-sorted every observation, and an index would quietly come to mean a
-    // different collection. The selection lives in notebook state, owned by
-    // this card and readable by every other one, so a detached card keeps
-    // answering for the same collection.
+    let families = families(collections);
     let chosen = *selected;
-    let position_of = chosen.and_then(position);
-    let drawn = LatticeGraph::new(&nodes, &edges).selected(position_of).show(ui);
-    if let Some(clicked) = drawn.clicked {
-        let handle = collections[clicked].handle;
-        *selected = (chosen != Some(handle)).then_some(handle);
+    let family = chosen.and_then(position).map(|index| families[index]);
+
+    // The picker. A family is named by its root; the count beside it is what
+    // choosing it will draw, so a reader can find the ones with a derivation.
+    let roots: Vec<usize> = (0..collections.len())
+        .filter(|index| families[*index] == *index)
+        .collect();
+    let size = |root: usize| {
+        (0..collections.len())
+            .filter(|index| families[*index] == root)
+            .filter(|index| collections[*index].kind != CollectionKind::Attached)
+            .count()
+    };
+    let attached_in = |root: usize| {
+        (0..collections.len())
+            .filter(|index| families[*index] == root)
+            .filter(|index| collections[*index].kind == CollectionKind::Attached)
+            .count()
+    };
+    let family_text = |root: usize| {
+        let derived = size(root) - 1;
+        let attached = attached_in(root);
+        let mut text = collections[root].label();
+        match (derived, attached) {
+            (0, 0) => {}
+            (0, a) => text.push_str(&format!(" · {a} attached")),
+            (d, 0) => text.push_str(&format!(" · {d} derived")),
+            (d, a) => text.push_str(&format!(" · {d} derived, {a} attached")),
+        }
+        text
+    };
+    let mut pick = family;
+    egui::ComboBox::from_id_salt("colony-family")
+        .width(ui.available_width().min(420.0))
+        .selected_text(match family {
+            Some(root) => family_text(root),
+            None => "Choose a collection family".to_owned(),
+        })
+        .show_ui(ui, |ui| {
+            for root in &roots {
+                ui.selectable_value(&mut pick, Some(*root), family_text(*root));
+            }
+        });
+    if pick != family {
+        // Choosing a family selects its root; a click in the graph then
+        // walks down to a derivation.
+        *selected = pick.map(|root| collections[root].handle);
     }
 
-    let derived = collections.iter().filter(|c| c.source.is_some()).count();
+    let count = |kind| collections.iter().filter(|c| c.kind == kind).count();
     let absent = collections
         .iter()
         .filter(|c| !c.descriptor_resident)
         .count();
     let unadmitted: u64 = collections.iter().map(|c| c.unadmitted).sum();
     let holding = collections.iter().filter(|c| c.unadmitted > 0).count();
-    ui.horizontal_wrapped(|ui| {
-        ui.small(format!(
-            "{} collections · {derived} derived",
-            collections.len()
-        ));
-        if absent != 0 {
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
-                format!("{absent} with no resident descriptor"),
-            );
+    let totals = |ui: &mut egui::Ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.small(format!(
+                "{} collections in this pile: {} root, {} derived, {} attached",
+                collections.len(),
+                count(CollectionKind::Root),
+                count(CollectionKind::Derived),
+                count(CollectionKind::Attached),
+            ));
+            if absent != 0 {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("{absent} with no resident descriptor"),
+                );
+            }
+            // Deliberately its own line rather than folded into the one above.
+            // Missing bytes arrive on their own once replication catches up;
+            // an unadmitted signer waits on a grant somebody has to issue.
+            // Folding them together would report work as weather.
+            if unadmitted != 0 {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("{unadmitted} unadmitted across {holding}"),
+                );
+            }
+        });
+    };
+
+    let Some(root) = pick else {
+        totals(ui);
+        ui.small(
+            "Choose a family to draw it. A family is a root and what derives from it; the \
+             roots of this pile are unrelated to one another, so they are not one picture.",
+        );
+        ui.separator();
+        return;
+    };
+
+    // The family, without its attached indexes. `drawn[i]` is the collection
+    // index of graph node `i`.
+    let drawn: Vec<usize> = (0..collections.len())
+        .filter(|index| families[*index] == root)
+        .filter(|index| collections[*index].kind != CollectionKind::Attached)
+        .collect();
+    let node_of = |handle: [u8; 32]| {
+        drawn
+            .iter()
+            .position(|index| collections[*index].handle == handle)
+    };
+
+    let nodes: Vec<LatticeNode> = drawn
+        .iter()
+        .map(|index| {
+            let collection = &collections[*index];
+            LatticeNode {
+                label: collection.label(),
+                // A root is authored — someone named it. A derivation is
+                // computed, and could in principle be rebuilt from its source.
+                mark: match collection.kind {
+                    CollectionKind::Root => LatticeMark::Authored,
+                    _ => LatticeMark::Computed,
+                },
+                presence: match collection.descriptor_resident {
+                    true => LatticePresence::Present,
+                    false => LatticePresence::Absent,
+                },
+                // Deliberately not the admission channel. A collection is not
+                // itself admitted or waiting; some of its MEMBERS are, and that
+                // count already has a home in the text below.
+                admission: LatticeAdmission::Unknown,
+                // Over the foundations alone: a MERGE never replicates, so its
+                // result being absent is nothing a peer will send. No COMMIT or
+                // DERIVE naming it draws an empty track: absence of evidence,
+                // not full residency.
+                coverage: (collection.foundations() > 0).then(|| {
+                    collection.foundations_resident as f32 / collection.foundations() as f32
+                }),
+                // A collection is named or derived, so something produced it by
+                // construction.
+                produced: true,
+                // Not claimed: `name` is `None` both for "no name" and for "a
+                // name whose bytes are missing", so neither is asserted.
+                label_known: true,
+            }
+        })
+        .collect();
+
+    let edges: Vec<LatticeEdge> = drawn
+        .iter()
+        .enumerate()
+        .filter_map(|(to, index)| {
+            let collection = &collections[*index];
+            let from = node_of(collection.source?)?;
+            Some(LatticeEdge {
+                from,
+                to,
+                // The descriptor declares the derivation; a DERIVE record is
+                // what performs it. Declared but never performed draws dashed.
+                endorsed: collection.derives > 0,
+            })
+        })
+        .collect();
+
+    // The selection is stored as a handle, not as an index: the projection is
+    // re-sorted every observation, and an index would quietly come to mean a
+    // different collection.
+    let position_of = chosen.and_then(node_of);
+    let shown = LatticeGraph::new(&nodes, &edges)
+        .selected(position_of)
+        .id_salt("colony-family-graph")
+        .show(ui);
+    if let Some(clicked) = shown.clicked {
+        let handle = collections[drawn[clicked]].handle;
+        // Unselecting a node keeps the family: fall back to its root.
+        *selected = Some(match chosen == Some(handle) {
+            true => collections[root].handle,
+            false => handle,
+        });
+    }
+
+    totals(ui);
+    let attached_here = attached_in(root);
+    ui.small(format!(
+        "This family: {} drawn ({} derived){}.",
+        drawn.len(),
+        drawn.len() - 1,
+        match attached_here {
+            0 => String::new(),
+            n => format!(
+                ", {n} attached index{} not drawn here",
+                if n == 1 { "" } else { "es" }
+            ),
         }
-        // Deliberately its own line rather than folded into the one above.
-        // Missing bytes arrive on their own once replication catches up; an
-        // unadmitted signer waits on a grant somebody has to issue. Folding
-        // them together would report work as weather.
-        //
-        // Both the total and the spread, because they answer different
-        // questions: the total says how much is waiting on a grant, the count
-        // of collections says how many places to go and look. The whole-pile
-        // aggregate on its own is the figure nobody can act on.
-        if unadmitted != 0 {
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
-                format!("{unadmitted} unadmitted across {holding}"),
-            );
-        }
-    });
+    ));
     ui.small(
         "Left to right is derivation; sources are always to the left. Square authored, \
          circle computed. Dashed is a hole: a collection known only by name, or a \
          derivation declared and never performed. Arc: payloads resident over the \
          COMMITs and DERIVEs naming that collection, per collection, in this pile \
-         alone. MERGEs never replicate, so their results are not in the arc.",
+         alone. MERGEs never replicate, so their results are not in the arc. Attached \
+         indexes have no lattice of their own: they stand over the member lattice in \
+         depth, and the attached collections card chooses which.",
     );
 
-    // Hover previews a chain; a click pins it. Previewing on hover is what
-    // makes a wide lattice explorable without committing to a selection.
-    match drawn.hovered.or(position_of) {
+    // Hover previews a chain; a click pins it.
+    match shown
+        .hovered
+        .map(|node| drawn[node])
+        .or(chosen.and_then(position))
+    {
         None => ui.small("Click a collection to walk its source chain."),
         Some(index) => {
             let mut chain = Vec::new();
@@ -767,7 +920,7 @@ fn render_lattice(ui: &mut egui::Ui, frame: &Frame, selected: &mut Option<[u8; 3
             let focus = &collections[index];
             ui.small(format!(
                 "{} · {} commit / {} derive · {} of {} resident · {} merge / {} map stored{}",
-                label(focus),
+                focus.label(),
                 focus.commits,
                 focus.derives,
                 focus.foundations_resident,
@@ -781,7 +934,7 @@ fn render_lattice(ui: &mut egui::Ui, frame: &Frame, selected: &mut Option<[u8; 3
             ));
             let walked = chain
                 .iter()
-                .map(|step| label(&collections[*step]))
+                .map(|step| collections[*step].label())
                 .collect::<Vec<_>>()
                 .join(" -> ");
             ui.small(match dangling {
@@ -794,6 +947,31 @@ fn render_lattice(ui: &mut egui::Ui, frame: &Frame, selected: &mut Option<[u8; 3
         }
     };
     ui.separator();
+}
+
+/// Each collection's family: the index of the root its source chain ends at.
+///
+/// A chain that leaves the observation ends at the last collection it reached
+/// here, which then stands as the family's root: the honest picture of what
+/// this observation can place. Descriptors that loop (an open-world
+/// possibility) form one family rooted at the loop's first collection in
+/// display order, so every member of it is still reachable from the picker.
+fn families(collections: &[LatticeCollection]) -> Vec<usize> {
+    let position = |handle: [u8; 32]| collections.iter().position(|c| c.handle == handle);
+    (0..collections.len())
+        .map(|start| {
+            let mut path = vec![start];
+            let mut at = start;
+            while let Some(next) = collections[at].source.and_then(position) {
+                if let Some(loop_start) = path.iter().position(|seen| *seen == next) {
+                    return path[loop_start..].iter().copied().min().unwrap_or(next);
+                }
+                path.push(next);
+                at = next;
+            }
+            at
+        })
+        .collect()
 }
 
 /// The join lattice inside the selected collection.
@@ -1040,7 +1218,7 @@ fn render_attached_tree(
             .lattice
             .as_ref()
             .and_then(|lattice| lattice.iter().find(|c| c.handle == handle))
-            .and_then(|c| c.name.clone())
+            .map(|c| c.label())
             .unwrap_or_else(|| short(&handle))
     };
     let shown: BTreeSet<[u8; 32]> = visible_layers(&members.attached, hidden)
@@ -1135,6 +1313,17 @@ fn render_overview(ui: &mut egui::Ui, frame: &Frame) {
 /// Per-node worker scopes and each node's health conditions.
 fn render_nodes(ui: &mut egui::Ui, frame: &Frame) {
     styled(ui, |ui| {
+        ui.label(
+            egui::RichText::new(Section::Nodes.title())
+                .strong()
+                .size(19.0),
+        );
+        if frame.nodes().is_empty() {
+            ui.small(
+                "No node reported here: no selected worker telemetry, and no readable \
+                 health report. Missing is not idle.",
+            );
+        }
         for node in frame.nodes() {
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new(format!("Node {}", short(&node))).strong().size(19.0));
