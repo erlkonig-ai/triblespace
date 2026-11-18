@@ -341,6 +341,12 @@ pub mod elements {
         "Unsigned 8-bit integer."
     );
     dense_element!(
+        U32,
+        32,
+        "50EF2485D75284ABCAA81C934073A2D7",
+        "Unsigned 32-bit integer, little-endian. Indices such as mesh connectivity."
+    );
+    dense_element!(
         E4M3,
         8,
         "5453AA907D7EDF3A61B07E0DFBA53CFC",
@@ -549,6 +555,40 @@ mod tests {
         let r1 = tensor_blob::<F32, 1>([2], payload(8)).expect("ok");
         let r4 = tensor_blob::<F32, 4>([1, 1, 1, 2], payload(8)).expect("ok");
         assert_eq!(r1.bytes.len(), r4.bytes.len(), "same payload, same total");
+    }
+}
+
+#[cfg(test)]
+mod integer_elements {
+    use super::elements::{F32, U32};
+    use super::*;
+
+    /// Connectivity is integers, and a float tensor of the same shape is a
+    /// different encoding: `Tensor<U32, 2>` cannot be read as `Tensor<F32, 2>`
+    /// by a query, although both are four bytes an element.
+    #[test]
+    fn u32_is_its_own_element_and_roundtrips_indices() {
+        assert_ne!(
+            <Tensor<U32, 2> as MetaDescribe>::id(),
+            <Tensor<F32, 2> as MetaDescribe>::id(),
+        );
+        assert_eq!(U32::payload_len(10), Some(40));
+        let rows: [[u32; 4]; 2] = [[0, 1, 2, 3], [3, 2, 1, u32::MAX]];
+        let bytes: Vec<u8> = rows
+            .iter()
+            .flatten()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let blob = tensor_blob::<U32, 2>([2, 4], Bytes::from_source(bytes)).expect("well formed");
+        let view: TensorView = blob.try_from_blob().expect("decodes");
+        assert_eq!(view.dims(), &[2, 4]);
+        let back: Vec<u32> = view
+            .payload()
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(back, rows.iter().flatten().copied().collect::<Vec<_>>());
+        assert!(tensor_blob::<U32, 2>([2, 4], Bytes::from_source(vec![0u8; 31])).is_err());
     }
 }
 

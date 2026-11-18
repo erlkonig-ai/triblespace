@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `tensor::elements::U32`: an unsigned 32-bit little-endian tensor element,
+  for integer data such as mesh connectivity (`Tensor<U32, 2>` of shape
+  `[elements, 10]`). It is its own encoding, distinct from `Tensor<F32, _>`.
+
 - `reactive::driver::CollectionDriver` polls one `CollectionEnvironment`
   against a store. It re-steps only when the last settled step's raw read-set
   (records and blobs, misses included) may have changed, so late content wakes
