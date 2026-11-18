@@ -40,11 +40,17 @@ impl Section {
         }
     }
 
-    fn draw(self, ui: &mut egui::Ui, frame: &Frame, selected: Option<[u8; 32]>) {
+    fn draw(
+        self,
+        ui: &mut egui::Ui,
+        frame: &Frame,
+        selected: Option<[u8; 32]>,
+        hidden: &BTreeSet<[u8; 32]>,
+    ) {
         match self {
             Self::Overview => render_overview(ui, frame),
             Self::Mesh => styled(ui, |ui| render_mesh(ui, frame)),
-            Self::Members => styled(ui, |ui| render_members(ui, frame, selected)),
+            Self::Members => styled(ui, |ui| render_members(ui, frame, selected, hidden)),
             Self::Nodes => render_nodes(ui, frame),
             Self::Links => render_links(ui, frame),
         }
@@ -212,12 +218,35 @@ fn compose<P, S>(
         },
     );
 
+    // The dependency view. It owns which attached collections the member card
+    // overlays, so it is a state card of its own rather than a widget inside
+    // the member card: the tree is a question about the collection lattice,
+    // the overlay an answer drawn over the member lattice, and keeping them
+    // apart is what lets a reader detach one beside the other.
+    //
+    // It holds what is HIDDEN, not what is shown. The store is an open world
+    // and an attachment that appears next observation should appear in the
+    // picture too, rather than wait for somebody to tick a box they cannot
+    // know exists.
+    let hidden = notebook.state(
+        "colony-hidden-attached",
+        BTreeSet::<[u8; 32]>::new,
+        move |ctx, hidden: &mut BTreeSet<[u8; 32]>| {
+            let held = observed.read(ctx);
+            let chosen = *selection.read(ctx);
+            draw(ctx, &held, ATTACHED_TITLE, |ui, frame| {
+                styled(ui, |ui| render_attached_tree(ui, frame, chosen, hidden));
+            });
+        },
+    );
+
     for section in CONSUMERS {
         notebook.view(move |ctx| {
             let held = observed.read(ctx);
             let chosen = *selection.read(ctx);
+            let hidden = hidden.read(ctx).clone();
             draw(ctx, &held, section.title(), |ui, frame| {
-                section.draw(ui, frame, chosen);
+                section.draw(ui, frame, chosen, &hidden);
             });
         });
     }
@@ -690,9 +719,15 @@ fn render_lattice(ui: &mut egui::Ui, frame: &Frame, selected: &mut Option<[u8; 3
 /// below it was committed or derived rather than joined; a member with none
 /// above it is a maximal element — nothing has joined it into anything yet,
 /// which is the merge work this collection still owes.
-fn render_members(ui: &mut egui::Ui, frame: &Frame, chosen: Option<[u8; 32]>) {
+fn render_members(
+    ui: &mut egui::Ui,
+    frame: &Frame,
+    chosen: Option<[u8; 32]>,
+    hidden: &BTreeSet<[u8; 32]>,
+) {
     use GORBIE::widgets::{
-        LatticeAdmission, LatticeEdge, LatticeGraph, LatticeMark, LatticeNode, LatticePresence,
+        LatticeAdmission, LatticeEdge, LatticeGraph, LatticeMark, LatticeNode, LatticeOverlay,
+        LatticePresence,
     };
 
     let Some(chosen) = chosen else { return };
@@ -774,7 +809,32 @@ fn render_members(ui: &mut egui::Ui, frame: &Frame, chosen: Option<[u8; 32]>) {
     let maximal = (0..nodes.len())
         .filter(|node| !members.joins.iter().any(|(from, _)| from == node))
         .count();
-    ui.add(LatticeGraph::new(&nodes, &edges));
+    // Each visible attached collection is one layer, stacked in tree order.
+    // Its depth on screen is its place in that stack, not its depth in the
+    // tree, so two collections attached side by side do not draw on top of
+    // one another; the tree card says which is attached to which.
+    let shown = visible_layers(&members.attached, hidden);
+    let nodes_ref = &nodes;
+    let overlays: Vec<LatticeOverlay> = shown
+        .iter()
+        .enumerate()
+        .flat_map(|(slot, layer)| {
+            let depth = u8::try_from(slot + 1).unwrap_or(u8::MAX);
+            layer.marks.iter().map(move |mark| LatticeOverlay {
+                anchor: mark.anchor,
+                depth,
+                presence: match mark.resident {
+                    true => LatticePresence::Present,
+                    false => LatticePresence::Absent,
+                },
+                // A MAP needs no grant: the host's own is believed as it
+                // stands. What can still be waiting is the node it indexes,
+                // so the attachment says what its anchor says.
+                admission: nodes_ref[mark.anchor].admission,
+            })
+        })
+        .collect();
+    let drawn = LatticeGraph::new(&nodes, &edges).overlays(&overlays).show(ui);
     ui.horizontal_wrapped(|ui| {
         ui.small(format!(
             "{} members · {} join edges · {maximal} not yet joined into anything",
@@ -785,6 +845,14 @@ fn render_members(ui: &mut egui::Ui, frame: &Frame, chosen: Option<[u8; 32]>) {
             ui.small(format!(
                 "· {} dashed edges of joins still waiting for an input's support",
                 members.waiting.len()
+            ));
+        }
+        if !shown.is_empty() {
+            ui.small(format!(
+                "· {} attachments in depth from {} attached collection{}",
+                drawn.overlaid,
+                shown.len(),
+                if shown.len() == 1 { "" } else { "s" }
             ));
         }
         // The clauses are separate labels so the row can wrap between them,
@@ -822,7 +890,127 @@ fn render_members(ui: &mut egui::Ui, frame: &Frame, chosen: Option<[u8; 32]>) {
          capability proof admits yet, and dashed is a member whose bytes are not here \
          at all. Each join's edges are the inputs of one of this host's MERGEs: solid \
          when every input has a support and a reader descends it, dashed while one \
-         still waits. Another key's MERGEs are not believed and are not drawn.",
+         still waits. Another key's MERGEs are not believed and are not drawn. \
+         Up and to the right of a member, one step per layer, stand the attachments \
+         the attached collections ticked in the dependency card give it: one small \
+         circle per MAP of this host's, dashed when its bytes are not here. A member \
+         with nothing above it has no attachment; none is invented for it.",
+    );
+}
+
+const ATTACHED_TITLE: &str = "Attached collections";
+
+/// The layers to draw: every attached collection not hidden and with no
+/// hidden ancestor. An attachment of a hidden layer indexes nodes the reader
+/// has put away, so drawing it would float a stack with nothing under it.
+fn visible_layers<'a>(
+    layers: &'a [AttachedLayer],
+    hidden: &BTreeSet<[u8; 32]>,
+) -> Vec<&'a AttachedLayer> {
+    let mut off: BTreeSet<[u8; 32]> = hidden.clone();
+    // Layers arrive shallowest first, so one pass carries hiding downward.
+    for layer in layers {
+        if off.contains(&layer.parent) {
+            off.insert(layer.collection);
+        }
+    }
+    layers
+        .iter()
+        .filter(|layer| !off.contains(&layer.collection))
+        .collect()
+}
+
+/// The dependency tree under the selection, and the switch for each layer.
+///
+/// The collection lattice says which collection is attached to which; this
+/// card says it for the selection alone, as a tree, and decides which of those
+/// the member card overlays. Every attached collection the descriptors place
+/// here is listed, including one nothing has mapped yet, because "attached
+/// and never maintained" is a fact worth seeing and an empty overlay cannot
+/// show it.
+fn render_attached_tree(
+    ui: &mut egui::Ui,
+    frame: &Frame,
+    chosen: Option<[u8; 32]>,
+    hidden: &mut BTreeSet<[u8; 32]>,
+) {
+    ui.label(egui::RichText::new(ATTACHED_TITLE).strong().size(19.0));
+    let Some(chosen) = chosen else {
+        ui.small("Select a collection in the lattice to see what is attached to it.");
+        return;
+    };
+    let Some(members) = frame.members.as_ref().filter(|m| m.collection == chosen) else {
+        ui.small("Reading the selected collection's attachments...");
+        return;
+    };
+    if members.too_large.is_some() {
+        ui.small("The member lattice is too large to draw, so nothing is overlaid on it.");
+        return;
+    }
+    if members.attached.is_empty() {
+        ui.small("Nothing is attached to this collection.");
+        return;
+    }
+    let name = |handle: [u8; 32]| {
+        frame
+            .lattice
+            .as_ref()
+            .and_then(|lattice| lattice.iter().find(|c| c.handle == handle))
+            .and_then(|c| c.name.clone())
+            .unwrap_or_else(|| short(&handle))
+    };
+    let shown: BTreeSet<[u8; 32]> = visible_layers(&members.attached, hidden)
+        .iter()
+        .map(|layer| layer.collection)
+        .collect();
+    ui.small(name(chosen));
+    // Depth-first in descriptor order, so a child sits under its parent.
+    fn walk(
+        layers: &[AttachedLayer],
+        parent: [u8; 32],
+        out: &mut Vec<usize>,
+    ) {
+        for (index, layer) in layers.iter().enumerate() {
+            if layer.parent == parent {
+                out.push(index);
+                walk(layers, layer.collection, out);
+            }
+        }
+    }
+    let mut order = Vec::new();
+    walk(&members.attached, chosen, &mut order);
+    for index in order {
+        let layer = &members.attached[index];
+        ui.horizontal_wrapped(|ui| {
+            ui.add_space(16.0 * layer.depth as f32);
+            let mut on = !hidden.contains(&layer.collection);
+            let ancestor_off = on && !shown.contains(&layer.collection);
+            if ui.checkbox(&mut on, name(layer.collection)).changed() {
+                match on {
+                    true => hidden.remove(&layer.collection),
+                    false => hidden.insert(layer.collection),
+                };
+            }
+            let resident = layer.marks.iter().filter(|mark| mark.resident).count();
+            ui.small(match layer.marks.len() {
+                0 => "nothing mapped yet".to_owned(),
+                mapped => format!("{mapped} mapped · {resident} resident"),
+            });
+            if layer.unanchored != 0 {
+                ui.small(format!("· {} over nodes this lattice does not reach", layer.unanchored));
+            }
+            if layer.foreign != 0 {
+                ui.small(format!("· {} by another key, not believed", layer.foreign));
+            }
+            if ancestor_off {
+                ui.small("· hidden with its parent");
+            }
+        });
+    }
+    ui.small(
+        "Ticked layers stand over the member lattice in depth. Only the host's MAPs \
+         over a node drawn there are overlaid; the rest are counted here and drawn \
+         nowhere.",
     );
 }
 

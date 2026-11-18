@@ -292,6 +292,12 @@ fn assert_mixed_states(frame: &Frame) {
         !members.members.is_empty(),
         "the selected collection has members to draw"
     );
+    // The registered attachment reaches the member card's dependency view as
+    // a layer, and since it was never maintained it carries no MAP: listed,
+    // and nothing overlaid.
+    assert_eq!(members.attached.len(), 1, "one collection is attached");
+    assert!(members.attached[0].marks.is_empty());
+    assert_eq!(members.attached[0].depth, 1);
     // Both admission answers, in one collection, told apart by nothing the
     // record scan can see.
     let admissions = |wanted| {
@@ -397,10 +403,11 @@ fn generated_colony_reader_preserves_mixed_states_and_pile_bytes() -> Result<()>
 #[test]
 #[ignore = "requires explicit evidence directory and externally bounded software-renderer scope"]
 fn capture_generated_colony_dashboard() -> Result<()> {
-    /// One producer, one selector, four consumers. Asserting the count is what
+    /// One producer, two selectors (the lattice and the attached tree), four
+    /// consumers. Asserting the count is what
     /// catches a card that silently stops rendering -- the failure that once
     /// read as a 2px stub and got misdiagnosed as a GPU fault.
-    const EXPECTED_CARDS: usize = 6;
+    const EXPECTED_CARDS: usize = 7;
 
     // The opt-in driver can record wgpu's actual adapter selection. This is
     // diagnostic evidence, not a substitute for selecting software drivers.

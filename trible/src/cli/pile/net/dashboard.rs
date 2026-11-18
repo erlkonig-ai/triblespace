@@ -372,7 +372,16 @@ impl Reader {
         let members = match (self.lattice, self.focus) {
             (true, Some(collection)) => {
                 match observe_members(&snapshot, collection, MEMBER_LIMIT) {
-                    Ok(members) => Some(members),
+                    Ok(mut members) => {
+                        if let Some(collections) = &lattice {
+                            match observe_attached(&snapshot, &members, collections) {
+                                Ok(attached) => members.attached = attached,
+                                Err(error) => warnings
+                                    .push(format!("Attached collections unreadable: {error}")),
+                            }
+                        }
+                        Some(members)
+                    }
                     Err(error) => {
                         warnings.push(format!("Collection members unreadable: {error}"));
                         None
@@ -749,6 +758,48 @@ struct MemberLattice {
     /// The lattice was too large to draw honestly, so it was not built.
     /// A truncated graph is a false picture, not a partial one.
     too_large: Option<usize>,
+    /// The collections attached under this one, each with the attachments
+    /// its MAP records give this lattice's nodes. Filled by
+    /// [`observe_attached`] once the collection lattice says which
+    /// collections those are; empty when it was not asked or there are none.
+    attached: Vec<AttachedLayer>,
+}
+
+/// One collection attached under the selection, as a layer over its lattice.
+///
+/// Depth one is attached to the selection itself; depth two is attached to a
+/// depth-one collection, and so on. A layer lists every collection the
+/// descriptors place there, including one with no MAP at all, so the
+/// dependency view can say "attached, and nothing mapped yet" rather than
+/// leaving it out.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AttachedLayer {
+    collection: [u8; 32],
+    /// The collection it is attached to: the selection, or a shallower layer.
+    parent: [u8; 32],
+    depth: u8,
+    /// The host's MAPs whose node this observation reaches.
+    marks: Vec<AttachmentMark>,
+    /// The host's MAPs whose node is not in the drawn lattice: a node the
+    /// parent lattice here does not reach. Believed by nobody, drawn nowhere,
+    /// and counted so the picture does not read as complete.
+    unanchored: usize,
+    /// MAPs signed by another key. Never believed, so never drawn.
+    foreign: usize,
+}
+
+/// One attachment, placed over the member of the selection it ultimately
+/// indexes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AttachmentMark {
+    /// Index into [`MemberLattice::members`].
+    anchor: usize,
+    /// The parent node the MAP names. At depth one it is the anchor member;
+    /// deeper, it is an attachment of the layer below.
+    node: [u8; 32],
+    attachment: [u8; 32],
+    /// The attachment's bytes are here.
+    resident: bool,
 }
 
 /// Project one collection's member lattice from a frozen observation.
@@ -855,6 +906,7 @@ fn observe_members<R: triblespace_core::repo::StoreRead>(
             waiting: Vec::new(),
             unproduced,
             too_large: Some(handles.len()),
+            attached: Vec::new(),
         });
     }
 
@@ -905,7 +957,122 @@ fn observe_members<R: triblespace_core::repo::StoreRead>(
         waiting,
         unproduced,
         too_large: None,
+        attached: Vec::new(),
     })
+}
+
+/// Deepest attachment layer drawn. Past this the stack stops reading as
+/// layers; the dependency view still lists what lies beyond.
+const ATTACHED_DEPTH_LIMIT: u8 = 4;
+
+/// Project the attachments over one collection's member lattice.
+///
+/// Which collections are attached where is the collection lattice's answer --
+/// each one's descriptor names its parent -- so this reads no descriptor of its
+/// own; it only walks `lattice` down from the selection. Each attached
+/// collection then costs one indexed lookup of its own records, the same as
+/// the member lattice itself.
+///
+/// A MAP is believed only when the store's host signed it and only for a node
+/// the reader reaches in the parent's lattice, so that is exactly what draws:
+/// the host's MAPs whose node is a drawn member (depth one) or an attachment
+/// already drawn one layer down. Every other MAP is counted, never drawn.
+///
+/// Nothing is invented for the nodes no MAP names. An attached collection
+/// could index every node of its parent, and drawing a hole for each one it
+/// has not would put work in the picture nobody declared.
+fn observe_attached<R: triblespace_core::repo::StoreRead>(
+    snapshot: &R,
+    members: &MemberLattice,
+    lattice: &[LatticeCollection],
+) -> ReadResult<Vec<AttachedLayer>> {
+    use triblespace_core::collection::records::CollectionRecord;
+    use triblespace_core::collection::CollectionRecordSelector;
+
+    if members.too_large.is_some() {
+        return Ok(Vec::new());
+    }
+    let host = snapshot
+        .index(&BTreeSet::from([CollectionHandle::new(members.collection)]))
+        .map_err(|_| ReadFailure::RefreshPile)?
+        .host();
+
+    // node handle -> anchor member, per collection already placed. The
+    // selection's own nodes are its members.
+    let mut placed: std::collections::BTreeMap<[u8; 32], std::collections::BTreeMap<[u8; 32], usize>> =
+        std::collections::BTreeMap::new();
+    placed.insert(
+        members.collection,
+        members
+            .members
+            .iter()
+            .enumerate()
+            .map(|(index, member)| (member.handle, index))
+            .collect(),
+    );
+
+    let mut layers = Vec::new();
+    let mut frontier = vec![members.collection];
+    for depth in 1..=ATTACHED_DEPTH_LIMIT {
+        let mut next = Vec::new();
+        for parent in &frontier {
+            for child in lattice.iter().filter(|c| c.source == Some(*parent)) {
+                // A cycle in the descriptors is an open-world possibility, not
+                // a reason to loop.
+                if placed.contains_key(&child.handle) {
+                    continue;
+                }
+                let target = CollectionHandle::new(child.handle);
+                let records = snapshot
+                    .select_records(&BTreeSet::from([CollectionRecordSelector::Collection(target)]))
+                    .map_err(|_| ReadFailure::RefreshPile)?;
+                let anchors = &placed[parent];
+                let mut layer = AttachedLayer {
+                    collection: child.handle,
+                    parent: *parent,
+                    depth,
+                    marks: Vec::new(),
+                    unanchored: 0,
+                    foreign: 0,
+                };
+                let mut own = std::collections::BTreeMap::new();
+                for record in records {
+                    let CollectionRecord::Map(map) = record else {
+                        continue;
+                    };
+                    if host != Some(map.public_key()) {
+                        layer.foreign += 1;
+                        continue;
+                    }
+                    let node = map.node().raw;
+                    let Some(&anchor) = anchors.get(&node) else {
+                        layer.unanchored += 1;
+                        continue;
+                    };
+                    let attachment = map.attachment().raw;
+                    own.insert(attachment, anchor);
+                    layer.marks.push(AttachmentMark {
+                        anchor,
+                        node,
+                        attachment,
+                        resident: snapshot
+                            .contains_blob(Inline::<Handle<UnknownBlob>>::new(attachment))
+                            .unwrap_or(false),
+                    });
+                }
+                layer.marks.sort_unstable_by_key(|mark| (mark.anchor, mark.attachment));
+                layer.marks.dedup();
+                placed.insert(child.handle, own);
+                next.push(child.handle);
+                layers.push(layer);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    Ok(layers)
 }
 
 #[derive(Clone)]
@@ -1793,6 +1960,73 @@ mod tests {
             commits.each_ref().map(|commit| commit.data().raw),
             result.raw,
         )
+    }
+
+    #[test]
+    fn an_attachment_draws_over_its_node_and_nothing_else_draws() {
+        // One host MAP over a member, one host MAP over a node this lattice
+        // does not reach, and one MAP signed by another key. Only the first is
+        // believed for a reached node, so only it may draw; the other two are
+        // counted so the picture does not read as complete. Nothing is drawn
+        // for the member no MAP names.
+        use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
+        use triblespace_core::collection::records::{CollectionData, CollectionMap};
+        use triblespace_core::collection::CollectionStore;
+        let host = member_host();
+        let mut store = MemoryRepo::for_host(host.verifying_key());
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let collection: Collection<SimpleArchive> = store.collection("members", policy).unwrap();
+        let first = store
+            .commit(collection, &host, entity! { metadata::name: "first" })
+            .unwrap();
+        let second = store
+            .commit(collection, &host, entity! { metadata::name: "second" })
+            .unwrap();
+        let attached = store.attach::<SuccinctArchiveBlob>(collection, ()).unwrap();
+        // The attachment's bytes are deliberately not stored: it must draw as
+        // the hole it is, not be left out.
+        let attachment = CollectionData::new([7; 32]);
+        let stranger = ed25519_dalek::SigningKey::from_bytes(&[92; 32]);
+        for map in [
+            CollectionMap::sign(&host, attached.handle(), first.data(), attachment),
+            CollectionMap::sign(
+                &host,
+                attached.handle(),
+                CollectionData::new([8; 32]),
+                CollectionData::new([9; 32]),
+            ),
+            CollectionMap::sign(&stranger, attached.handle(), second.data(), attachment),
+        ] {
+            store.insert(CollectionRecord::Map(map)).unwrap();
+        }
+
+        let snapshot = store.snapshot().unwrap();
+        let lattice = observe_lattice(&snapshot, []).unwrap();
+        let mut members =
+            observe_members(&snapshot, collection.handle().raw, MEMBER_LIMIT).unwrap();
+        members.attached = observe_attached(&snapshot, &members, &lattice).unwrap();
+
+        assert_eq!(members.attached.len(), 1, "one collection is attached");
+        let layer = &members.attached[0];
+        assert_eq!(layer.collection, attached.handle().raw);
+        assert_eq!(layer.parent, collection.handle().raw);
+        assert_eq!(layer.depth, 1);
+        assert_eq!((layer.unanchored, layer.foreign), (1, 1));
+        let anchor = members
+            .members
+            .iter()
+            .position(|member| member.handle == first.data().raw)
+            .unwrap();
+        assert_eq!(
+            layer.marks,
+            vec![AttachmentMark {
+                anchor,
+                node: first.data().raw,
+                attachment: attachment.raw,
+                resident: false,
+            }],
+            "only the host's MAP over a reached member draws"
+        );
     }
 
     #[test]
