@@ -1559,6 +1559,112 @@ mod tests {
     }
 
     #[test]
+    fn two_of_three_roots_invite_together_while_each_root_works_alone() {
+        // Three hosts are the roots of a 2-of-3 policy. Each grants the
+        // others invoke-only access once, so every host meets the threshold
+        // from proofs it already holds, while a new subject needs two hosts
+        // to sign for it.
+        let mut repo = MemoryRepo::default();
+        let invoke = definition(&mut repo, &[ACTION_READ], &[]);
+        let delegable = definition(&mut repo, &[ACTION_READ], &[ACTION_READ]);
+        let hosts = [key(1), key(2), key(3)];
+        let roots = || hosts.iter().map(SigningKey::verifying_key);
+        let invitee = key(4);
+        let cross: Vec<_> = hosts
+            .iter()
+            .flat_map(|issuer| {
+                hosts
+                    .iter()
+                    .filter(move |subject| subject.verifying_key() != issuer.verifying_key())
+                    .map(move |subject| {
+                        CapabilityProof::new(resource(9), issuer, invoke, subject.verifying_key())
+                    })
+            })
+            .collect();
+        let snapshot = repo.snapshot().unwrap();
+        for host in &hosts {
+            assert!(!capability_quorum_authorizes(
+                &snapshot,
+                [],
+                roots(),
+                host.verifying_key(),
+                read_request(),
+                threshold(2)
+            ));
+            assert!(capability_quorum_authorizes(
+                &snapshot,
+                &cross,
+                roots(),
+                host.verifying_key(),
+                read_request(),
+                threshold(2)
+            ));
+        }
+
+        // One host's invitation is a pending share, not admission.
+        let first = CapabilityProof::new(resource(9), &hosts[0], invoke, invitee.verifying_key());
+        let mut proofs = cross.clone();
+        proofs.push(first);
+        assert_eq!(
+            capability_quorum_decide(
+                &snapshot,
+                &proofs,
+                roots(),
+                invitee.verifying_key(),
+                read_request(),
+                threshold(2)
+            ),
+            QuorumOutcome::Unmet
+        );
+        // The invoke-only grant it holds from host 0 cannot carry host 0's
+        // share onward, so host 1 cannot complete the quorum alone.
+        let from_zero = cross
+            .iter()
+            .find(|proof| {
+                proof.root_key() == hosts[0].verifying_key()
+                    && proof.leaf_key() == hosts[1].verifying_key()
+            })
+            .unwrap();
+        let forwarded = from_zero
+            .delegate(&hosts[1], invoke, invitee.verifying_key())
+            .unwrap();
+        let own = CapabilityProof::new(resource(9), &hosts[1], invoke, invitee.verifying_key());
+        assert!(!capability_quorum_authorizes(
+            &snapshot,
+            cross.iter().chain([&forwarded, &own]),
+            roots(),
+            invitee.verifying_key(),
+            read_request(),
+            threshold(2)
+        ));
+        // A second host signing the same invitation admits the subject.
+        proofs.push(own.clone());
+        assert!(capability_quorum_authorizes(
+            &snapshot,
+            &proofs,
+            roots(),
+            invitee.verifying_key(),
+            read_request(),
+            threshold(2)
+        ));
+
+        // If the hosts' mutual grants were delegable, one host alone could
+        // forward another root's share and the quorum would mean nothing.
+        let leaky =
+            CapabilityProof::new(resource(9), &hosts[0], delegable, hosts[1].verifying_key())
+                .delegate(&hosts[1], invoke, invitee.verifying_key())
+                .unwrap();
+        assert!(capability_quorum_authorizes(
+            &snapshot,
+            [&leaky, &own],
+            roots(),
+            invitee.verifying_key(),
+            read_request(),
+            threshold(2)
+        ));
+    }
+
+    #[test]
     fn sibling_paths_cannot_lend_delegation_to_each_other() {
         let mut repo = MemoryRepo::default();
         let read = definition(&mut repo, &[ACTION_READ], &[]);
