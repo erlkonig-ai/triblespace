@@ -14,14 +14,16 @@ use anyhow::{Context, Result};
 use ed25519_dalek::VerifyingKey;
 use triblespace_core::attribute::Attribute;
 use triblespace_core::blob::encodings::UnknownBlob;
+use triblespace_core::collection::lww_register::LwwQuery;
 use triblespace_core::collection::{CollectionHandle, CollectionRecord};
-use triblespace_core::exists;
+use triblespace_core::{and, exists};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::encodings::iu256::U256BE;
 use triblespace_core::macros::{find, pattern};
 use triblespace_core::metadata;
 use triblespace_core::prelude::Id;
+use triblespace_core::query::{ContainsConstraint, TriblePattern};
 use triblespace_core::repo::{StoreRead, WantRequest};
 use triblespace_core::trible::TribleSet;
 
@@ -357,16 +359,60 @@ where
 /// Project replicated health reports without maintaining an index or assuming
 /// cardinality. This chooses the latest report per observer for presentation;
 /// every fact within that report stays open-world.
-pub fn observe_health(facts: &TribleSet, now_ns: i128, max_age: Duration) -> Vec<ObserverReport> {
-    let mut latest = BTreeMap::<Id, (i128, Id)>::new();
-    for (report, node, created) in find!(
+///
+/// It looks at every report to find each observer's latest, so its cost
+/// grows with the collection's whole history. [`observe_latest_health`] is
+/// the same projection through the collection's last-writer-wins index.
+pub fn observe_health<F: TriblePattern>(
+    facts: &F,
+    now_ns: i128,
+    max_age: Duration,
+) -> Vec<ObserverReport> {
+    let candidates = find!(
         (report: Id, node: Id, created: (i128, i128)),
         pattern!(facts, [{
             ?report @ metadata::tag: &health_record::KIND_REPORT,
             health_record::attrs::node: ?node,
             metadata::created_at: ?created,
         }])
-    ) {
+    );
+    project_health(facts, candidates, now_ns, max_age)
+}
+
+/// [`observe_health`] with each observer's latest report taken from
+/// `latest`, the health collection's last-writer-wins index keyed by
+/// `health_record::attrs::node` and ordered by `metadata::created_at` (what
+/// `trible pile net health` attaches). Only the winning reports are
+/// enumerated, so the cost follows the number of observers rather than the
+/// number of reports ever written.
+pub fn observe_latest_health<F: TriblePattern>(
+    facts: &F,
+    latest: &LwwQuery,
+    now_ns: i128,
+    max_age: Duration,
+) -> Vec<ObserverReport> {
+    let candidates = find!(
+        (report: Id, node: Id, created: (i128, i128)),
+        and!(
+            pattern!(facts, [{
+                ?report @ metadata::tag: &health_record::KIND_REPORT,
+                health_record::attrs::node: ?node,
+                metadata::created_at: ?created,
+            }]),
+            latest.has(report),
+        )
+    );
+    project_health(facts, candidates, now_ns, max_age)
+}
+
+fn project_health<F: TriblePattern>(
+    facts: &F,
+    candidates: impl Iterator<Item = (Id, Id, (i128, i128))>,
+    now_ns: i128,
+    max_age: Duration,
+) -> Vec<ObserverReport> {
+    let mut latest = BTreeMap::<Id, (i128, Id)>::new();
+    for (report, node, created) in candidates {
         let candidate = (created.1, report);
         latest
             .entry(node)
@@ -461,7 +507,7 @@ where
     })
 }
 
-fn observe_condition(facts: &TribleSet, condition: Id) -> ObservedCondition {
+fn observe_condition<F: TriblePattern>(facts: &F, condition: Id) -> ObservedCondition {
     let mut tags: Vec<Id> = find!(
         tag: Id,
         pattern!(facts, [{ condition @ metadata::tag: ?tag }])
@@ -586,7 +632,7 @@ fn observe_condition(facts: &TribleSet, condition: Id) -> ObservedCondition {
     }
 }
 
-fn count_metric(facts: &TribleSet, entity: Id, attribute: &Attribute<U256BE>) -> CountMetric {
+fn count_metric<F: TriblePattern>(facts: &F, entity: Id, attribute: &Attribute<U256BE>) -> CountMetric {
     let mut values: Vec<u128> = find!(
         value: u128,
         pattern!(facts, [{ entity @ attribute: ?value }])

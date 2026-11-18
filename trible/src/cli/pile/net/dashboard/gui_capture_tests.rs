@@ -247,6 +247,25 @@ fn generated_frame(directory: &Path) -> Result<(Frame, i128)> {
     )?;
     writer.commit(health, &signer, health_facts)?;
     writer.close()?;
+    // What the maintenance daemon keeps on a colony pile: the health
+    // collection's archives and latest-report index, mapped by the host the
+    // reader opens as. The reader takes health through them.
+    let mut upkeep = crate::cli::pile::open_refreshed_with(&path, Some(authority))?;
+    let succinct = upkeep.attach::<SuccinctArchiveBlob>(health, ())?;
+    let archive = upkeep.attach::<Rank9AcceleratedSuccinctArchiveBlob>(health, succinct)?;
+    let latest = upkeep.attach::<LwwRegisterBlob>(
+        health,
+        (health_record::attrs::node.id(), metadata::created_at.id()),
+    )?;
+    tokio::runtime::Builder::new_current_thread()
+        .build()?
+        .block_on(async {
+            drop(upkeep.maintain_attached(succinct, &signer).await?);
+            drop(upkeep.maintain_attached(archive, &signer).await?);
+            drop(upkeep.maintain_attached(latest, &signer).await?);
+            Ok::<_, anyhow::Error>(())
+        })?;
+    upkeep.close()?;
 
     let before = fs::read(&path)?;
     let mut reader = Reader::open(&Options {
@@ -275,8 +294,25 @@ fn generated_frame(directory: &Path) -> Result<(Frame, i128)> {
 fn assert_mixed_states(frame: &Frame) {
     assert_eq!((frame.readable_sources, frame.selected_sources), (1, 1));
     let lattice = frame.lattice.as_ref().expect("the lattice was requested");
-    let derived: Vec<_> = lattice.iter().filter(|c| c.source.is_some()).collect();
+    let health = lattice
+        .iter()
+        .find(|c| c.name.as_deref() == Some(health_record::COLLECTION_NAME))
+        .expect("the health root is present")
+        .handle;
+    // The health collection's two indexes are the reader's, not the subject.
+    let derived: Vec<_> = lattice
+        .iter()
+        .filter(|c| c.source.is_some() && c.source != Some(health))
+        .collect();
     assert_eq!(derived.len(), 1, "one derivation is registered");
+    assert_eq!(
+        lattice
+            .iter()
+            .filter(|c| c.source == Some(health))
+            .count(),
+        3,
+        "the health indexes are drawn attached to it"
+    );
     assert_eq!(
         derived[0].foundations(),
         0,

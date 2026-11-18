@@ -12,19 +12,24 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::blob::encodings::succinctarchive::{
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchive, SuccinctArchiveBlob,
+    UnionArchive,
+};
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::Blob;
 use triblespace_core::collection::descriptor;
+use triblespace_core::collection::lww_register::{LwwIndex, LwwQuery, LwwRegisterBlob};
 use triblespace_core::collection::{
-    AdmissionPolicy, Collection, CollectionHandle, CollectionPolicy, CollectionSnapshot,
+    AdmissionPolicy, AttachedSnapshot, Collection, CollectionHandle, CollectionPolicy, CollectionSnapshot,
     CollectionSnapshotExt, CollectionStoreExt, TryFromCoverError,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::pile::{Pile, PileSnapshot};
-use triblespace_core::repo::SnapshotSource;
+use triblespace_core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace_core::trible::TribleSet;
 use triblespace_net::dashboard::{self, CountMetric, Freshness, ObserverReport};
 use triblespace_net::health_record;
@@ -175,10 +180,175 @@ impl SelectedSource {
     }
 }
 
+/// The health collection, read the way `trible pile net health` reads it:
+/// through an attached archive of its facts and its last-writer-wins index of
+/// each observer's latest report, so one observation costs the observers'
+/// latest reports and the attachments the host has mapped, not a decode of
+/// every report ever written. The archive is the Rank9-accelerated one: the
+/// projection makes a few hundred point lookups per observer, and over the
+/// plain Succinct attachment those took about 240 ms each on sky's live
+/// pile (2026-11-18) against well under one ms here. Nothing is maintained
+/// or published: a foundation no believed MAP reaches yet is read raw for
+/// this observation.
+///
+/// A pile without those two attachments has nothing to read through. Then
+/// the collection is decoded in full, as before, and the frame says so
+/// rather than being slow without a reason. (The plain Succinct attachment
+/// alone is no substitute: its lookups made the projection slower than the
+/// full decode.)
+struct HealthSource {
+    full: SelectedSource,
+    indexed: Option<IndexedHealth>,
+    /// Whether the last observation found no attached index.
+    unindexed: bool,
+}
+
+struct IndexedHealth {
+    facts: AttachedSnapshot<PileSnapshot, Rank9AcceleratedSuccinctArchiveBlob>,
+    latest: AttachedSnapshot<PileSnapshot, LwwRegisterBlob>,
+    archive: UnionArchive<OrderedUniverse>,
+    winners: LwwQuery,
+}
+
+impl HealthSource {
+    fn new(handle: CollectionHandle) -> Self {
+        Self {
+            full: SelectedSource::new(handle),
+            indexed: None,
+            unindexed: false,
+        }
+    }
+
+    fn handle(&self) -> CollectionHandle {
+        self.full.handle
+    }
+
+    fn is_current(&self, snapshot: &PileSnapshot) -> bool {
+        match &self.indexed {
+            Some(indexed) => {
+                indexed.facts.is_current(snapshot) && indexed.latest.is_current(snapshot)
+            }
+            None => self.unindexed && self.full.is_current(snapshot),
+        }
+    }
+
+    /// The accelerated archive and latest-report index over the health
+    /// collection, if this pile has their descriptors (`net health` and the
+    /// maintenance daemon keep them). Their handles follow from the root's
+    /// alone.
+    fn attachments(
+        &self,
+        snapshot: &PileSnapshot,
+    ) -> ReadResult<Option<(Collection<Rank9AcceleratedSuccinctArchiveBlob>, Collection<LwwRegisterBlob>)>> {
+        let root = Collection::<SimpleArchive>::open(snapshot, self.handle())
+            .map_err(|_| ReadFailure::OpenCollection)?;
+        let mut descriptors = MemoryRepo::default();
+        let succinct = descriptors
+            .attach::<SuccinctArchiveBlob>(root, ())
+            .map_err(|_| ReadFailure::HealthDescriptor)?;
+        let facts = descriptors
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(root, succinct)
+            .map_err(|_| ReadFailure::HealthDescriptor)?;
+        let latest = descriptors
+            .attach::<LwwRegisterBlob>(
+                root,
+                (
+                    health_record::attrs::node.id(),
+                    triblespace_core::metadata::created_at.id(),
+                ),
+            )
+            .map_err(|_| ReadFailure::HealthDescriptor)?;
+        match (
+            Collection::<Rank9AcceleratedSuccinctArchiveBlob>::open(snapshot, facts.handle()),
+            Collection::<LwwRegisterBlob>::open(snapshot, latest.handle()),
+        ) {
+            (Ok(facts), Ok(latest)) => Ok(Some((facts, latest))),
+            _ => Ok(None),
+        }
+    }
+
+    fn observe(
+        &mut self,
+        snapshot: &PileSnapshot,
+        now_ns: i128,
+        max_age: Duration,
+    ) -> ReadResult<Vec<ObserverReport>> {
+        let current = self
+            .indexed
+            .as_ref()
+            .is_some_and(|indexed| {
+                indexed.facts.is_current(snapshot) && indexed.latest.is_current(snapshot)
+            });
+        if !current {
+            self.indexed = None;
+            self.unindexed = false;
+            match self.attachments(snapshot)? {
+                Some((facts, latest)) => {
+                    let facts = snapshot
+                        .attached(facts)
+                        .map_err(|_| ReadFailure::ObserveCollection)?;
+                    let latest = snapshot
+                        .attached(latest)
+                        .map_err(|_| ReadFailure::ObserveCollection)?;
+                    // The accelerated archive's mapping reads its Succinct
+                    // sibling, so a read cannot build the foundations no MAP
+                    // reaches yet (a report landed since the last upkeep):
+                    // those are read raw and joined as one more segment.
+                    let mut archive = facts
+                        .view::<UnionArchive<OrderedUniverse>>()
+                        .map_err(|_| ReadFailure::InvalidFacts)?;
+                    if !facts.residual().is_empty() {
+                        let mut residual = TribleSet::new();
+                        for foundation in facts.residual().members() {
+                            // A foundation whose bytes are not here may hold
+                            // an observer's newest report, so the read is
+                            // unavailable, as a missing member of the full
+                            // decode is.
+                            let set: TribleSet = snapshot
+                                .get(foundation)
+                                .map_err(|_| ReadFailure::MemberUnavailable)?;
+                            residual += set;
+                        }
+                        archive = archive.union(&UnionArchive::new(vec![
+                            SuccinctArchive::<OrderedUniverse>::from(&residual),
+                        ]));
+                    }
+                    let (index, unread_latest) = latest
+                        .read::<LwwIndex>()
+                        .map_err(|_| ReadFailure::InvalidFacts)?
+                        .into_parts();
+                    if !unread_latest.is_empty() {
+                        return Err(ReadFailure::MemberUnavailable);
+                    }
+                    let winners = index.query().map_err(|_| ReadFailure::InvalidFacts)?;
+                    self.indexed = Some(IndexedHealth {
+                        facts,
+                        latest,
+                        archive,
+                        winners,
+                    });
+                }
+                None => {
+                    self.unindexed = true;
+                    let facts = self.full.facts(snapshot)?;
+                    return Ok(dashboard::observe_health(facts, now_ns, max_age));
+                }
+            }
+        }
+        let indexed = self.indexed.as_ref().expect("indexed observation installed");
+        Ok(dashboard::observe_latest_health(
+            &indexed.archive,
+            &indexed.winners,
+            now_ns,
+            max_age,
+        ))
+    }
+}
+
 struct Reader {
     pile: Pile,
     sources: Vec<SelectedSource>,
-    health: Option<SelectedSource>,
+    health: Option<HealthSource>,
     setup_warnings: Vec<String>,
     max_age: Duration,
     lattice: bool,
@@ -239,7 +409,7 @@ impl Reader {
             // Named: read exactly that generation, which is what the producer
             // was told to write (`net sync --health-collection`). Opening it
             // is the first observation; nothing is derived or created.
-            (Some(handle), _) => Some(SelectedSource::new(handle)),
+            (Some(handle), _) => Some(HealthSource::new(handle)),
             (None, Some(authority)) => {
                 let mut descriptors = MemoryRepo::default();
                 let collection: Collection<SimpleArchive> = descriptors
@@ -251,7 +421,7 @@ impl Reader {
                         ),
                     )
                     .map_err(|_| ReadFailure::HealthDescriptor)?;
-                Some(SelectedSource::new(collection.handle()))
+                Some(HealthSource::new(collection.handle()))
             }
             (None, None) => {
                 setup_warnings.push(
@@ -348,8 +518,19 @@ impl Reader {
         let workers = telemetry::observe(&facts, &snapshot, now_ns, self.max_age);
         let mut health_readable = true;
         let health = match self.health.as_mut() {
-            Some(source) => match source.facts(&snapshot) {
-                Ok(facts) => dashboard::observe_health(facts, now_ns, self.max_age),
+            Some(source) => match source.observe(&snapshot, now_ns, self.max_age) {
+                Ok(reports) => {
+                    if source.unindexed {
+                        warnings.push(
+                            "Health read in full: this pile has no attached rank9 archive and \
+                             latest-report index for it, so every report ever written is \
+                             decoded. `trible pile collection attach PILE HEALTH rank9` and \
+                             `trible pile net health` attach them."
+                                .into(),
+                        );
+                    }
+                    reports
+                }
                 Err(error) => {
                     health_readable = false;
                     warnings.push(format!("Health reports unreadable: {error}"));
@@ -2827,7 +3008,7 @@ mod tests {
         // is `disposable_reader_does_not_append_or_create_a_pile`'s.
         let mut reader = Reader::open_as(&options, None).unwrap();
         // Exercise the health warning arm over the same disposable bad member.
-        reader.health = Some(SelectedSource::new(collection.handle()));
+        reader.health = Some(HealthSource::new(collection.handle()));
         let frame = reader.sample().unwrap();
         assert_eq!((frame.selected_sources, frame.readable_sources), (1, 0));
         assert!(frame.workers.is_empty() && frame.health.is_empty());
@@ -3093,7 +3274,7 @@ mod tests {
         // Observed as no key; the refusal of a named key that does not load
         // is `disposable_reader_does_not_append_or_create_a_pile`'s.
         let mut reader = Reader::open_as(&options, None).unwrap();
-        reader.health = Some(SelectedSource::new(collection.handle()));
+        reader.health = Some(HealthSource::new(collection.handle()));
         // Cross Future -> Fresh, prior expiry, current expiry, then return
         // within the original valid interval and finally before its origin.
         // A retained already-aged copy would lose rates on the return to 115.
@@ -3136,6 +3317,110 @@ mod tests {
         );
         reader.close().unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn health_reads_through_the_attached_latest_report_index_when_it_exists() {
+        // The read through the health collection's attached rank9 archive and
+        // latest-report index. The frame must
+        // come from them (a fall back to the full decode would also give the
+        // right reports, only slowly, which is how this would regress), agree
+        // with the full projection, and write nothing.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("indexed-health.pile");
+        std::fs::File::create(&path).unwrap();
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
+        let authority = signer.verifying_key();
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(authority),
+            AdmissionPolicy::direct(authority),
+        );
+        let mut writer = crate::cli::pile::open_refreshed_with(&path, Some(authority)).unwrap();
+        let health: Collection<SimpleArchive> =
+            writer.collection("swarm-health", policy).unwrap();
+        let session = genid();
+        let nodes = [genid(), genid()];
+        let mut all = TribleSet::new();
+        let mut report = |writer: &mut Pile, node: &ExclusiveId, seconds: f64| {
+            let id = genid();
+            let at = hifitime::Epoch::from_tai_seconds(seconds);
+            let facts = entity! { &id @
+                metadata::tag: &health_record::KIND_REPORT,
+                health_record::attrs::node: node,
+                health_record::attrs::session: &session,
+                metadata::created_at: (at, at).try_to_inline().unwrap(),
+            };
+            all += facts.facts().clone();
+            writer.commit(health, &signer, facts).unwrap();
+        };
+        for seconds in [90.0, 95.0, 100.0] {
+            for node in &nodes {
+                report(&mut writer, node, seconds);
+            }
+        }
+        let succinct = writer.attach::<SuccinctArchiveBlob>(health, ()).unwrap();
+        let facts = writer
+            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(health, succinct)
+            .unwrap();
+        let latest = writer
+            .attach::<LwwRegisterBlob>(
+                health,
+                (health_record::attrs::node.id(), metadata::created_at.id()),
+            )
+            .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                drop(writer.maintain_attached(succinct, &signer).await.unwrap());
+                drop(writer.maintain_attached(facts, &signer).await.unwrap());
+                drop(writer.maintain_attached(latest, &signer).await.unwrap());
+            });
+        // Written after the upkeep: no MAP reaches it, so the read takes it raw.
+        report(&mut writer, &nodes[0], 104.0);
+        writer.close().unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let options = Options {
+            pile: path.clone(),
+            key: None,
+            telemetry: vec![],
+            max_age: Duration::from_secs(30),
+            interval: Duration::from_secs(1),
+            once: true,
+            gui: false,
+            lattice: false,
+            focus: None,
+            capture: None,
+            health_collection: Some(health.handle()),
+        };
+        let mut reader = Reader::open_as(&options, Some(authority)).unwrap();
+        let now_ns = 106_000_000_000;
+        let frame = reader.sample_at(now_ns).unwrap();
+        let source = reader.health.as_ref().unwrap();
+        assert!(source.indexed.is_some(), "read through the attachments");
+        assert!(!source.unindexed);
+        assert!(
+            !frame
+                .warnings
+                .iter()
+                .any(|warning| warning.starts_with("Health read in full")),
+            "{:?}",
+            frame.warnings
+        );
+        assert_eq!(frame.health.len(), 2);
+        assert_eq!(
+            frame.health,
+            dashboard::observe_health(&all, now_ns, options.max_age)
+        );
+        let newest = frame
+            .health
+            .iter()
+            .find(|observer| observer.node == *nodes[0])
+            .unwrap();
+        assert_eq!(newest.created_ns, 104_000_000_000);
+        reader.close().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before, "the read wrote nothing");
     }
 
     #[test]
@@ -3187,7 +3472,7 @@ mod tests {
         reader.sample_at(100_000_000_000).unwrap();
         reader.sample_at(101_000_000_000).unwrap();
         assert_eq!(reader.projection_runs, 1);
-        reader.health = Some(SelectedSource::new(health.handle()));
+        reader.health = Some(HealthSource::new(health.handle()));
         for expected in 2..=3 {
             let frame = reader.sample_at(102_000_000_000).unwrap();
             assert!(frame.warnings.iter().any(|warning| warning
