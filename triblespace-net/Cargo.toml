@@ -36,6 +36,7 @@ tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 tracing = "0.1"
 hifitime = "4.1.2"
+libc = "0.2"
 
 [dev-dependencies]
 # `test-utils` exposes `iroh::test_utils::test_transport::TestNetwork`,

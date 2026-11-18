@@ -2051,8 +2051,13 @@ COMMITs. Reporting never creates a descriptor, key, grant, derived index or
 replication selection. To replicate these samples the operator separately
 selects their collection with `trible pile net select`.
 
-The producer attempts an ordinary signed append every sixty seconds at the
-existing sync-loop boundary. Five subjects distinguish the measurements:
+The producer is `triblespace_net::telemetry::sync::Publisher`, which native
+applications use too. `Publisher::open(store, signer, destination, worker)`
+checks the destination and appends nothing. `reconciled` accounts each returned
+reconcile tick, and `publish` appends one sample per subject. The cadence
+belongs to the caller: custody attempts an ordinary signed append every sixty
+seconds (`health_record::REPORT_EVERY`) at the existing sync-loop boundary.
+Five subjects distinguish the measurements:
 
 - `hydration`: successful verified reconciler puts and their payload bytes;
   one landing shared by a WANT and a selected root counts once. Blobs a

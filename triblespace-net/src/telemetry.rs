@@ -15,7 +15,9 @@
 //! descendants or every node in a globally enumerable colony.
 //!
 //! Producers use `entity!` directly; there is no catalogue or parallel writer
-//! state machine. All IDs below were minted with `trible genid` on 2026-09-16.
+//! state machine. The sync producer, [`sync::Publisher`], is one such
+//! producer: session counters and five subjects, shared by custody and native
+//! applications. All IDs below were minted with `trible genid` on 2026-09-16.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -30,6 +32,11 @@ use triblespace_core::repo::BlobStoreGet;
 
 use crate::dashboard::{CountMetric, Freshness};
 use crate::health_record;
+
+mod process;
+pub mod sync;
+
+pub use process::process_cpu_ns;
 
 /// A label as stored: the content handle of its `UTF8String` blob.
 type TextHandle = Inline<inlineencodings::Handle<UTF8String>>;

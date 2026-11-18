@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `telemetry::sync::Publisher` is the sync producer custody used privately:
+  open it on an existing source collection with a signer and worker label,
+  account reconcile ticks with `reconciled`, and append one sample per subject
+  with `publish` at the caller's cadence. Records and errors are unchanged.
+  `telemetry::process_cpu_ns` moved here from the trible crate with it.
+
 - A delayed connection close cancels only walks on that connection. Walks,
   queued grant requests and peer accounting on a replacement survive. Prefix
   agreement is reused only on the connection that confirmed it, so a restarted

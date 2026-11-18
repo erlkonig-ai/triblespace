@@ -1,17 +1,11 @@
-//! Optional aggregate publication at the existing sync-loop boundary.
-//! No inventory, acquisition, new subscription or implicit flush lives here.
-
-use std::time::{Duration, Instant};
+//! Custody's wiring of the sync producer, [`Publisher`]: the flags and the
+//! destination handle. The producer itself lives in
+//! `triblespace_net::telemetry::sync`, shared with native applications.
 
 use anyhow::{anyhow, Result};
 use ed25519_dalek::SigningKey;
-use triblespace_core::collection::{descriptor, Collection, CollectionStoreExt};
-use triblespace_core::metadata;
-use triblespace_core::prelude::*;
-use triblespace_net::health::HealthSnapshot;
-use triblespace_net::health_record as h;
-use triblespace_net::reconcile::ReconcileStats;
-use triblespace_net::telemetry as t;
+
+use triblespace_net::telemetry::sync::Publisher;
 
 use super::Custody;
 
@@ -26,13 +20,38 @@ pub(crate) struct Options {
     telemetry_worker: String,
 }
 
+/// Open custody's producer when `--telemetry-collection` is given.
+pub(super) fn open(
+    pile: &mut Custody,
+    signer: &SigningKey,
+    options: Options,
+) -> Result<Option<Publisher>> {
+    let Some(handle) = options.telemetry_collection else {
+        return Ok(None);
+    };
+    let handle = super::parse_collection(&handle)
+        .map_err(|_| anyhow!("telemetry destination is not a collection handle"))?;
+    Ok(Some(Publisher::open(
+        pile,
+        signer,
+        handle,
+        &options.telemetry_worker,
+    )?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
     use ed25519_dalek::VerifyingKey;
-    use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt};
-    use triblespace_net::dashboard::CountMetric;
+    use std::time::Duration;
+    use triblespace_core::collection::{
+        AdmissionPolicy, Collection, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
+    };
+    use triblespace_core::metadata;
+    use triblespace_core::prelude::*;
+    use triblespace_net::health::HealthSnapshot;
+    use triblespace_net::telemetry as t;
 
     fn fixture() -> (
         tempfile::TempDir,
@@ -112,7 +131,7 @@ mod tests {
         let path = directory.path().join("telemetry.pile");
         let before = std::fs::read(&path).unwrap();
         let mut pile = super::super::open_custody(&path).unwrap();
-        assert!(Publisher::open(
+        assert!(open(
             &mut pile,
             &signer,
             Options {
@@ -123,9 +142,7 @@ mod tests {
         .unwrap()
         .is_none());
         let other = SigningKey::from_bytes(&[9; 32]);
-        let error = Publisher::open(&mut pile, &other, options(collection))
-            .err()
-            .unwrap();
+        let error = open(&mut pile, &other, options(collection)).err().unwrap();
         assert_eq!(
             error.to_string(),
             "telemetry reporting key is not admitted by the destination"
@@ -136,7 +153,7 @@ mod tests {
         .get_handle();
         let mut unknown = options(collection);
         unknown.telemetry_collection = Some(hex::encode(missing.raw));
-        let error = Publisher::open(&mut pile, &signer, unknown).err().unwrap();
+        let error = open(&mut pile, &signer, unknown).err().unwrap();
         assert_eq!(
             error.to_string(),
             "telemetry destination is not a readable source collection"
@@ -163,7 +180,7 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         let node = signer.verifying_key();
-        let publisher = Publisher::open(&mut pile, &signer, options(collection))
+        let publisher = open(&mut pile, &signer, options(collection))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -274,9 +291,7 @@ mod tests {
             .writer_is_admitted(&snapshot, signer.verifying_key())
             .unwrap());
         let before = snapshot.records().unwrap().count();
-        let error = Publisher::open(&mut pile, &signer, options(derived))
-            .err()
-            .unwrap();
+        let error = open(&mut pile, &signer, options(derived)).err().unwrap();
         assert_eq!(
             error.to_string(),
             "telemetry destination must be a source collection"
@@ -299,356 +314,5 @@ mod tests {
             .unwrap()
             .is_empty());
         pile.close().unwrap();
-    }
-
-    #[test]
-    fn samples_keep_unknowns_sessions_and_successful_landing_counters_distinct() {
-        let (_directory, mut pile, collection, signer) = fixture();
-        let mut publisher = Publisher::open(&mut pile, &signer, options(collection))
-            .unwrap()
-            .unwrap();
-        let mut health = health(signer.verifying_key());
-        let now = triblespace_core::clock::epoch_now();
-        let first = publisher
-            .sample(&health, now, Duration::from_secs(1), None)
-            .unwrap();
-        let before = t::observe(
-            first.facts(),
-            &triblespace_core::repo::SnapshotSource::snapshot(&mut first.blobs().clone()).unwrap(),
-            now.to_tai_duration().total_nanoseconds(),
-            Duration::from_secs(180),
-        );
-        let hydration = before
-            .iter()
-            .find(|report| report.role == "hydration")
-            .unwrap();
-        assert_eq!(
-            hydration
-                .metrics
-                .iter()
-                .find(|value| value.metric == t::Metric::Queued)
-                .unwrap()
-                .value,
-            CountMetric::Absent
-        );
-        let serve = before.iter().find(|report| report.role == "serve").unwrap();
-        assert_eq!(
-            serve
-                .metrics
-                .iter()
-                .find(|value| value.metric == t::Metric::Active)
-                .unwrap()
-                .value,
-            CountMetric::Absent
-        );
-        assert!(before.iter().all(|report| report
-            .metrics
-            .iter()
-            .find(|value| value.metric == t::Metric::CpuNs)
-            .unwrap()
-            .value
-            == CountMetric::Absent));
-
-        publisher.reconciled(
-            &ReconcileStats {
-                landed: 2,
-                received_bytes: 223,
-                pending_blobs: Some(0),
-                ..Default::default()
-            },
-            Duration::from_millis(20),
-        );
-        health.observed_at = Some(triblespace_core::clock::mono_now());
-        health.blob_serving.completed = 1;
-        health.blob_serving.sent_bytes = 223;
-        health.blob_serving.in_flight = 2;
-        let later = now + hifitime::Duration::from_seconds(1.0);
-        let second = publisher
-            .sample(&health, later, Duration::from_secs(2), Some(500_000_000))
-            .unwrap();
-        let mut joined = first;
-        joined += second;
-        let reports = t::observe(
-            joined.facts(),
-            &triblespace_core::repo::SnapshotSource::snapshot(&mut joined.blobs().clone()).unwrap(),
-            later.to_tai_duration().total_nanoseconds(),
-            Duration::from_secs(180),
-        );
-        let hydration = reports
-            .iter()
-            .find(|report| report.role == "hydration")
-            .unwrap();
-        assert_eq!(
-            hydration
-                .metrics
-                .iter()
-                .find(|value| value.metric == t::Metric::Queued)
-                .unwrap()
-                .value,
-            CountMetric::Value(0)
-        );
-        let received = hydration
-            .metrics
-            .iter()
-            .find(|value| value.metric == t::Metric::ReceivedBytes)
-            .unwrap();
-        assert_eq!(received.value, CountMetric::Value(223));
-        assert_eq!(received.per_second, Some(223.0));
-        let serve = reports
-            .iter()
-            .find(|report| report.role == "serve")
-            .unwrap();
-        assert_eq!(
-            serve
-                .metrics
-                .iter()
-                .find(|value| value.metric == t::Metric::Active)
-                .unwrap()
-                .value,
-            CountMetric::Value(2)
-        );
-        assert_eq!(
-            reports
-                .iter()
-                .filter(|report| report
-                    .metrics
-                    .iter()
-                    .any(|value| value.metric == t::Metric::CpuNs
-                        && value.value == CountMetric::Value(500_000_000)))
-                .map(|report| report.role.as_str())
-                .collect::<Vec<_>>(),
-            ["process"]
-        );
-
-        publisher.reconciled(&ReconcileStats::default(), Duration::from_millis(5));
-        let failed = publisher
-            .sample(&health, later, Duration::from_secs(3), None)
-            .unwrap();
-        let reports = t::observe(
-            failed.facts(),
-            &triblespace_core::repo::SnapshotSource::snapshot(&mut failed.blobs().clone()).unwrap(),
-            later.to_tai_duration().total_nanoseconds(),
-            Duration::from_secs(180),
-        );
-        let hydration = reports
-            .iter()
-            .find(|report| report.role == "hydration")
-            .unwrap();
-        assert_eq!(
-            hydration
-                .metrics
-                .iter()
-                .find(|value| value.metric == t::Metric::Queued)
-                .unwrap()
-                .value,
-            CountMetric::Absent
-        );
-        assert_eq!(
-            hydration
-                .metrics
-                .iter()
-                .find(|value| value.metric == t::Metric::Completed)
-                .unwrap()
-                .value,
-            CountMetric::Value(2)
-        );
-        assert_eq!(
-            hydration
-                .metrics
-                .iter()
-                .find(|value| value.metric == t::Metric::ReceivedBytes)
-                .unwrap()
-                .value,
-            CountMetric::Value(223)
-        );
-        publisher.session = ufoid();
-        let restarted = later + hifitime::Duration::from_seconds(1.0);
-        let fresh_session = publisher
-            .sample(&health, restarted, Duration::from_secs(1), None)
-            .unwrap();
-        let mut joined = joined;
-        joined += fresh_session;
-        assert!(t::observe(
-            joined.facts(),
-            &triblespace_core::repo::SnapshotSource::snapshot(&mut joined.blobs().clone()).unwrap(),
-            restarted.to_tai_duration().total_nanoseconds(),
-            Duration::from_secs(180)
-        )
-        .iter()
-        .all(|report| report
-            .metrics
-            .iter()
-            .all(|value| value.per_second.is_none())));
-        pile.close().unwrap();
-    }
-}
-
-pub(super) struct Publisher {
-    collection: Collection<blobencodings::SimpleArchive>,
-    signer: SigningKey,
-    session: ExclusiveId,
-    started: Instant,
-    subjects: [Fragment; 5],
-    landed: u128,
-    received_bytes: u128,
-    reconcile_work_ns: u128,
-    pending_blobs: Option<u64>,
-}
-
-impl Publisher {
-    pub(super) fn open(
-        pile: &mut Custody,
-        signer: &SigningKey,
-        options: Options,
-    ) -> Result<Option<Self>> {
-        let Some(handle) = options.telemetry_collection else {
-            return Ok(None);
-        };
-        let node = signer.verifying_key();
-        let handle = super::parse_collection(&handle)
-            .map_err(|_| anyhow!("telemetry destination is not a collection handle"))?;
-        let worker = options.telemetry_worker.as_str();
-        if options.telemetry_worker.is_empty()
-            || options.telemetry_worker.chars().any(char::is_control)
-        {
-            return Err(anyhow!(
-                "telemetry worker label must be nonempty printable text"
-            ));
-        }
-        // Opening and checking the selected destination is a read. There is
-        // deliberately no collection(), derive(), grant or maintain fallback.
-        let snapshot = pile
-            .snapshot()
-            .map_err(|_| anyhow!("telemetry destination observation failed"))?;
-        let collection = Collection::<blobencodings::SimpleArchive>::open(&snapshot, handle)
-            .map_err(|_| anyhow!("telemetry destination is not a readable source collection"))?;
-        let facts: TribleSet = snapshot
-            .get(handle)
-            .map_err(|_| anyhow!("telemetry destination descriptor is unavailable"))?;
-        if descriptor::source(&facts)
-            .map_err(|_| anyhow!("telemetry destination lineage is not readable"))?
-            .is_some()
-        {
-            return Err(anyhow!("telemetry destination must be a source collection"));
-        }
-        if !collection
-            .writer_is_admitted(&snapshot, signer.verifying_key())
-            .map_err(|_| anyhow!("telemetry writer admission could not be observed"))?
-        {
-            return Err(anyhow!(
-                "telemetry reporting key is not admitted by the destination"
-            ));
-        }
-        Ok(Some(Self {
-            collection,
-            signer: signer.clone(),
-            session: ufoid(),
-            started: Instant::now(),
-            subjects: ["hydration", "serve", "repair", "publication", "process"].map(|role| {
-                entity! {
-                    h::attrs::endpoint: node,
-                    t::attrs::worker: worker,
-                    t::attrs::role: role,
-                }
-            }),
-            landed: 0,
-            received_bytes: 0,
-            reconcile_work_ns: 0,
-            pending_blobs: None,
-        }))
-    }
-
-    pub(super) fn reconciled(&mut self, stats: &ReconcileStats, elapsed: Duration) {
-        self.landed += stats.landed as u128;
-        self.received_bytes += u128::from(stats.received_bytes);
-        self.reconcile_work_ns += elapsed.as_nanos();
-        self.pending_blobs = stats.pending_blobs.map(|count| count as u64);
-    }
-
-    fn sample(
-        &self,
-        health: &HealthSnapshot,
-        now: hifitime::Epoch,
-        elapsed: Duration,
-        cpu_ns: Option<u128>,
-    ) -> Result<Fragment> {
-        let created: Inline<inlineencodings::NsTAIInterval> = (now, now)
-            .try_to_inline()
-            .map_err(|_| anyhow!("telemetry sample timestamp cannot be encoded"))?;
-        let elapsed_ns = elapsed.as_nanos();
-        let live = health.is_fresh(triblespace_core::clock::mono_now(), h::HOST_MAX_AGE);
-        let serving = &health.blob_serving;
-        let publication = &health.publication;
-        let mut facts = entity! {
-            metadata::tag: &t::KIND_SAMPLE,
-            t::attrs::subject*: self.subjects[0].clone(),
-            h::attrs::session: &self.session,
-            metadata::created_at: created,
-            t::attrs::elapsed_ns: elapsed_ns,
-            t::attrs::completed: self.landed,
-            t::attrs::received_bytes: self.received_bytes,
-            t::attrs::work_ns: self.reconcile_work_ns,
-            t::attrs::queued?: self.pending_blobs,
-        };
-        // No hydration active/failed estimate: sampling does not run inside an
-        // awaited tick, and an unavailable speculative word is not a known
-        // failed blob. Capacity and attempts are not those measurements.
-        facts += entity! {
-            metadata::tag: &t::KIND_SAMPLE,
-            t::attrs::subject*: self.subjects[1].clone(),
-            h::attrs::session: &self.session,
-            metadata::created_at: created,
-            t::attrs::elapsed_ns: elapsed_ns,
-            t::attrs::active?: live.then_some(serving.in_flight),
-            t::attrs::completed?: live.then_some(serving.completed),
-            t::attrs::failed?: live.then_some(serving.failed),
-            t::attrs::sent_bytes?: live.then_some(serving.sent_bytes),
-            t::attrs::work_ns?: live.then_some(serving.work_ns),
-        };
-        facts += entity! {
-            metadata::tag: &t::KIND_SAMPLE,
-            t::attrs::subject*: self.subjects[2].clone(),
-            h::attrs::session: &self.session,
-            metadata::created_at: created,
-            t::attrs::elapsed_ns: elapsed_ns,
-            // Host health records the ends of pushes and receives, not the
-            // ones in flight, so the repair subject's active count stays
-            // absent rather than estimated.
-            t::attrs::active?: None::<u64>,
-        };
-        facts += entity! {
-            metadata::tag: &t::KIND_SAMPLE,
-            t::attrs::subject*: self.subjects[3].clone(),
-            h::attrs::session: &self.session,
-            metadata::created_at: created,
-            t::attrs::elapsed_ns: elapsed_ns,
-            t::attrs::active?: live.then_some(publication.in_flight as u64),
-            t::attrs::completed?: live.then_some(publication.acknowledged),
-            t::attrs::failed?: live.then_some(publication.rejected.saturating_add(publication.unavailable)),
-        };
-        facts += entity! {
-            metadata::tag: &t::KIND_SAMPLE,
-            t::attrs::subject*: self.subjects[4].clone(),
-            h::attrs::session: &self.session,
-            metadata::created_at: created,
-            t::attrs::elapsed_ns: elapsed_ns,
-            t::attrs::cpu_ns?: cpu_ns,
-            t::attrs::parallel_compiled: triblespace_core::PARALLEL_COMPILED,
-        };
-        Ok(facts)
-    }
-
-    pub(super) fn publish(&self, pile: &mut Custody, health: &HealthSnapshot) -> Result<()> {
-        let facts = self.sample(
-            health,
-            triblespace_core::clock::epoch_now(),
-            self.started.elapsed(),
-            crate::cli::util::process_cpu_ns(),
-        )?;
-        // Discard backend cause chains at this reporting boundary. An error
-        // may include a read capability or a private path, never telemetry.
-        pile.commit(self.collection, &self.signer, facts)
-            .map_err(|_| anyhow!("telemetry append failed"))?;
-        Ok(())
     }
 }

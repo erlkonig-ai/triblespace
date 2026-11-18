@@ -601,7 +601,7 @@ fn run_sync(
         }
     };
     let mut selected = selected_collections(&mut pile, key.verifying_key())?;
-    let mut telemetry = telemetry::Publisher::open(&mut pile, &key, telemetry_options)?;
+    let mut telemetry = telemetry::open(&mut pile, &key, telemetry_options)?;
     let mut recorder = Recorder::new(key.verifying_key());
     let health_collection = if health || health_collection_value.is_some() {
         let collection = open_health_collection(
