@@ -1004,7 +1004,7 @@ fn render_members(
     }
     if let Some(count) = members.too_large {
         ui.small(format!(
-            "{count} members: more than can be drawn legibly. A truncated lattice              would hide the joins that ran through the dropped members, so none is drawn."
+            "{count} members: more than can be drawn legibly. A truncated lattice would hide the joins that ran through the dropped members, so none is drawn."
         ));
         return;
     }
