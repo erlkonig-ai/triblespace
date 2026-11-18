@@ -43,11 +43,21 @@ pub(super) struct Options {
     pub once: bool,
     pub gui: bool,
     pub lattice: bool,
+    /// Collection whose member lattice opens selected (`--focus`).
+    pub focus: Option<[u8; 32]>,
+    /// Render one observation's cards into this directory and exit.
+    pub capture: Option<PathBuf>,
 }
 
 pub(super) fn run(mut options: Options) -> Result<()> {
     if options.interval.is_zero() {
         bail!("dashboard observation interval must be positive");
+    }
+    if let Some(directory) = options.capture.clone() {
+        #[cfg(feature = "dashboard-gui")]
+        return gui::capture(options, &directory);
+        #[cfg(not(feature = "dashboard-gui"))]
+        bail!("this trible was built without the dashboard-gui feature");
     }
     if options.gui {
         #[cfg(feature = "dashboard-gui")]
@@ -256,7 +266,7 @@ impl Reader {
             setup_warnings,
             max_age: options.max_age,
             lattice: options.lattice,
-            focus: None,
+            focus: options.focus,
             retained: None,
             #[cfg(test)]
             projection_runs: 0,
@@ -2693,6 +2703,8 @@ mod tests {
             once: true,
             gui: false,
             lattice: false,
+            focus: None,
+            capture: None,
         };
         // Observed as no key; the refusal of a named key that does not load
         // is `disposable_reader_does_not_append_or_create_a_pile`'s.
@@ -2779,6 +2791,8 @@ mod tests {
             once: true,
             gui: false,
             lattice: false,
+            focus: None,
+            capture: None,
         };
         let failure = match Reader::open(&options) {
             Err(error) => error,
@@ -2844,6 +2858,8 @@ mod tests {
             once: true,
             gui: false,
             lattice: false,
+            focus: None,
+            capture: None,
         };
         // Observed as no key; the refusal of a named key that does not load
         // is `disposable_reader_does_not_append_or_create_a_pile`'s.
@@ -2951,6 +2967,8 @@ mod tests {
             once: true,
             gui: false,
             lattice: false,
+            focus: None,
+            capture: None,
         };
         // Observed as no key; the refusal of a named key that does not load
         // is `disposable_reader_does_not_append_or_create_a_pile`'s.
@@ -3038,6 +3056,8 @@ mod tests {
             once: true,
             gui: false,
             lattice: false,
+            focus: None,
+            capture: None,
         };
         // Observed as no key; the refusal of a named key that does not load
         // is `disposable_reader_does_not_append_or_create_a_pile`'s.
@@ -3112,6 +3132,8 @@ mod tests {
             once: true,
             gui: false,
             lattice: false,
+            focus: None,
+            capture: None,
         };
         let before = std::fs::read(&path).unwrap();
         // A key named on the command line must load: a mistyped one is
@@ -3160,6 +3182,8 @@ mod tests {
             once: true,
             gui: false,
             lattice: false,
+            focus: None,
+            capture: None,
         };
         let mut reader = Reader::open(&options).unwrap();
         let host = reader

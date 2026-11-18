@@ -20,7 +20,6 @@ use std::path::Path;
 use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 use triblespace_core::prelude::*;
 use triblespace_core::{metadata, signing_key_file};
-use GORBIE::{CaptureOptions, HeadlessTheme};
 
 const MIB: u128 = 1024 * 1024;
 const SECOND: u128 = 1_000_000_000;
@@ -259,6 +258,8 @@ fn generated_frame(directory: &Path) -> Result<(Frame, i128)> {
         once: true,
         gui: false,
         lattice: true,
+        focus: None,
+        capture: None,
     })?;
     // Stand in for a viewer's click, so the capture also exercises the member
     // lattice the renderer requests through the sampler.
@@ -450,61 +451,40 @@ fn capture_generated_colony_dashboard() -> Result<()> {
     let mut encoded_bytes = 0_usize;
     let mut rendered_height = 0_usize;
     let mut card_heights: Vec<usize> = Vec::new();
-    let capture = NotebookConfig::new("Generated colony dashboard fixture")
-        .with_headless_theme(HeadlessTheme::Dark)
-        .capture(
-            CaptureOptions {
-                pixels_per_point: 1.0,
-                settle_timeout: Duration::from_secs(2),
-            },
-            move |notebook| {
-                // The capture exercises the LIVE card graph over a fixed
-                // observation, rather than a second arrangement that merely
-                // resembles it: only the pull and the publish differ.
-                let frame = frame.clone();
-                super::compose(
-                    notebook,
-                    move || (Some(Ok(frame.clone())), None),
-                    |_chosen| {},
-                    selected,
-                );
-                notebook.settled();
-            },
-            |image| {
-                // Bound retained evidence, not wgpu's allocations before emit.
-                if images >= 16
-                    || image.bytes.len() > 8 * 1024 * 1024
-                    || encoded_bytes + image.bytes.len() > 32 * 1024 * 1024
-                {
-                    return Err(
-                        io::Error::other("generated capture exceeded its output budget").into(),
-                    );
-                }
-                assert!(image.width > 0 && image.height > 0);
-                assert!(image.tile_count > 0 && image.tile_index < image.tile_count);
-                assert!(image.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
-                let name = image.filename();
-                OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(artifacts.join(&name))?
-                    .write_all(&image.bytes)?;
-                use std::fmt::Write as _;
-                writeln!(
-                    manifest,
-                    "{name}: {}x{}, {} bytes, BLAKE3 {}",
-                    image.width,
-                    image.height,
-                    image.bytes.len(),
-                    blake3::hash(&image.bytes)
-                )?;
-                images += 1;
-                encoded_bytes += image.bytes.len();
-                rendered_height += image.height as usize;
-                card_heights.push(image.height as usize);
-                Ok(())
-            },
-        );
+    // The command's own capture path, so this fixture draws what `--capture`
+    // draws: the live card graph over a fixed observation.
+    let capture = super::capture_frame(frame, selected, |image| {
+        // Bound retained evidence, not wgpu's allocations before emit.
+        if images >= 16
+            || image.bytes.len() > 8 * 1024 * 1024
+            || encoded_bytes + image.bytes.len() > 32 * 1024 * 1024
+        {
+            return Err(io::Error::other("generated capture exceeded its output budget").into());
+        }
+        assert!(image.width > 0 && image.height > 0);
+        assert!(image.tile_count > 0 && image.tile_index < image.tile_count);
+        assert!(image.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let name = image.filename();
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(artifacts.join(&name))?
+            .write_all(&image.bytes)?;
+        use std::fmt::Write as _;
+        writeln!(
+            manifest,
+            "{name}: {}x{}, {} bytes, BLAKE3 {}",
+            image.width,
+            image.height,
+            image.bytes.len(),
+            blake3::hash(&image.bytes)
+        )?;
+        images += 1;
+        encoded_bytes += image.bytes.len();
+        rendered_height += image.height as usize;
+        card_heights.push(image.height as usize);
+        Ok(())
+    });
     let after = fs::read(&pile_path)?;
     assert_eq!(
         after, before,

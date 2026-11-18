@@ -4,7 +4,9 @@
 use super::*;
 use anyhow::anyhow;
 use GORBIE::cards::DEFAULT_CARD_PADDING;
-use GORBIE::{CardCtx, NotebookConfig};
+use GORBIE::{
+    CaptureOptions, CaptureResult, CapturedPng, CardCtx, HeadlessTheme, NotebookConfig,
+};
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "gui_capture_tests.rs"]
@@ -253,6 +255,7 @@ fn compose<P, S>(
 }
 
 pub(super) fn run(options: Options) -> Result<()> {
+    let focus = options.focus;
     let mut sampler = Sampler::start(options)?;
     let shared = Arc::clone(&sampler.shared);
     let result = NotebookConfig::new("TribleSpace colony").run(move |notebook| {
@@ -290,13 +293,94 @@ pub(super) fn run(options: Options) -> Result<()> {
                     publishing.1.notify_all();
                 }
             },
-            // A live dashboard opens on nothing selected: the reader picks.
-            None,
+            // A live dashboard opens on `--focus`, else on nothing: the
+            // reader picks.
+            focus,
         );
     });
     let closed = sampler.finish();
     result.map_err(|error| anyhow!("open colony notebook: {error}"))?;
     closed
+}
+
+/// Render one fixed observation through the LIVE card graph, headlessly.
+///
+/// Only the pull and the publish differ from [`run`]: the pull always answers
+/// `frame`, and a selection goes nowhere because nothing samples again. `emit`
+/// receives each card's PNG in card order; its first error stops the capture.
+/// This is the one capture path, shared by `--capture` and the generated-pile
+/// visual fixture, so the fixture cannot drift from what the command draws.
+///
+/// It initializes wgpu with GORBIE's adapter choice (`Instance::default()`,
+/// high performance), which on a machine with a GPU is the GPU unless the
+/// caller restricts the Vulkan ICD and EGL vendor to a software driver.
+fn capture_frame(
+    frame: Frame,
+    selected: Option<[u8; 32]>,
+    emit: impl FnMut(CapturedPng) -> CaptureResult<()>,
+) -> CaptureResult<()> {
+    NotebookConfig::new("TribleSpace colony")
+        .with_headless_theme(HeadlessTheme::Dark)
+        .capture(
+            CaptureOptions {
+                pixels_per_point: 1.0,
+                settle_timeout: Duration::from_secs(2),
+            },
+            move |notebook| {
+                let frame = frame.clone();
+                compose(
+                    notebook,
+                    move || (Some(Ok(frame.clone())), None),
+                    |_chosen| {},
+                    selected,
+                );
+                notebook.settled();
+            },
+            emit,
+        )
+}
+
+/// `--capture DIR`: take ONE observation through the ordinary reader, close
+/// it, then write each card's PNG and the terminal render of the same frame
+/// into `DIR`. Files are created new, never overwritten, so a second capture
+/// into the same directory fails instead of mixing two observations.
+pub(super) fn capture(options: Options, directory: &std::path::Path) -> Result<()> {
+    use std::io::Write as _;
+    anyhow::ensure!(
+        directory.is_dir(),
+        "capture directory {} must already exist",
+        directory.display()
+    );
+    let mut reader =
+        Reader::open(&options).map_err(|error| anyhow!("open reader: {}", error.message()))?;
+    let sampled = reader.sample();
+    let closed = reader.close();
+    let frame = sampled.map_err(|error| anyhow!("observe: {}", error.message()))?;
+    closed.map_err(|error| anyhow!("close reader: {}", error.message()))?;
+    let selected = frame.members.as_ref().map(|members| members.collection);
+    let create = |name: &str| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(directory.join(name))
+    };
+    create("terminal.txt")?.write_all(render_terminal(&frame).as_bytes())?;
+    let mut manifest = String::new();
+    let captured = capture_frame(frame, selected, |image| {
+        let name = image.filename();
+        create(&name)?.write_all(&image.bytes)?;
+        manifest.push_str(&format!(
+            "{name}: {}x{}, {} bytes\n",
+            image.width,
+            image.height,
+            image.bytes.len()
+        ));
+        Ok(())
+    });
+    create("cards.txt")?.write_all(manifest.as_bytes())?;
+    captured.map_err(|error| anyhow!("capture dashboard: {error}"))?;
+    eprint!("{manifest}");
+    Ok(())
 }
 
 /// The dashboard type scale, applied per card.

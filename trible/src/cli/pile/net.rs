@@ -200,6 +200,16 @@ pub enum Command {
         /// a large pile, while the rest of the dashboard is cheap.
         #[arg(long)]
         lattice: bool,
+        /// Open with this collection selected, so its member lattice and the
+        /// attached collections over it are drawn. Without it a member
+        /// lattice appears only after a click in the GUI.
+        #[arg(long, value_name = "HANDLE", requires = "lattice")]
+        focus: Option<String>,
+        /// Take one observation, write each GUI card as a PNG plus the
+        /// terminal render into this existing directory, and exit. No window
+        /// is opened; wgpu still renders, on whatever adapter it is given.
+        #[arg(long, value_name = "DIR", conflicts_with_all = ["gui", "tui", "once"])]
+        capture: Option<PathBuf>,
     },
     /// Sync the collections this pile selects with peers.
     ///
@@ -280,6 +290,8 @@ pub fn run(command: Command) -> Result<()> {
             tui: _,
             gui,
             lattice,
+            focus,
+            capture,
         } => dashboard::run(dashboard::Options {
             pile,
             key,
@@ -292,6 +304,10 @@ pub fn run(command: Command) -> Result<()> {
             once,
             gui,
             lattice,
+            focus: focus
+                .map(|value| parse_collection(&value).map(|handle| handle.raw))
+                .transpose()?,
+            capture,
         }),
         Command::Sync {
             pile,
@@ -1585,6 +1601,28 @@ mod tests {
         );
         assert!(
             Command::try_parse_from(["net", "dashboard", "test.pile", "--gui", "--once"]).is_err()
+        );
+        assert!(matches!(
+            Command::try_parse_from(["net", "dashboard", "test.pile", "--capture", "out"])
+                .unwrap(),
+            Command::Dashboard {
+                capture: Some(_),
+                gui: false,
+                ..
+            }
+        ));
+        assert!(Command::try_parse_from([
+            "net",
+            "dashboard",
+            "test.pile",
+            "--capture",
+            "out",
+            "--gui"
+        ])
+        .is_err());
+        // A focus draws a member lattice, which only the lattice reader projects.
+        assert!(
+            Command::try_parse_from(["net", "dashboard", "test.pile", "--focus", "ab"]).is_err()
         );
         // No arbitrary local-blob samples and no external renderer switch.
         assert!(
