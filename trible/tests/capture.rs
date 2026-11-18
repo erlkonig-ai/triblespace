@@ -2,10 +2,14 @@
 
 use assert_cmd::Command;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 
 #[test]
 fn bare_relative_destination_is_published_under_the_resolved_private_parent() {
     let directory = tempfile::tempdir().unwrap();
+    // Capture refuses a staging parent with group/other permissions; make the
+    // directory private regardless of the ambient umask.
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(directory.path().join("source.pile"), []).unwrap();
     let output = Command::cargo_bin("trible")
         .unwrap()

@@ -167,6 +167,14 @@ mod tests {
     use triblespace_core::repo::pile::Pile;
     use triblespace_core::repo::BlobStorePut;
 
+    /// A temporary directory that is private regardless of the ambient umask,
+    /// because capture refuses a staging parent with group/other permissions.
+    fn private_tempdir() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        directory
+    }
+
     fn append(path: &Path, text: &str) {
         if !path.exists() {
             fs::File::create(path).unwrap();
@@ -178,7 +186,7 @@ mod tests {
 
     #[test]
     fn receipt_and_reopened_capture_match_raw_bytes_including_duplicates() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let source = directory.path().join("source.pile");
         let into = directory.path().join("capture.pile");
         append(&source, "captured bytes");
@@ -210,7 +218,7 @@ mod tests {
 
     #[test]
     fn pinned_snapshot_copy_excludes_later_appends() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let source = directory.path().join("source.pile");
         append(&source, "before");
         let expected = fs::read(&source).unwrap();
@@ -228,7 +236,7 @@ mod tests {
 
     #[test]
     fn existing_file_hardlink_and_dangling_symlink_are_never_overwritten() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let source = directory.path().join("source.pile");
         append(&source, "unchanged");
         let expected = fs::read(&source).unwrap();
@@ -253,7 +261,7 @@ mod tests {
 
     #[test]
     fn malformed_source_creates_no_output_and_empty_source_is_valid() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let source = directory.path().join("source.pile");
         append(&source, "complete record");
         let mut malformed = fs::read(&source).unwrap();
@@ -271,7 +279,7 @@ mod tests {
 
     #[test]
     fn staging_parent_must_be_private_and_is_not_chmodded() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let source = directory.path().join("source.pile");
         append(&source, "private");
         let staging = directory.path().join("public");
@@ -284,7 +292,7 @@ mod tests {
 
     #[test]
     fn no_clobber_publication_failure_cleans_only_our_temporary() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let into = directory.path().join("capture");
         let temporary = super::super::subtract::temporary_sibling(&into, "capture").unwrap();
         fs::write(&temporary, b"ours").unwrap();
@@ -298,7 +306,7 @@ mod tests {
 
     #[test]
     fn failures_after_publication_never_remove_the_published_file() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let into = directory.path().join("capture");
         let temporary = directory.path().join("hidden");
         fs::write(&temporary, b"complete").unwrap();
@@ -323,7 +331,7 @@ mod tests {
                 Ok(())
             }
         }
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let source = directory.path().join("source.pile");
         let into = directory.path().join("capture.pile");
         append(&source, "retain on receipt failure");
