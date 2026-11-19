@@ -279,8 +279,8 @@ fn one_attached_collection_failing_leaves_the_others_upkept() {
             upkeep: Upkeep,
         ) -> Result<Realized, CollectionRealizationError> {
             if attached.handle == self.0 {
-                return Err(CollectionRealizationError::Resolution(
-                    "this one cannot be taken up".to_owned(),
+                return Err(CollectionRealizationError::resolution(
+                    "this one cannot be taken up",
                 ));
             }
             CoreRealizer

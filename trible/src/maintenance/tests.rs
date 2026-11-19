@@ -1084,7 +1084,7 @@ impl Mappings for Deferring {
             *self.due.lock().unwrap() = Some(Instant::now());
             return Box::pin(async move {
                 pile.snapshot().map_err(|error| {
-                    triblespace_core::collection::CollectionRealizationError::Resolution(format!(
+                    triblespace_core::collection::CollectionRealizationError::resolution(format!(
                         "{error:?}"
                     ))
                 })

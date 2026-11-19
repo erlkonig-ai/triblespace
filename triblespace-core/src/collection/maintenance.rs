@@ -216,7 +216,7 @@ where
             return Ok(false);
         }
         let missing = E::missing_representation_dependencies(node, snapshot)
-            .map_err(|error| CollectionRealizationError::Resolution(error.to_string()))?;
+            .map_err(CollectionRealizationError::resolution_source)?;
         if missing.is_empty() {
             cover.push((node, support.clone()));
             return Ok(true);
@@ -269,7 +269,7 @@ where
             continue;
         }
         let missing = E::missing_representation_dependencies(attachment, snapshot)
-            .map_err(|error| CollectionRealizationError::Resolution(error.to_string()))?;
+            .map_err(CollectionRealizationError::resolution_source)?;
         if missing.is_empty() {
             return Ok(Some(attachment));
         }
@@ -400,12 +400,12 @@ fn sign_merge(
     result: CollectionData,
 ) -> Result<CollectionMerge, CollectionRealizationError> {
     if !inputs.windows(2).all(|pair| pair[0].raw < pair[1].raw) {
-        return Err(CollectionRealizationError::Resolution(
-            "plan a MERGE without eight distinct canonically ordered inputs".into(),
+        return Err(CollectionRealizationError::resolution(
+            "plan a MERGE without eight distinct canonically ordered inputs",
         ));
     }
     CollectionMerge::sign(signing_key, collection, inputs, result).map_err(|error| {
-        CollectionRealizationError::Resolution(format!("plan an invalid MERGE: {error}"))
+        CollectionRealizationError::resolution_from("plan an invalid MERGE", error)
     })
 }
 
@@ -759,9 +759,10 @@ where
 {
     let (parent, attached_descriptor, parent_descriptor) = attached_lineage(snapshot, attached)?;
     let mapping = M::bind(&parent_descriptor, &attached_descriptor).map_err(|error| {
-        CollectionRealizationError::Resolution(format!(
-            "attached descriptor does not bind the requested mapping: {error}"
-        ))
+        CollectionRealizationError::resolution_from(
+            "attached descriptor does not bind the requested mapping",
+            error,
+        )
     })?;
     let siblings = mapping.siblings();
     Ok(BoundAttachment {
@@ -846,20 +847,24 @@ where
                         member: Handle::<SimpleArchive>::to_hash(collection),
                     };
                 }
-                CollectionRealizationError::Resolution(format!(
-                    "load collection descriptor {}: {error}",
-                    hex::encode_upper(collection.raw),
-                ))
+                CollectionRealizationError::resolution_from(
+                    format!(
+                        "load collection descriptor {}",
+                        hex::encode_upper(collection.raw)
+                    ),
+                    error,
+                )
             })
     };
     let attached_descriptor = load(attached.handle())?;
     super::encoding::validate_descriptor_type::<E>(&attached_descriptor).map_err(|error| {
-        CollectionRealizationError::Resolution(format!(
-            "attached descriptor has the wrong representation: {error}"
-        ))
+        CollectionRealizationError::resolution_from(
+            "attached descriptor has the wrong representation",
+            error,
+        )
     })?;
     let parents = super::descriptor::parents(attached_descriptor.facts()).map_err(|error| {
-        CollectionRealizationError::Resolution(format!("decode attached parent: {error}"))
+        CollectionRealizationError::resolution_from("decode attached parent", error)
     })?;
     // An attached read walks one parent's lattice. A descriptor naming
     // several parents is one this reader does not read; attaching never
@@ -884,12 +889,12 @@ where
     let parent_descriptor = load(parent)?;
     let parent_is_root = super::descriptor::source(parent_descriptor.facts())
         .map_err(|error| {
-            CollectionRealizationError::Resolution(format!("decode parent source: {error}"))
+            CollectionRealizationError::resolution_from("decode parent source", error)
         })?
         .is_none()
         && super::descriptor::parents(parent_descriptor.facts())
             .map_err(|error| {
-                CollectionRealizationError::Resolution(format!("decode parent kind: {error}"))
+                CollectionRealizationError::resolution_from("decode parent kind", error)
             })?
             .is_empty();
     if !parent_is_root {
@@ -899,9 +904,10 @@ where
     }
     super::encoding::validate_descriptor_type::<SimpleArchive>(&parent_descriptor).map_err(
         |error| {
-            CollectionRealizationError::Resolution(format!(
-                "attached parent is not a SimpleArchive root: {error}"
-            ))
+            CollectionRealizationError::resolution_from(
+                "attached parent is not a SimpleArchive root",
+                error,
+            )
         },
     )?;
     Ok((
@@ -1075,21 +1081,23 @@ where
         .get(&target.handle())
         .copied()
         .ok_or_else(|| {
-            CollectionRealizationError::Resolution(
-                "derived maintenance requires a derived target descriptor".to_owned(),
+            CollectionRealizationError::resolution(
+                "derived maintenance requires a derived target descriptor",
             )
         })?;
     let source_descriptor = lineage.descriptor(source);
     let target_descriptor = lineage.descriptor(target.handle());
     super::encoding::validate_descriptor_type::<M::Source>(source_descriptor).map_err(|error| {
-        CollectionRealizationError::Resolution(format!(
-            "mapping source descriptor has the wrong representation: {error}"
-        ))
+        CollectionRealizationError::resolution_from(
+            "mapping source descriptor has the wrong representation",
+            error,
+        )
     })?;
     let mapping = M::bind(source_descriptor, target_descriptor).map_err(|error| {
-        CollectionRealizationError::Resolution(format!(
-            "target descriptor does not bind the requested mapping: {error}"
-        ))
+        CollectionRealizationError::resolution_from(
+            "target descriptor does not bind the requested mapping",
+            error,
+        )
     })?;
     Ok(Bound {
         source,
@@ -1658,10 +1666,9 @@ where
     let snapshot = open(store, frontier, "open re-derivation snapshot")?;
     let bound: Bound<M> = bind(&snapshot, target)?;
     if !bound.mapping.computable_here() {
-        return Err(CollectionRealizationError::Resolution(
+        return Err(CollectionRealizationError::resolution(
             "the mapping is pinned to a class of host this one is not; re-derive on a host \
-             that can compute it"
-                .to_owned(),
+             that can compute it",
         ));
     }
     if source != bound.source {
@@ -1853,14 +1860,21 @@ mod tests {
             .verify_strict()
             .unwrap();
         inputs.swap(0, 1);
+        let structural = sign_merge(&host, collection, inputs, result).unwrap_err();
         assert!(matches!(
-            sign_merge(&host, collection, inputs, result),
-            Err(CollectionRealizationError::Resolution(_))
+            structural,
+            CollectionRealizationError::Resolution { source: None, .. }
         ));
+        // A structural refusal has no underlying failure to expose.
+        assert!(std::error::Error::source(&structural).is_none());
+        assert_eq!(
+            structural.to_string(),
+            "resolve collection: plan a MERGE without eight distinct canonically ordered inputs",
+        );
         inputs[0] = inputs[1];
         assert!(matches!(
             sign_merge(&host, collection, inputs, result),
-            Err(CollectionRealizationError::Resolution(_))
+            Err(CollectionRealizationError::Resolution { .. })
         ));
     }
 

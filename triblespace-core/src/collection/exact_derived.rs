@@ -50,8 +50,16 @@ pub enum CollectionRealizationError {
     /// The supplied support belongs to another foundation or cannot describe
     /// the requested target.
     InvalidCover(String),
-    /// Descriptor ancestry or stored equations are contradictory.
-    Resolution(String),
+    /// Descriptor ancestry or stored equations are contradictory, or a step
+    /// that reads them failed.
+    Resolution {
+        /// The whole diagnostic, including the cause's own text when there is
+        /// one.
+        reason: String,
+        /// The failure that stopped resolution, kept typed so a caller can
+        /// classify it. A purely structural contradiction has none.
+        source: Option<BoxError>,
+    },
     /// The target does not have a complete resident realization.
     IncompleteCover {
         /// Target-frontier obligations without a resident realization.
@@ -119,6 +127,34 @@ impl CollectionRealizationError {
             source: Box::new(source),
         }
     }
+
+    /// A structural contradiction, with no underlying failure.
+    pub fn resolution(reason: impl Into<String>) -> Self {
+        Self::Resolution {
+            reason: reason.into(),
+            source: None,
+        }
+    }
+
+    /// A resolution step that failed because of `source`. The reason reads
+    /// `{context}: {source}`, the text these errors have always had.
+    pub fn resolution_from(
+        context: impl fmt::Display,
+        source: impl Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::Resolution {
+            reason: format!("{context}: {source}"),
+            source: Some(Box::new(source)),
+        }
+    }
+
+    /// A resolution step whose failure is the whole reason.
+    pub(super) fn resolution_source(source: impl Error + Send + Sync + 'static) -> Self {
+        Self::Resolution {
+            reason: source.to_string(),
+            source: Some(Box::new(source)),
+        }
+    }
 }
 
 /// How many identities an error names before it starts counting instead.
@@ -151,7 +187,7 @@ impl fmt::Display for CollectionRealizationError {
         match self {
             Self::Storage { operation, source } => write!(formatter, "{operation}: {source}"),
             Self::InvalidCover(reason) => write!(formatter, "invalid exact support: {reason}"),
-            Self::Resolution(reason) => write!(formatter, "resolve collection: {reason}"),
+            Self::Resolution { reason, .. } => write!(formatter, "resolve collection: {reason}"),
             Self::IncompleteCover {
                 missing,
                 unsupported_members,
@@ -213,6 +249,9 @@ impl Error for CollectionRealizationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Storage { source, .. } => Some(source.as_ref()),
+            Self::Resolution { source, .. } => source
+                .as_ref()
+                .map(|source| source.as_ref() as &(dyn Error + 'static)),
             _ => None,
         }
     }
@@ -262,9 +301,10 @@ where
     let lineage = load_record_lineage(snapshot, target.handle())?;
     super::encoding::validate_descriptor_type::<E>(lineage.descriptor(target.handle())).map_err(
         |error| {
-            CollectionRealizationError::Resolution(format!(
-                "target descriptor has the wrong representation: {error}"
-            ))
+            CollectionRealizationError::resolution_from(
+                "target descriptor has the wrong representation",
+                error,
+            )
         },
     )?;
     Ok(lineage)
@@ -284,7 +324,7 @@ where
 
     loop {
         if !collections.insert(cursor) {
-            return Err(CollectionRealizationError::Resolution(format!(
+            return Err(CollectionRealizationError::resolution(format!(
                 "collection descriptor ancestry contains a cycle at {}",
                 hex::encode_upper(cursor.raw),
             )));
@@ -299,19 +339,25 @@ where
         }
 
         let loaded = super::api::load_collection_descriptor(snapshot, cursor).map_err(|error| {
-            CollectionRealizationError::Resolution(format!(
-                "load collection descriptor {}: {error}",
-                hex::encode_upper(cursor.raw),
-            ))
+            CollectionRealizationError::resolution_from(
+                format!(
+                    "load collection descriptor {}",
+                    hex::encode_upper(cursor.raw)
+                ),
+                error,
+            )
         })?;
         // An attached collection is no lattice: it has no carry, no leaves
         // and no merges of its own, and nothing derives from it.
         if !descriptor::parents(loaded.fragment.facts())
             .map_err(|error| {
-                CollectionRealizationError::Resolution(format!(
-                    "decode collection parent for {}: {error}",
-                    hex::encode_upper(cursor.raw),
-                ))
+                CollectionRealizationError::resolution_from(
+                    format!(
+                        "decode collection parent for {}",
+                        hex::encode_upper(cursor.raw)
+                    ),
+                    error,
+                )
             })?
             .is_empty()
         {
@@ -321,10 +367,13 @@ where
             )));
         }
         let source = descriptor::source(loaded.fragment.facts()).map_err(|error| {
-            CollectionRealizationError::Resolution(format!(
-                "decode collection source for {}: {error}",
-                hex::encode_upper(cursor.raw),
-            ))
+            CollectionRealizationError::resolution_from(
+                format!(
+                    "decode collection source for {}",
+                    hex::encode_upper(cursor.raw)
+                ),
+                error,
+            )
         })?;
         descriptors.insert(cursor, loaded.fragment);
 
@@ -339,9 +388,10 @@ where
                     .expect("root descriptor was inserted before inspection");
                 super::encoding::validate_descriptor_type::<SimpleArchive>(root).map_err(
                     |error| {
-                        CollectionRealizationError::Resolution(format!(
-                            "collection ancestry terminates in a non-SimpleArchive root: {error}"
-                        ))
+                        CollectionRealizationError::resolution_from(
+                            "collection ancestry terminates in a non-SimpleArchive root",
+                            error,
+                        )
                     },
                 )?;
                 return Ok(Lineage {

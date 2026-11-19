@@ -147,7 +147,7 @@ where
         let descriptor = super::api::load_collection_descriptor(&observed, target)
             .map_err(|error| CollectionRealizationError::storage("read view descriptor", error))?;
         let named = super::descriptor::source(descriptor.fragment.facts()).map_err(|error| {
-            CollectionRealizationError::Resolution(format!("read view source: {error}"))
+            CollectionRealizationError::resolution_from("read view source", error)
         })?;
         let source_collection = source.cover().collection();
         if named != Some(source_collection.handle()) {

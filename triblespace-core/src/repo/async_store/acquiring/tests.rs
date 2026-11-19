@@ -385,3 +385,65 @@ impl<S: crate::repo::WantRead> crate::repo::WantRead for ColdSnapshot<S> {
         self.frozen.wants()
     }
 }
+
+#[test]
+fn interrupted_descriptor_acquisition_keeps_its_typed_cause() {
+    let (mut source, _root, attached) = fixture();
+    let descriptor = hex::encode_upper(attached.handle().raw);
+    for (interruption, text) in [
+        (
+            AcquiringReadInterrupted::Cancelled,
+            "exact acquisition cancelled",
+        ),
+        (
+            AcquiringReadInterrupted::DeadlineExceeded,
+            "exact acquisition deadline exceeded",
+        ),
+    ] {
+        let control = match interruption {
+            AcquiringReadInterrupted::Cancelled => {
+                let control = AcquiringReadControl::new(None);
+                control.cancel();
+                control
+            }
+            AcquiringReadInterrupted::DeadlineExceeded => {
+                AcquiringReadControl::new(Some(std::time::Instant::now()))
+            }
+        };
+        let error = reader(cold(&mut source, attached.handle().raw))
+            .with_control(control)
+            .attached_acquiring(attached)
+            .err()
+            .unwrap();
+        // The text is the one this error always had.
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "resolve collection: load collection descriptor {descriptor}: failed to fetch \
+                 collection descriptor {descriptor}: {text}"
+            ),
+        );
+        assert!(matches!(
+            error,
+            crate::collection::CollectionRealizationError::Resolution {
+                source: Some(_),
+                ..
+            }
+        ));
+        // The cause is the exact fetch failure, and beneath it the interruption.
+        let cause = error.source().expect("a fetch failure is a typed cause");
+        let Some(crate::collection::CollectionDescriptorError::Get {
+            collection,
+            source: read,
+        }) = cause.downcast_ref::<crate::collection::CollectionDescriptorError<ReadFailure>>()
+        else {
+            panic!("unexpected cause: {cause:?}");
+        };
+        assert_eq!(*collection, attached.handle());
+        assert_eq!(
+            read.source()
+                .and_then(|interrupted| interrupted.downcast_ref::<AcquiringReadInterrupted>()),
+            Some(&interruption),
+        );
+    }
+}

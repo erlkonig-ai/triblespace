@@ -64,10 +64,10 @@ where
     let loaded = super::api::load_collection_descriptor(&observed, target.handle())
         .map_err(|error| CollectionRealizationError::storage("read target descriptor", error))?;
     super::encoding::validate_descriptor_type::<E>(&loaded.fragment)
-        .map_err(|error| CollectionRealizationError::Resolution(error.to_string()))?;
+        .map_err(CollectionRealizationError::resolution_source)?;
     let handle = target.handle();
     if !super::descriptor::parents(loaded.fragment.facts())
-        .map_err(|error| CollectionRealizationError::Resolution(error.to_string()))?
+        .map_err(CollectionRealizationError::resolution_source)?
         .is_empty()
     {
         return Err(CollectionRealizationError::InvalidCover(format!(
@@ -169,8 +169,11 @@ where
         super::maintenance::attached_lineage(&observed, attached)
     };
     let (parent, _, parent_descriptor) = lineage.map_err(|error| match error {
+        // Deliberately source-free: the MissingDependency is not this error's
+        // cause to expose. A passive read must not look pending to a caller
+        // that searches the chain for an absent blob.
         CollectionRealizationError::MissingDependency { member } if !acquire => {
-            CollectionRealizationError::Resolution(format!(
+            CollectionRealizationError::resolution(format!(
                 "attached lineage descriptor {} is not resident",
                 hex::encode_upper(member.raw),
             ))

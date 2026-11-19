@@ -97,13 +97,16 @@ pub trait Mappings: Send + Sync {
 }
 
 fn unregistered(algorithm: Id) -> CollectionRealizationError {
-    CollectionRealizationError::Resolution(format!(
+    CollectionRealizationError::resolution(format!(
         "mapping algorithm {algorithm:X} is not registered here"
     ))
 }
 
-fn resolution(what: &str, error: impl std::fmt::Display) -> CollectionRealizationError {
-    CollectionRealizationError::Resolution(format!("{what}: {error}"))
+fn resolution(
+    what: &str,
+    error: impl std::error::Error + Send + Sync + 'static,
+) -> CollectionRealizationError {
+    CollectionRealizationError::resolution_from(what, error)
 }
 
 /// No registered mappings.
@@ -282,7 +285,9 @@ where
         .map_err(|error| resolution("read derived collection descriptor", error))?;
     let source = descriptor::source(&facts)
         .map_err(|error| resolution("read derived collection source", error))?
-        .ok_or_else(|| resolution("derived collection descriptor", "names no source"))?;
+        .ok_or_else(|| {
+            CollectionRealizationError::resolution("derived collection descriptor: names no source")
+        })?;
     let source = Collection::<M::Source>::open(snapshot, source)
         .map_err(|error| resolution("open derived collection source", error))?;
     Ok((source, target))

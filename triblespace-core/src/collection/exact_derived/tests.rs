@@ -2334,7 +2334,7 @@ fn warm_reuse_keeps_representation_and_mapping_checks() {
         };
         assert!(matches!(
             wrong_representation,
-            Err(CollectionRealizationError::Resolution(reason))
+            Err(CollectionRealizationError::Resolution { reason, .. })
                 if reason.contains("target descriptor has the wrong representation"),
         ));
 
@@ -2345,7 +2345,7 @@ fn warm_reuse_keeps_representation_and_mapping_checks() {
         };
         assert!(matches!(
             wrong_mapping,
-            Err(CollectionRealizationError::Resolution(reason))
+            Err(CollectionRealizationError::Resolution { reason, .. })
                 if reason.contains("does not bind the requested mapping"),
         ));
         assert!(store.acquired.is_empty());
@@ -6279,9 +6279,7 @@ mod lattice_v2 {
                             GuardStoreError::Backend("this one cannot be taken up".to_owned()),
                         )
                     } else {
-                        CollectionRealizationError::Resolution(
-                            "this one cannot be taken up".to_owned(),
-                        )
+                        CollectionRealizationError::resolution("this one cannot be taken up")
                     });
                 }
                 if derived.representation == <FirstEncoding as MetaDescribe>::id() {

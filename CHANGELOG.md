@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `CollectionRealizationError::Resolution` keeps the failure that caused it.
+  It is now `Resolution { reason, source }`, and `Error::source` returns that
+  cause when there is one, so a caller can classify it by type: a descriptor
+  fetch interrupted by its `AcquiringReadControl` is
+  `CollectionDescriptorError::Get` over a `ReadFailure` over
+  `AcquiringReadInterrupted`. The displayed text is unchanged. Purely
+  structural contradictions have no source. Construct with
+  `CollectionRealizationError::resolution(reason)` or
+  `resolution_from(context, source)`; code that matched `Resolution(reason)`
+  matches `Resolution { reason, .. }`. Callers that search an error's source
+  chain now see these causes too.
+
 - `tensor::elements::U32`: an unsigned 32-bit little-endian tensor element,
   for integer data such as mesh connectivity (`Tensor<U32, 2>` of shape
   `[elements, 10]`). It is its own encoding, distinct from `Tensor<F32, _>`.
