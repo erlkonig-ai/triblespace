@@ -22,6 +22,10 @@ struct ColdSnapshot<S> {
     frozen: S,
     source: S,
     fail: Option<[u8; 32]>,
+    // Content no provider has: get answers MissingBlob without fetching.
+    missing: Option<[u8; 32]>,
+    // Content this snapshot reports resident whether or not it holds it.
+    advertise: Option<[u8; 32]>,
     requested: Arc<Mutex<Vec<[u8; 32]>>>,
 }
 
@@ -42,6 +46,11 @@ impl<S: StoreRead> AsyncBlobStoreGet for ColdSnapshot<S> {
                 return Err(ReadFailure::new(std::io::Error::other(
                     "injected storage failure",
                 )));
+            }
+            if self.missing == Some(raw) {
+                return Err(ReadFailure::new(crate::repo::MissingBlob {
+                    handle: Inline::new(raw),
+                }));
             }
             let handle = Inline::<Handle<E>>::new(raw);
             if self
@@ -111,6 +120,8 @@ fn cold(source: &mut MemoryRepo, omit: [u8; 32]) -> ColdSnapshot<MemoryRepoSnaps
         frozen: local.snapshot().unwrap(),
         source,
         fail: None,
+        missing: None,
+        advertise: None,
         requested: Default::default(),
     }
 }
@@ -323,6 +334,9 @@ impl<S: BlobStoreList> BlobStoreList for ColdSnapshot<S> {
         E: crate::blob::BlobEncoding + 'static,
         Handle<E>: InlineEncoding,
     {
+        if self.advertise == Some(handle.raw) {
+            return Ok(true);
+        }
         self.frozen.contains_blob(handle)
     }
 }
@@ -446,4 +460,67 @@ fn interrupted_descriptor_acquisition_keeps_its_typed_cause() {
             Some(&interruption),
         );
     }
+}
+
+#[test]
+fn a_descriptor_reported_resident_whose_get_fails_stays_a_fault() {
+    let (mut source, _root, attached) = fixture();
+    let raw = attached.handle().raw;
+    let descriptor = hex::encode_upper(raw);
+    let mut snapshot = cold(&mut source, raw);
+    snapshot.missing = Some(raw);
+    snapshot.advertise = Some(raw);
+    // A passive read checks residency first; this store says resident.
+    let error = reader(snapshot).attached(attached).err().unwrap();
+    assert!(
+        error.to_string().starts_with(&format!(
+            "resolve collection: load collection descriptor {descriptor}: failed to fetch \
+             collection descriptor {descriptor}: "
+        )),
+        "{error}"
+    );
+    assert!(matches!(
+        error,
+        crate::collection::CollectionRealizationError::Resolution {
+            source: Some(_),
+            ..
+        }
+    ));
+    // It is a fault: neither missing nor anything a recovery walk goes beneath.
+    assert!(!crate::repo::is_missing_blob(&error));
+    assert_eq!(crate::repo::recovery_chain(&error).count(), 1);
+    // The real cause is still there for diagnostics.
+    let mut cause: Option<&(dyn Error + 'static)> = Some(&error);
+    let mut found = None;
+    while let Some(current) = cause {
+        if let Some(missing) = current.downcast_ref::<crate::repo::MissingBlob>() {
+            found = Some(missing.handle.raw);
+        }
+        cause = current.source();
+    }
+    assert_eq!(found, Some(raw));
+}
+
+#[test]
+fn a_descriptor_no_provider_has_is_still_a_missing_dependency() {
+    let (mut source, _root, attached) = fixture();
+    let raw = attached.handle().raw;
+    let mut snapshot = cold(&mut source, raw);
+    snapshot.missing = Some(raw);
+    // Not reported resident: an acquiring read fetches it and finds it absent.
+    let error = reader(snapshot).attached_acquiring(attached).err().unwrap();
+    assert!(
+        matches!(
+            error,
+            crate::collection::CollectionRealizationError::MissingDependency { member }
+                if member.raw == raw
+        ),
+        "{error}"
+    );
+    // A missing blob that no Resolution wraps is still missing.
+    let read = ReadFailure::new(crate::repo::MissingBlob {
+        handle: Inline::new(raw),
+    });
+    assert!(crate::repo::is_missing_blob(&read));
+    assert_eq!(crate::repo::recovery_chain(&read).count(), 2);
 }

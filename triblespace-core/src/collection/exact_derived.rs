@@ -57,7 +57,15 @@ pub enum CollectionRealizationError {
         /// one.
         reason: String,
         /// The failure that stopped resolution, kept typed so a caller can
-        /// classify it. A purely structural contradiction has none.
+        /// inspect it. A purely structural contradiction has none.
+        ///
+        /// This source is diagnostic ancestry, not recovery policy: a
+        /// Resolution is a fault whatever it wraps.
+        /// [`crate::repo::recovery_chain`] and
+        /// [`crate::repo::is_missing_blob`] stop beneath it, so a
+        /// descriptor reported resident whose get then fails never reads as
+        /// missing or pending. A caller may still recognise one exact cause
+        /// through exact downcasts.
         source: Option<BoxError>,
     },
     /// The target does not have a complete resident realization.

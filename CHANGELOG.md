@@ -16,8 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   structural contradictions have no source. Construct with
   `CollectionRealizationError::resolution(reason)` or
   `resolution_from(context, source)`; code that matched `Resolution(reason)`
-  matches `Resolution { reason, .. }`. Callers that search an error's source
-  chain now see these causes too.
+  matches `Resolution { reason, .. }`. A Resolution's source is diagnostic
+  ancestry, not recovery policy: `repo::recovery_chain` walks an error and
+  its sources and stops beneath a Resolution, and `repo::is_missing_blob`
+  uses it. A descriptor the store reported resident whose get then fails is
+  therefore still a fault, never a missing blob, while its cause stays
+  reachable through `Error::source` for diagnostics.
 
 - `tensor::elements::U32`: an unsigned 32-bit little-endian tensor element,
   for integer data such as mesh connectivity (`Tensor<U32, 2>` of shape

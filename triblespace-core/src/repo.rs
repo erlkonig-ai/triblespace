@@ -66,16 +66,38 @@ impl std::error::Error for MissingBlob {}
 
 /// Whether a backend error's source chain names unavailable exact bytes.
 /// Check before a diagnostic boundary converts the error into text.
-pub fn is_missing_blob(mut error: &(dyn std::error::Error + 'static)) -> bool {
-    loop {
-        if error.is::<MissingBlob>() {
-            return true;
+///
+/// The walk is [`recovery_chain`]: a blob missing beneath a
+/// [`crate::collection::CollectionRealizationError::Resolution`] is part of
+/// that fault's diagnosis, never an absent dependency to fetch.
+pub fn is_missing_blob(error: &(dyn std::error::Error + 'static)) -> bool {
+    recovery_chain(error).any(|error| error.is::<MissingBlob>())
+}
+
+/// `error` and the sources a caller may base recovery on: retrying, waiting
+/// for a blob, or reading an interruption.
+///
+/// The walk includes a
+/// [`crate::collection::CollectionRealizationError::Resolution`] and stops
+/// beneath it. A Resolution is a fault. Its source is kept so diagnostics
+/// can show and inspect it, but that source is diagnostic ancestry, not
+/// recovery policy: a descriptor the store reported resident and then could
+/// not read stays a fault even when the read failed with [`MissingBlob`].
+/// A caller that recognises one exact wrapped cause beneath a Resolution
+/// does so by exact downcasts, not with this walk.
+pub fn recovery_chain<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> + 'a {
+    std::iter::successors(Some(error), |&error| {
+        if matches!(
+            error.downcast_ref::<crate::collection::CollectionRealizationError>(),
+            Some(crate::collection::CollectionRealizationError::Resolution { .. })
+        ) {
+            None
+        } else {
+            error.source()
         }
-        match error.source() {
-            Some(source) => error = source,
-            None => return false,
-        }
-    }
+    })
 }
 
 impl std::fmt::Debug for MissingBlob {
