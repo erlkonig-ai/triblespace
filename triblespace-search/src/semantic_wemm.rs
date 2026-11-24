@@ -169,7 +169,9 @@ impl WemmProfile {
 
     /// The profile `label` names (`bf16`, `w4a4` or `w4a4-vw4a16`), exactly.
     pub fn parse(label: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|profile| profile.label() == label)
+        Self::ALL
+            .into_iter()
+            .find(|profile| profile.label() == label)
     }
 
     /// The decoder precision a model is bound with to run this profile.
@@ -526,12 +528,13 @@ impl<E: BlobEncoding> WemmIndex<E> {
     /// selections and document window caps may differ.
     ///
     /// An empty slice returns an empty vector without accessing a runtime.
-    /// Each supplied view, including an empty one,
+    /// A query preparation error fails the batch. A view error belongs only to
+    /// that input. Each supplied view, including an empty one,
     /// has the same scoring semantics as [`Self::reconstructed_cosines`].
     pub fn reconstructed_cosines_many(
         indexes: &[(&Self, &NvFp4CosineIndex<E>)],
         text: &str,
-    ) -> Result<Vec<ReconstructedCosines>, CollectionOperationError>
+    ) -> Result<Vec<Result<ReconstructedCosines, CollectionOperationError>>, CollectionOperationError>
     where
         View<[f32]>: TryFromBlob<E>,
         <View<[f32]> as TryFromBlob<E>>::Error: fmt::Display + Send + Sync + 'static,
@@ -549,7 +552,7 @@ impl<E: BlobEncoding> WemmIndex<E> {
         }
         with_matching_runtime(&first.identity, |runtime| {
             runtime.with_text_scorer(text, |score| {
-                indexes.iter().map(|(_, index)| score(index)).collect()
+                Ok(indexes.iter().map(|(_, index)| score(index)).collect())
             })
         })
     }
@@ -703,7 +706,11 @@ where
                 match classify(bytes.as_ref()) {
                     Some(Input::Text(text)) => texts.push((*raw, text.into_owned())),
                     Some(Input::Image(image)) => rows.extend(
-                        runtime.encode_image(image)?.into_iter().map(|row| (*raw, row))),
+                        runtime
+                            .encode_image(image)?
+                            .into_iter()
+                            .map(|row| (*raw, row)),
+                    ),
                     None => {}
                 }
             }
@@ -722,8 +729,14 @@ where
             let started = std::time::Instant::now();
             let mut reported = started;
             for (done, chunk) in windows.chunks(WINDOW_BATCH).enumerate() {
-                let embedded = runtime.encode_windows(&chunk.iter().map(|(_, w)| *w).collect::<Vec<_>>())?;
-                rows.extend(chunk.iter().zip(embedded).map(|((raw, _), row)| (**raw, row)));
+                let embedded =
+                    runtime.encode_windows(&chunk.iter().map(|(_, w)| *w).collect::<Vec<_>>())?;
+                rows.extend(
+                    chunk
+                        .iter()
+                        .zip(embedded)
+                        .map(|((raw, _), row)| (**raw, row)),
+                );
                 if reported.elapsed() >= PROGRESS_EVERY {
                     reported = std::time::Instant::now();
                     let finished = ((done + 1) * WINDOW_BATCH).min(windows.len());
@@ -1113,7 +1126,10 @@ impl WemmRuntime {
             }
             self.forwards += 1;
             let embedding = self.native.embed_image(bytes, None).map_err(fatal)?;
-            return Ok(vec![self.encoder.encode(&embedding).map_err(|e| fatal(e.to_string()))?]);
+            return Ok(vec![self
+                .encoder
+                .encode(&embedding)
+                .map_err(|e| fatal(e.to_string()))?]);
         }
         #[cfg(not(feature = "semantic-wemm-cuda"))]
         {
@@ -1800,8 +1816,7 @@ mod tests {
     #[test]
     fn only_complete_wemm_descriptors_are_found_and_unknown_facts_are_ignored() {
         use triblespace_core::collection::{
-            CollectionDerive, CollectionRecord, CollectionStore, CollectionStoreExt,
-            SourceLocator,
+            CollectionDerive, CollectionRecord, CollectionStore, CollectionStoreExt, SourceLocator,
         };
         use triblespace_core::repo::BlobStorePut;
         let identity = other_identity(2, GB10_NATIVE_BF16_PROFILE);
@@ -2196,7 +2211,11 @@ mod tests {
         ] {
             let hex = |set: &TribleSet| {
                 let blob: Blob<SimpleArchive> = set.clone().to_blob();
-                blob.get_handle().raw.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                blob.get_handle()
+                    .raw
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
             };
             let fragment = index.fragment();
             let (_, described) = descriptor(&index);
@@ -2250,13 +2269,13 @@ mod tests {
                 }
             }
             // Stored NVFP4 vision under a BF16 decoder is no profile either.
-            assert!(
-                WemmProfile::of_bound(bf16, nvfp4(DecoderPrecision::W4a16, true)).is_err()
-            );
+            assert!(WemmProfile::of_bound(bf16, nvfp4(DecoderPrecision::W4a16, true)).is_err());
             let at_load =
-                WemmProfile::of_bound(decoder, nvfp4(DecoderPrecision::W4a16, false))
-                    .unwrap_err();
-            assert!(at_load.contains("vision linears were quantized"), "{at_load}");
+                WemmProfile::of_bound(decoder, nvfp4(DecoderPrecision::W4a16, false)).unwrap_err();
+            assert!(
+                at_load.contains("vision linears were quantized"),
+                "{at_load}"
+            );
         }
     }
 
@@ -2303,8 +2322,9 @@ mod tests {
         let policy =
             CollectionPolicy::new(AdmissionPolicy::direct(key), AdmissionPolicy::direct(key));
         let source = store.collection("source", policy.clone()).unwrap();
-        let first: Collection<NvFp4CosineSet<Embedding>> =
-            store.derive_with(source, bf16.clone(), policy.clone()).unwrap();
+        let first: Collection<NvFp4CosineSet<Embedding>> = store
+            .derive_with(source, bf16.clone(), policy.clone())
+            .unwrap();
         let second: Collection<NvFp4CosineSet<Embedding>> =
             store.derive_with(source, w4a4.clone(), policy).unwrap();
         assert_ne!(first.handle(), second.handle());
@@ -2689,7 +2709,11 @@ mod tests {
             kernel_profile: GB10_NATIVE_BF16_PROFILE,
         };
         let runtime = WemmRuntime::from_native(native, codec.clone(), &model).unwrap();
-        assert_eq!(runtime.identity(), identity, "the bound model's own identity");
+        assert_eq!(
+            runtime.identity(),
+            identity,
+            "the bound model's own identity"
+        );
         let runtime = Arc::new(Mutex::new(runtime));
 
         let filler: String = (0..40)
@@ -2826,8 +2850,9 @@ mod tests {
         .unwrap();
         assert_eq!(runtime.lock().unwrap().forwards() - before, 1);
         assert_eq!(batch.len(), 3);
-        assert!(batch[1].is_empty());
+        assert!(batch[1].as_ref().unwrap().is_empty());
         for result in [&batch[0], &batch[2]] {
+            let result = result.as_ref().unwrap();
             assert_eq!(result.len(), cosines.len());
             for handle in &handles {
                 assert_eq!(result.cosine(handle), cosines.cosine(handle));
