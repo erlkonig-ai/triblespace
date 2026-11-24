@@ -6,6 +6,10 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+- `WemmIndex::reconstructed_cosines_many` scores an ordered batch of
+  mapping/view pairs with one native text forward and one prepared query.
+  The mappings must share their model collection, root and kernel profile.
+
 - The WeMM descriptor names the model collection again: `WemmIdentity` is
   `(model_collection, model_root, kernel_profile)`, and the mapping states
   `model_collection` (Mary's model reference attribute

@@ -515,7 +515,43 @@ impl<E: BlobEncoding> WemmIndex<E> {
         View<[f32]>: TryFromBlob<E>,
         <View<[f32]> as TryFromBlob<E>>::Error: fmt::Display + Send + Sync + 'static,
     {
-        with_matching_runtime(&self.identity, |runtime| runtime.score_text(index, text))
+        with_matching_runtime(&self.identity, |runtime| {
+            runtime.with_text_scorer(text, |score| score(index))
+        })
+    }
+
+    /// Score caller-selected mapping/view pairs in input order with one text
+    /// forward and one prepared query. All mappings must name the same model
+    /// collection, root and kernel profile as the scoped runtime. Attribute
+    /// selections and document window caps may differ.
+    ///
+    /// An empty slice returns an empty vector without accessing a runtime.
+    /// Each supplied view, including an empty one,
+    /// has the same scoring semantics as [`Self::reconstructed_cosines`].
+    pub fn reconstructed_cosines_many(
+        indexes: &[(&Self, &NvFp4CosineIndex<E>)],
+        text: &str,
+    ) -> Result<Vec<ReconstructedCosines>, CollectionOperationError>
+    where
+        View<[f32]>: TryFromBlob<E>,
+        <View<[f32]> as TryFromBlob<E>>::Error: fmt::Display + Send + Sync + 'static,
+    {
+        let Some(((first, _), rest)) = indexes.split_first() else {
+            return Ok(Vec::new());
+        };
+        if rest
+            .iter()
+            .any(|(mapping, _)| mapping.identity != first.identity)
+        {
+            return Err(fatal(
+                "WeMM indexes must share a model collection, root and kernel profile",
+            ));
+        }
+        with_matching_runtime(&first.identity, |runtime| {
+            runtime.with_text_scorer(text, |score| {
+                indexes.iter().map(|(_, index)| score(index)).collect()
+            })
+        })
     }
 
     /// Whole PNG/JPEG query, with the same model and fixed preparation profile
@@ -1086,11 +1122,13 @@ impl WemmRuntime {
         }
     }
 
-    fn score_text<E>(
+    fn with_text_scorer<E, R>(
         &mut self,
-        index: &NvFp4CosineIndex<E>,
         text: &str,
-    ) -> Result<ReconstructedCosines, CollectionOperationError>
+        body: impl FnOnce(
+            &dyn Fn(&NvFp4CosineIndex<E>) -> Result<ReconstructedCosines, CollectionOperationError>,
+        ) -> Result<R, CollectionOperationError>,
+    ) -> Result<R, CollectionOperationError>
     where
         E: BlobEncoding,
         View<[f32]>: TryFromBlob<E>,
@@ -1104,13 +1142,15 @@ impl WemmRuntime {
                 .scorer
                 .prepare(&embedding)
                 .map_err(|e| fatal(e.to_string()))?;
-            return index
-                .reconstructed_cosines_cuda_4096(&self.scorer, &query)
-                .map_err(|e| fatal(e.to_string()));
+            body(&|index| {
+                index
+                    .reconstructed_cosines_cuda_4096(&self.scorer, &query)
+                    .map_err(|e| fatal(e.to_string()))
+            })
         }
         #[cfg(not(feature = "semantic-wemm-cuda"))]
         {
-            let _ = (index, text);
+            let _ = (body, text);
             Err(fatal("native WeMM CUDA runtime is not compiled"))
         }
     }
@@ -1378,7 +1418,7 @@ mod tests {
             "org/wemm",
             "native",
             members,
-            facts,
+            facts.into(),
             &[],
             mary::ingest::RootParts {
                 tokenizer,
@@ -1654,6 +1694,58 @@ mod tests {
             model_collection: Inline::new([1; 32]),
             model_root: Id::new([root; 16]).unwrap(),
             kernel_profile: profile,
+        }
+    }
+
+    #[test]
+    fn text_query_batch_checks_every_identity_before_binding_a_runtime() {
+        use triblespace_core::collection::CollectionSnapshotExt;
+
+        let mapping = mapping();
+        let id = mapping.identity();
+        let (mut store, _, handles) = indexes_with_leaves(&[(id, false)]);
+        let snapshot = store.snapshot().unwrap();
+        let target = Collection::<NvFp4CosineSet<Embedding>>::open(&snapshot, handles[0]).unwrap();
+        let index = snapshot.collection(target).unwrap().view().unwrap();
+        assert!(
+            WemmIndex::<Embedding>::reconstructed_cosines_many(&[], "query")
+                .unwrap()
+                .is_empty()
+        );
+
+        let single = mapping.reconstructed_cosines(&index, "query").unwrap_err();
+        assert!(single
+            .to_string()
+            .contains("requires an explicit scoped runtime"));
+        let compatible = WemmIndex::new([metadata::name.id()], id, 1).unwrap();
+        let pairs = [(&mapping, &index), (&compatible, &index)];
+        let error = WemmIndex::reconstructed_cosines_many(&pairs, "query").unwrap_err();
+        assert_eq!(error.to_string(), single.to_string());
+
+        for other in [
+            WemmIdentity {
+                model_collection: Inline::new([4; 32]),
+                ..id
+            },
+            WemmIdentity {
+                model_root: Id::new([4; 16]).unwrap(),
+                ..id
+            },
+            WemmIdentity {
+                kernel_profile: GB10_NATIVE_W4A4_PROFILE,
+                ..id
+            },
+        ] {
+            let incompatible = WemmIndex::new([metadata::name.id()], other, 1).unwrap();
+            let pairs = [
+                (&mapping, &index),
+                (&compatible, &index),
+                (&incompatible, &index),
+            ];
+            let error = WemmIndex::reconstructed_cosines_many(&pairs, "query").unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("must share a model collection, root and kernel profile"));
         }
     }
 
@@ -2686,6 +2778,13 @@ mod tests {
 
         let target: Collection<NvFp4CosineSet<Embedding>> =
             store.derive_with(source, mapping.clone(), policy).unwrap();
+        let empty = store
+            .snapshot()
+            .unwrap()
+            .collection(target)
+            .unwrap()
+            .view()
+            .unwrap();
         let index: NvFp4CosineIndex<Embedding> = with_wemm_runtime(Arc::clone(&runtime), || {
             let snapshot = futures::executor::block_on(
                 store.maintain_with::<WemmIndex<Embedding>>(target, &key),
@@ -2696,11 +2795,9 @@ mod tests {
         .unwrap();
         assert_eq!(index.len(), items.iter().map(|item| item.2).sum::<usize>());
         let started = Instant::now();
-        let cosines = with_wemm_runtime(runtime, || {
-            mapping.reconstructed_cosines(
-                &index,
-                "How do I repot an orchid, and what should I plant it in?",
-            )
+        let text = "How do I repot an orchid, and what should I plant it in?";
+        let cosines = with_wemm_runtime(Arc::clone(&runtime), || {
+            mapping.reconstructed_cosines(&index, text)
         })
         .unwrap()
         .unwrap();
@@ -2717,6 +2814,25 @@ mod tests {
             }
         }
         assert!(cosines.cosine(&handles[4]).is_none() && cosines.cosine(&handles[5]).is_none());
+
+        let before = runtime.lock().unwrap().forwards();
+        let batch = with_wemm_runtime(Arc::clone(&runtime), || {
+            WemmIndex::reconstructed_cosines_many(
+                &[(&mapping, &index), (&mapping, &empty), (&mapping, &index)],
+                text,
+            )
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(runtime.lock().unwrap().forwards() - before, 1);
+        assert_eq!(batch.len(), 3);
+        assert!(batch[1].is_empty());
+        for result in [&batch[0], &batch[2]] {
+            assert_eq!(result.len(), cosines.len());
+            for handle in &handles {
+                assert_eq!(result.cosine(handle), cosines.cosine(handle));
+            }
+        }
     }
 }
 
