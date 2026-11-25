@@ -2064,14 +2064,15 @@ fn bring_up_cold<T: Transport>(harness: Harness<T>, key: &SigningKey, daemon: Op
 }
 
 /// The piles of W and S, which share `shared` collections W roots, each with
-/// S's READ grant at both. W also holds a grant over the last of them, in
-/// handle order, that S never saw.
+/// S's READ grant at both. W also holds a grant over the first and one over
+/// the last of them, in handle order, that S never saw.
 struct Shared {
     w: SigningKey,
     s: SigningKey,
     wp: Pile,
     sp: Pile,
     collections: Vec<CollectionHandle>,
+    early: CapabilityProof,
     missed: CapabilityProof,
 }
 
@@ -2093,8 +2094,9 @@ impl Shared {
         }
         collections.sort_unstable_by_key(|collection| collection.raw);
         let missed = grant(&w, write_capability(), &key(0x99), *collections.last().unwrap());
-        wp.insert(&[&missed]);
-        Self { w, s, wp, sp, collections, missed }
+        let early = grant(&w, write_capability(), &key(0x99), collections[0]);
+        wp.insert(&[&early, &missed]);
+        Self { w, s, wp, sp, collections, early, missed }
     }
 
     fn last(&self) -> CollectionHandle {
@@ -2194,17 +2196,24 @@ impl Restarted {
 /// S restarts alone while W keeps running: W's listing of every collection
 /// the two share reaches S before S's first store observation, when S cannot
 /// yet tell what it takes part in. They share more collections than a
-/// connection may list unknown ones, so S skips some, and W lists each root
-/// once per connection. The observation drops that connection, once, and on
-/// the one S's candidate order makes W lists all of them again. W also holds
-/// a grant over the last collection listed that S never saw.
+/// connection may list unknown ones, so S skips some, until W lists all of
+/// them again on the same connection. What S kept of the listing meanwhile
+/// waits for no repeat, however long S took to observe: S lists at once what it
+/// holds, and W walks where that differs, so a grant over the first collection
+/// listed that S never saw arrives. One over the last arrives as well.
 #[test]
 fn a_listing_heard_before_the_first_observation_is_not_lost() {
     for s_lower in [true, false] {
         for seed in 0..SEEDS {
             run(async |clock| {
-                let cold =
+                let mut cold =
                     Cold::new(&clock, seed, s_lower, UNKNOWN_RESOURCES_PER_LINK + 44).await;
+                // Every fourth seed, S observes when the retries are far apart.
+                let late = seed % 4 == 2;
+                if late {
+                    advance(&clock, &mut [&mut cold.wh], 200).await;
+                    assert_eq!(connections(&cold.taps, 0, cold.w_id), 1, "control");
+                }
                 // Every other seed, S activates a while after it observed.
                 let gap = 4 * (seed % 2);
                 let (restarted, mut wh, mut sh) = cold.observe(&clock, gap).await;
@@ -2213,14 +2222,17 @@ fn a_listing_heard_before_the_first_observation_is_not_lost() {
                 let w_id = restarted.w_id;
                 let mut states = Vec::new();
                 let started = clock::mono_now();
-                let mut relisted = None;
-                for _ in 0..if seed == 0 { 1500 } else { 300 } {
+                let (mut relisted, mut early) = (None, None);
+                for _ in 0..REPEATED * 10 {
                     SimNet::step(&clock, Duration::from_millis(100)).await;
                     wh.refresh();
                     sh.refresh();
                     let after = clock::mono_now().duration_since(started);
                     if relisted.is_none() && restarted.unheard(&sh) == 0 {
                         relisted = Some(after);
+                    }
+                    if early.is_none() && holds_proof(&mut sh, &restarted.shared.early) {
+                        early = Some(after);
                     }
                     let state = pairs(&sh, &collections, w_id);
                     if states.last().is_none_or(|(_, last)| *last != state) {
@@ -2246,7 +2258,7 @@ fn a_listing_heard_before_the_first_observation_is_not_lost() {
                 let arrived = holds_proof(&mut sh, &restarted.shared.missed);
                 println!(
                     "S lower {s_lower}, seed {seed}, activated after {gap} s: unheard {} of {total}, listed again {}, all \
-                     heard after {relisted:?}; connections since {opened}, dials by W {by_w} and \
+                     heard after {relisted:?}, the grant kept early after {early:?}; connections since {opened}, dials by W {by_w} and \
                      by S {by_s}; grant walks over the last opened by S {} and by W {}, the \
                      missed grant arrived: {arrived}",
                     restarted.unheard(&sh),
@@ -2257,13 +2269,11 @@ fn a_listing_heard_before_the_first_observation_is_not_lost() {
                 if seed == 0 {
                     println!("  S's pairs with W (unknown, behind, current): {states:?}");
                 }
-                assert_eq!(restarted.unheard(&sh), 0, "listings W will not repeat were lost");
-                assert!(relisted.unwrap() <= Duration::from_secs(5), "{relisted:?}");
+                assert_eq!(restarted.unheard(&sh), 0, "lost for good");
                 assert!(arrived, "the missed grant");
-                // One connection was dropped, and what replaced it stays:
-                // each side dials at most once for it.
-                assert!((1..=2).contains(&opened) && by_w <= 1 && by_s <= 1);
-                assert_eq!(opened, by_w + by_s);
+                let bound = Duration::from_secs(10);
+                assert!(early.is_some_and(|early| early <= bound), "kept early: {early:?}");
+                assert_eq!((opened, by_w, by_s), (0, 0, 0), "on the same connection");
                 assert!(receives_from(&sh, w_id, last), "S is peered with W");
             });
         }
@@ -2315,10 +2325,9 @@ fn a_listing_heard_after_the_first_observation_keeps_its_connection() {
 }
 
 /// Both hosts restart. S observes its store first, dials W and lists to it
-/// while W has observed nothing: W drops that connection at its own first
-/// observation, and only W does.
+/// while W has observed nothing: W hears all of it at S's next repeat.
 #[test]
-fn of_two_restarted_hosts_the_later_one_drops_one_connection() {
+fn of_two_restarted_hosts_the_later_one_hears_the_next_repeat() {
     for s_lower in [true, false] {
         for seed in 0..SEEDS / 2 {
             run(async |clock| {
@@ -2343,7 +2352,7 @@ fn of_two_restarted_hosts_the_later_one_drops_one_connection() {
                 let took = until(
                     &clock,
                     &mut [&mut wh, &mut sh],
-                    10,
+                    REPEATED,
                     "each side's listing at the other",
                     |hosts| {
                         heard(hosts[0], &shared.collections, s_id) == total
@@ -2362,84 +2371,18 @@ fn of_two_restarted_hosts_the_later_one_drops_one_connection() {
                     "both restarted (S lower {s_lower}, seed {seed}): all heard after {took:?}; \
                      connections since {opened}, dials by W {by_w} and by S {by_s}"
                 );
-                assert!((1..=2).contains(&opened) && by_w <= 1 && by_s <= 1);
+                assert_eq!((opened, by_w, by_s), (0, 0, 0));
             });
         }
     }
 }
 
-/// How W goes away just as S's first observation drops their connection.
-#[derive(Clone, Copy, Debug)]
-enum Gone {
-    /// The path is cut, which ends the connection at the same moment.
-    Partitioned,
-    /// W cannot be dialled: a dial to it neither completes nor fails.
-    Stalled,
-}
-
-/// W is gone as S drops the connection: nothing is dropped again, and once W
-/// is back the candidate orders reach it and everything is listed.
+/// A stranger driven by hand lists 300 junk resources before S has observed
+/// anything: a walk it opens is refused, and the listing is cut short. S's
+/// first observation gives none of those slots back, drops nothing and dials
+/// nobody, and the same listing on another connection meets the same budget.
 #[test]
-fn a_peer_gone_as_its_connection_is_dropped_is_heard_once_it_is_back() {
-    for gone in [Gone::Partitioned, Gone::Stalled] {
-        for s_lower in [true, false] {
-            for seed in 0..SEEDS / 4 {
-                run(async |clock| {
-                    let cold =
-                        Cold::new(&clock, seed, s_lower, UNKNOWN_RESOURCES_PER_LINK + 44).await;
-                    let (net, w_id, s_id) = (cold.net.clone(), cold.w_id, cold.s_id);
-                    if let Gone::Stalled = gone {
-                        net.stall_dials(w_id);
-                        net.stall_dials(s_id);
-                    }
-                    let (restarted, mut wh, mut sh) = cold.observe(&clock, 0).await;
-                    if let Gone::Partitioned = gone {
-                        net.partition(w_id, s_id);
-                    }
-                    advance(&clock, &mut [&mut wh, &mut sh], 30).await;
-                    assert_eq!(
-                        restarted.unheard(&sh),
-                        restarted.shared.collections.len(),
-                        "W is out of reach"
-                    );
-                    match gone {
-                        Gone::Partitioned => net.heal(w_id, s_id),
-                        Gone::Stalled => {
-                            net.unstall_dials(w_id);
-                            net.unstall_dials(s_id);
-                        }
-                    }
-                    let back = until(
-                        &clock,
-                        &mut [&mut wh, &mut sh],
-                        90,
-                        "W's listing of every collection",
-                        |hosts| restarted.unheard(hosts[1]) == 0,
-                    )
-                    .await;
-                    let opened = restarted.since();
-                    advance(&clock, &mut [&mut wh, &mut sh], 30).await;
-                    println!(
-                        "gone {gone:?}, S lower {s_lower}, seed {seed}: all heard {back:?} after \
-                         W was back; connections, dials by W, dials by S: {opened:?}"
-                    );
-                    assert_eq!(restarted.unheard(&sh), 0);
-                    assert!(holds_proof(&mut sh, &restarted.shared.missed));
-                    assert!((1..=2).contains(&restarted.since().0), "{opened:?}");
-                });
-            }
-        }
-    }
-}
-
-/// A stranger driven by hand, which lists as a peer that knows nothing of
-/// any of this does: each root once per connection. S has observed nothing,
-/// so a walk the stranger opens is refused, and 300 junk resources are cut
-/// short. S's first observation drops that connection and dials nobody; the
-/// same listing on the stranger's next connection meets the same budget and
-/// is left standing.
-#[test]
-fn a_stranger_cut_short_early_is_dropped_once_and_never_dialled() {
+fn a_stranger_cut_short_early_keeps_its_budget_and_is_never_dialled() {
     run(async |clock| {
         let net = SimNet::new(0x6A47_0EC0, SimConfig::default());
         let [s, z] = [0x98, 0x9A].map(key);
@@ -2504,7 +2447,10 @@ fn a_stranger_cut_short_early_is_dropped_once_and_never_dialled() {
         let mut sh = Peer::with_wiring(sp.store, sender, receiver);
         sh.activate_collection(own);
         advance(&clock, &mut [&mut sh], 5).await;
-        assert!(first.borrow().0, "dropped at the first observation");
+        assert!(!first.borrow().0, "not dropped");
+        assert!(first.borrow().1 >= GRANT_WALKS_PER_PEER, "walked now that S can tell");
+        conn.close(0, b"the next one");
+        advance(&clock, &mut [&mut sh], 1).await;
         let (_conn, second) = connect(2).await;
         until(&clock, &mut [&mut sh], 30, "walks over the second listing", |_| {
             second.borrow().1 >= GRANT_WALKS_PER_PEER
@@ -2514,7 +2460,7 @@ fn a_stranger_cut_short_early_is_dropped_once_and_never_dialled() {
         let late = grant(&s, read_capability(), &key(0x9B), own);
         sh.store().insert_proof(late).unwrap();
         advance(&clock, &mut [&mut sh], 60).await;
-        assert!(!second.borrow().0, "not dropped again");
+        assert!(!second.borrow().0, "not dropped");
         let kept = sh
             .health()
             .grants

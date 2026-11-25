@@ -1710,28 +1710,13 @@ where
         peer: PeerId,
         max_bytes: u64,
     ) -> anyhow::Result<Option<Blob<UnknownBlob>>> {
-        let mut connection = self.connections.connect(peer).await?;
-        let deadline = tokio::time::Instant::now() + OP_DEADLINE;
-        let expired = |_| anyhow::anyhow!("exact blob provider request deadline exceeded");
-        let mut response = tokio::time::timeout_at(
-            deadline,
+        let connection = self.connections.connect(peer).await?;
+        let response = tokio::time::timeout(
+            OP_DEADLINE,
             op_get_blob_with_limit(&connection, self.my_id, &hash, max_bytes),
         )
         .await
-        .map_err(expired)?;
-        // A connection this side replaced under the request says nothing
-        // about the provider: ask once more on the next one, within the same
-        // deadline.
-        if response.is_err() && connection.replaced() {
-            (connection, response) = tokio::time::timeout_at(deadline, async {
-                let connection = self.connections.connect(peer).await?;
-                let response =
-                    op_get_blob_with_limit(&connection, self.my_id, &hash, max_bytes).await;
-                anyhow::Ok((connection, response))
-            })
-            .await
-            .map_err(expired)??;
-        }
+        .map_err(|_| anyhow::anyhow!("exact blob provider request deadline exceeded"))?;
         match response {
             Ok(Some(bytes)) => {
                 self.candidates.lock().unwrap().promote_authenticated(peer);
@@ -2710,133 +2695,6 @@ mod tests {
             super::descriptor_metadata(blob.bytes).len(),
             super::METADATA_DEPENDENCIES
         );
-    }
-
-    /// How a connection carrying a blob request ends in the test below.
-    #[cfg(feature = "sim")]
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum Cut {
-        /// This side replaces it.
-        Replaced,
-        /// This side replaces every connection the request reaches.
-        ReplacedAgain,
-        /// This side replaces it late, and the next one never answers.
-        ReplacedLate,
-        /// The provider closes it.
-        Closed,
-    }
-
-    /// A blob request in flight on a connection this side replaces is asked
-    /// once more on the next one, within its own deadline, and lands once. It
-    /// is not asked a third time, and one whose connection the provider
-    /// closed is not asked again.
-    #[cfg(feature = "sim")]
-    #[tokio::test(start_paused = true)]
-    async fn a_blob_request_survives_its_connection_being_replaced_once() {
-        use crate::transport::Conn;
-        use crate::transport::sim::{SimConfig, SimNet};
-        use tokio::io::AsyncReadExt as _;
-        use triblespace_core::repo::memoryrepo::MemoryRepoSnapshot;
-        let _guard = crate::protocol::exact_blob_receive_test_guard();
-        for cut in [
-            Cut::Replaced,
-            Cut::ReplacedAgain,
-            Cut::ReplacedLate,
-            Cut::Closed,
-        ] {
-            let requester_key = SigningKey::from_bytes(&[93; 32]);
-            let provider_key = SigningKey::from_bytes(&[94; 32]);
-            let requester = requester_key.verifying_key().to_bytes();
-            let provider = provider_key.verifying_key().to_bytes();
-            let net = SimNet::new(0xB10B_0001, SimConfig::default());
-            let requester_harness = net.join(&requester_key);
-            let mut provider_harness = net.join(&provider_key);
-            let bytes = anybytes::Bytes::from_source(b"asked once more".to_vec());
-            let hash = Blob::<UnknownBlob>::new(bytes.clone()).get_handle().raw;
-            let (asked_tx, mut asked) = tokio::sync::mpsc::unbounded_channel();
-            let serving = tokio::spawn(async move {
-                let mut connections = 0;
-                while let Some(incoming) = provider_harness.incoming.recv().await {
-                    connections += 1;
-                    let (connection, first) = (incoming.conn, connections == 1);
-                    let (bytes, asked) = (bytes.clone(), asked_tx.clone());
-                    tokio::spawn(async move {
-                        while let Some((mut send, mut recv)) = connection.accept_bi().await {
-                            let (bytes, asked) = (bytes.clone(), asked.clone());
-                            let connection = connection.clone();
-                            tokio::spawn(async move {
-                                match crate::protocol::recv_u8(&mut recv).await.unwrap() {
-                                    crate::protocol::TAG_RECON => {
-                                        let _ = recv.read_to_end(&mut Vec::new()).await;
-                                        return;
-                                    }
-                                    tag => assert_eq!(tag, crate::protocol::TAG_BLOB),
-                                }
-                                asked.send(connection).unwrap();
-                                // Only a request nothing cuts is answered.
-                                if first || cut != Cut::Replaced {
-                                    return std::future::pending().await;
-                                }
-                                let _ = crate::protocol::serve_get_blob(
-                                    &mut recv,
-                                    &mut send,
-                                    requester,
-                                    provider,
-                                    |locator| (locator == super::blob_locator(hash)).then_some(hash),
-                                    |requested| (requested == hash).then_some(bytes),
-                                )
-                                .await;
-                            });
-                        }
-                    });
-                }
-            });
-            let client = super::ProviderClient::<_, MemoryRepoSnapshot>::for_test(
-                requester_harness.transport,
-                super::RoutingTable::with_candidates(requester, [provider]),
-            );
-            // The request's deadline does not cover its first dial.
-            let _connected = client.connections.connect(provider).await.unwrap();
-            let started = tokio::time::Instant::now();
-            let fetch = client.fetch_from_provider(hash, provider);
-            let cutting = async {
-                let mut requests = 0;
-                while let Some(connection) = asked.recv().await {
-                    requests += 1;
-                    match cut {
-                        Cut::Closed => connection.close(0, b"gone"),
-                        Cut::Replaced | Cut::ReplacedLate if requests > 1 => {}
-                        _ => {
-                            if cut == Cut::ReplacedLate {
-                                tokio::time::sleep(super::OP_DEADLINE * 2 / 3).await;
-                            }
-                            let link = client.connections.current(provider).unwrap().link();
-                            client.connections.replace(&link);
-                            assert!(link.closed(), "closed at once");
-                            assert!(client.connections.current(provider).is_none());
-                            client.connections.replace(&link);
-                        }
-                    }
-                }
-            };
-            tokio::pin!(cutting);
-            let fetched = tokio::select! {
-                fetched = fetch => fetched,
-                () = &mut cutting => unreachable!(),
-            };
-            assert!(started.elapsed() <= super::OP_DEADLINE, "{cut:?}");
-            match cut {
-                Cut::Replaced => assert_eq!(
-                    &fetched.unwrap().unwrap().bytes[..],
-                    b"asked once more",
-                    "{cut:?}"
-                ),
-                _ => assert!(fetched.is_err(), "{cut:?}"),
-            }
-            let dials = if cut == Cut::Closed { 1 } else { 2 };
-            assert_eq!(net.dial_count(requester, provider), dials, "{cut:?}");
-            serving.abort();
-        }
     }
 
     #[cfg(feature = "sim")]

@@ -1002,23 +1002,15 @@ more. At most eight grant walks with one peer run at once, and the rest wait
 in order.
 
 Before its first store observation a node cannot tell what it takes part in,
-so every listed resource counts against that bound, and one skipped there would
-stay unheard until the peer repeats it, or for good if the peer is a build that
-does not. A connection
-whose listing the bound cut short before the first observation is therefore
-dropped when that observation is taken, and the peer lists everything again on
-the connection that replaces it. That happens once: after the first observation
-a listing beyond the bound is only cut. Nothing is dialled for it. The candidate
-order reaches the peer like any other. A node's first order is drawn once it
-has a collection active, which may be after its first observation: a peer over
-a running host observes its store as it is made, before anything is activated.
-A peer that order does not reach is reached when a later one on either side
-does. The repair is eventual; nothing promises a reconnection at once. The old connection closes
-before anything replaces it, because two connections of a pair are ranked by
-their diallers, so a fresh dial by the higher key would lose to the old one.
-A grantless collection a node activates later can still have been skipped; the
-next repeat brings it. What is charged to the bound stays charged until the
-connection closes, so repeats neither evict nor add anything to it.
+so every listed resource counts against that bound, and one skipped there is
+heard at the peer's next repeat. A node assumes that its peers repeat: against a
+build that does not, what was skipped is heard only on a new connection. What was
+kept of such a listing needs no repeat: at the observation the node lists what it
+holds, and the peer walks where that differs; and the node's own walks, which
+could not start before it, are retried at most a minute later. The observation gives back, once, the slots
+charged for resources the node turns out to take part in; those charged for
+unknown ones, then or later, stay charged until the connection closes, so
+repeats neither evict nor add anything.
 
 The sender of a walk is a participant of R, and the receiver receives. A side
 joins at most sixteen grant walks one peer opened at once, and charges a walk
