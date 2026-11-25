@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- A walk in which nothing moves ends after about a minute (60 to 80 s), whatever
+  it waits for: the peer's LANDED or FIN, this side's own landing, a blob.
+  Before, it waited for the peer's end as long as the connection stood. A landing
+  or a blob fetch that takes longer keeps its walk by moving: a side whose own
+  moved on says so every 20 s in the new empty `walk/1` frame PROGRESS (`0x0d`),
+  which settles nothing. A frame kind that is not understood was always skipped,
+  so the ALPN stays; but a peer without it that lands for over a minute in
+  silence has its walk ended here, and starts what it was fetching over. A walk's
+  blob fetches end with it.
+
 - A peer that refused a peering request is asked again on the same connection,
   two minutes later at the earliest, when a place is free or a swap draws it.
   Before, it was passed over as long as the connection stood, so a refuser that

@@ -1093,26 +1093,6 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
         self.outcome.is_none() && self.unlanded < MAX_WALK_UNLANDED
     }
 
-    pub(crate) fn awaits(&self) -> bool {
-        if let Some(r) = &self.riblt {
-            // FIN/landing alone has no frame-progress deadline. References'
-            // pending cursor is local fetch work, not an owed VALUE frame.
-            // A promised RESUME that holds back our cells is a remote frame
-            // owed like any other, even once replayed cells proved the peer.
-            let resume_owed = r.awaiting_resume && !self.discovery_stopped();
-            return !self.peer_done
-                && (resume_owed || !r.proven || (self.kind != WalkKind::References
-                    && (!self.wanted.is_empty() || !self.requests.is_empty()
-                        || r.remote_queued < r.decoder.remote().len())));
-        }
-        !self.peer_done
-            || !self.requests.is_empty()
-            || self.offers.as_ref().is_some_and(Offers::awaits)
-            || self.riblt.as_ref().is_some_and(|r| {
-                !self.wanted.is_empty() || r.remote_queued < r.decoder.remote().len()
-            })
-    }
-
     pub(crate) fn end(mut self) -> Ended {
         self.keep_received();
         let confirmed = self.outcome == Some(Outcome::Confirmed);
@@ -1179,6 +1159,8 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
     fn frame(&mut self, frame: Frame, outs: &mut Vec<Out>) -> Result<(), Failure> {
         match frame {
             Frame::Open { .. } => Err(Failure::Protocol),
+            // It told the driver that the peer moves, and settles nothing.
+            Frame::Progress => Ok(()),
             Frame::RibltRoot { summary, resume } => {
                 let r = self.riblt.as_mut().ok_or(Failure::Protocol)?;
                 if self.peer_root.is_some() {

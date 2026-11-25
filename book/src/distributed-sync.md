@@ -583,6 +583,7 @@ resource32 || proof-id32 key. Integers are big-endian.
 | `0x0a` | RIBLT_CELL | index:u32, symbol32, checksum:u64, count:i64 |
 | `0x0b` | HAVE | exact offered depth:u8, prefix32, hash32, leaf-count:u64 |
 | `0x0c` | RIBLT_RESUME | held:u32, hash32, leaf-count:u64 |
+| `0x0d` | PROGRESS | empty |
 
 DONE/LANDED are Prefix-only; cached RIBLT refuses them and uses the gated FIN
 semantics below. RIBLT_ROOT has 41 payload bytes (46 framed): the exact
@@ -689,7 +690,7 @@ all-missing transfer can progress beyond the window through ordinary landing
 ACKs. Authenticated offered keys alone admit eager VALUEs, with the existing
 signature, collection, fingerprint and proof checks. Racing duplicate bodies
 are validated but land at most once. A missing receipt eventually fails under
-the existing progress deadline; there is no silent pull fallback. Offer/receipt
+the walk's rule for standing still; there is no silent pull fallback. Offer/receipt
 indexes and admitted-body identities share the explicit 1,048,576 entry ceiling.
 This window bounds instantaneous speculation, not cumulative duplicate bytes
 over an entire cold high-overlap stream, and makes no universal speedup claim.
@@ -716,9 +717,28 @@ Withheld-value demand has a separate 32,768-entry ceiling. Requests and blob fet
 share 64 slots; at most 1,024 unacknowledged values go to landing before reading
 pauses and stream flow control applies.
 
-Incoming frame/value waits and blob fetches have 60-second progress deadlines,
-not total-transfer timeouts. After DONE, peer landing may take as long as the
-connection remains. Actual outgoing byte writes and final finish are separately
+A walk in which nothing moves ends, whatever it waits for: each side by itself
+looks every 20 seconds, and at the third look in a row at which nothing moved it
+resets the stream, so between 60 and 80 seconds after the last movement while
+its runtime runs. Movement is a byte of the walk's stream that crossed either
+way, a value of this walk that landed, and a blob, or a byte of one, that this
+walk fetches. A fetch that still waits for one of the connection's 16 request
+permits, or then for its stream, moves while that line does: permits are given
+in order, and bytes arrive for the requests ahead. Work that is only under way is
+no movement: not a value that waits to land, not a fetch behind 16 requests that
+receive nothing, and once a fetch has its stream only its own bytes are, whatever
+else arrives on the connection. So the bound holds after the peer's DONE or FIN, while
+reading pauses for landing, and for a landing that never answers. There is no
+limit on how long a landing or a fetch may take, only on its standing still: a
+side whose landing or fetch moved on tells the peer so in the next PROGRESS
+frame, at most one every 20 seconds. PROGRESS is a sign of life only. It settles
+nothing, hearing one is no reason to send one, and writing one is no
+movement, so two sides cannot keep each other alive. A side that resets still
+keeps what landed, and its next exchange offers the rest; its blob fetches end
+with the walk.
+
+Blob fetches have a 60-second progress deadline of their own, not a total one,
+which starts once they have their permit. Actual outgoing byte writes and final finish are separately
 progress-bounded/cancellable, including when a driver is retired. A walk takes no
 request permit but uses transport stream credit and counts as connection use.
 Small and scratch/sim gates do not establish many-collection live stream-credit
@@ -891,9 +911,8 @@ connections.
   heard and never before our own ROOT: also when the roots are equal and no
   cell follows, and even after a peer FIN has confirmed the exchange; local
   readiness to finish waits for it. The peer sends no cell before it arrives.
-  That wait is a remote frame owed like any other, under the walk's frame
-  deadline even when replayed cells have already proved the difference, and
-  a peer FIN while it still holds our cells back fails the exchange.
+  A walk in which that never comes ends like any in which nothing moves, also
+  when replayed cells have already proved the difference, and a peer FIN while it still holds our cells back fails the exchange.
 - RIBLT_RESUME says "I hold your first `held` cells for your root R", R being
   the root the peer just announced. The claimant takes the entry for (profile,
   R) out of the cache and claims its length only when R differs from its own

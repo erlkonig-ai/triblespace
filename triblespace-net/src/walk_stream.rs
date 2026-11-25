@@ -12,6 +12,7 @@
 //! | 0x0a | RIBLT_CELL    | index:u32, symbol32, hash:u64, count:i64 |
 //! | 0x0b | HAVE          | offered depth:u8, prefix32, hash32, u64 |
 //! | 0x0c | RIBLT_RESUME  | held:u32, hash32, u64           |
+//! | 0x0d | PROGRESS      | empty                           |
 //!
 //! SUBTREE has exactly73 payload bytes, or78 bytes with the ordinary five-byte
 //! frame header. Integers are big-endian. Prefix bytes outside depth are zero;
@@ -38,7 +39,9 @@
 //! that root is the sender's own and `held` is below the cell bound of the
 //! two ROOT counts, and at 0 otherwise. Both sides apply the same rule, so the
 //! receiver knows the first index it must see (ALPN 36).
-//! DONE/LANDED belong only to Prefix. Cached completion uses
+//! PROGRESS says that what this side received moved on here, a value landed or
+//! a byte of a blob it fetches arrived, since it last said so. It settles
+//! nothing. DONE/LANDED belong only to Prefix. Cached completion uses
 //! clean write-half FIN after proof, actual landing and all owed frame writes.
 
 use triblespace_core::collection::CollectionHandle;
@@ -59,6 +62,7 @@ pub const FRAME_RIBLT_ROOT: u8 = 0x09;
 pub const FRAME_RIBLT_CELL: u8 = 0x0a;
 pub const FRAME_HAVE: u8 = 0x0b;
 pub const FRAME_RIBLT_RESUME: u8 = 0x0c;
+pub const FRAME_PROGRESS: u8 = 0x0d;
 
 /// The discovery profile an OPEN names. It is derived, never configured: a
 /// data tree walked both ways is CachedRiblt, one walked one way and every
@@ -127,6 +131,8 @@ pub(crate) enum Frame {
     },
     Done,
     Landed,
+    /// Landing or a blob fetch moved on at the sender since its last one.
+    Progress,
     /// `resume`: a RIBLT_RESUME follows once the peer's ROOT is heard, and
     /// the peer must send no cell before it.
     RibltRoot {
@@ -193,6 +199,7 @@ impl Frame {
             }
             Self::Done => FRAME_DONE,
             Self::Landed => FRAME_LANDED,
+            Self::Progress => FRAME_PROGRESS,
             Self::RibltRoot { summary, resume } => {
                 push_summary(&mut payload, *summary);
                 payload.push(u8::from(*resume));
@@ -308,6 +315,7 @@ impl Frame {
             }
             FRAME_DONE => Self::Done,
             FRAME_LANDED => Self::Landed,
+            FRAME_PROGRESS => Self::Progress,
             FRAME_RIBLT_ROOT => Self::RibltRoot {
                 summary: rest.summary()?,
                 resume: match rest.byte()? {

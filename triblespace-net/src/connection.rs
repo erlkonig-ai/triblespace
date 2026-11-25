@@ -322,6 +322,8 @@ struct State {
     /// Woken on retirement and on the last in-flight stream.
     changed: Notify,
     opened: Arc<Semaphore>,
+    /// Moves when a request stream this side opened receives a byte.
+    line: AtomicU64,
     held: Arc<Semaphore>,
     /// Request streams served at once on the connection.
     served: Semaphore,
@@ -353,6 +355,7 @@ impl State {
             recon: AtomicBool::new(false),
             changed: Notify::new(),
             opened: Arc::new(Semaphore::new(MAX_REQUESTS_PER_CONNECTION)),
+            line: AtomicU64::new(0),
             held: Arc::new(Semaphore::new(MAX_HELD_REQUESTS_PER_CONNECTION)),
             served: Semaphore::new(MAX_SERVED_PER_CONNECTION),
             outbox,
@@ -523,6 +526,12 @@ impl<C> Connection<C> {
         self.link().set_neighbour(neighbour);
     }
 
+    /// Moves with the line of this side's requests: one that waits for a permit
+    /// waits for those ahead, which move it as they receive bytes.
+    pub(crate) fn line(&self) -> u64 {
+        self.state().line.load(Ordering::Relaxed)
+    }
+
     /// The connection's `recon/1`, as its service sees it.
     pub fn link(&self) -> Link {
         Link {
@@ -613,7 +622,11 @@ impl<R: AsyncRead + Unpin> AsyncRead for Tracked<R> {
     ) -> Poll<io::Result<()>> {
         let before = buf.filled().len();
         let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
-        self.note(polled, buf.filled().len() > before)
+        let progressed = buf.filled().len() > before;
+        if progressed && self.request.as_ref().is_some_and(|request| request.handle.is_some()) {
+            self.state.line.fetch_add(1, Ordering::Relaxed);
+        }
+        self.note(polled, progressed)
     }
 }
 
@@ -717,6 +730,11 @@ impl<T: Transport, S: Service> ConnectionTable<T, S> {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn service(&self) -> &S {
+        &self.shared.service
     }
 
     /// Request streams that could start serving now, across the table.

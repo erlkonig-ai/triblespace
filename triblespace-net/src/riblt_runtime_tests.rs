@@ -444,10 +444,6 @@ fn riblt_runtime_stop_requires_written_matching_prefix_but_not_bodies() {
     );
     assert_eq!(exchange.next_delta(), None);
     assert!(!exchange.ready_to_finish(), "an owed body forbids local FIN");
-    assert!(
-        exchange.awaits(),
-        "a body remains owed after coded discovery stops"
-    );
     assert!(exchange.end().agreed.is_none());
 }
 
@@ -491,6 +487,7 @@ async fn riblt_runtime_writer_receipts_exclude_partial_frames_and_cancelled_tail
         resetting,
         failed,
         Some(progress),
+        Arc::default(),
     ));
     let frame = Frame::RibltRoot {
         summary: PatchSummary::new(None, 0).unwrap(),
@@ -1040,7 +1037,6 @@ fn riblt_runtime_peer_fin_leaves_more_than_one_reference_fetch_window_alive() {
     assert_eq!(pending.len(), 64, "remaining references have not entered the fetch window");
     assert!(exchange.on_fin().is_empty());
     assert_eq!(exchange.outcome(), None);
-    assert!(!exchange.awaits(), "remaining work is local fetch/landing, not peer frames");
     assert!(!exchange.ready_to_finish());
     let mut fetched = Vec::new();
     while let Some(handle) = pending.pop_front() {
@@ -1212,10 +1208,6 @@ fn riblt_runtime_more_than_one_body_window_cannot_finish_at_an_empty_current_win
         assert!(matches!(&b_outs[..], [Out::Land(events)] if events.len() == 1));
         assert!(left.on_landed_ack(1, 0).is_empty());
         assert!(right.on_landed_ack(1, 0).is_empty());
-        assert!(
-            left.awaits() && right.awaits(),
-            "later decoded body work remains owed"
-        );
         assert_eq!(left.outcome(), None);
         assert_eq!(right.outcome(), None);
     }
@@ -1757,4 +1749,252 @@ async fn riblt_runtime_a_malformed_frame_drops_the_recorded_cells_a_cut_keeps_th
             assert_eq!(held, 3, "a cut keeps the cells it received");
         }
     }
+}
+
+/// Roots agree, nothing is to land, and the peer never finishes: the walk ends,
+/// though the peer's endpoint and everything else on the connection lives.
+#[tokio::test(start_paused = true)]
+async fn an_agreed_walk_whose_peer_never_finishes_ends() {
+    let mut local = Node::new(231);
+    let mut peer = Node::new(232);
+    let collection = local.hold("riblt-no-fin", open());
+    assert_eq!(peer.hold("riblt-no-fin", open()), collection);
+    let mut run = driven(&local, &peer, collection);
+    let started = tokio::time::Instant::now();
+    assert_eq!(receive_frame(&mut run.recv).await, root(&local, collection));
+    send_frame(&mut run.send, root(&peer, collection)).await;
+    assert_eq!(receive_or_fin(&mut run.recv).await, None, "its own half is done");
+    let ended = ends_within(run.done, 3 * WALK_DEADLINE).await;
+    assert!(!ended.confirmed && ended.agreed.is_none());
+    assert_eq!(*run.reset.lock().unwrap(), Some(RESET_WALK_FAILED));
+    assert!((60..=80).contains(&started.elapsed().as_secs()), "{:?}", started.elapsed());
+}
+
+async fn ends_within(
+    done: tokio::task::JoinHandle<(Ended, bool)>,
+    limit: Duration,
+) -> Ended {
+    let (ended, duplicate) = tokio::time::timeout(limit, done)
+        .await
+        .expect("a walk in which nothing moves ends")
+        .unwrap();
+    assert!(!duplicate);
+    ended
+}
+
+/// A local node that lacks `records` of C that the peer holds, driven until the
+/// peer's bodies reached its landing; none is acknowledged.
+async fn landing(records: u64) -> (Driven, usize) {
+    let mut local = Node::new(233);
+    let mut peer = Node::new(234);
+    let collection = local.hold("riblt-landing", open());
+    assert_eq!(peer.hold("riblt-landing", open()), collection);
+    let records = (0..records)
+        .map(|data| peer.commit(collection, data))
+        .collect::<Vec<_>>();
+    peer.observe();
+    let mut run = driven_with_capacity(&local, &peer, collection, 1 << 20);
+    assert_eq!(receive_frame(&mut run.recv).await, root(&local, collection));
+    send_frame(&mut run.send, root(&peer, collection)).await;
+    for index in 0..4 * records.len() {
+        send_frame(&mut run.send, cell(&peer, collection, index)).await;
+    }
+    for record in &records {
+        let body = Frame::Value {
+            key: record.fingerprint().raw(),
+            bytes: encode_record(collection, *record).unwrap(),
+        };
+        send_frame(&mut run.send, body).await;
+    }
+    let mut waiting = 0;
+    while waiting < records.len() {
+        match tokio::time::timeout(Duration::from_secs(1), run.landings.recv()).await {
+            Ok(Some((_, events))) => waiting += events.len(),
+            _ => break,
+        }
+    }
+    (run, waiting)
+}
+
+/// A landing that stands still ends the walk on the side that lands, after the
+/// peer's FIN too: a value handed over and never acknowledged is no movement.
+#[tokio::test(start_paused = true)]
+async fn a_landing_that_stands_still_ends_its_walk() {
+    for fin in [false, true] {
+        let (mut run, waiting) = landing(8).await;
+        assert_eq!(waiting, 8);
+        if fin {
+            run.send.shutdown().await.unwrap();
+        }
+        let started = tokio::time::Instant::now();
+        let ended = ends_within(run.done, 3 * WALK_DEADLINE).await;
+        assert!(!ended.landed && ended.agreed.is_none());
+        assert_eq!(ended.confirmed, fin, "its FIN is the peer's receipt");
+        assert!((58..=80).contains(&started.elapsed().as_secs()), "{:?}", started.elapsed());
+    }
+}
+
+/// So does one for which reading pauses, at [`MAX_WALK_UNLANDED`] values.
+#[tokio::test(start_paused = true)]
+async fn a_walk_that_reads_no_further_ends_when_its_landing_stands_still() {
+    let (mut run, waiting) = landing(MAX_WALK_UNLANDED as u64 + 200).await;
+    assert_eq!(waiting, MAX_WALK_UNLANDED, "reading paused");
+    // Its own frames are read throughout, so no write stands still.
+    tokio::spawn(async move { while let Ok(Some(_)) = read_frame(&mut run.recv).await {} });
+    let ended = ends_within(run.done, 3 * WALK_DEADLINE).await;
+    assert!(!ended.landed && ended.agreed.is_none());
+}
+
+/// A landing of twenty minutes that keeps moving, one value every fifty
+/// seconds, keeps its walk, and tells the peer each time it moved, once. Once
+/// it stops, so does the walk, and PROGRESS itself holds nothing open.
+#[tokio::test(start_paused = true)]
+async fn a_slow_landing_keeps_its_walk_and_says_so_while_it_moves() {
+    for stops in [false, true] {
+        let (mut run, waiting) = landing(25).await;
+        assert_eq!(waiting, 25);
+        run.send.shutdown().await.unwrap();
+        // Cells the local side wrote before discovery stopped.
+        let mut told = Vec::new();
+        let started = tokio::time::Instant::now();
+        let mut acked = 0;
+        let mut next = started + Duration::from_secs(50);
+        let mut last = started;
+        let end = loop {
+            tokio::select! {
+                frame = read_frame(&mut run.recv) => match frame {
+                    Ok(Some((kind, _))) => {
+                        if kind == crate::walk_stream::FRAME_PROGRESS {
+                            told.push(started.elapsed().as_secs());
+                        }
+                    }
+                    _ => break started.elapsed(),
+                },
+                () = tokio::time::sleep_until(next), if acked < if stops { 5 } else { 25 } => {
+                    acked += 1;
+                    last = tokio::time::Instant::now();
+                    run.acked.send((1, 0)).unwrap();
+                    next += Duration::from_secs(50);
+                }
+            }
+        };
+        let ended = ends_within(run.done, 3 * WALK_DEADLINE).await;
+        assert!(told.windows(2).all(|pair| pair[1] - pair[0] >= 20), "{told:?}");
+        if stops {
+            assert_eq!(told.len(), 5, "{told:?}");
+            assert!(!ended.landed && ended.agreed.is_none());
+            let quiet = started + end - last;
+            assert!((60..=80).contains(&quiet.as_secs()), "{quiet:?}");
+        } else {
+            assert_eq!(told.len(), 24, "the last one is its FIN: {told:?}");
+            assert!(end >= Duration::from_secs(20 * 60), "{end:?}");
+            assert!(ended.landed && ended.confirmed);
+        }
+    }
+}
+
+/// The waiting side: a peer that says every fifty seconds that it moves is
+/// waited for, half an hour here, and one that stops is not. Hearing PROGRESS
+/// is no reason to send it.
+#[tokio::test(start_paused = true)]
+async fn a_peer_that_moves_is_waited_for_and_one_that_stops_is_not() {
+    for finishes in [true, false] {
+        let mut local = Node::new(235);
+        let mut peer = Node::new(236);
+        let collection = local.hold("riblt-waiting", open());
+        assert_eq!(peer.hold("riblt-waiting", open()), collection);
+        let mut run = driven(&local, &peer, collection);
+        assert_eq!(receive_frame(&mut run.recv).await, root(&local, collection));
+        send_frame(&mut run.send, root(&peer, collection)).await;
+        assert_eq!(receive_or_fin(&mut run.recv).await, None, "no PROGRESS of its own");
+        for _ in 0..36 {
+            tokio::time::sleep(Duration::from_secs(50)).await;
+            assert!(!run.done.is_finished());
+            send_frame(&mut run.send, Frame::Progress).await;
+        }
+        let last = tokio::time::Instant::now();
+        if finishes {
+            run.send.shutdown().await.unwrap();
+        }
+        let ended = ends_within(run.done, 3 * WALK_DEADLINE).await;
+        assert_eq!(ended.confirmed, finishes);
+        if !finishes {
+            let quiet = last.elapsed();
+            assert!((60..=80).contains(&quiet.as_secs()), "{quiet:?}");
+        }
+    }
+}
+
+/// PROGRESS is no answer to PROGRESS: while both halves are open and nothing
+/// lands here, none goes back, and the peer's own end comes once it stops.
+#[tokio::test(start_paused = true)]
+async fn progress_is_never_echoed() {
+    let (local, peer, collection, _) = pair();
+    let mut run = driven(&local, &peer, collection);
+    discover_without_body(&mut run, &local, &peer, collection).await;
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        send_frame(&mut run.send, Frame::Progress).await;
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), receive_or_fin(&mut run.recv))
+            .await
+            .is_err(),
+        "nothing was sent"
+    );
+    let last = tokio::time::Instant::now();
+    let ended = ends_within(run.done, 3 * WALK_DEADLINE).await;
+    assert!(!ended.landed && !ended.confirmed);
+    assert!((58..=80).contains(&last.elapsed().as_secs()), "{:?}", last.elapsed());
+}
+
+/// A frame that crosses a few bytes at a time, for five minutes, keeps its walk
+/// either way; one that stands still half way does not.
+#[tokio::test(start_paused = true)]
+async fn a_frame_that_crosses_slowly_keeps_its_walk() {
+    for stops in [false, true] {
+        // The peer's body trickles in.
+        let (local, peer, collection, record) = pair();
+        let mut run = driven(&local, &peer, collection);
+        discover_without_body(&mut run, &local, &peer, collection).await;
+        let (kind, payload) = Frame::Value {
+            key: record.fingerprint().raw(),
+            bytes: encode_record(collection, record).unwrap(),
+        }
+        .encode();
+        let mut frame = vec![kind];
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        let pieces = frame.chunks(frame.len().div_ceil(10)).collect::<Vec<_>>();
+        for piece in if stops { &pieces[..5] } else { &pieces[..] } {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            assert!(!run.done.is_finished());
+            run.send.write_all(piece).await.unwrap();
+        }
+        let last = tokio::time::Instant::now();
+        if stops {
+            let ended = ends_within(run.done, 3 * WALK_DEADLINE).await;
+            assert!(!ended.confirmed);
+            assert!((60..=80).contains(&last.elapsed().as_secs()), "{:?}", last.elapsed());
+            continue;
+        }
+        run.landings.recv().await.unwrap();
+        run.acked.send((1, 0)).unwrap();
+        run.send.shutdown().await.unwrap();
+        let ended = ends_within(run.done, WALK_DEADLINE).await;
+        assert!(ended.landed && ended.confirmed);
+    }
+    // This side's ROOT, then its first cell, trickle out, through a pipe of
+    // eight bytes.
+    let (empty, full, collection, _) = pair();
+    let mut run = driven_with_capacity(&full, &empty, collection, 8);
+    let mut heard = 0;
+    let mut piece = [0; 8];
+    send_frame(&mut run.send, root(&empty, collection)).await;
+    while heard < 46 + crate::riblt_cache::CELL_FRAME_BYTES {
+        tokio::time::sleep(Duration::from_secs(50)).await;
+        assert!(!run.done.is_finished(), "a write that moves: {heard}");
+        heard += run.recv.read(&mut piece).await.unwrap();
+    }
+    run.done.abort();
 }

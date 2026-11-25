@@ -15,8 +15,9 @@ pub(super) async fn drive<T: Transport, S: Service, R>(
 where
     R: BlobStoreGet + Clone + Send + Sync + 'static,
 {
+    let mut movement = Movement::new();
     let (frames, mut framed) = mpsc::channel(1);
-    let reader = tokio::spawn(read(recv, frames));
+    let reader = tokio::spawn(read(Noted(recv, movement.crossed.clone()), frames));
     let (outgoing, queued) = mpsc::channel(1);
     let mut outgoing = Some(outgoing);
     let (reset, resetting) = oneshot::channel();
@@ -24,10 +25,11 @@ where
     let (write_failed, mut writer_failed) = oneshot::channel();
     let (finish_note, mut finished) = oneshot::channel();
     let (progress, mut progressed) = watch::channel(Written::default());
+    let crossed = movement.crossed.clone();
     let writer = tokio::spawn(async move {
         let mut resetting = futures::FutureExt::fuse(resetting);
         let (_, finished) = write_stream_inner(
-            &mut send, queued, &mut resetting, write_failed, Some(progress),
+            &mut send, queued, &mut resetting, write_failed, Some(progress), crossed,
         ).await;
         let _ = finish_note.send(finished);
         if finished {
@@ -40,11 +42,10 @@ where
             }
         }
     });
-    let (fetches, mut fetched) = mpsc::unbounded_channel::<Fetched>();
+    let mut fetches = JoinSet::<Fetched>::new();
     let mut outbox = VecDeque::new();
     let mut pending = exchange.next_delta(); // ROOT always precedes other work.
     let mut deferred_delta = None;
-    let mut heard_at = tokio::time::Instant::now();
     let mut peer_fin = false;
     let mut local_finished = false;
     let mut finish_seen = false;
@@ -99,41 +100,36 @@ where
         if matches!(exchange.outcome(), Some(Outcome::Failed(_))) {
             continue;
         }
-        let deadline = exchange.awaits().then(|| heard_at + WALK_DEADLINE);
         let outs = tokio::select! {
             permit = async { outgoing.as_ref().unwrap().reserve().await },
                 if outgoing.is_some() && pending.is_some() => match permit {
                     Ok(permit) => {
+                        // Its bytes are the movement.
                         permit.send(pending.take().expect("pending frame"));
-                        Vec::new()
+                        continue;
                     }
                     Err(_) => {
                         stopped = Some(("outgoing frame channel closed", None));
                         break 'drive true;
                     }
                 },
-            frame = next(&mut framed, deadline), if !peer_fin && exchange.want_read() => match frame {
-                Err(_) => {
-                    stopped = Some(("no frame within the walk deadline", None));
-                    break 'drive true;
-                }
-                Ok(Some(Ok(Some(frame)))) => {
-                    heard_at = tokio::time::Instant::now();
+            frame = framed.recv(), if !peer_fin && exchange.want_read() => match frame {
+                Some(Ok(Some(frame))) => {
                     // The guard drops here, not after on_frame: see walk.rs.
                     let snapshot = driver.snapshots.borrow().clone();
                     exchange.on_frame(frame, snapshot)
                 }
-                Ok(Some(Ok(None))) => {
+                Some(Ok(None)) => {
                     peer_fin = true;
                     exchange.on_fin()
                 }
-                Ok(Some(Err(ReadEnd::Malformed))) => {
+                Some(Err(ReadEnd::Malformed)) => {
                     // The peer broke the walk: a failure of the exchange's own.
                     exchange.malformed();
                     stopped = Some(("malformed or truncated frame", None));
                     break 'drive true;
                 }
-                Ok(Some(Err(ReadEnd::Reset(code)))) => {
+                Some(Err(ReadEnd::Reset(code))) => {
                     duplicate = code == Some(RESET_WALK_DUPLICATE);
                     stopped = Some(match code {
                         Some(_) => ("peer reset the stream", code),
@@ -141,13 +137,25 @@ where
                     });
                     break 'drive true;
                 }
-                Ok(None) => {
+                None => {
                     stopped = Some(("reader ended", None));
                     break 'drive true;
                 }
             },
-            Some((landed, failed)) = acked.recv() => exchange.on_landed_ack(landed, failed),
-            Some((handle, blob)) = fetched.recv() => exchange.on_fetched(handle, blob),
+            Some((landed, failed)) = acked.recv() => {
+                movement.advanced = true;
+                exchange.on_landed_ack(landed, failed)
+            }
+            Some(fetched) = fetches.join_next() => match fetched {
+                Ok((handle, blob)) => {
+                    movement.advanced |= blob.is_some();
+                    exchange.on_fetched(handle, blob)
+                }
+                Err(_) => {
+                    stopped = Some(("a blob fetch panicked", None));
+                    break 'drive true;
+                }
+            },
             changed = progressed.changed(), if progress_open => {
                 if changed.is_err() {
                     // Normal writer completion closes this channel too.
@@ -178,7 +186,18 @@ where
                 Vec::new()
             },
             _ = &mut replaced => break 'drive true,
+            _ = movement.tick.tick() => match movement.judge() {
+                Some(told) => {
+                    outbox.extend(told.then_some(Frame::Progress));
+                    continue;
+                }
+                None => {
+                    stopped = Some(("nothing moved", None));
+                    break 'drive true;
+                }
+            },
         };
+        movement.moved = true;
         for out in outs {
             match out {
                 Out::Send(frame) => {
@@ -194,13 +213,13 @@ where
                 // Cached exchanges never walk grants.
                 Out::Pending(_) => {}
                 Out::Fetch(handle) => {
-                    let connections = driver.connections.clone();
-                    let fetches = fetches.clone();
-                    let peer = driver.peer;
-                    tokio::spawn(async move {
-                        let blob = fetch_blob(connections, peer, handle).await;
-                        let _ = fetches.send((handle, blob));
-                    });
+                    let fetch = fetch_blob(
+                        driver.connections.clone(),
+                        driver.peer,
+                        handle,
+                        movement.arrived.clone(),
+                    );
+                    fetches.spawn(async move { (handle, fetch.await) });
                 }
             }
         }
@@ -244,21 +263,9 @@ enum ReadEnd {
     Malformed,
 }
 
-/// `Err` when the deadline passes first: the peer went quiet while the walk
-/// awaited it, which is not the same fact as the stream failing.
-async fn next(
-    frames: &mut mpsc::Receiver<Incoming>,
-    deadline: Option<tokio::time::Instant>,
-) -> Result<Option<Incoming>, tokio::time::error::Elapsed> {
-    match deadline {
-        Some(deadline) => tokio::time::timeout_at(deadline, frames.recv()).await,
-        None => Ok(frames.recv().await),
-    }
-}
-
 /// Only framing-level clean EOF becomes FIN. Truncation, reset and malformed
 /// known frames remain failures, in FIFO order after all preceding frames.
-async fn read(mut recv: Box<dyn RecvStream>, frames: mpsc::Sender<Incoming>) {
+async fn read(mut recv: impl AsyncRead + Unpin, frames: mpsc::Sender<Incoming>) {
     loop {
         let frame = match read_frame(&mut recv).await {
             Ok(Some((kind, payload))) => match Frame::decode(kind, &payload) {
