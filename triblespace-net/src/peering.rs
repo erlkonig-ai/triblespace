@@ -611,7 +611,8 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
                 self.swap(collection, &selected, now, due, &mut dials);
             }
             while asked < MAX_ASKED {
-                let Some(peer) = self.next_candidate(collection, &selected, now, true) else {
+                let Some(peer) = self.next_candidate(collection, &selected, now, false, true)
+                else {
                     break;
                 };
                 self.ask_or_dial(collection, peer, &mut dials);
@@ -1181,7 +1182,7 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
         if leaving.is_none() {
             return;
         }
-        if let Some(peer) = self.next_candidate(collection, local, now, due) {
+        if let Some(peer) = self.next_candidate(collection, local, now, false, due) {
             self.ask_or_dial(collection, peer, dials);
             self.meshes.get_mut(&collection.raw).unwrap().candidate = Some(peer);
         }
@@ -1274,7 +1275,7 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
                 _ => return,
             },
         };
-        let Some(peer) = self.next_named(collection, local, now) else {
+        let Some(peer) = self.next_candidate(collection, local, now, true, true) else {
             return;
         };
         if let Some(id) = held {
@@ -1284,18 +1285,21 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
         self.meshes.get_mut(&collection.raw).unwrap().reserved = Some((peer, now));
     }
 
-    /// The next participant of C in the reserved slot's walk that no open
-    /// connection reaches and that is not taken, as [`Self::next_candidate`]
-    /// takes them. Its end draws the walk again on the same terms, and looks
-    /// nothing up.
-    fn next_named(
+    /// The next candidate in C's order that is not already a neighbour, being
+    /// dialled, or refusing this side. If `redraw`, the end of the order draws
+    /// it again once [`MIN_RESHUFFLE_INTERVAL`] has passed, or sooner if its
+    /// candidates changed, and a draw that was due looks up C's DHT providers
+    /// again. For the `reserved` slot the order is of C's participants, those
+    /// an open connection reaches are passed over too, and nothing is looked
+    /// up.
+    fn next_candidate(
         &mut self,
         collection: CollectionHandle,
         local: &CollectionSnapshot,
         now: Mono,
+        reserved: bool,
+        redraw: bool,
     ) -> Option<PeerId> {
-        let snapshot = self.snapshot.as_ref()?;
-        let grants = snapshot.grants().clone();
         let mesh = self.meshes.get_mut(&collection.raw)?;
         let skipped = mesh
             .peerings
@@ -1306,11 +1310,15 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
             .chain(
                 self.links
                     .values()
-                    .filter(|link| !link.closed())
+                    .filter(|link| reserved && !link.closed())
                     .map(Link::peer),
             )
             .collect::<BTreeSet<_>>();
-        let order = &mut mesh.named;
+        let order = if reserved {
+            &mut mesh.named
+        } else {
+            &mut mesh.order
+        };
         loop {
             while let Some(peer) = order.peers.get(order.next).copied() {
                 order.next += 1;
@@ -1321,77 +1329,22 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
             let due = order
                 .drawn_at
                 .is_none_or(|drawn| now >= drawn + MIN_RESHUFFLE_INTERVAL);
-            if !due && !order.stale {
-                return None;
-            }
-            let peers = candidate_order(
-                local,
-                snapshot.store(),
-                &grants,
-                &[],
-                self.local,
-                &rand::random(),
-            )
-            .into_iter()
-            .filter(|peer| grants.participates(collection, *peer))
-            .collect::<Vec<_>>();
-            let changed = order.stale
-                && peers.iter().collect::<BTreeSet<_>>()
-                    != order.peers.iter().collect::<BTreeSet<_>>();
-            order.stale = false;
-            if !due && !changed {
-                return None;
-            }
-            order.peers = peers;
-            order.next = 0;
-            order.drawn_at = Some(now);
-        }
-    }
-
-    /// The next candidate in C's order that is not already a neighbour, being
-    /// dialled, or refusing this side. If `redraw`, the end of the order draws
-    /// it again once [`MIN_RESHUFFLE_INTERVAL`] has passed, or sooner if its
-    /// candidates changed, and a draw that was due looks up C's DHT providers
-    /// again.
-    fn next_candidate(
-        &mut self,
-        collection: CollectionHandle,
-        local: &CollectionSnapshot,
-        now: Mono,
-        redraw: bool,
-    ) -> Option<PeerId> {
-        let mesh = self.meshes.get_mut(&collection.raw)?;
-        let taken = mesh
-            .peerings
-            .iter()
-            .filter(|(_, peering)| !matches!(peering.side, Side::Idle) || peering.refused_by_them)
-            .filter_map(|(id, _)| self.links.get(id).map(Link::peer))
-            .chain(mesh.dialling.iter().copied())
-            .collect::<BTreeSet<_>>();
-        let order = &mut mesh.order;
-        loop {
-            while let Some(peer) = order.peers.get(order.next).copied() {
-                order.next += 1;
-                if !taken.contains(&peer) {
-                    return Some(peer);
-                }
-            }
-            let due = order
-                .drawn_at
-                .is_none_or(|drawn| now >= drawn + MIN_RESHUFFLE_INTERVAL);
             if !redraw || (!due && !order.stale) {
                 return None;
             }
             let snapshot = self.snapshot.as_ref()?;
-            let grants = snapshot.grants().clone();
-            let peers = candidate_order(
+            let grants = snapshot.grants();
+            let mut peers = candidate_order(
                 local,
                 snapshot.store(),
-                &grants,
+                grants,
                 &mesh.providers,
                 self.local,
                 &rand::random(),
             );
+            if reserved {
+                peers.retain(|peer| grants.participates(collection, *peer));
+            }
             // Any change to C's records or evidence makes the order stale;
             // only a change of its candidates draws it before it is due.
             let changed = order.stale
@@ -1401,7 +1354,7 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
             if !due && !changed {
                 return None;
             }
-            if due && !mesh.looking_up {
+            if due && !reserved && !mesh.looking_up {
                 mesh.looking_up = true;
                 self.lookups.push(collection);
             }
@@ -3352,6 +3305,45 @@ mod tests {
         }
     }
 
+    /// The reserved slot dials no candidate that is not a participant: an
+    /// owner known by a record it signed waits for a place of the five.
+    #[test]
+    fn the_reserved_slot_passes_over_owners_named_on_no_grant() {
+        use triblespace_core::blob::encodings::UnknownBlob;
+        use triblespace_core::collection::{
+            CollectionCommit, CollectionData, CollectionRecord, CollectionStore,
+            empty_metadata_handle,
+        };
+        let mut node = Node::new(80);
+        let collection = node.hold(CollectionPolicy::new(
+            AdmissionPolicy::Open,
+            AdmissionPolicy::Open,
+        ));
+        node.select(collection, true);
+        let now = crate::clock::mono_now();
+        for byte in 100..106 {
+            let bytes = anybytes::Bytes::from_source(vec![byte]);
+            let data = node.pile.store.put::<UnknownBlob, _>(bytes).unwrap();
+            let record = CollectionRecord::Commit(CollectionCommit::sign(
+                &key(byte),
+                collection,
+                CollectionData::new(data.raw),
+                empty_metadata_handle(),
+            ));
+            node.pile.store.insert(record).unwrap();
+            node.observe();
+            let dials = node.peerings.fill(now);
+            let id = key(byte).verifying_key().to_bytes();
+            if byte < 105 {
+                assert_eq!(dials, [id]);
+                open(&mut node, byte.into(), byte);
+            } else {
+                assert_eq!(dials, [[0; 32]; 0], "past the five");
+            }
+        }
+        assert!(node.peerings.fill(now + MIN_RESHUFFLE_INTERVAL).is_empty());
+    }
+
     #[test]
     fn a_drawn_order_looks_up_providers_and_draws_their_answer_in() {
         let mut node = Node::new(30);
@@ -3383,6 +3375,16 @@ mod tests {
             [provider]
         );
         assert_eq!(node.peerings.take_lookups(), [collection]);
+        // The reserved slot's order, drawn again too, looks nothing up.
+        node.peerings.providers(collection, vec![provider]);
+        let snapshot = node.peerings.snapshot.clone().unwrap();
+        let local = snapshot.selected(collection).unwrap();
+        let later = answered + MIN_RESHUFFLE_INTERVAL * 2;
+        for (reserved, lookups) in [(true, vec![]), (false, vec![collection])] {
+            node.peerings
+                .next_candidate(collection, &local, later, reserved, true);
+            assert_eq!(node.peerings.take_lookups(), lookups);
+        }
     }
 
     /// A peer that sends peering requests without reading gets no answer
