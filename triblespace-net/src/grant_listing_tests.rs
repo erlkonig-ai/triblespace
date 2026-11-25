@@ -389,109 +389,36 @@ fn unknown_resources_are_charged_to_a_per_connection_budget() {
     assert_eq!(hear(&mut host, &fresh, vec![(handle(299), summary(2))]).walks.len(), 1);
 }
 
-/// What `effects` asks to drop, by connection id.
-fn dropped(effects: &Effects) -> Vec<u64> {
-    effects.drops.iter().map(Link::id).collect()
-}
-
 fn unknowns(count: usize) -> Vec<(CollectionHandle, PatchSummary)> {
     (0..count as u64).map(|index| (handle(index), summary(1))).collect()
 }
 
-/// A connection whose listing the budget cut short before the first
-/// observation is dropped at that observation, once; nothing after it is.
+/// Slots charged before the first observation for resources this node turns
+/// out to take part in are given back at that observation, so that a resource
+/// it truly does not know is heard on the same connection; those charged for
+/// unknown ones stay, and nothing is given back later.
 #[test]
-fn an_early_listing_cut_short_drops_its_connection_once() {
-    let peer = key(0x6B);
-    let mut host = Node::new(0x6C);
-    let over = MAX_UNKNOWN_RESOURCES_PER_LINK + 1;
+fn slots_charged_before_the_first_observation_are_judged_by_it() {
+    let [alice, bob, peer] = [0x60, 0x61, 0x6B].map(key);
+    let mut host = Node::new(0x61);
+    let (r, _) = holding(&mut host, &alice, &bob);
     let (linked, _) = open_to(&mut host, id(&peer), 1);
-    let early = hear(&mut host, &linked, unknowns(over));
-    assert_eq!(early.walks.len(), MAX_UNKNOWN_RESOURCES_PER_LINK);
-    assert!(early.drops.is_empty(), "nothing is dropped before the observation");
-    // A walk opened for it could not start: it is retried after a backoff.
-    host.grants.walked(
-        GrantEvent::Ended(GrantWalkEnd {
-            peer: id(&peer),
-            resource: handle(0),
-            outcome: GrantOutcome::NotStarted(NotStarted::StartDeclined),
-            skipped: 0,
-        }),
-        crate::clock::mono_now(),
-    );
-    assert!(host.grants.deadline().is_some(), "positive control");
-    let first = host.observe();
-    assert_eq!(dropped(&first), [1]);
-    assert!(first.walks.is_empty(), "nothing opens on a dropped connection");
-    assert!(host.grants.deadline().is_none(), "nothing is retried on it");
-    // Frames still queued for it are not heard.
-    assert!(hear(&mut host, &linked, vec![(handle(0), summary(9))]).walks.is_empty());
-    assert!(host.observe().drops.is_empty(), "once");
-    host.grants.event(&ReconEvent::Closed(linked.link.clone()));
-    // What replaces it keeps the budget and is never dropped.
-    let (next, _) = open_to(&mut host, id(&peer), 2);
+    let mut roots = vec![(r, summary(1))];
+    roots.extend(unknowns(MAX_UNKNOWN_RESOURCES_PER_LINK));
+    assert_eq!(hear(&mut host, &linked, roots).walks.len(), MAX_UNKNOWN_RESOURCES_PER_LINK);
+    let last = handle(MAX_UNKNOWN_RESOURCES_PER_LINK as u64 - 1);
+    assert!(hear(&mut host, &linked, vec![(last, summary(1))]).walks.is_empty(), "skipped");
+    host.observe();
     assert_eq!(
-        hear(&mut host, &next, unknowns(over)).walks.len(),
-        MAX_UNKNOWN_RESOURCES_PER_LINK
+        hear(&mut host, &linked, vec![(last, summary(1))]).walks,
+        [(id(&peer), last)],
+        "R's slot was given back"
     );
-    assert!(host.observe().drops.is_empty());
-    assert_eq!(hear(&mut host, &next, vec![(handle(0), summary(2))]).walks.len(), 1);
-}
-
-#[test]
-fn an_early_listing_within_the_budget_drops_nothing() {
-    let peer = key(0x6B);
-    let mut host = Node::new(0x6C);
-    let (linked, _) = open_to(&mut host, id(&peer), 1);
-    // A resource listed again is charged once.
-    for _ in 0..2 {
-        hear(&mut host, &linked, unknowns(MAX_UNKNOWN_RESOURCES_PER_LINK));
+    for index in 1000..1010 {
+        assert!(hear(&mut host, &linked, vec![(handle(index), summary(1))]).walks.is_empty());
     }
-    assert!(host.observe().drops.is_empty());
-    assert!(host.observe().drops.is_empty());
-}
-
-#[test]
-fn a_listing_cut_short_after_the_first_observation_drops_nothing() {
-    let peer = key(0x6B);
-    let mut host = Node::new(0x6C);
-    assert!(host.observe().drops.is_empty());
-    let (linked, _) = open_to(&mut host, id(&peer), 1);
-    hear(&mut host, &linked, unknowns(MAX_UNKNOWN_RESOURCES_PER_LINK + 1));
-    assert!(host.observe().drops.is_empty());
-    assert_eq!(hear(&mut host, &linked, vec![(handle(0), summary(2))]).walks.len(), 1);
-}
-
-/// Each connection carries its own listing, so each one cut short is
-/// dropped; one that is closed, or that the tie-break retired, is left to
-/// end as it would.
-#[test]
-fn every_open_connection_cut_short_early_is_dropped() {
-    let [peer, other] = [0x6B, 0x6D].map(key);
-    let mut host = Node::new(0x6C);
-    let over = MAX_UNKNOWN_RESOURCES_PER_LINK + 1;
-    let mut links = Vec::new();
-    for (index, (peer, listed)) in [
-        (&peer, over),
-        (&peer, over),
-        (&other, over),
-        (&other, over - 1),
-        (&other, over),
-        (&other, over),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let (linked, _) = open_to(&mut host, id(peer), index as u64 + 1);
-        hear(&mut host, &linked, unknowns(listed));
-        links.push(linked);
-    }
-    links[4].link.end(true);
-    links[5].link.end(false);
-    assert_eq!(dropped(&host.observe()), [1, 2, 3]);
-    assert!(host.observe().drops.is_empty());
-    // The others still stand.
-    assert_eq!(hear(&mut host, &links[3], vec![(handle(0), summary(2))]).walks.len(), 1);
+    host.observe();
+    assert!(hear(&mut host, &linked, vec![(handle(1000), summary(1))]).walks.is_empty(), "once");
 }
 
 #[test]

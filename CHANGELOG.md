@@ -18,10 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `triblespace-net`: a node that accepts connections before its first store
   observation no longer loses grant listings beyond the 256-resource bound. It
-  drops a connection whose listing was cut short then, once, at that
-  observation, and the peer lists everything on the connection its candidate
-  order makes instead. No wire change. An exact-blob request in flight on the
-  dropped connection is asked once more within its own deadline.
+  hears them at the peer's next repeat, and that observation gives back the
+  slots charged for resources the node takes part in.
 
 - `CollectionRealizationError::Resolution` keeps the failure that caused it.
   It is now `Resolution { reason, source }`, and `Error::source` returns that
