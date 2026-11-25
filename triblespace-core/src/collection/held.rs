@@ -52,32 +52,35 @@
 //! applies it, so a step cut off by the time budget, a dropped driver or a
 //! clone of the index loses nothing.
 //!
-//! # Scanning each blob once
+//! # A blob is read for each collection that reaches it
 //!
-//! A blob is read when it is first reached, and its edges to the children
-//! resident at that moment are recorded in one edge cache shared by every
-//! collection. A new seed, a new edge or a new membership then extends a held
-//! set by following cached edges; no bytes are read twice. A shared blob
-//! already scanned for one collection joins another without being read again.
+//! Children are not remembered: a blob is read when it is applied in a
+//! collection, so a blob that several collections reach is read once for
+//! each, and a blob a collection holds is read again only when a peer reports
+//! it there. The children found are those resident at that read.
 //!
-//! The price of scanning once is the late child: a child that becomes
-//! resident after its parent was scanned is not an edge. Three things catch
-//! it:
+//! So a child that becomes resident after its parent was read for C is a
+//! late child of C. Four things catch it:
 //!
-//! - it is itself a seed (a record names it): seeds are scanned on arrival;
+//! - it is itself a seed (a record names it): seeds are read on arrival;
 //! - a peer holding it advertises it in C ([`HeldStore::note_held`]): a
 //!   resident blob a peer reports in C joins `held(C)` however it arrived.
 //!   This is routing evidence, kept in memory only; a reopened store forgets
 //!   it unless one of C's own records reaches the blob by then;
+//! - a peer reports its parent in C, which reads the parent again;
 //! - a reset of the index recomputes every closure from the roots.
 //!
 //! Otherwise it stays out of `held(C)` until the index resets or the store is
 //! reopened, though it stays readable by its hash. Sync states this as a
 //! limitation (design 2.9, Astra's R2): between two neighbours that replicate
 //! C in full, the one holding the late child through a seed or a report
-//! reports it to the other. A report of the late child's parent does not
-//! bring it in: the parent is not read again, and its cached edges do not
-//! name the child.
+//! reports it to the other. Another collection that reads the same parent
+//! later does hold the child; that brings it into C's set no sooner.
+//!
+//! A read that fails takes nothing back: a blob C holds stays in `held(C)`
+//! when reading it again fails. What the report that woke it would have
+//! retried under it then waits for another report. A blob that one collection
+//! holds and that fails when another reaches it is unknown in the other only.
 //!
 //! # Snapshots
 //!
@@ -106,7 +109,7 @@
 //! a judgement of proofs runs to its end first, so the budget is
 //! cooperative, not a hard slice. It judges proofs, which reads the
 //! collection descriptors they name, and drains the frontier, which reads
-//! every blob it reaches once. It extends built collections first, and
+//! every blob it reaches. It extends built collections first, and
 //! building collections take turns, so a small one is published without
 //! waiting for a large one's whole first closure. A built collection's set
 //! grows as the driver reaches what arrived, so a snapshot's held sets can
@@ -119,14 +122,14 @@
 //! driver's thread is its caller's.
 //!
 //! A snapshot that lost a blob its predecessor had (a store that forgets
-//! blobs) resets the index: the edges, the frontier and the unknown sets are
-//! forgotten and every collection is recomputed from its roots as if newly
+//! blobs) resets the index: the held sets, the frontier and the unknown sets
+//! are forgotten and every collection is recomputed from its roots as if newly
 //! tracked.
 //!
 //! Nothing is computed before the store has been observed whole once. A
 //! step of a climb ([`Covered::snapshot_step`](super::covered::Covered::snapshot_step))
 //! observes a prefix, where a parent can be resident before its child; a
-//! parent scanned there would make the child a late child. Until a step
+//! parent read there would make the child a late child. Until a step
 //! reaches the end of the store, or a whole snapshot is taken, every held set
 //! is unknown.
 
@@ -180,7 +183,7 @@ struct Wake {
     /// observation did not see that evidence.
     at: u64,
     /// A peer reported the blob in the collection: when it is applied, its
-    /// cached children that wait in unknown are tried again.
+    /// children that wait in unknown are tried again.
     report: bool,
 }
 
@@ -411,12 +414,6 @@ struct State<T> {
     /// `collection || blob`: resident blobs peers reported in C. Roots that
     /// survive a reset.
     routes: Pairs,
-    /// Every blob scanned (read and readable) since the last reset, whether
-    /// it has children or not.
-    scanned: Handles,
-    /// `parent || child`: each scanned blob and every child resident when it
-    /// was scanned.
-    edges: Pairs,
     /// `collection || blob`: reached in C and not applied yet.
     frontier: Frontier,
     /// `blob || collection`: reached in C and not readable when applied --
@@ -467,8 +464,6 @@ impl<T> Default for HeldIndex<T> {
             held: HeldSets::new(),
             seeds: Pairs::new(),
             routes: Pairs::new(),
-            scanned: Handles::new(),
-            edges: Pairs::new(),
             frontier: Frontier::new(),
             unknown: Pairs::new(),
             unjudged: Judgements::new(),
@@ -620,16 +615,9 @@ fn proof_seeds<T: HeldSource>(
     Ok(found)
 }
 
-/// One blob's scan: its resident children and the edges to them, ready to
-/// join the cache. Built without the index state.
-struct Scan {
-    children: Vec<Raw>,
-    edges: Pairs,
-}
-
 /// Read one blob and list its resident children, or `None` if it is not
 /// readable. Children are probed in the store's index without reading them.
-fn scan<T: HeldSource>(snapshot: &T, blob: &Raw) -> Option<Scan> {
+fn scan<T: HeldSource>(snapshot: &T, blob: &Raw) -> Option<Vec<Raw>> {
     let body: Bytes = snapshot.get::<Bytes, UnknownBlob>(handle(*blob)).ok()?;
     let mut children: Vec<Raw> = body
         .as_ref()
@@ -639,24 +627,18 @@ fn scan<T: HeldSource>(snapshot: &T, blob: &Raw) -> Option<Scan> {
         .collect();
     children.sort_unstable();
     children.dedup();
-    let mut edges = Pairs::new();
-    for child in &children {
-        edges.insert(&Entry::new(&pair(blob, child)));
-    }
-    Some(Scan { children, edges })
+    Some(children)
 }
 
 impl<T> State<T> {
-    /// Forget every edge, scan, held set, frontier and unknown blob, and
-    /// every judgement: every collection is unsettled, and the next
-    /// observation recomputes it from its roots, seeds and peer reports,
-    /// which are kept. A read that began before this is dropped.
+    /// Forget every held set, frontier and unknown blob, and every judgement:
+    /// every collection is unsettled, and the next observation recomputes it
+    /// from its roots, seeds and peer reports, which are kept. A read that
+    /// began before this is dropped.
     fn reset(&mut self) {
         self.held = HeldSets::new();
         self.frontier = Frontier::new();
         self.unknown = Pairs::new();
-        self.edges = Pairs::new();
-        self.scanned = Handles::new();
         self.built = Handles::new();
         self.unjudged = Judgements::new();
         self.turn = None;
@@ -677,12 +659,6 @@ impl<T> State<T> {
             generation: self.generation,
             sets,
         });
-    }
-
-    /// Record one scan: the blob, and an edge to each resident child.
-    fn record_scan(&mut self, blob: Raw, edges: Pairs) {
-        self.scanned.insert(&Entry::new(&blob));
-        self.edges.union(edges);
     }
 
     /// `blob` is reached in `collection` (at observation `at`): it enters the
@@ -828,11 +804,12 @@ impl<T> State<T> {
 impl<T: HeldSource> State<T> {
     /// Apply the frontier entry `blob` of `collection`, which a read made
     /// against observation `read_at` could not read (`absent`: not even
-    /// resident there). It moves to unknown, always, unless positive
+    /// resident there). It moves to unknown, unless positive
     /// evidence for it arrived after that observation: it was woken since,
     /// or it was absent then and is resident now. Then it stays in the
     /// frontier for one more read. Residency alone is no evidence: it cannot
-    /// tell persistent corruption from a new valid copy.
+    /// tell persistent corruption from a new valid copy. A blob the
+    /// collection holds stays held and never waits in unknown.
     fn apply_unreadable(&mut self, collection: &Raw, blob: Raw, read_at: u64, absent: bool) {
         let key = pair(collection, &blob);
         let Some(wake) = self.frontier.get(&key).copied() else {
@@ -848,7 +825,13 @@ impl<T: HeldSource> State<T> {
             return;
         }
         self.frontier.remove(&key);
-        self.unknown.insert(&Entry::new(&pair(&blob, collection)));
+        let held = self
+            .held
+            .get(collection)
+            .is_some_and(|held| held.has_prefix(&blob));
+        if !held {
+            self.unknown.insert(&Entry::new(&pair(&blob, collection)));
+        }
     }
 
     /// Apply a judgement of `judged` made against observation `read_at`. A
@@ -1086,8 +1069,8 @@ impl<T: HeldSource> HeldIndex<T> {
             }
             // A route even if it is held, or something under it cannot be
             // read yet: it is positive evidence for the blob and its
-            // children, so even a held blob's cached children that wait in
-            // unknown are tried again.
+            // children, so even a held blob is read again, and its children
+            // that wait in unknown are tried again.
             state.routes.insert(&Entry::new(&key));
             state.wake(&collection, blob, Wake { at, report: true });
         }
@@ -1171,33 +1154,23 @@ impl<T: HeldSource + Send> Drive for HeldIndex<T> {
             let Some((collection, blob)) = state.next(&mut new_turn) else {
                 break;
             };
-            let grew = if state.scanned.get(&blob).is_some() {
-                // Scanned already: its children come from the edge cache.
-                let children = related(&state.edges, &blob);
-                state.apply_readable(&collection, blob, &children)
-            } else {
-                let Some(snapshot) = state.fed.clone() else {
-                    break;
-                };
-                let (read_at, epoch) = (state.fed_count, state.epoch);
-                drop(state);
-                let read = scan(&snapshot, &blob);
-                let absent =
-                    read.is_none() && !snapshot.contains_blob(handle(blob)).unwrap_or(false);
-                drop(snapshot);
-                state = self.lock_driver();
-                if state.epoch != epoch {
-                    continue;
-                }
-                match read {
-                    Some(Scan { children, edges }) => {
-                        state.record_scan(blob, edges);
-                        state.apply_readable(&collection, blob, &children)
-                    }
-                    None => {
-                        state.apply_unreadable(&collection, blob, read_at, absent);
-                        false
-                    }
+            let Some(snapshot) = state.fed.clone() else {
+                break;
+            };
+            let (read_at, epoch) = (state.fed_count, state.epoch);
+            drop(state);
+            let read = scan(&snapshot, &blob);
+            let absent = read.is_none() && !snapshot.contains_blob(handle(blob)).unwrap_or(false);
+            drop(snapshot);
+            state = self.lock_driver();
+            if state.epoch != epoch {
+                continue;
+            }
+            let grew = match read {
+                Some(children) => state.apply_readable(&collection, blob, &children),
+                None => {
+                    state.apply_unreadable(&collection, blob, read_at, absent);
+                    false
                 }
             };
             // A built collection's set is published as it grows.

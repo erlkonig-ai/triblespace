@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `triblespace-core`: the held index keeps no edge cache. A blob is read for
+  each collection that reaches it, where one read used to serve all of them,
+  and the parent-child edges and the set of scanned blobs are gone from memory.
+  A report of a held blob reads it again, so it now brings in a child that
+  became resident after the first read; a held blob whose second read fails
+  stays held.
+
 - `triblespace-net`: the neighbours a node asks for per collection no longer
   grow past five and the reserved one. A swap could end the reserved holder's
   peering, or find no healthy neighbour to end, and asked its candidate either

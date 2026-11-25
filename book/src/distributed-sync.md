@@ -1641,14 +1641,14 @@ a blob no record names. Reachability is conservative: an aligned 32-byte word
 is a child when that exact H is resident. It issues no network request,
 creates no WANT and remembers no absent word.
 
-Each blob is scanned once, when first reached, and its edges to the children
-resident at that moment enter one edge cache shared by every collection. A new
-seed, edge or membership then extends a held set without reading bytes again;
-an already scanned blob shared with another collection joins it for free. A
-seed whose bytes arrive after its record is scanned on arrival. The late
-child -- resident only after its parent was scanned -- is caught two ways:
+A blob is read for each collection that reaches it, and its children are those
+resident at that read; nothing remembers them. A blob C holds is read again
+only when a note reports it in C. A seed whose bytes arrive after its record
+is read on arrival. The late child -- resident only after its parent was read
+for C -- is caught three ways:
 
-- it is itself a seed of some collection; or
+- it is itself a seed of C;
+- a note reports its parent in C, which reads the parent again; or
 - a Full neighbour holds it in C: its references push notes it held in C
   here too, however it arrived, and the receiver fetches it first when it is
   not resident. A note is routing evidence kept in memory: a reopened store forgets it unless
@@ -1656,9 +1656,9 @@ child -- resident only after its parent was scanned -- is caught two ways:
   the next snapshot is taken is dropped.
 
 Otherwise it stays out of held(C) until the index resets or the store is
-reopened, though it stays readable by its hash. A note of its parent does
-not bring it in: the parent is not read again, and its cached edges do not
-name the child. That is a stated limitation: there is no periodic rescan. Between two Full neighbours, a late child that
+reopened, though it stays readable by its hash. Another collection that reads
+the same parent later holds the child, and C's set does not gain it from that.
+That is a stated limitation: there is no periodic rescan. Between two Full neighbours, a late child that
 one side holds through a seed or a note reaches the other side's held set by
 its next references push.
 
@@ -1679,7 +1679,7 @@ steps against the latest observed snapshot, never holding the index across a
 read. Its time budget is cooperative: it is checked between steps, and a blob
 read or a judgement of proofs runs to its end first. It judges proofs, which
 reads the collection descriptors they name, and computes closures, which
-reads every blob they reach once. It extends built collections first, and
+reads every blob they reach. It extends built collections first, and
 building collections take turns, one budget's worth of steps each, so a small
 collection is not held back by a large one. A newly tracked collection is
 unknown until its first closure is whole and its
@@ -1699,17 +1699,19 @@ evidence, since it cannot tell persistent corruption from a new valid copy,
 so a corrupt blob costs one read per collection and never a loop; a valid
 copy that lands beside a corrupt one by any path but the held-set thread's
 own repair waits for such a note. A read that fails while evidence for its
-blob arrives is applied after that evidence and reads the blob once more. No
+blob arrives is applied after that evidence and reads the blob once more. A
+held blob whose second read fails stays held; what the note would have tried
+under it waits for another note. No
 held set is computed before the
 store has been observed whole once: a step of a climb observes a prefix,
 where a parent can precede its child and would make it a late child, so every
-held set is unknown until a step reaches the end. Because the driver scans a
+held set is unknown until a step reaches the end. Because the driver reads a
 blob against the latest snapshot rather than the one that brought it, a child
 that lands after its parent but before the driver reaches the parent is not a
 late child. A collection whose records the store cannot select stays
 unsettled -- absent from the held sets, never published short -- and is
 selected again at the next observation. A snapshot that lost a blob its
-predecessor had resets the index: the held sets, frontiers, edges and the
+predecessor had resets the index: the held sets, frontiers and the
 blobs that could not be read are forgotten, and every collection is
 recomputed from its seeds and notes as if newly tracked. Short-lived readers of the same pile track nothing.
 
