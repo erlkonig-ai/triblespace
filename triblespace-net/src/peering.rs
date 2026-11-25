@@ -2325,6 +2325,171 @@ mod tests {
         assert_eq!(asked(&node), MAX_ASKED, "the five regular neighbours stay");
     }
 
+    fn mr_open(node: &mut Node, id: u64, peer: PeerId) -> (Link, Receiver<Frame>) {
+        let (link, frames) = Link::detached(id, peer);
+        node.peerings.event(ReconEvent::Opened(link.clone()));
+        (link, frames)
+    }
+
+    fn mr_accept(node: &mut Node, collection: CollectionHandle, links: &[Link]) {
+        for link in links {
+            let flags = Flags { send: true, full: false };
+            node.peerings.event(ReconEvent::Frame(
+                link.clone(),
+                Frame::PeerAccept { collection, flags },
+            ));
+        }
+    }
+
+    /// Throwaway: does the swap ever take the reserved holder, and what does
+    /// the asked set then do?
+    #[test]
+    fn mr_swap_and_the_reserved_holder() {
+        let mut node = Node::new(80);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(node.key.verifying_key()),
+            AdmissionPolicy::direct(node.key.verifying_key()),
+        );
+        let collection = node.hold(policy);
+        node.select(collection, true);
+        let mut links = Vec::new();
+        let mut unread = Vec::new();
+        for byte in 81..86 {
+            let k = key(byte);
+            let proof = grant(&node.key, &k, read_capability(), collection);
+            node.learn(proof);
+            let (l, f) = mr_open(&mut node, byte as u64, k.verifying_key().to_bytes());
+            links.push(l);
+            unread.push(f);
+        }
+        let now = crate::clock::mono_now();
+        node.peerings.fill(now);
+        mr_accept(&mut node, collection, &links);
+        // Ten more, connected: candidates of the swap, never of the reserved place.
+        for byte in 100..110 {
+            let k = key(byte);
+            let proof = grant(&node.key, &k, read_capability(), collection);
+            node.learn(proof);
+            let (l, f) = mr_open(&mut node, byte as u64, k.verifying_key().to_bytes());
+            links.push(l);
+            unread.push(f);
+        }
+        let mut fresh = 120u8;
+        for round in 1..=60u32 {
+            // A new grantee nobody reaches, whenever the reserved place is free.
+            if node.peerings.reserved_holder(collection).is_none() && fresh < 140 {
+                let k = key(fresh);
+                let proof = grant(&node.key, &k, read_capability(), collection);
+                node.learn(proof);
+                let at = now + (SWAP_INTERVAL * round - Duration::from_secs(300));
+                let dials = node.peerings.fill(at);
+                let id = k.verifying_key().to_bytes();
+                if dials.contains(&id) {
+                    let (l, f) = mr_open(&mut node, fresh as u64, id);
+                    links.push(l);
+                    unread.push(f);
+                    mr_accept(&mut node, collection, &links);
+                }
+                fresh += 1;
+            }
+            node.peerings.fill(now + SWAP_INTERVAL * round + Duration::from_secs(1));
+            mr_accept(&mut node, collection, &links);
+            let asked = node.health().iter().filter(|p| p.asked).count();
+            let reserved = node.peerings.reserved_holder(collection).is_some();
+            println!("MR-SWAP round {round} asked {asked} reserved {reserved}");
+        }
+    }
+
+    /// Throwaway: a request refused for want of room, on a connection that
+    /// stays open, after room is there.
+    #[test]
+    fn mr_refused_for_room() {
+        let mut node = Node::new(80);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(node.key.verifying_key()),
+            AdmissionPolicy::direct(node.key.verifying_key()),
+        );
+        let collection = node.hold(policy);
+        node.select(collection, true);
+        for byte in 100..117 {
+            let proof = grant(&node.key, &key(byte), read_capability(), collection);
+            node.learn(proof);
+        }
+        // Stop the node from asking: the links open after the requests' grants,
+        // and fill is never called.
+        let mut ends = Vec::new();
+        for byte in 100..117 {
+            let (link, mut frames) = mr_open(&mut node, byte as u64, key(byte).verifying_key().to_bytes());
+            node.peerings.event(ReconEvent::Frame(
+                link.clone(),
+                Frame::PeerRequest {
+                    collection,
+                    flags: Flags { send: false, full: false },
+                    invitation: false,
+                    credentials: Vec::new(),
+                },
+            ));
+            let mut kinds = Vec::new();
+            while let Ok(f) = frames.try_recv() {
+                kinds.push(f.encode().0);
+            }
+            ends.push((link, frames, kinds));
+        }
+        println!("MR-ROOM answers {:?}", ends.iter().map(|e| e.2.clone()).collect::<Vec<_>>());
+        // One of the sixteen leaves.
+        node.peerings.event(ReconEvent::Frame(ends[0].0.clone(), Frame::Unpeer { collection }));
+        for _ in 0..5 {
+            node.observe();
+        }
+        let mut after = Vec::new();
+        while let Ok(f) = ends[16].1.try_recv() {
+            after.push(f.encode().0);
+        }
+        println!("MR-ROOM quiet, one place free, 5 observations: {after:?}");
+        node.learn(grant(&node.key, &key(150), read_capability(), collection));
+        while let Ok(f) = ends[16].1.try_recv() {
+            after.push(f.encode().0);
+        }
+        println!("MR-ROOM after the evidence changed: {after:?} (request is {FRAME_PEER_REQUEST}, refuse {FRAME_PEER_REFUSE})");
+    }
+
+    /// Throwaway: the asker's side of a refusal, while the connection stands
+    /// and after it closed.
+    #[test]
+    fn mr_asker_after_a_refusal() {
+        let mut node = Node::new(80);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(node.key.verifying_key()),
+            AdmissionPolicy::direct(node.key.verifying_key()),
+        );
+        let collection = node.hold(policy);
+        let k = key(81);
+        node.learn(grant(&node.key, &k, read_capability(), collection));
+        node.select(collection, true);
+        let (link, mut frames) = mr_open(&mut node, 1, k.verifying_key().to_bytes());
+        let now = crate::clock::mono_now();
+        node.peerings.fill(now);
+        while frames.try_recv().is_ok() {}
+        node.peerings.event(ReconEvent::Frame(link.clone(), Frame::PeerRefuse { collection }));
+        let (mut dials, mut sent) = (0, 0);
+        for t in 1..=3600u64 {
+            dials += node.peerings.fill(now + Duration::from_secs(t)).len();
+            while frames.try_recv().is_ok() {
+                sent += 1;
+            }
+        }
+        println!("MR-ASKER open for an hour after the refusal: dials {dials} frames {sent}");
+        node.peerings.event(ReconEvent::Closed(link));
+        let mut first = None;
+        for t in 3601..=3800u64 {
+            if !node.peerings.fill(now + Duration::from_secs(t)).is_empty() {
+                first = Some(t - 3600);
+                break;
+            }
+        }
+        println!("MR-ASKER seconds to the next dial after the close: {first:?}");
+    }
+
     #[test]
     fn a_drawn_order_looks_up_providers_and_draws_their_answer_in() {
         let mut node = Node::new(30);
