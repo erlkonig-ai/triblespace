@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   included. While a candidate is tried a collection has one asked-for peering
   more.
 
+- `triblespace-net`: a peering request refused only because a collection's 16
+  inbound places were taken is invited when a place frees. Until now it waited
+  on an open connection for the next change of evidence or a new connection.
+
 - `triblespace-net`: frames on a connection's `recon/1` no longer count as its
   use. A connection closes 120 s after the last byte on any other stream, and
   the least recently used one is chosen for eviction by the same clock; becoming

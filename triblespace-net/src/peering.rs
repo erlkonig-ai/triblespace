@@ -10,8 +10,9 @@
 //!
 //! A side that refuses a request remembers it for the connection. When a
 //! credential, an arriving definition, a new proof or its own selection
-//! admits the asker, it invites it: a request in the other direction. The
-//! asker never asks again on its own.
+//! admits the asker, or a place frees for a request refused only for want of
+//! room, it invites it: a request in the other direction. The asker never asks
+//! again on its own.
 //!
 //! A side that asked or invited is owed an answer, also after it withdrew the
 //! request with an UNPEER, and sends no other request for C on the connection
@@ -111,8 +112,9 @@ struct Peering {
     /// The peer has yet to answer this side's last request, standing or not.
     owed: bool,
     /// The peer's request this side refused: the peer's flags, and the
-    /// definitions whose arrival could admit it.
-    refused: Option<(Flags, Vec<CapabilityHandle>)>,
+    /// definitions whose arrival could admit it, or `Ok` if only room was
+    /// lacking.
+    refused: Option<(Flags, Result<(), Vec<CapabilityHandle>>)>,
     /// The peer refused this side's request.
     refused_by_them: bool,
     /// The peer's credentials for the collection that this side validated.
@@ -541,9 +543,12 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
                 .filter(|(_, peering)| {
                     changed
                         || (full_changed && peering.peered())
-                        || peering.refused.as_ref().is_some_and(|(_, undefined)| {
-                            undefined
-                                .iter()
+                        || peering.refused.as_ref().is_some_and(|(_, refusal)| {
+                            refusal
+                                .as_ref()
+                                .err()
+                                .into_iter()
+                                .flatten()
                                 .any(|handle| snapshot.get_blob(&handle.raw).is_some())
                         })
                 })
@@ -613,6 +618,7 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
                 asked += 1;
             }
             self.fill_reserved(collection, &selected, now, &mut dials);
+            self.invite_waiting(collection);
         }
         dials.sort_unstable();
         dials.dedup();
@@ -795,6 +801,7 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
                 peering.side = match (peering.side, frame) {
                     (Side::Asked { asked, mine }, Frame::PeerAccept { flags: theirs, .. }) => {
                         peering.refused_by_them = false;
+                        peering.refused = None;
                         Side::Peered {
                             asked,
                             mine,
@@ -929,9 +936,11 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
                 if peering.peered() {
                     peering.side = Side::Idle;
                 }
-                let undefined = decision.err().unwrap_or_default();
-                let wanted = wanted(link.peer(), &undefined, &peering.presented);
-                peering.refused = Some((theirs, undefined));
+                let decision = decision.map(drop);
+                let undefined = decision.as_ref().err();
+                let wanted = undefined
+                    .and_then(|undefined| wanted(link.peer(), undefined, &peering.presented));
+                peering.refused = Some((theirs, decision));
                 self.wanted.extend(wanted);
             }
         }
@@ -1010,16 +1019,37 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
                     theirs,
                     &peering.presented,
                 ) {
-                    Ok(_) if room => self.ask(collection, &link, true),
-                    Ok(_) => {}
+                    Ok(_) if room && !peering.owed => self.ask(collection, &link, true),
+                    Ok(_) => peering.refused = Some((theirs, Ok(()))),
                     Err(undefined) => {
                         let wanted = wanted(link.peer(), &undefined, &peering.presented);
-                        peering.refused = Some((theirs, undefined));
+                        peering.refused = Some((theirs, Err(undefined)));
                         self.wanted.extend(wanted);
                     }
                 }
             }
             Side::Asked { .. } => {}
+        }
+    }
+
+    /// Invite requests for C refused only for want of room, while there is
+    /// room. An invitation holds its place and uses the remembered request up.
+    fn invite_waiting(&mut self, collection: CollectionHandle) {
+        let Some(mesh) = self.meshes.get(&collection.raw) else {
+            return;
+        };
+        let waiting = mesh
+            .peerings
+            .iter()
+            .filter(|(_, peering)| matches!(peering.side, Side::Idle) && !peering.owed)
+            .filter(|(_, peering)| matches!(peering.refused, Some((_, Ok(())))))
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for id in waiting {
+            if self.inbound(collection, id) >= MAX_INBOUND_PEERINGS {
+                return;
+            }
+            self.revisit(collection, id);
         }
     }
 
@@ -2046,6 +2076,12 @@ mod tests {
             }]
         );
         assert!(asker.peerings.take_wanted().is_empty());
+        // It does not lack room: no refill decides or fetches for it again.
+        let now = crate::clock::mono_now();
+        for second in 0..5 {
+            owner.peerings.fill(now + PEERING_TICK * second);
+        }
+        assert!(owner.peerings.take_wanted().is_empty());
 
         owner
             .pile
@@ -2580,6 +2616,11 @@ mod tests {
                         node.select(collection, selected[side]);
                         log.push((side, "select or deselect"));
                     }
+                    5 => {
+                        let dials = node.peerings.fill(crate::clock::mono_now());
+                        assert!(dials.is_empty());
+                        log.push((side, "fill"));
+                    }
                     _ => {
                         let frames = [&mut wire.from_right, &mut wire.from_left];
                         if let Ok(frame) = frames[side].try_recv() {
@@ -2973,6 +3014,221 @@ mod tests {
         node.peerings
             .fill(now + SWAP_INTERVAL + PEERING_TICK * 1202);
         assert_eq!(tried(&node, collection, &five[1..]), [candidate]);
+    }
+
+    /// A node whose asked-for set is full, whose [`MAX_INBOUND_PEERINGS`]
+    /// inbound places are taken by `ends[2..]`, and that refused two further
+    /// readers, `ends[..2]`, for want of room; with every frame read.
+    fn crowded() -> (Node, CollectionHandle, Vec<(Link, Receiver<Frame>)>) {
+        let readers = (MAX_ASKED + MAX_INBOUND_PEERINGS + 2) as u8;
+        let (mut node, collection) = owner(100..100 + readers);
+        let mut ends = (100..100 + readers)
+            .map(|byte| open(&mut node, byte.into(), byte))
+            .collect::<Vec<_>>();
+        node.peerings.fill(crate::clock::mono_now());
+        let five = asked_for(&node, collection);
+        for end in &mut ends {
+            if five.contains(&end.0.peer()) {
+                assert_eq!(sent(end), [FRAME_PEER_REQUEST]);
+                accept(&mut node, collection, &end.0);
+            }
+        }
+        ends.retain(|end| !five.contains(&end.0.peer()));
+        for index in (0..ends.len()).rev() {
+            request(&mut node, collection, &ends[index].0);
+            let answer = if index < 2 {
+                FRAME_PEER_REFUSE
+            } else {
+                FRAME_PEER_ACCEPT
+            };
+            assert_eq!(sent(&mut ends[index]), [answer]);
+        }
+        (node, collection, ends)
+    }
+
+    /// Fill for a while, and the invitations then sent to each end.
+    fn invited(node: &mut Node, ends: &mut [(Link, Receiver<Frame>)]) -> Vec<usize> {
+        let now = crate::clock::mono_now();
+        for second in 0..50 {
+            assert!(node.peerings.fill(now + PEERING_TICK * second).is_empty());
+        }
+        let invitations = |end: &mut (Link, Receiver<Frame>)| {
+            let frames = std::iter::from_fn(|| end.1.try_recv().ok());
+            frames
+                .filter(|frame| {
+                    matches!(
+                        frame,
+                        Frame::PeerRequest {
+                            invitation: true,
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+        ends.iter_mut().map(invitations).collect()
+    }
+
+    /// Of two requests refused for want of room, each place that frees
+    /// invites one, once, and a third place nobody.
+    #[test]
+    fn a_freed_place_invites_one_request_refused_for_room() {
+        let (mut node, collection, mut ends) = crowded();
+        assert_eq!(invited(&mut node, &mut ends[..2]), [0, 0], "no room");
+        let mut invitations = [0, 0];
+        for (place, expected) in [(2, 1), (3, 2), (4, 2)] {
+            unpeer(&mut node, collection, &ends[place].0);
+            for _ in 0..2 {
+                let now = invited(&mut node, &mut ends[..2]);
+                invitations = [invitations[0] + now[0], invitations[1] + now[1]];
+                assert_eq!(invitations.iter().sum::<usize>(), expected, "{place}");
+                node.observe();
+            }
+        }
+        assert_eq!(invitations, [1, 1]);
+    }
+
+    /// A place frees when its connection closes too, and an invited peer holds
+    /// it: the node never has more inbound peerings than places.
+    #[test]
+    fn an_invitation_holds_the_place_it_was_sent_for() {
+        let (mut node, collection, mut ends) = crowded();
+        let (closing, _) = ends.remove(2);
+        node.peerings.event(ReconEvent::Closed(closing));
+        let first = invited(&mut node, &mut ends[..2]);
+        assert_eq!(first.iter().sum::<usize>(), 1);
+        let (first, other) = if first[0] == 1 { (0, 1) } else { (1, 0) };
+        // It has not answered, and the other one asks again.
+        request(&mut node, collection, &ends[other].0);
+        assert_eq!(sent(&mut ends[other]), [FRAME_PEER_REFUSE]);
+        accept(&mut node, collection, &ends[first].0);
+        assert_eq!(invited(&mut node, &mut ends[..2]), [0, 0]);
+        assert_eq!(
+            node.peerings.inbound(collection, u64::MAX),
+            MAX_INBOUND_PEERINGS
+        );
+        assert!(peering(&node, ends[first].0.peer()).is_some_and(|peering| peering.peered));
+    }
+
+    /// An invitation that is refused gives its place to the other request
+    /// that waits, and neither is invited again.
+    #[test]
+    fn a_refused_invitation_gives_its_place_to_the_next() {
+        let (mut node, collection, mut ends) = crowded();
+        unpeer(&mut node, collection, &ends[2].0);
+        let first = invited(&mut node, &mut ends[..2]);
+        assert_eq!(first.iter().sum::<usize>(), 1);
+        let (first, other) = if first[0] == 1 { (0, 1) } else { (1, 0) };
+        refuse(&mut node, collection, &ends[first].0);
+        let next = invited(&mut node, &mut ends[..2]);
+        assert_eq!((next[first], next[other]), (0, 1));
+        refuse(&mut node, collection, &ends[other].0);
+        assert_eq!(invited(&mut node, &mut ends[..2]), [0, 0]);
+    }
+
+    /// A freed place invites whom the node admits by then: not a request it
+    /// refused as not admitted, nor one whose key has lost its admission.
+    #[test]
+    fn a_freed_place_invites_only_who_is_admitted_by_then() {
+        let (mut node, collection, mut ends) = crowded();
+        let mut stranger = open(&mut node, 200, 200);
+        request(&mut node, collection, &stranger.0);
+        assert_eq!(sent(&mut stranger), [FRAME_PEER_REFUSE]);
+        // A store that holds no grants, observed with the collection selected.
+        let current = node.pile.snapshot();
+        let (mut bare, same) = owner(100..100);
+        assert_eq!(same, collection);
+        let bare = bare.pile.snapshot();
+        node.peerings.observe(bare);
+        unpeer(&mut node, collection, &ends[2].0);
+        assert_eq!(
+            invited(&mut node, &mut ends[..2]),
+            [0, 0],
+            "not admitted now"
+        );
+        node.peerings.observe(current);
+        let again = invited(&mut node, &mut ends[..2]);
+        assert!(again.iter().sum::<usize>() >= 1, "admitted again");
+        let stranger = invited(&mut node, std::slice::from_mut(&mut stranger));
+        assert_eq!(stranger, [0], "never admitted");
+    }
+
+    /// A request refused as not admitted, and admitted while there is no room,
+    /// waits for a place like one refused for room.
+    #[test]
+    fn a_request_admitted_without_room_waits_for_a_place() {
+        let (mut node, collection, mut ends) = crowded();
+        let mut late = open(&mut node, 200, 200);
+        request(&mut node, collection, &late.0);
+        assert_eq!(sent(&mut late), [FRAME_PEER_REFUSE]);
+        let proof = grant(&node.key, &key(200), read_capability(), collection);
+        node.learn(proof);
+        ends.push(late);
+        assert_eq!(
+            invited(&mut node, &mut ends).iter().sum::<usize>(),
+            0,
+            "no room"
+        );
+        for place in [2, 3, 4] {
+            unpeer(&mut node, collection, &ends[place].0);
+        }
+        let invitations = invited(&mut node, &mut ends);
+        assert_eq!(
+            (&invitations[..2], invitations.last()),
+            (&[1, 1][..], Some(&1))
+        );
+    }
+
+    /// A waiting peer whose own answer is owed for a request this side withdrew
+    /// is invited after that answer, not before it.
+    #[test]
+    fn a_waiting_peer_is_invited_after_the_answer_it_owes() {
+        let (mut node, collection, mut ends) = crowded();
+        let link = ends[0].0.clone();
+        node.peerings.ask(collection, &link, false);
+        node.peerings.end_peering(collection, link.id());
+        for place in [2, 3] {
+            unpeer(&mut node, collection, &ends[place].0);
+        }
+        assert_eq!(invited(&mut node, &mut ends[..2]), [0, 1]);
+        node.peerings.observe(node.pile.snapshot());
+        accept(&mut node, collection, &link);
+        assert!(!peering(&node, link.peer()).is_some_and(|peering| peering.peered));
+        assert_eq!(invited(&mut node, &mut ends[..2]), [1, 0]);
+    }
+
+    /// So is one whose request is admitted while the answer is owed.
+    #[test]
+    fn a_request_admitted_before_the_answer_it_owes_is_invited_after_it() {
+        let (mut node, collection, ends) = crowded();
+        unpeer(&mut node, collection, &ends[2].0);
+        let mut late = open(&mut node, 200, 200);
+        request(&mut node, collection, &late.0);
+        node.peerings.ask(collection, &late.0, false);
+        node.peerings.end_peering(collection, late.0.id());
+        for place in 3..6 {
+            unpeer(&mut node, collection, &ends[place].0);
+        }
+        let proof = grant(&node.key, &key(200), read_capability(), collection);
+        node.learn(proof);
+        let late = std::slice::from_mut(&mut late);
+        assert_eq!(invited(&mut node, late), [0]);
+        accept(&mut node, collection, &late[0].0);
+        assert_eq!(invited(&mut node, late), [1]);
+    }
+
+    /// A request refused for want of room is moot once this side's own request
+    /// made the peering: when that one ends, it is not invited.
+    #[test]
+    fn a_peering_that_stood_forgets_the_refused_request() {
+        let (mut node, collection, mut ends) = crowded();
+        let link = ends[0].0.clone();
+        node.peerings.ask(collection, &link, false);
+        accept(&mut node, collection, &link);
+        unpeer(&mut node, collection, &link);
+        unpeer(&mut node, collection, &ends[2].0);
+        unpeer(&mut node, collection, &ends[3].0);
+        assert_eq!(invited(&mut node, &mut ends[..2]), [0, 1]);
     }
 
     /// Whatever happens on its connections, a node asks for at most

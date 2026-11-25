@@ -438,7 +438,10 @@ credentials' root and delegated keys among connected peers. When a
 credential, a fetched definition, a new proof or the refuser's own selection
 admits a refused request, the refuser sends an invitation: a PEER_REQUEST with
 the invitation bit, which counts against the receiver's room for inbound
-peerings. The asker never asks again on its own.
+peerings. The asker never asks again on its own. A request that was admitted
+and refused only for want of room is invited once a place is free, at the next
+refill of the neighbour sets, if it is still admitted. The invitation holds that
+place until it is answered, and each remembered request is invited once.
 
 ### Neighbours
 
