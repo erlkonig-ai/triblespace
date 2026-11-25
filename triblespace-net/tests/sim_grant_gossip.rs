@@ -1865,6 +1865,109 @@ fn a_failed_grant_walk_is_retried(fault: bool, base_seed: u64) {
     }
 }
 
+/// S restarts alone while W keeps running: W's listing of every collection
+/// the two share reaches S before S's first store observation, when S cannot
+/// yet tell what it takes part in. They share more collections than a
+/// connection may list unknown ones. The observation must not leave any of
+/// them unheard: W lists each root once and nothing changes it afterwards.
+/// W also holds a grant over the last collection listed that S never saw,
+/// and it reaches S on that same connection.
+#[test]
+fn a_listing_heard_before_the_first_observation_is_not_lost() {
+    let lost = Arc::new(Mutex::new(Vec::new()));
+    for seed in 0..SEEDS {
+        let lost = lost.clone();
+        run(async move |clock| {
+            let net = SimNet::new(0x6A47_0E00 ^ seed, SimConfig::default());
+            let [w, s, x] = [0x97, 0x98, 0x99].map(key);
+            let (w_id, s_id) = (id(&w), id(&s));
+            let policy = private_policy(w.verifying_key());
+            let mut wp = Pile::new(&w);
+            let mut sp = Pile::new(&s);
+            let mut collections = Vec::new();
+            for index in 0..UNKNOWN_RESOURCES_PER_LINK + 44 {
+                let name = format!("shared {index}");
+                let collection = wp.hold(&name, &policy);
+                assert_eq!(sp.hold(&name, &policy), collection);
+                for pile in [&mut wp, &mut sp] {
+                    pile.insert(&[&grant(&w, read_capability(), &s, collection)]);
+                    pile.select(collection);
+                }
+                collections.push(collection);
+            }
+            let last = *collections.iter().max_by_key(|collection| collection.raw).unwrap();
+            let missed = grant(&w, write_capability(), &x, last);
+            wp.insert(&[&missed]);
+
+            let (s_harness, taps) = net.tap(&s);
+            let mut wh = bring_up(net.join(&w), &w, wp.store);
+            // S's host accepts connections; no store has been observed yet.
+            let (sender, receiver, wiring) = host::wire(EndpointId::from_bytes(&s_id).unwrap());
+            tokio::task::spawn_local(host::run_host(
+                s_harness,
+                PeerConfig {
+                    daemon: None,
+                    provider_publication_budget: Some(0),
+                    bind: None,
+                },
+                wiring,
+            ));
+            wh.activate_collections(collections.iter().copied());
+            until(&clock, &mut [&mut wh], 60, "W's listing at S", |_| {
+                let heard = listed(&taps, 0, w_id, false);
+                collections.iter().all(|collection| heard.contains(collection))
+            })
+            .await;
+            advance(&clock, &mut [&mut wh], 2).await;
+            assert!(listed(&taps, 0, w_id, true).is_empty(), "S has observed nothing yet");
+            let from = taps.crossed().len();
+            let dials = (net.dial_count(w_id, s_id), net.dial_count(s_id, w_id));
+
+            let mut sh = Peer::with_wiring(sp.store, sender, receiver);
+            sh.activate_collections(collections.iter().copied());
+            advance(&clock, &mut [&mut wh, &mut sh], 30).await;
+            assert_eq!(
+                (net.dial_count(w_id, s_id), net.dial_count(s_id, w_id)),
+                dials,
+                "seed {seed}: the connection was replaced"
+            );
+            let again = listed(&taps, from, w_id, false);
+            let unheard = collections
+                .iter()
+                .filter(|collection| {
+                    grant_peer(&sh, **collection, w_id).and_then(|peer| peer.listed).is_none()
+                })
+                .count();
+            let last_unheard =
+                grant_peer(&sh, last, w_id).and_then(|peer| peer.listed).is_none();
+            let opened = |sent: bool| {
+                taps.since(from, w_id, TAG_WALK)
+                    .iter()
+                    .filter(|crossed| {
+                        crossed.sent == sent
+                            && crossed.kind == FRAME_OPEN
+                            && crossed.walk_kind == Some(WALK_AUTHORIZATION)
+                            && crossed.walk_resource == Some(last.raw)
+                    })
+                    .count()
+            };
+            let arrived = holds_proof(&mut sh, &missed);
+            println!(
+                "seed {seed}: unheard {unheard} of {}, listed again {}; the last unheard: {last_unheard}, \
+                 its grant walks opened by S {} and by W {}, the missed grant arrived: {arrived}",
+                collections.len(),
+                again.len(),
+                opened(true),
+                opened(false),
+            );
+            lost.lock().unwrap().push((unheard, arrived));
+        });
+    }
+    let lost = lost.lock().unwrap();
+    assert!(lost.iter().all(|(unheard, _)| *unheard == 0), "listings W will not repeat were lost: {lost:?}");
+    assert!(lost.iter().all(|(_, arrived)| *arrived), "the missed grant: {lost:?}");
+}
+
 #[test]
 fn a_failed_grant_walk_is_retried_on_the_same_connection() {
     a_failed_grant_walk_is_retried(true, 0x6A47_0D00);
