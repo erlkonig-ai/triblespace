@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `triblespace-net`: the neighbours a node asks for per collection no longer
+  grow past five and the reserved one. A swap could end the reserved holder's
+  peering, or find no healthy neighbour to end, and asked its candidate either
+  way; nothing reduced the set again.
+
 - `triblespace-net`: frames on a connection's `recon/1` no longer count as its
   use. A connection closes 120 s after the last byte on any other stream, and
   the least recently used one is chosen for eviction by the same clock; becoming

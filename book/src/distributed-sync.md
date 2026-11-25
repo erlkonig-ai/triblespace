@@ -461,7 +461,9 @@ refilled every second.
 Every ten minutes, when a collection's five asked-for places are full and
 another candidate is available, one healthy asked-for neighbour chosen at
 random is unpeered and replaced by the next candidate, so neighbour groups that
-formed separately during a partition meet again after it heals.
+formed separately during a partition meet again after it heals. The holder of
+the reserved place, below, is not one of the five and never leaves for a swap,
+and while none of the five is healthy nobody is asked.
 
 One more place per collection is reserved for participants of C that no open
 connection reaches, walked in the same tiers and redrawn on the same terms,

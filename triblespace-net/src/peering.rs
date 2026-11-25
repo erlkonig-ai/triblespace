@@ -582,9 +582,10 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
             if now >= swap {
                 mesh.next_swap = Some(now + SWAP_INTERVAL);
                 if asked >= MAX_ASKED
+                    && let Some(leaving) = self.leaving(collection)
                     && let Some(peer) = self.next_candidate(collection, &selected, now)
                 {
-                    self.swap_out(collection);
+                    self.end_peering(collection, leaving);
                     self.ask_or_dial(collection, peer, &mut dials);
                 }
             }
@@ -1080,21 +1081,20 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
         self.changed = true;
     }
 
-    /// End one healthy asked-for peering for C, chosen at random.
-    fn swap_out(&mut self, collection: CollectionHandle) {
-        let Some(mesh) = self.meshes.get_mut(&collection.raw) else {
-            return;
-        };
+    /// The connection of the neighbour a swap of C ends: a healthy one of the
+    /// asked-for set, chosen at random. The reserved slot's holder is not one
+    /// of the set, and ending its peering would put its successor there.
+    fn leaving(&self, collection: CollectionHandle) -> Option<u64> {
+        let mesh = self.meshes.get(&collection.raw)?;
+        let held = mesh.reserved.map(|(holder, _)| holder);
         let healthy = mesh
             .peerings
             .iter()
             .filter(|(_, peering)| matches!(peering.side, Side::Peered { asked: true, .. }))
+            .filter(|(id, _)| self.links.get(id).map(Link::peer) != held)
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
-        let Some(id) = healthy.choose(&mut rand::thread_rng()).copied() else {
-            return;
-        };
-        self.end_peering(collection, id);
+        healthy.choose(&mut rand::thread_rng()).copied()
     }
 
     /// End the peering for C on connection `id`.
@@ -2323,6 +2323,242 @@ mod tests {
         assert!(kinds(&carried).contains(&("left", FRAME_UNPEER)), "{:?}", kinds(&carried));
         assert!(!peering(&node, newcomer.id()).is_some_and(|peering| peering.peered));
         assert_eq!(asked(&node), MAX_ASKED, "the five regular neighbours stay");
+    }
+
+    /// An owner that selects C, with READ grants to `grantees`.
+    fn owner(grantees: std::ops::Range<u8>) -> (Node, CollectionHandle) {
+        let mut node = Node::new(80);
+        let owner = AdmissionPolicy::direct(node.key.verifying_key());
+        let collection = node.hold(CollectionPolicy::new(owner.clone(), owner));
+        for byte in grantees {
+            let proof = grant(&node.key, &key(byte), read_capability(), collection);
+            node.learn(proof);
+        }
+        node.select(collection, true);
+        (node, collection)
+    }
+
+    /// Open a connection to the key of `byte`.
+    fn open(node: &mut Node, id: u64, byte: u8) -> (Link, Receiver<Frame>) {
+        let (link, frames) = Link::detached(id, key(byte).verifying_key().to_bytes());
+        node.peerings.event(ReconEvent::Opened(link.clone()));
+        (link, frames)
+    }
+
+    fn accept(node: &mut Node, collection: CollectionHandle, link: &Link) {
+        let flags = Flags {
+            send: true,
+            full: false,
+        };
+        let accept = Frame::PeerAccept { collection, flags };
+        node.peerings.event(ReconEvent::Frame(link.clone(), accept));
+    }
+
+    /// The keys this node asked for, or is dialling to ask, for C.
+    fn asked_for(node: &Node, collection: CollectionHandle) -> Vec<PeerId> {
+        let Some(mesh) = node.peerings.meshes.get(&collection.raw) else {
+            return Vec::new();
+        };
+        mesh.peerings
+            .iter()
+            .filter(|(_, peering)| peering.asked())
+            .map(|(id, _)| node.peerings.links[id].peer())
+            .chain(mesh.dialling.iter().copied())
+            .collect()
+    }
+
+    /// The reserved slot's holder is not one of the asked-for set, so no swap
+    /// ends its peering: the candidate would join the set in its place, and
+    /// the freed slot would go to a further participant.
+    #[test]
+    fn a_swap_never_takes_the_reserved_holder() {
+        let (mut node, collection) = owner(100..105);
+        let mut links = Vec::new();
+        for byte in 100..105 {
+            links.push(open(&mut node, byte.into(), byte).0);
+        }
+        let now = crate::clock::mono_now();
+        assert!(node.peerings.fill(now).is_empty());
+        let holder = key(105).verifying_key().to_bytes();
+        for byte in 105..110 {
+            let proof = grant(&node.key, &key(byte), read_capability(), collection);
+            node.learn(proof);
+            if byte == 105 {
+                assert_eq!(node.peerings.fill(now), [holder]);
+            }
+            links.push(open(&mut node, byte.into(), byte).0);
+        }
+        let mut sets = BTreeSet::new();
+        for round in 0..60 {
+            for second in 0..3 {
+                for link in &links {
+                    accept(&mut node, collection, link);
+                }
+                let at = now + SWAP_INTERVAL * round + PEERING_TICK * second;
+                assert!(node.peerings.fill(at).is_empty());
+            }
+            let mut asked = asked_for(&node, collection);
+            asked.sort_unstable();
+            assert!(asked.contains(&holder), "swap {round} took the holder");
+            assert_eq!(asked.len(), MAX_ASKED + 1, "after swap {round}");
+            sets.insert(asked);
+        }
+        assert!(sets.len() > 10, "the other places are swapped");
+    }
+
+    /// A swap replaces a healthy neighbour. While none of the asked-for set
+    /// is, it asks nobody else either.
+    #[test]
+    fn a_swap_without_a_healthy_neighbour_asks_nobody() {
+        let (mut node, collection) = owner(100..110);
+        let links = (100..110)
+            .map(|byte| open(&mut node, byte.into(), byte).0)
+            .collect::<Vec<_>>();
+        let now = crate::clock::mono_now();
+        node.peerings.fill(now);
+        let asked = asked_for(&node, collection);
+        for round in 1..4 {
+            node.peerings.fill(now + SWAP_INTERVAL * round);
+            assert_eq!(
+                asked_for(&node, collection).len(),
+                MAX_ASKED,
+                "after swap {round}"
+            );
+        }
+        // Once one of them peers, a swap has somebody to replace.
+        for link in &links {
+            if link.peer() == asked[0] {
+                accept(&mut node, collection, link);
+            }
+        }
+        node.peerings.fill(now + SWAP_INTERVAL * 4);
+        for link in &links {
+            accept(&mut node, collection, link);
+        }
+        node.peerings.fill(now + SWAP_INTERVAL * 4 + PEERING_TICK);
+        let after = asked_for(&node, collection);
+        assert_eq!(after.len(), MAX_ASKED);
+        assert!(!asked.iter().all(|peer| after.contains(peer)));
+    }
+
+    /// Whatever happens on its connections, a node asks for at most
+    /// [`MAX_ASKED`] neighbours and a reserved one; and once its peers answer
+    /// again, for exactly that many.
+    #[test]
+    fn no_sequence_of_events_outgrows_the_asked_for_set() {
+        use rand::rngs::StdRng;
+        use rand::{Rng as _, SeedableRng as _};
+        for seed in 0..12 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            // Connected and answering often, rarely, or seldom dialled.
+            let answers = [0.9, 0.5, 0.1][seed as usize % 3];
+            let (mut node, collection) = owner(100..108);
+            let mut granted = 108;
+            let mut links: Vec<Link> = Vec::new();
+            let mut id = 0;
+            let mut now = crate::clock::mono_now();
+            let check = |node: &Node, what: &str| {
+                let asked = asked_for(node, collection);
+                let held = usize::from(node.peerings.reserved_holder(collection).is_some());
+                assert!(
+                    asked.len() <= MAX_ASKED + held,
+                    "seed {seed}: {} asked for and {held} held after {what}",
+                    asked.len()
+                );
+            };
+            let mut dialled = Vec::new();
+            for _ in 0..600 {
+                let what = match rng.gen_range(0..12) {
+                    0..=2 => {
+                        now = now + Duration::from_millis(rng.gen_range(1..200_000));
+                        dialled.extend(node.peerings.fill(now));
+                        "a fill"
+                    }
+                    3..=4 if !dialled.is_empty() => {
+                        let peer: PeerId = dialled.swap_remove(rng.gen_range(0..dialled.len()));
+                        if rng.gen_bool(answers) {
+                            id += 1;
+                            let (link, _) = Link::detached(id, peer);
+                            node.peerings.event(ReconEvent::Opened(link.clone()));
+                            links.push(link);
+                        }
+                        node.peerings
+                            .dialled(peer, links.iter().any(|link| link.peer() == peer));
+                        "a dial"
+                    }
+                    5 => {
+                        id += 1;
+                        links.push(open(&mut node, id, rng.gen_range(100..granted)).0);
+                        "an opened connection"
+                    }
+                    6 if !links.is_empty() && rng.gen_bool(0.3) => {
+                        let link = links.swap_remove(rng.gen_range(0..links.len()));
+                        node.peerings.event(ReconEvent::Closed(link));
+                        "a closed connection"
+                    }
+                    7 if granted < 130 && rng.gen_bool(0.3) => {
+                        let proof = grant(&node.key, &key(granted), read_capability(), collection);
+                        node.learn(proof);
+                        granted += 1;
+                        "a new grant"
+                    }
+                    8 if rng.gen_bool(0.02) => {
+                        node.select(collection, false);
+                        node.select(collection, true);
+                        "a new selection"
+                    }
+                    _ if links.is_empty() => continue,
+                    frame => {
+                        let link = links[rng.gen_range(0..links.len())].clone();
+                        let flags = Flags {
+                            send: rng.gen_bool(0.5),
+                            full: false,
+                        };
+                        let invitation = rng.gen_bool(0.5);
+                        let frame = match frame {
+                            9 if rng.gen_bool(0.3) => Frame::PeerRefuse { collection },
+                            9 if rng.gen_bool(0.3) => Frame::Unpeer { collection },
+                            9 => Frame::PeerRequest {
+                                collection,
+                                flags,
+                                invitation,
+                                credentials: Vec::new(),
+                            },
+                            _ => Frame::PeerAccept { collection, flags },
+                        };
+                        if rng.gen_bool(answers) {
+                            node.peerings.event(ReconEvent::Frame(link, frame));
+                        }
+                        "a frame"
+                    }
+                };
+                check(&node, what);
+            }
+            for _ in 0..8 {
+                now = now + SWAP_INTERVAL;
+                for second in 0..40 {
+                    for peer in node.peerings.fill(now + PEERING_TICK * second) {
+                        id += 1;
+                        let (link, _) = Link::detached(id, peer);
+                        node.peerings.event(ReconEvent::Opened(link.clone()));
+                        links.push(link);
+                    }
+                    for link in &links {
+                        accept(&mut node, collection, link);
+                    }
+                    for peer in std::mem::take(&mut dialled) {
+                        node.peerings.dialled(peer, false);
+                    }
+                    check(&node, "its peers answered again");
+                }
+            }
+            let held = usize::from(node.peerings.reserved_holder(collection).is_some());
+            assert_eq!(
+                asked_for(&node, collection).len(),
+                MAX_ASKED + held,
+                "seed {seed}"
+            );
+        }
     }
 
     #[test]
