@@ -1912,6 +1912,10 @@ mod tests {
         let failed = settled(&mut store);
         assert_eq!(failed.held(c1), first.held(c1), "nothing is taken back");
         assert_eq!(held_set(&failed, c2), BTreeSet::from([c2.raw, metadata]));
+        let leaf = blob(&mut store, b"a new leaf of C1");
+        commit(&mut store, c1, leaf, metadata);
+        let republished = settled(&mut store);
+        assert!(held_set(&republished, c1).is_superset(&BTreeSet::from([p, q, leaf])));
         store.faults.unreadable.lock().unwrap().remove(&p);
         assert!(!held_set(&settled(&mut store), c2).contains(&p));
         store.note_held(c2, Inline::new(p));
@@ -3036,7 +3040,13 @@ mod tests {
                 driver.join().unwrap();
                 continue;
             }
-            assert_eq!(held_set(&settled(&mut store), c), first);
+            // A new record republishes the set, so what the failed read did
+            // to it shows.
+            let leaf = blob(&mut store, b"a new leaf, after the failed read");
+            commit(&mut store, c, leaf, metadata);
+            let mut expected = first.clone();
+            expected.insert(leaf);
+            assert_eq!(held_set(&settled(&mut store), c), expected);
             assert_eq!(reads(&store, &p), 2);
             assert_eq!(reads(&store, &z), 1, "P was not read, so Z was not tried");
             store.faults.unreadable.lock().unwrap().remove(&p);
