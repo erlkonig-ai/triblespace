@@ -13,6 +13,12 @@
 //! admits the asker, it invites it: a request in the other direction. The
 //! asker never asks again on its own.
 //!
+//! A side that asked or invited is owed an answer, also after it withdrew the
+//! request with an UNPEER, and sends no other request for C on the connection
+//! until the answer came. What comes before it was sent before the peer took
+//! the request up: an UNPEER leaves the request standing, and a request that
+//! crosses a withdrawal is refused, as the UNPEER on its way would end it.
+//!
 //! Each selected collection has up to [`MAX_ASKED`] neighbours this side asked
 //! for, plus up to [`MAX_INBOUND_PEERINGS`] peerings others asked for or were
 //! invited to. Candidates come in tiers -- C's participants in the grant
@@ -100,6 +106,8 @@ enum Side {
 #[derive(Default)]
 struct Peering {
     side: Side,
+    /// The peer has yet to answer this side's last request, standing or not.
+    owed: bool,
     /// The peer's request this side refused: the peer's flags, and the
     /// definitions whose arrival could admit it.
     refused: Option<(Flags, Vec<CapabilityHandle>)>,
@@ -130,6 +138,7 @@ impl Peering {
 
     fn is_empty(&self) -> bool {
         matches!(self.side, Side::Idle)
+            && !self.owed
             && self.refused.is_none()
             && !self.refused_by_them
             && self.presented.is_empty()
@@ -772,6 +781,10 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
             }
             frame => {
                 let peering = self.peering(collection, link.id());
+                let owed = peering.owed;
+                if let Frame::PeerAccept { .. } | Frame::PeerRefuse { .. } = frame {
+                    peering.owed = false;
+                }
                 peering.side = match (peering.side, frame) {
                     (Side::Asked { asked, mine }, Frame::PeerAccept { flags: theirs, .. }) => {
                         peering.refused_by_them = false;
@@ -796,6 +809,11 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
                             Side::Idle
                         }
                     }
+                    // Sent before the peer took up the request that stands.
+                    (
+                        Side::Asked { asked, mine } | Side::Peered { asked, mine, .. },
+                        Frame::Unpeer { .. },
+                    ) if owed => Side::Asked { asked, mine },
                     (_, Frame::Unpeer { .. }) => Side::Idle,
                     // An answer to a request this side has since withdrawn.
                     (side, _) => side,
@@ -876,8 +894,11 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
             theirs,
             &peering.presented,
         );
+        // It crosses the UNPEER that withdrew this side's request, which would
+        // end the peering at the peer.
+        let withdrawn = peering.owed && matches!(peering.side, Side::Idle);
         match decision {
-            Ok(mine) if room || peering.peered() => {
+            Ok(mine) if !withdrawn && (room || peering.peered()) => {
                 link.send(Frame::PeerAccept {
                     collection,
                     flags: mine,
@@ -1006,8 +1027,9 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
         let credentials = self.credentials(&local);
         let full = self.full(collection);
         let peering = self.peering(collection, link.id());
-        // A peering or request already on this connection stands.
-        if !matches!(peering.side, Side::Idle) {
+        // A peering or request already on this connection stands, or the
+        // answer to one withdrawn is owed.
+        if peering.owed || !matches!(peering.side, Side::Idle) {
             return;
         }
         let mine = flags(
@@ -1024,6 +1046,7 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
             asked: !invitation,
             mine,
         };
+        peering.owed = true;
         if invitation {
             peering.refused = None;
         }
@@ -2439,6 +2462,83 @@ mod tests {
         let after = asked_for(&node, collection);
         assert_eq!(after.len(), MAX_ASKED);
         assert!(!asked.iter().all(|peer| after.contains(peer)));
+    }
+
+    /// Two nodes ask, end what they asked for, and deselect and select C, with
+    /// every frame delivered late, in order and one at a time: once all are
+    /// delivered both agree whether they peer, and no answer is owed. Each
+    /// frame may meet its receiver in any state.
+    #[test]
+    fn both_ends_agree_whenever_every_frame_arrived() {
+        use rand::rngs::StdRng;
+        use rand::{Rng as _, SeedableRng as _};
+        let mut ends = BTreeMap::new();
+        for seed in 0..400 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut nodes = [Node::new(30), Node::new(31)];
+            let open = || CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+            let collection = nodes[0].hold(open());
+            assert_eq!(nodes[1].hold(open()), collection);
+            let mut selected = [true, true];
+            for node in &mut nodes {
+                node.select(collection, true);
+            }
+            let [left, right] = &mut nodes;
+            let mut wire = connect(left, right, 1);
+            let mut log = Vec::new();
+            for _ in 0..40 {
+                let side = rng.gen_range(0..2);
+                let links = [&wire.to_right, &wire.to_left];
+                let node = &mut nodes[side];
+                let asked = node
+                    .peerings
+                    .meshes
+                    .get(&collection.raw)
+                    .and_then(|mesh| mesh.peerings.get(&1))
+                    .is_some_and(Peering::asked);
+                match rng.gen_range(0..10) {
+                    0..=1 if asked => {
+                        node.peerings.end_peering(collection, 1);
+                        log.push((side, "end"));
+                    }
+                    2..=3 => {
+                        node.peerings.ask(collection, links[side], false);
+                        log.push((side, "ask"));
+                    }
+                    4 => {
+                        selected[side] = !selected[side];
+                        node.select(collection, selected[side]);
+                        log.push((side, "select or deselect"));
+                    }
+                    _ => {
+                        let frames = [&mut wire.from_right, &mut wire.from_left];
+                        if let Ok(frame) = frames[side].try_recv() {
+                            let frame = ReconEvent::Frame(links[side].clone(), frame);
+                            node.peerings.event(frame);
+                            log.push((side, "hear"));
+                        }
+                    }
+                }
+            }
+            let [left, right] = &mut nodes;
+            carry(left, right, &mut wire);
+            let states = nodes.each_ref().map(|node| {
+                let mesh = node.peerings.meshes.get(&collection.raw);
+                let peering = mesh.and_then(|mesh| mesh.peerings.get(&1));
+                (
+                    peering.is_some_and(Peering::peered),
+                    peering.is_some_and(|peering| peering.owed),
+                )
+            });
+            assert_eq!(
+                states[0], states[1],
+                "seed {seed}: peered and owed at either end after {log:?}"
+            );
+            assert!(!states[0].1, "seed {seed}: an answer is owed after {log:?}");
+            *ends.entry(states[0].0).or_insert(0) += 1;
+        }
+        assert!(ends.values().all(|count| *count > 40), "{ends:?}");
+        assert_eq!(ends.len(), 2);
     }
 
     /// Whatever happens on its connections, a node asks for at most

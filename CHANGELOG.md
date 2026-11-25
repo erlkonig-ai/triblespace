@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   peering, or find no healthy neighbour to end, and asked its candidate either
   way; nothing reduced the set again.
 
+- `triblespace-net`: the late answer to a peering request that was withdrawn no
+  longer passes for the answer to the next one on the same connection, which
+  left one end counting a neighbour that did not count it. A node waits for the
+  answer it is owed before it asks or invites again.
+
 - `triblespace-net`: frames on a connection's `recon/1` no longer count as its
   use. A connection closes 120 s after the last byte on any other stream, and
   the least recently used one is chosen for eviction by the same clock; becoming

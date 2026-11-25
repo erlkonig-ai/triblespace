@@ -406,6 +406,12 @@ flag set, the reader accepts with its own flag unset, and records flow from the
 writer to the reader only.
 A refusal is a PEER_REFUSE frame; `recon/1` stays open.
 
+An answer names no request, so a side sends its next request or invitation for
+C on a connection only once the last one was answered, also if it withdrew that
+one with an UNPEER. What arrives before the answer was sent before the peer took
+the request up: an UNPEER leaves a standing request as it is, and a request that
+crosses a withdrawal is refused.
+
 Admission is evaluated again whenever its inputs change: a store observation
 that changes C's evidence or brings a missing definition, a CREDENTIAL frame,
 a change of replication mode. A peering's send flag follows READ admission and
