@@ -1683,7 +1683,9 @@ is read on arrival. The late child -- resident only after its parent was read
 for C -- is caught three ways:
 
 - it is itself a seed of C;
-- a note reports its parent in C, which reads the parent again; or
+- a note reports its parent in C, which reads the parent again (a note that
+  lands while the parent is being read reads it once more, against the
+  snapshot that took the note); or
 - a Full neighbour holds it in C: its references push notes it held in C
   here too, however it arrived, and the receiver fetches it first when it is
   not resident. A note is routing evidence kept in memory: a reopened store forgets it unless

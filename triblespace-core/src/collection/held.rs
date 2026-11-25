@@ -67,7 +67,11 @@
 //!   resident blob a peer reports in C joins `held(C)` however it arrived.
 //!   This is routing evidence, kept in memory only; a reopened store forgets
 //!   it unless one of C's own records reaches the blob by then;
-//! - a peer reports its parent in C, which reads the parent again;
+//! - a peer reports its parent in C, which reads the parent again. A report
+//!   that lands while the parent is being read reads it once more, against
+//!   the snapshot that took the report. That costs one more read of the
+//!   parent for each read a report lands during (reports during one read
+//!   wake one entry), and without a new report nothing reads it again;
 //! - a reset of the index recomputes every closure from the roots.
 //!
 //! Otherwise it stays out of `held(C)` until the index resets or the store is
@@ -250,10 +254,13 @@ pub trait HeldStore {
     fn track_held(&mut self, collections: impl IntoIterator<Item = CollectionHandle>);
 
     /// A peer reported `handle` in its held set of `collection`. If the blob
-    /// is resident when the next snapshot is taken, the driver adds it and
-    /// everything it reaches to `held(collection)`, and tries again its
-    /// children that could not be read; a report of a blob that is not
-    /// resident is dropped. Kept in memory only.
+    /// is resident when the next snapshot is taken, the driver reads it
+    /// (again, if the collection holds it already) and adds it and everything
+    /// that read reaches to `held(collection)`, trying again its children
+    /// that could not be read. A read that fails retries nothing: a blob the
+    /// collection holds stays held, and its children wait for another report.
+    /// A report that arrives during the read reads the blob once more. A
+    /// report of a blob that is not resident is dropped. Kept in memory only.
     fn note_held(&mut self, collection: CollectionHandle, handle: Inline<Handle<UnknownBlob>>);
 
     /// The work that computes the held sets: every blob read and every proof
@@ -689,16 +696,27 @@ impl<T> State<T> {
         self.frontier.replace(&Entry::with_value(&key, wake));
     }
 
-    /// Apply the frontier entry `blob` of `collection`, readable with
-    /// `children`: it joins the collection's held set, and every child not
-    /// held there enters the frontier. A child waiting in unknown is tried
-    /// again only when a peer reported `blob`. Whether the held set grew.
-    fn apply_readable(&mut self, collection: &Raw, blob: Raw, children: &[Raw]) -> bool {
+    /// Apply the frontier entry `blob` of `collection`, read against
+    /// observation `read_at` with `children`: it joins the collection's held
+    /// set, and every child not held there enters the frontier. A child
+    /// waiting in unknown is tried again only when a peer reported `blob`.
+    /// An entry woken after `read_at` stays in the frontier for one more
+    /// read: the evidence that woke it (a report) came after the read, whose
+    /// children may lack a child resident since. Whether the held set grew.
+    fn apply_readable(
+        &mut self,
+        collection: &Raw,
+        blob: Raw,
+        read_at: u64,
+        children: &[Raw],
+    ) -> bool {
         let key = pair(collection, &blob);
         let Some(wake) = self.frontier.get(&key).copied() else {
             return false;
         };
-        self.frontier.remove(&key);
+        if wake.at <= read_at {
+            self.frontier.remove(&key);
+        }
         let Some(mut held) = self.held.get(collection).cloned() else {
             return false;
         };
@@ -1110,9 +1128,10 @@ impl<T: HeldSource + Send> Drive for HeldIndex<T> {
     /// applied. A reset meanwhile drops the read (the reset recomputes
     /// everything from the roots), and a clone keeps the entry. Snapshots may
     /// be fed in meanwhile, so a read is applied against the evidence that
-    /// arrived since: an entry that could not be read but was woken since, or
-    /// was absent and is resident now, is read again, since the snapshot that
-    /// saw the evidence found it in the frontier, not in unknown.
+    /// arrived since: an entry that was woken since, whether its read
+    /// succeeded or not, or that was absent and is resident now, is read
+    /// again, since the snapshot that saw the evidence found it in the
+    /// frontier, not in unknown.
     fn advance(&self, budget: Duration) -> bool {
         let started = Instant::now();
         let mut stepped = false;
@@ -1167,7 +1186,7 @@ impl<T: HeldSource + Send> Drive for HeldIndex<T> {
                 continue;
             }
             let grew = match read {
-                Some(children) => state.apply_readable(&collection, blob, &children),
+                Some(children) => state.apply_readable(&collection, blob, read_at, &children),
                 None => {
                     state.apply_unreadable(&collection, blob, read_at, absent);
                     false
@@ -3138,5 +3157,59 @@ mod tests {
         assert!(held_set(&reported, c).contains(&h));
         assert_eq!(reads(&store, &p), 2);
         assert_eq!(reads(&store, &h), 1);
+    }
+
+    /// A report of P that lands while the driver reads P (a review finding,
+    /// 2026-11-26): the read is made against snapshot S, which lacks H; then
+    /// H arrives and a peer reports P, and the snapshot S2 that takes the
+    /// report finds P in the frontier. The read of P against
+    /// S is applied after that, and its children lack H, so it is not P's
+    /// last read: P is read once more, against S2, and H joins.
+    #[test]
+    fn a_report_arriving_during_a_successful_read_reads_it_again() {
+        let mut store = Store::default();
+        let c = collection(&mut store, "reported mid-read");
+        let metadata = blob(&mut store, b"metadata");
+        let h_bytes = unresident_naming(b"a child arriving during its parent's read", &[]);
+        let h = handle_of(&h_bytes);
+        let p = blob_naming(&mut store, b"a parent read while reported", &[h]);
+        commit(&mut store, c, p, metadata);
+        store.track_held([c]);
+        let first = held_set(&settled(&mut store), c);
+        assert_eq!(first, BTreeSet::from([c.raw, metadata, p]));
+        store.note_held(c, Inline::new(p));
+        // S: takes the report; the driver reads P against it.
+        store.snapshot().unwrap();
+        let work = store.drive_held().expect("the only driver");
+        let (release, driver) = block_driver_in(&mut store, work, p);
+        store.put::<UnknownBlob, _>(h_bytes).unwrap();
+        store.note_held(c, Inline::new(p));
+        // S2: holds H, and takes the report while the read is in flight.
+        store.snapshot().unwrap();
+        release.send(()).unwrap();
+        let mut held = BTreeSet::new();
+        for _ in 0..1000 {
+            held = held_set(&store.snapshot().unwrap(), c);
+            if held.contains(&h) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(held.contains(&h), "the report in flight is not lost");
+        assert_eq!(
+            reads(&store, &p),
+            3,
+            "its first closure, the read in flight, and once more"
+        );
+        assert_eq!(reads(&store, &h), 1);
+        // Quiescent: with no further report, P is not read again.
+        for _ in 0..20 {
+            store.snapshot().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(reads(&store, &p), 3, "once more, and no more");
+        assert_eq!(reads(&store, &h), 1);
+        drop(store);
+        driver.join().unwrap();
     }
 }
