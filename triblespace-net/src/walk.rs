@@ -46,12 +46,12 @@
 //! one within a round trip, the stream the smaller peer id opened survives
 //! and the larger id's own is reset [`RESET_WALK_DUPLICATE`], which neither
 //! counts nor forgets anything; a later stream from the peer for a running
-//! incoming exchange replaces it. An exchange ends after [`WALK_DEADLINE`]
-//! without a frame from the peer while one is owed: before its DONE, and
-//! after it for the values asked for; the peer's LANDED is waited for as
-//! long as the connection lives, since landings take what time they take,
-//! and a blob fetch ends after [`WALK_DEADLINE`] without progress, never for
-//! its size. Walk streams count as in use on their connection, so a
+//! incoming exchange replaces it. An exchange ends once nothing moved in it for
+//! about a minute ([`Movement`]), whatever it waits for: no frame, no landing,
+//! no byte of a blob. Landings and fetches take what time they take: a side
+//! whose own move on says so in PROGRESS frames, which settle nothing and are
+//! never an answer to one. A blob fetch ends after [`WALK_DEADLINE`] without
+//! progress, never for its size. Walk streams count as in use on their connection, so a
 //! draining connection waits for them.
 //!
 //! Cached whole-component walks instead use gated FINs: local readiness does
@@ -63,6 +63,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -71,6 +72,7 @@ use anybytes::View;
 use ed25519_dalek::VerifyingKey;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinSet;
 use tracing::{debug, info};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::Blob;
@@ -202,9 +204,14 @@ impl Reader<'_> {
     }
 }
 
-/// An exchange ends after this long without a frame from the peer while one
-/// is owed, and a blob fetch after this long without progress.
+/// A write on a walk stream and a blob fetch end after this long without a
+/// byte.
 pub(crate) const WALK_DEADLINE: Duration = Duration::from_secs(60);
+/// How often a driver looks whether its exchange moved, and tells the peer
+/// that what it received did.
+pub(crate) const PROGRESS_TICK: Duration = Duration::from_secs(20);
+/// An exchange ends at this many ticks in a row in which nothing moved.
+const QUIET_TICKS: u8 = 3;
 /// Value requests and blob fetches one exchange keeps in flight.
 pub(crate) const MAX_WALK_REQUESTS: usize = 64;
 /// Grant walks one peer runs at once; the rest wait in order.
@@ -1288,7 +1295,7 @@ where
         let Some(exchange) = self.walks.start(connection.link().id(), peer, collection, kind) else {
             return not_started(self, NotStarted::StartDeclined);
         };
-        let (driver, acked, replaced) = self.register(key, connection.link().id(), true, &exchange);
+        let (mut driver, acked, replaced) = self.register(key, connection.link().id(), true, &exchange);
         tokio::spawn(async move {
             let (ended, duplicate) = match open_walk(
                 &connection,
@@ -1395,7 +1402,7 @@ where
             recv.stop(RESET_WALK_REFUSED);
             return;
         };
-        let (driver, acked, replaced) = self.register(key, link.id(), false, &exchange);
+        let (mut driver, acked, replaced) = self.register(key, link.id(), false, &exchange);
         tokio::spawn(async move {
             let (ended, duplicate) = drive(&driver, exchange, send, recv, acked, replaced).await;
             driver.ended(ended, duplicate);
@@ -1482,6 +1489,7 @@ where
             peer,
             collection,
             kind,
+            lost: Some(exchange.lost()),
         };
         (driver, acked, replaced)
     }
@@ -1491,17 +1499,35 @@ where
 /// fetch ends after [`WALK_DEADLINE`] without progress, between any two
 /// chunks, never for its size, so a blob of any size lands at a steady rate;
 /// the wait for an opener permit before it is not timed.
+///
+/// A byte that arrives is noted in `arrived`. So is the connection's line until
+/// the fetch has its stream: permits go in order, and the requests ahead move
+/// it as bytes arrive for them.
 async fn fetch_blob<T: Transport, S: Service>(
     connections: ConnectionTable<T, S>,
     peer: PeerId,
     handle: RawHash,
+    arrived: Arc<AtomicBool>,
 ) -> Option<Blob<UnknownBlob>> {
     let connection = connections.current(peer)?;
     let local = connections.transport().local_id();
     let provider = connection.remote_id();
-    let (mut send, recv) = connection.open_bi().await.ok()?;
+    let mut opening = std::pin::pin!(connection.open_bi());
+    let mut line = connection.line();
+    let (send, recv) = loop {
+        tokio::select! {
+            opened = &mut opening => break opened.ok()?,
+            () = tokio::time::sleep(PROGRESS_TICK / 2) => {
+                let now = connection.line();
+                if std::mem::replace(&mut line, now) != now {
+                    arrived.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    };
+    let mut send = Progress::new(send, WALK_DEADLINE);
     send_u8(&mut send, TAG_BLOB).await.ok()?;
-    let mut recv = Progress::new(recv, WALK_DEADLINE);
+    let mut recv = Noted(Progress::new(recv, WALK_DEADLINE), arrived);
     fetch_get_blob_stream_with_limit(
         &mut send,
         &mut recv,
@@ -1515,8 +1541,8 @@ async fn fetch_blob<T: Transport, S: Service>(
         .flatten()
 }
 
-/// Stream IO under a deadline on byte progress: a read or write that moves
-/// no byte for `idle` fails, and every byte moved starts the wait again.
+/// Stream IO under a deadline on byte progress: a read, write or shutdown that
+/// moves no byte for `idle` fails, and every byte moved starts the wait again.
 struct Progress<R> {
     inner: R,
     idle: Duration,
@@ -1589,7 +1615,56 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Progress<W> {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        let this = &mut *self;
+        match Pin::new(&mut this.inner).poll_shutdown(cx) {
+            Poll::Pending => this.deadline.as_mut().poll(cx).map(|()| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "no finish within the walk deadline",
+                ))
+            }),
+            ready => ready,
+        }
+    }
+}
+
+/// A stream half that notes every byte it moves.
+struct Noted<R>(R, Arc<AtomicBool>);
+
+impl<R: AsyncRead + Unpin> AsyncRead for Noted<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut self.0).poll_read(cx, buf);
+        if buf.filled().len() != before {
+            self.1.store(true, Ordering::Relaxed);
+        }
+        polled
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for Noted<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let polled = Pin::new(&mut self.0).poll_write(cx, bytes);
+        if matches!(polled, Poll::Ready(Ok(n)) if n > 0) {
+            self.1.store(true, Ordering::Relaxed);
+        }
+        polled
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
     }
 }
 
@@ -1605,10 +1680,22 @@ struct Driver<T: Transport, S, R> {
     peer: PeerId,
     collection: CollectionHandle,
     kind: WalkKind,
+    /// What the task hears if the driver is dropped without its exchange's end,
+    /// as by a panic.
+    lost: Option<Ended>,
+}
+
+impl<T: Transport, S, R> Drop for Driver<T, S, R> {
+    fn drop(&mut self) {
+        if let Some(lost) = self.lost.take() {
+            self.ended(lost, false);
+        }
+    }
 }
 
 impl<T: Transport, S, R> Driver<T, S, R> {
-    fn ended(&self, ended: Ended, duplicate: bool) {
+    fn ended(&mut self, ended: Ended, duplicate: bool) {
+        self.lost = None;
         let _ = self.commands.send(Command::Ended {
             id: self.id,
             peer: self.peer,
@@ -1623,12 +1710,56 @@ impl<T: Transport, S, R> Driver<T, S, R> {
 /// A blob fetch's result, as a driver hears it.
 type Fetched = (RawHash, Option<Blob<UnknownBlob>>);
 
+/// Whether an exchange moves, as its driver sees it: a byte of its stream that
+/// crossed either way, a value that landed, a byte of a blob that arrived, or
+/// the line a fetch waits in. Work that is only under way is no movement, nor
+/// is a PROGRESS of this side.
+struct Movement {
+    tick: tokio::time::Interval,
+    /// Something moved since the last tick.
+    moved: bool,
+    /// A byte crossed the stream since the last tick.
+    crossed: Arc<AtomicBool>,
+    /// What this side received moved on since it last told the peer.
+    advanced: bool,
+    /// A blob this exchange fetches moved on since the last tick.
+    arrived: Arc<AtomicBool>,
+    /// Ticks in a row in which nothing moved.
+    quiet: u8,
+}
+
+impl Movement {
+    fn new() -> Self {
+        let first = tokio::time::Instant::now() + PROGRESS_TICK;
+        let mut tick = tokio::time::interval_at(first, PROGRESS_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Self {
+            tick,
+            moved: false,
+            crossed: Arc::default(),
+            advanced: false,
+            arrived: Arc::default(),
+            quiet: 0,
+        }
+    }
+
+    /// At a tick: whether to tell the peer, or `None` to end the exchange.
+    fn judge(&mut self) -> Option<bool> {
+        self.advanced |= self.arrived.swap(false, Ordering::Relaxed);
+        let crossed = self.crossed.swap(false, Ordering::Relaxed);
+        let moved = std::mem::take(&mut self.moved) || crossed || self.advanced;
+        self.quiet = if moved { 0 } else { self.quiet + 1 };
+        (self.quiet < QUIET_TICKS).then(|| std::mem::take(&mut self.advanced))
+    }
+}
+
 /// Drive one exchange on its stream, after the tag and Open: write the
 /// frames of this side's delta as the stream takes them, interleaved with
 /// its answers, feed the peer's frames while the exchange wants them and
 /// what landing and blob fetches report, and end the stream as the exchange
-/// did: finished once confirmed, reset otherwise. A stream whose peer owes a
-/// frame and sends none for [`WALK_DEADLINE`] is reset too. Returns the
+/// did: finished once confirmed, reset otherwise. An exchange in which nothing
+/// moved for [`QUIET_TICKS`] ticks ([`Movement`]) is reset too, whatever it
+/// waits for. Its blob fetches end with it. Returns the
 /// exchange as it ended, and whether the peer reset the stream for the one
 /// it opened at the same time.
 async fn drive<T: Transport, S: Service, R>(
@@ -1645,8 +1776,9 @@ where
     if exchange.algorithm() == crate::walk_stream::Algorithm::CachedRiblt {
         return cached::drive(driver, exchange, send, recv, acked, replaced).await;
     }
+    let mut movement = Movement::new();
     let (frames, mut framed) = mpsc::channel(1);
-    let reader = tokio::spawn(read_stream(recv, frames));
+    let reader = tokio::spawn(read_stream(Noted(recv, movement.crossed.clone()), frames));
     let (outgoing, written) = mpsc::channel(1);
     let (reset, resetting) = oneshot::channel();
     let (write_failed, mut writer_failed) = oneshot::channel();
@@ -1657,13 +1789,13 @@ where
         resetting,
         write_failed,
         Some(progress),
+        movement.crossed.clone(),
     ));
-    let (fetches, mut fetched) = mpsc::unbounded_channel::<Fetched>();
+    let mut fetches = JoinSet::<Fetched>::new();
     let mut outbox = VecDeque::new();
     // ROOT first, whatever arrives meanwhile.
     let mut pending = exchange.next_delta();
     let mut deferred_delta = None;
-    let mut heard_at = tokio::time::Instant::now();
     let mut duplicate = false;
     let mut refused = false;
     let failed = 'drive: loop {
@@ -1712,18 +1844,17 @@ where
         if exchange.outcome().is_some() {
             continue;
         }
-        let deadline = exchange.awaits().then(|| heard_at + WALK_DEADLINE);
         let outs = tokio::select! {
             permit = outgoing.reserve(), if pending.is_some() => match permit {
+                // Its bytes are the movement.
                 Ok(permit) => {
                     permit.send(pending.take().expect("a frame is pending"));
-                    Vec::new()
+                    continue;
                 }
                 Err(_) => break 'drive true,
             },
-            frame = next_frame(&mut framed, deadline), if exchange.want_read() => match frame {
+            frame = framed.recv(), if exchange.want_read() => match frame {
                 Some(Ok(frame)) => {
-                    heard_at = tokio::time::Instant::now();
                     // Clone out and let the watch guard drop before the
                     // frame is handled: held across a long on_frame, it made
                     // the next publish wait, and every reader queued behind
@@ -1738,8 +1869,17 @@ where
                 }
                 None => break 'drive true,
             },
-            Some((landed, failed)) = acked.recv() => exchange.on_landed_ack(landed, failed),
-            Some((handle, blob)) = fetched.recv() => exchange.on_fetched(handle, blob),
+            Some((landed, failed)) = acked.recv() => {
+                movement.advanced = true;
+                exchange.on_landed_ack(landed, failed)
+            }
+            Some(fetched) = fetches.join_next() => match fetched {
+                Ok((handle, blob)) => {
+                    movement.advanced |= blob.is_some();
+                    exchange.on_fetched(handle, blob)
+                }
+                Err(_) => break 'drive true,
+            },
             changed = progressed.changed() => {
                 if changed.is_err() { break 'drive true; }
                 let written = *progressed.borrow_and_update();
@@ -1749,7 +1889,18 @@ where
             },
             _ = &mut writer_failed => break 'drive true,
             _ = &mut replaced => break 'drive true,
+            _ = movement.tick.tick() => match movement.judge() {
+                Some(told) => {
+                    outbox.extend(told.then_some(Frame::Progress));
+                    continue;
+                }
+                None => {
+                    debug!("walk/1 exchange ended: nothing moved");
+                    break 'drive true;
+                }
+            },
         };
+        movement.moved = true;
         for out in outs {
             match out {
                 Out::Send(frame) => outbox.push_back(frame),
@@ -1765,13 +1916,13 @@ where
                     });
                 }
                 Out::Fetch(handle) => {
-                    let connections = driver.connections.clone();
-                    let fetches = fetches.clone();
-                    let peer = driver.peer;
-                    tokio::spawn(async move {
-                        let blob = fetch_blob(connections, peer, handle).await;
-                        let _ = fetches.send((handle, blob));
-                    });
+                    let fetch = fetch_blob(
+                        driver.connections.clone(),
+                        driver.peer,
+                        handle,
+                        movement.arrived.clone(),
+                    );
+                    fetches.spawn(async move { (handle, fetch.await) });
                 }
             }
         }
@@ -1824,30 +1975,12 @@ where
     (ended, duplicate)
 }
 
-/// The next frame the reader forwarded, within `deadline` when the driver
-/// is owed one: past it, as for a stream that ended.
-async fn next_frame(
-    frames: &mut mpsc::Receiver<Result<Frame, Option<u32>>>,
-    deadline: Option<tokio::time::Instant>,
-) -> Option<Result<Frame, Option<u32>>> {
-    match deadline {
-        Some(deadline) => tokio::time::timeout_at(deadline, frames.recv())
-            .await
-            .unwrap_or_else(|_| {
-                debug!("walk/1 exchange deadline exceeded");
-                Some(Err(None))
-            }),
-        None => frames.recv().await,
-    }
-}
-
 /// Read a walk stream's frames to `frames`, one ahead of the driver, so no
 /// frame is left half read when the driver turns to something else. An
 /// `Err` ends it: the stream ended, failed (with the code the peer reset it
-/// with, if it did) or carried a malformed frame. The driver times its
-/// waits, when a frame is owed.
+/// with, if it did) or carried a malformed frame. The driver times its waits.
 async fn read_stream(
-    mut recv: Box<dyn RecvStream>,
+    mut recv: impl AsyncRead + Unpin,
     frames: mpsc::Sender<Result<Frame, Option<u32>>>,
 ) {
     loop {
@@ -1880,7 +2013,8 @@ async fn read_stream(
 /// reset it with the code `reset` brings, even in the middle of a frame the
 /// peer is not reading. A stream that fails under a write is still reset or
 /// finished as the driver says, once it says so. A failed write also wakes
-/// the driver immediately. Writes have a byte-progress deadline, and final
+/// the driver immediately. The bytes of every frame but PROGRESS are noted in
+/// `crossed`. Writes have a byte-progress deadline, and final
 /// shutdown is bounded and cancellable. Returns actual LANDED write and
 /// successful stream-finish receipts separately.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1897,9 +2031,10 @@ async fn write_stream_progress(
     reset: oneshot::Receiver<u32>,
     write_failed: oneshot::Sender<()>,
     progress: Option<watch::Sender<Written>>,
+    crossed: Arc<AtomicBool>,
 ) -> (bool, bool) {
     let mut reset = futures::FutureExt::fuse(reset);
-    write_stream_inner(&mut send, frames, &mut reset, write_failed, progress).await
+    write_stream_inner(&mut send, frames, &mut reset, write_failed, progress, crossed).await
 }
 
 /// The cached driver retains the send handle after half-close so replacement
@@ -1910,6 +2045,7 @@ async fn write_stream_inner(
     reset: &mut Reset,
     write_failed: oneshot::Sender<()>,
     progress: Option<watch::Sender<Written>>,
+    crossed: Arc<AtomicBool>,
 ) -> (bool, bool) {
     let mut broken = false;
     let mut write_failed = Some(write_failed);
@@ -1957,7 +2093,7 @@ async fn write_stream_inner(
                             send.reset(code);
                             return (landed_written, false);
                         }
-                        written = write_cells(&mut **send, first, frames, |cells| {
+                        written = write_cells(&mut **send, first, frames, &crossed, |cells| {
                             receipt.cells = cells;
                             if let Some(progress) = &progress {
                                 let _ = progress.send(receipt);
@@ -1971,6 +2107,11 @@ async fn write_stream_inner(
                     continue;
                 }
                 let (kind, payload) = frame.encode();
+                // This side's sign of life is not the walk's movement.
+                let crossed = match frame {
+                    Frame::Progress => Arc::default(),
+                    _ => crossed.clone(),
+                };
                 tokio::select! {
                     biased;
                     Ok(code) = &mut *reset => {
@@ -1978,7 +2119,8 @@ async fn write_stream_inner(
                         return (landed_written, false);
                     }
                     written = async {
-                        write_frame(&mut Progress::new(&mut send, WALK_DEADLINE), kind, &payload).await
+                        let send = Progress::new(&mut send, WALK_DEADLINE);
+                        write_frame(&mut Noted(send, crossed), kind, &payload).await
                     } => {
                         broken = written.is_err();
                         if broken {
@@ -2009,11 +2151,13 @@ async fn write_stream_inner(
 /// Write a run of canonical RIBLT_CELL frames, cells `first..`, as one owned
 /// buffer through [`SendStream::write_owned`], with the walk's byte-progress
 /// deadline on every write. `done` hears the cells completely written so far
-/// (an absolute count) after each write that completes another frame.
+/// (an absolute count) after each write that completes another frame, and
+/// `crossed` notes every write.
 async fn write_cells(
     send: &mut dyn SendStream,
     first: u32,
     frames: anybytes::Bytes,
+    crossed: &AtomicBool,
     mut done: impl FnMut(usize),
 ) -> io::Result<()> {
     use crate::riblt_cache::CELL_FRAME_BYTES;
@@ -2029,6 +2173,7 @@ async fn write_cells(
         if written == 0 {
             return Err(io::ErrorKind::WriteZero.into());
         }
+        crossed.store(true, Ordering::Relaxed);
         let complete = (total - buffer.len()) / CELL_FRAME_BYTES;
         if complete > reported {
             reported = complete;
@@ -2084,6 +2229,10 @@ mod cell_write_tests {
         fn reset(&mut self, _: u32) {}
     }
 
+    fn crossed() -> AtomicBool {
+        AtomicBool::new(false)
+    }
+
     fn generation() -> Arc<Generation> {
         let mut patch = PATCH::<32, IdentitySchema, (), Blake3Merkle>::new();
         for number in 0u64..90 {
@@ -2112,7 +2261,7 @@ mod cell_write_tests {
             assert_eq!(cells, 40);
             let mut stream = Trickle { wire: Vec::new(), step, ready: false, calls: 0 };
             let mut receipts = Vec::new();
-            write_cells(&mut stream, first as u32, frames, |done| {
+            write_cells(&mut stream, first as u32, frames, &crossed(), |done| {
                 receipts.push(done);
             })
             .await
@@ -2222,7 +2371,7 @@ mod cell_write_tests {
         let (mut send, script) = Scripted::new(2 * CELL_FRAME_BYTES + 10, Then::Stall);
         let mut receipts = Vec::new();
         let started = tokio::time::Instant::now();
-        let error = write_cells(&mut *send, 0, frames, |done| receipts.push(done))
+        let error = write_cells(&mut *send, 0, frames, &crossed(), |done| receipts.push(done))
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
@@ -2254,7 +2403,7 @@ mod cell_write_tests {
                 .unwrap();
             drop(frames);
             let ended =
-                write_stream_inner(&mut send, queued, &mut resetting, failed, Some(progress)).await;
+                write_stream_inner(&mut send, queued, &mut resetting, failed, Some(progress), Arc::default()).await;
             assert_eq!(ended, (false, false));
             assert!(write_failed.try_recv().is_ok(), "the driver hears the failure");
             assert_eq!(receipts.borrow().cells, 3);
@@ -2281,7 +2430,7 @@ mod cell_write_tests {
             .await
             .unwrap();
         let writer = tokio::spawn(async move {
-            write_stream_inner(&mut send, queued, &mut resetting, failed, Some(progress)).await
+            write_stream_inner(&mut send, queued, &mut resetting, failed, Some(progress), Arc::default()).await
         });
         tokio::time::sleep(WALK_DEADLINE / 2).await;
         assert_eq!(receipts.borrow().cells, 4);
@@ -2306,7 +2455,7 @@ mod cell_write_tests {
         drop(generation);
         assert!(weak.upgrade().is_none(), "nothing else holds the generation");
         let mut stream = Trickle { wire: Vec::new(), step: 100, ready: false, calls: 0 };
-        write_cells(&mut stream, first as u32, frames, |_| {}).await.unwrap();
+        write_cells(&mut stream, first as u32, frames, &crossed(), |_| {}).await.unwrap();
         assert_eq!(stream.wire, wanted);
     }
 
@@ -2341,7 +2490,7 @@ mod cell_write_tests {
         let frames = generation.frames(0, 10).unwrap();
         let mut stream = Broken(3 * CELL_FRAME_BYTES + 5);
         let mut receipts = Vec::new();
-        let error = write_cells(&mut stream, 0, frames, |done| receipts.push(done))
+        let error = write_cells(&mut stream, 0, frames, &crossed(), |done| receipts.push(done))
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
@@ -3333,8 +3482,8 @@ pub(crate) mod tests {
             }
         }
 
-        /// Serves `blob/1` from the node's serving snapshot, one request at
-        /// a time, writing each piece of a response after a pause: a
+        /// Serves `blob/1` from the node's serving snapshot, `at_once` requests
+        /// at a time, writing each piece of a response after a pause: a
         /// transfer that makes steady progress for longer than the walk
         /// deadline.
         #[derive(Clone)]
@@ -3343,7 +3492,8 @@ pub(crate) mod tests {
             snapshots: watch::Receiver<Option<StoreSnapshot<MemoryRepoSnapshot>>>,
             pause: Duration,
             piece: usize,
-            one_at_a_time: Arc<tokio::sync::Mutex<()>>,
+            at_once: Arc<tokio::sync::Semaphore>,
+            asked: Arc<std::sync::atomic::AtomicUsize>,
         }
 
         impl Service for PacedBlobs {
@@ -3359,7 +3509,8 @@ pub(crate) mod tests {
                 R: RecvStream,
             {
                 anyhow::ensure!(tag == TAG_BLOB, "only blob/1 is served here: {tag:#x}");
-                let _one = self.one_at_a_time.lock().await;
+                self.asked.fetch_add(1, Ordering::SeqCst);
+                let _one = self.at_once.acquire().await;
                 let snapshot = self.snapshots.borrow().clone();
                 let (resolving, getting) = (snapshot.clone(), snapshot);
                 let mut paced = Paced {
@@ -3435,7 +3586,8 @@ pub(crate) mod tests {
                 snapshots,
                 pause,
                 piece,
-                one_at_a_time: Arc::default(),
+                at_once: Arc::new(tokio::sync::Semaphore::new(1)),
+                asked: Arc::default(),
             });
             receiver.hold("held", policy);
             receiver.store.track_held([collection]);
@@ -3834,6 +3986,60 @@ pub(crate) mod tests {
 
         include!("connection_close_tests.rs");
 
+        /// A driver that goes without its exchange's end, as by a panic, leaves
+        /// no walk running: the exchange ends unconfirmed and can be opened
+        /// again.
+        #[tokio::test(start_paused = true)]
+        async fn a_lost_driver_leaves_no_walk_running() {
+            let net = SimNet::new(0x3A2F, SimConfig::default());
+            let mut node = Node::new(86);
+            let collection = node.hold("lost driver", open());
+            node.observe();
+            let peer = Node::new(87).id();
+            let harness = net.join(&node.key);
+            let (commands, mut commanded) = mpsc::unbounded_channel();
+            let (_snapshots, snapshot) = watch::channel(Some(node.snapshot()));
+            let (events, mut heard) = mpsc::unbounded_channel();
+            let mut task = Task {
+                connections: ConnectionTable::new(harness.transport, NoRequests),
+                snapshots: snapshot,
+                walks: Walks::new(node.health.clone()),
+                commands: WalksHandle(commands),
+                landing: mpsc::unbounded_channel().0,
+                events,
+                grants: mpsc::unbounded_channel().0,
+                grant_queue: GrantQueue::default(),
+                unknown_joins: PATCH::new(),
+                running: HashMap::new(),
+                next_id: 0,
+            };
+            task.observe(node.snapshot());
+            let kind = WalkKind::Commit;
+            let key = (peer, collection.raw, kind);
+            let exchange = task.walks.start(0, peer, collection, kind).unwrap();
+            let (driver, _acked, _replaced) = task.register(key, 0, true, &exchange);
+            let driving = tokio::spawn(async move {
+                let _driver = driver;
+                panic!("a driver's bug");
+            });
+            assert!(driving.await.unwrap_err().is_panic());
+            assert!(task.running.contains_key(&key));
+            task.command(commanded.try_recv().expect("its end is reported"));
+            assert!(task.running.is_empty());
+            assert_eq!(heard.try_recv(), Ok(Event::Receiving { collection, kind }));
+            assert_eq!(
+                heard.try_recv(),
+                Ok(Event::Received { collection, kind, landed: false })
+            );
+            assert!(commanded.try_recv().is_err(), "once");
+            // One whose end it reported says nothing more.
+            let (mut driver, _acked, _replaced) = task.register(key, 0, true, &exchange);
+            driver.ended(exchange.end(), false);
+            drop(driver);
+            assert!(matches!(commanded.try_recv(), Ok(Command::Ended { .. })));
+            assert!(commanded.try_recv().is_err(), "once");
+        }
+
         async fn stale_completion_is_ignored(deselect: bool) {
             let net = SimNet::new(0x3A29, SimConfig::default());
             let mut node = Node::new(105);
@@ -4084,6 +4290,7 @@ pub(crate) mod tests {
                 peer: Node::new(228).id(),
                 collection,
                 kind: WalkKind::Commit,
+                lost: None,
             };
             let (script, driven) = tokio::io::duplex(128);
             let (mut recv, mut send) = tokio::io::split(script);
@@ -4139,7 +4346,7 @@ pub(crate) mod tests {
                 assert_eq!(values, 64);
                 tokio::time::advance(WALK_DEADLINE + Duration::from_secs(1)).await;
             }
-            let (ended, duplicate) = tokio::time::timeout(Duration::from_secs(1), task)
+            let (ended, duplicate) = tokio::time::timeout(2 * WALK_DEADLINE, task)
                 .await
                 .expect("bounded failure/retirement")
                 .unwrap();
@@ -4156,6 +4363,105 @@ pub(crate) mod tests {
         #[tokio::test(start_paused = true)]
         async fn prefix_offer_retirement_cancels_blocked_speculative_body() {
             offer_writer_stall(true).await;
+        }
+
+        /// A Prefix landing that keeps moving, one value every fifty seconds,
+        /// keeps its walk and tells the peer, who waits for LANDED, each time.
+        #[tokio::test(start_paused = true)]
+        async fn a_slow_prefix_landing_keeps_its_walk_and_says_so() {
+            let net = SimNet::new(0x3A34, SimConfig::default());
+            let kind = WalkKind::References;
+            let (mut sender, mut receiver) = (Node::new(88), Node::new(89));
+            let policy = one_way(&sender, &receiver);
+            let collection = sender.hold("slow landing", policy.clone());
+            assert_eq!(receiver.hold("slow landing", policy), collection);
+            for node in [&mut sender, &mut receiver] {
+                node.store.track_held([collection]);
+            }
+            for fill in 0..6 {
+                let blob = Blob::<UnknownBlob>::new(Bytes::from_source(vec![fill; 64]));
+                let handle = blob.get_handle().raw;
+                // Resident here already, so it is landed without a fetch.
+                receiver.insert(vec![NetEvent::Blob(blob.clone())]);
+                sender.insert(vec![
+                    NetEvent::Blob(blob),
+                    NetEvent::Held { collection, handle },
+                ]);
+            }
+            sender.observe();
+            receiver.observe();
+            let start = |node: &Node, sends| {
+                Exchange::start_one_way(
+                    collection,
+                    kind,
+                    node.pinned(collection),
+                    None,
+                    sends,
+                    !sends,
+                )
+            };
+            let mut offer = start(&sender, true);
+            let exchange = start(&receiver, false);
+            let hosted = Hosted::new(receiver, &net);
+            let (landing, mut landings) = mpsc::unbounded_channel();
+            let (commands, _commands) = mpsc::unbounded_channel();
+            let driver = Driver {
+                connections: hosted.table.clone(),
+                snapshots: hosted.lander.snapshots.subscribe(),
+                landing,
+                grants: mpsc::unbounded_channel().0,
+                commands,
+                id: 1,
+                peer: sender.id(),
+                collection,
+                kind,
+                lost: None,
+            };
+            let (script, driven) = tokio::io::duplex(1 << 16);
+            let (mut recv, mut send) = tokio::io::split(script);
+            let (driven_recv, driven_send) = tokio::io::split(driven);
+            let reset = Arc::new(Mutex::new(None));
+            let (acks, acked) = mpsc::unbounded_channel();
+            let (_replace, replaced) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                drive(
+                    &driver,
+                    exchange,
+                    Box::new(Tx(driven_send, reset.clone())),
+                    Box::new(Rx(driven_recv, reset)),
+                    acked,
+                    replaced,
+                )
+                .await
+            });
+            while let Some(frame) = offer.next_delta() {
+                write(&mut send, frame).await;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let mut waiting = 0;
+            while let Ok((_, events)) = landings.try_recv() {
+                waiting += events.len();
+            }
+            assert!(waiting >= 6, "{waiting}");
+            let started = tokio::time::Instant::now();
+            for _ in 0..waiting {
+                tokio::time::sleep(Duration::from_secs(50)).await;
+                assert!(!task.is_finished());
+                acks.send((1, 0)).unwrap();
+            }
+            let mut told = 0;
+            loop {
+                match read(&mut recv).await.expect("the stream is open") {
+                    Frame::Progress => told += 1,
+                    Frame::Landed => break,
+                    _ => {}
+                }
+            }
+            assert!(started.elapsed() >= Duration::from_secs(300));
+            assert_eq!(told, waiting - 1, "the last one is its LANDED");
+            write(&mut send, Frame::Landed).await;
+            let (ended, _) = task.await.unwrap();
+            assert!(ended.landed && ended.confirmed, "{:?}", ended.failure);
         }
 
         async fn blocked_final_write_finishes(retire: bool) {
@@ -4178,6 +4484,7 @@ pub(crate) mod tests {
                 peer: Node::new(108).id(),
                 collection,
                 kind,
+                lost: None,
             };
             let (script, driven) = tokio::io::duplex(1 << 20);
             let (mut recv, mut send) = tokio::io::split(script);
@@ -4276,6 +4583,7 @@ pub(crate) mod tests {
                 peer: Node::new(104).id(),
                 collection,
                 kind,
+                lost: None,
             };
             let (script, driven) = tokio::io::duplex(1 << 20);
             let (mut recv, mut send) = tokio::io::split(script);
@@ -4374,6 +4682,7 @@ pub(crate) mod tests {
                 peer: Node::new(104).id(),
                 collection,
                 kind,
+                lost: None,
             };
             let (script, driven) = tokio::io::duplex(1 << 20);
             let (mut recv, mut send) = tokio::io::split(script);
@@ -4841,8 +5150,8 @@ pub(crate) mod tests {
         /// A references exchange whose one held blob takes longer than the
         /// walk deadline to transfer still lands: the fetch is held to
         /// progress between chunks, not to a deadline for the whole blob,
-        /// and after DONE each side waits for the other's LANDED as long as
-        /// the connection lives.
+        /// and after DONE the sender waits for LANDED as long as the receiver
+        /// says that it moves.
         #[tokio::test(start_paused = true)]
         async fn a_references_exchange_lands_while_one_held_blob_outlasts_the_walk_deadline() {
             let net = SimNet::new(
@@ -4888,10 +5197,8 @@ pub(crate) mod tests {
         }
 
         /// A fetch phase longer than the walk deadline, two held blobs the
-        /// sender serves one at a time, resets neither end: after DONE the
-        /// receiver reads nothing it is owed and times nothing while it
-        /// fetches, and the sender waits for LANDED as long as the
-        /// connection lives.
+        /// sender serves one at a time, resets neither end: the receiver says
+        /// that it moves while bytes arrive, and the sender waits for LANDED.
         #[tokio::test(start_paused = true)]
         async fn a_references_fetch_phase_longer_than_the_walk_deadline_resets_neither_end() {
             let net = SimNet::new(
@@ -4925,6 +5232,272 @@ pub(crate) mod tests {
                 root,
                 &handles
             ));
+        }
+
+        /// A References fetch of four minutes at a steady trickle keeps its walk
+        /// on both ends. (Serving one request ends after five.)
+        #[tokio::test(start_paused = true)]
+        async fn a_references_fetch_of_minutes_at_a_trickle_lands() {
+            let net = SimNet::new(0x3A29, SimConfig::default());
+            let kind = WalkKind::References;
+            // Sixteen pieces fifteen seconds apart.
+            let (sender, collection, root, handles, receiver) =
+                holding(&net, (74, 75), &[10], Duration::from_secs(15), 1 << 16);
+            let receiver = Hosted::new(receiver, &net);
+            let _connection = sender.table.connect(receiver.peer).await.unwrap();
+            let started = tokio::time::Instant::now();
+            let health = sender.exchange(receiver.peer, collection, kind).await;
+            assert!(health.pushes.last_ok, "{health:?}");
+            assert!(started.elapsed() > 3 * WALK_DEADLINE, "{:?}", started.elapsed());
+            assert!(holds(
+                &receiver.lander.node.lock().unwrap(),
+                collection,
+                root,
+                &handles
+            ));
+        }
+
+        /// Beside `holding`, which is the busy collection: one more that the
+        /// sender holds one blob of, of `policy`.
+        fn holding_another(
+            sender: &Hosted<PacedBlobs>,
+            receiver: &mut Node,
+            policy: CollectionPolicy,
+        ) -> CollectionHandle {
+            let collection = receiver.hold("another", policy.clone());
+            receiver.store.track_held([collection]);
+            receiver.observe();
+            let mut node = sender.lander.node.lock().unwrap();
+            assert_eq!(node.hold("another", policy), collection);
+            node.store.track_held([collection]);
+            let blob = Blob::<UnknownBlob>::new(Bytes::from_source(vec![200; 1 << 10]));
+            let handle = blob.get_handle().raw;
+            node.insert(vec![
+                NetEvent::Blob(blob),
+                NetEvent::Held { collection, handle },
+            ]);
+            node.observe();
+            let snapshot = node.snapshot();
+            sender.lander.snapshots.send_replace(Some(snapshot));
+            collection
+        }
+
+        /// The walk of a collection whose blob never arrives ends while
+        /// another collection's blob arrives steadily on the same connection,
+        /// and that one lands. Its fetch holds a request permit and waits for
+        /// its first byte: the sender serves one request at a time.
+        #[tokio::test(start_paused = true)]
+        async fn another_collection_s_fetch_keeps_no_walk_alive() {
+            for two_way in [false, true] {
+                let net = SimNet::new(0x3A2A, SimConfig::default());
+                let kind = WalkKind::References;
+                let (sender, busy, busy_root, busy_handles, mut receiver) =
+                    holding(&net, (76, 77), &[11], Duration::from_secs(15), 1 << 16);
+                let policy = if two_way { open() } else { one_way(&Node::new(76), &receiver) };
+                let stalled = holding_another(&sender, &mut receiver, policy);
+                let receiver = Hosted::new(receiver, &net);
+                let _connection = sender.table.connect(receiver.peer).await.unwrap();
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                sender.walks.open(receiver.peer, busy, kind);
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                let started = tokio::time::Instant::now();
+                let health = sender.exchange(receiver.peer, stalled, kind).await;
+                let took = started.elapsed();
+                assert_eq!((health.pushes.ok, health.pushes.failed), (0, 1));
+                assert!((59..=81).contains(&took.as_secs()), "{took:?}");
+                assert!(sender.health(busy, receiver.peer).is_none_or(|busy| {
+                    busy.pushes.ok + busy.pushes.failed == 0
+                }), "the busy walk still runs");
+                let health = sender.ended(receiver.peer, busy, None).await;
+                assert!(health.pushes.last_ok, "{health:?}");
+                assert!(holds(
+                    &receiver.lander.node.lock().unwrap(),
+                    busy,
+                    busy_root,
+                    &busy_handles
+                ));
+            }
+        }
+
+        /// Every request permit of the connection is held by a stream that
+        /// moves nothing: the walk whose fetch waits for one ends, and its
+        /// fetch with it, which leaves the line.
+        #[tokio::test(start_paused = true)]
+        async fn a_fetch_behind_a_line_that_stands_still_ends_its_walk() {
+            let net = SimNet::new(0x3A2D, SimConfig::default());
+            let kind = WalkKind::References;
+            let (sender, collection, _, _, receiver) =
+                holding(&net, (82, 83), &[13], Duration::ZERO, 1 << 20);
+            let receiver = Hosted::new(receiver, &net);
+            let _connection = sender.table.connect(receiver.peer).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let to_sender = receiver.table.current(sender.peer).unwrap();
+            let mut permits = Vec::new();
+            for _ in 0..crate::connection::MAX_REQUESTS_PER_CONNECTION {
+                permits.push(to_sender.open_bi().await.unwrap());
+            }
+            let started = tokio::time::Instant::now();
+            let health = sender.exchange(receiver.peer, collection, kind).await;
+            let took = started.elapsed();
+            assert_eq!((health.pushes.ok, health.pushes.failed), (0, 1));
+            assert!((59..=81).contains(&took.as_secs()), "{took:?}");
+            let asked = || sender.table.service().asked.load(Ordering::SeqCst);
+            let before = asked();
+            permits.clear();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(asked(), before, "its fetch ended with it");
+        }
+
+        /// A line in which nothing ends moves while one of its sixteen requests
+        /// receives bytes: for four minutes the fetch behind it keeps its walk,
+        /// then it lands.
+        #[tokio::test(start_paused = true)]
+        async fn a_fetch_behind_a_line_that_trickles_keeps_its_place_and_lands() {
+            let net = SimNet::new(0x3A35, SimConfig::default());
+            let kind = WalkKind::References;
+            let (sender, busy, _, _, mut receiver) =
+                holding(&net, (90, 91), &[14], Duration::from_secs(15), 1 << 16);
+            let policy = one_way(&Node::new(90), &receiver);
+            let small = holding_another(&sender, &mut receiver, policy);
+            let receiver = Hosted::new(receiver, &net);
+            let _connection = sender.table.connect(receiver.peer).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            sender.walks.open(receiver.peer, busy, kind);
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let to_sender = receiver.table.current(sender.peer).unwrap();
+            let mut permits = Vec::new();
+            for _ in 1..crate::connection::MAX_REQUESTS_PER_CONNECTION {
+                permits.push(to_sender.open_bi().await.unwrap());
+            }
+            let started = tokio::time::Instant::now();
+            let health = sender.exchange(receiver.peer, small, kind).await;
+            assert_eq!((health.pushes.ok, health.pushes.failed), (1, 0));
+            assert!(started.elapsed() > 3 * WALK_DEADLINE, "{:?}", started.elapsed());
+        }
+
+        /// A collection with one small blob asks behind another's long line of
+        /// slow ones, in either walk: it waits for over a minute and a half
+        /// without a byte, keeps its place and its one walk on both ends, and
+        /// lands.
+        #[tokio::test(start_paused = true)]
+        async fn a_fetch_behind_a_line_that_moves_keeps_its_place_and_lands() {
+            for two_way in [false, true] {
+                let net = SimNet::new(0x3A2E, SimConfig::default());
+                let kind = WalkKind::References;
+                // Served eight at a time, each for about half a minute.
+                let fills = (100..164).collect::<Vec<_>>();
+                let (sender, busy, _, _, mut receiver) =
+                    holding(&net, (84, 85), &fills, Duration::from_secs(3), 1 << 18);
+                sender.table.service().at_once.add_permits(63);
+                let policy = if two_way { open() } else { one_way(&Node::new(84), &receiver) };
+                let small = holding_another(&sender, &mut receiver, policy);
+                let receiver = Hosted::new(receiver, &net);
+                let _connection = sender.table.connect(receiver.peer).await.unwrap();
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                sender.walks.open(receiver.peer, busy, kind);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                let started = tokio::time::Instant::now();
+                let health = sender.exchange(receiver.peer, small, kind).await;
+                let took = started.elapsed();
+                assert_eq!((health.pushes.ok, health.pushes.failed), (1, 0), "{took:?}");
+                assert!(took > Duration::from_secs(90), "{took:?}");
+                let received = receiver.health(small, sender.peer).unwrap();
+                assert_eq!((received.receives.ok, received.receives.failed), (1, 0));
+                assert!(
+                    sender.health(busy, receiver.peer).is_none_or(|busy| busy.pushes.failed == 0),
+                    "its line moved to its end"
+                );
+            }
+        }
+
+        /// A peer that lives and accepts no stream allows 100 of them. Walks
+        /// and requests past those end within a minute of being opened, and no
+        /// collection's walk is left running.
+        #[tokio::test(start_paused = true)]
+        async fn a_peer_that_allows_no_more_streams_holds_no_walk_and_no_request() {
+            let net = SimNet::new(0x3A2C, SimConfig::default());
+            let mut node = Node::new(80);
+            let collections = (0..120)
+                .map(|n| node.hold(&format!("opened {n}"), open()))
+                .collect::<Vec<_>>();
+            for collection in &collections {
+                node.commit(*collection, 1);
+            }
+            node.observe();
+            let mut hung = net.join(&Node::new(81).key);
+            let hung_id = hung.transport.local_id();
+            let sender = Hosted::new(node, &net);
+            let connection = sender.table.connect(hung_id).await.unwrap();
+            let _alive = hung.incoming.recv().await.unwrap();
+            let started = tokio::time::Instant::now();
+            for collection in &collections {
+                sender.walks.open(hung_id, *collection, WalkKind::Commit);
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let request = connection.open_bi().await;
+            assert!(request.is_err() && started.elapsed() < Duration::from_secs(62));
+            let failed = |collection: &CollectionHandle| {
+                sender
+                    .health(*collection, hung_id)
+                    .is_some_and(|health| health.pushes.failed == 1)
+            };
+            while !collections.iter().all(failed) {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                assert!(started.elapsed() < Duration::from_secs(82), "still running");
+            }
+        }
+
+        /// A peer whose landing died after the difference was proven: the walk
+        /// that waits for it ends, while the walks of 34 other collections keep
+        /// the connection busy and go on agreeing.
+        #[tokio::test(start_paused = true)]
+        async fn a_peer_whose_landing_died_ends_its_walk_on_a_busy_connection() {
+            let net = SimNet::new(0x3A2B, SimConfig::default());
+            let mut nodes = [Node::new(78), Node::new(79)];
+            let held = nodes.each_mut().map(|node| {
+                (0..35)
+                    .map(|n| node.hold(&format!("busy {n}"), open()))
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(held[0], held[1]);
+            let [collections, _] = held;
+            let record = nodes[0].commit(collections[0], 1);
+            for node in &mut nodes {
+                node.observe();
+            }
+            let [sender, receiver] = nodes.map(|node| Hosted::new(node, &net));
+            let _connection = sender.table.connect(receiver.peer).await.unwrap();
+            // Its landing panics at the first value and never runs again.
+            let lander = receiver.lander.clone();
+            std::thread::spawn(move || {
+                let _held = lander.node.lock().unwrap();
+                panic!("the store is gone");
+            })
+            .join()
+            .unwrap_err();
+            let kind = WalkKind::Commit;
+            sender.walks.open(receiver.peer, collections[0], kind);
+            let started = tokio::time::Instant::now();
+            let ended = loop {
+                for collection in &collections[1..] {
+                    sender.walks.open(receiver.peer, *collection, kind);
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let health = sender.health(collections[0], receiver.peer);
+                if let Some(health) = health
+                    && health.pushes.failed + health.pushes.ok > 0
+                {
+                    assert_eq!((health.pushes.ok, health.pushes.failed), (0, 1));
+                    break started.elapsed();
+                }
+                assert!(started.elapsed() < 3 * WALK_DEADLINE, "still running");
+            };
+            assert!((55..=85).contains(&ended.as_secs()), "{ended:?}");
+            for collection in &collections[1..] {
+                let health = sender.health(*collection, receiver.peer).unwrap();
+                assert!(health.pushes.ok >= 10 && health.pushes.failed == 0, "{health:?}");
+            }
+            drop(record);
         }
 
         /// `count` resources rooted at `node`, each with one delegable

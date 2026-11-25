@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- A walk whose driver panicked ends unconfirmed instead of running on in the
+  books, where it kept its collection's next walk with that peer from starting.
+
+- A peering request is never dropped: while 1,024 frames wait for a peer, its
+  `recon/1` is read no further, instead of leaving the requests on it unanswered.
+  The asker waited for such an answer, and asked nothing else for that
+  collection, as long as the connection stood.
+
+- Opening a stream ends after 60 s: a walk stream with its tag and Open frame, a
+  request stream once its permit is taken, and the request a walk's blob fetch
+  writes. A peer that allows no more streams held them, and the walk of its
+  collection, as long as the connection stood.
+
+- A walk in which nothing moves ends after about a minute (60 to 80 s), whatever
+  it waits for: the peer's LANDED or FIN, this side's own landing, a blob.
+  Before, it waited for the peer's end as long as the connection stood. A landing
+  or a blob fetch that takes longer keeps its walk by moving: a side whose own
+  moved on says so every 20 s in the new empty `walk/1` frame PROGRESS (`0x0d`),
+  which settles nothing. A frame kind that is not understood was always skipped,
+  so the ALPN stays; but a peer without it that lands for over a minute in
+  silence has its walk ended here, and starts what it was fetching over. A walk's
+  blob fetches end with it.
+
+- A peer that refused a peering request is asked again on the same connection,
+  two minutes later at the earliest, when a place is free or a swap draws it.
+  Before, it was passed over as long as the connection stood, so a refuser that
+  did not hold the collection, and so kept no note of the request, was never
+  reached on it.
+
+- A peering request or invitation nobody answered no longer holds its place
+  while the connection stands. When a collection's swap comes due (every ten
+  minutes) it is taken back with an UNPEER, be it one of the five asked-for
+  places, the reserved one or an invited inbound place. The answer is still
+  owed, so nothing else for the collection is sent to that peer on the
+  connection before it.
+
 - `telemetry::sync::Publisher` is the sync producer custody used privately:
   open it on an existing source collection with a signer and worker label,
   account reconcile ticks with `reconciled`, and append one sample per subject

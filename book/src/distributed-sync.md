@@ -335,14 +335,16 @@ dial per redraw of its order, at most one a minute, rather than a loop of
 streams.
 
 A connection's frame queue refuses no frame, so what it holds is bounded by
-what is put on it. A side asked to peer leaves the request unanswered while
-the connection already queues 1,024 frames, at most 64 KiB each, and the
+what is put on it. A side reads `recon/1` no further while
+it queues 1,024 frames for the peer, at most 64 KiB each, and the
 grant exchange sends an entry of its listing only when that root changes, and
 all of it again every minute, which it leaves out while the connection
 has frames queued; a peer that
-asks faster than it reads therefore stops being answered rather than growing
-the queue, and an unanswered peering request waits until the stalled stream's end
-closes the connection. A push is not on this queue: it has a stream of its
+asks faster than it reads therefore waits rather than growing
+the queue, its other requests on the connection with it, and each request is
+answered, in order, or the connection ends. Should both sides stop reading at
+once, with more queued than the stream's window takes, the first writer to wait
+60 seconds for credit closes the connection. A push is not on this queue: it has a stream of its
 own, and QUIC's flow control holds a sender whose receiver stops reading
 (*Walk streams*).
 
@@ -438,7 +440,7 @@ credentials' root and delegated keys among connected peers. When a
 credential, a fetched definition, a new proof or the refuser's own selection
 admits a refused request, the refuser sends an invitation: a PEER_REQUEST with
 the invitation bit, which counts against the receiver's room for inbound
-peerings. The asker never asks again on its own. A request that was admitted
+peerings. The asker asks again as *Neighbours* says. A request that was admitted
 and refused only for want of room is invited once a place is free, at the next
 refill of the neighbour sets, if it is still admitted. The invitation holds that
 place until it is answered, and each remembered request is invited once.
@@ -459,8 +461,13 @@ fresh for each order. Readers come first because a signer that cannot read
 does not relay; free DHT keys come last. The position in that order is the
 only retry state: a refusal, a failed dial or an ended peering (its
 connection closed, as it does when its `recon/1` ends) moves on to the next
-candidate. A key that refused is not asked again on that connection, and
-the others come round again only when the order is redrawn. Reaching the end
+candidate. A key that refused is passed over for two minutes, and then is a
+candidate again on the same connection, without which a refuser that keeps no
+note of the request, because it does not hold C, could not be reached. So a
+refuser is asked at most 30 times an hour for a collection while a place is
+free, and only by the swaps, at most six times, while all are taken; nothing it
+sends shortens that. Otherwise candidates come round again only when the order
+is redrawn. Reaching the end
 redraws it with a new salt, no sooner than 60 seconds after the last draw
 unless the candidates changed. A redraw that is not merely of changed
 candidates also looks up C's DHT providers again, at most three such lookups
@@ -473,17 +480,24 @@ it has peered, one healthy neighbour of the five, chosen at random, is
 unpeered, so neighbour groups that formed separately during a partition meet
 again after it heals. A candidate that refuses or cannot be dialled is followed
 by the next of the same draw, one at a time, and the end of the draw ends the
-swap with nobody gone. One that never answers is withdrawn when the next swap
-is due. A place of the five that frees meanwhile is the candidate's. While none
+swap with nobody gone. A place of the five that frees meanwhile is the candidate's. While none
 of the five is healthy nobody leaves and no swap begins; a candidate that
 peered by then waits. The holder of the reserved place, below, is not one of
 the five and never leaves for a swap. So a node asks for at most seven
 neighbours per collection: the five, the holder and one candidate.
 
+Nothing holds a place by not answering. When a collection's swap comes due,
+whether its places are full or not, every request and invitation for it that is
+still unanswered is taken back with an UNPEER on the connection that stands: an
+asked-for place, the reserved one, the swap's candidate and an invited inbound
+place are free again within ten minutes, for others the same second. The peer
+still owes its answer, and is sent no other request for C on that connection
+before it.
+
 One more place per collection is reserved for participants of C that no open
 connection reaches, walked in the same tiers and redrawn on the same terms,
 with no provider lookup. Its holder keeps it while it is being dialled or its
-asked-for peering stands; once the holder has been peered for 60 seconds it is
+asked-for peering or request stands; once the holder has been peered for 60 seconds it is
 unpeered when another such participant waits, so the place rotates, and the
 five asked-for places never shrink for it. This is how a new grantee is
 reached when every neighbour set that could reach it is full: nobody dials on
@@ -571,6 +585,7 @@ resource32 || proof-id32 key. Integers are big-endian.
 | `0x0a` | RIBLT_CELL | index:u32, symbol32, checksum:u64, count:i64 |
 | `0x0b` | HAVE | exact offered depth:u8, prefix32, hash32, leaf-count:u64 |
 | `0x0c` | RIBLT_RESUME | held:u32, hash32, leaf-count:u64 |
+| `0x0d` | PROGRESS | empty |
 
 DONE/LANDED are Prefix-only; cached RIBLT refuses them and uses the gated FIN
 semantics below. RIBLT_ROOT has 41 payload bytes (46 framed): the exact
@@ -677,7 +692,7 @@ all-missing transfer can progress beyond the window through ordinary landing
 ACKs. Authenticated offered keys alone admit eager VALUEs, with the existing
 signature, collection, fingerprint and proof checks. Racing duplicate bodies
 are validated but land at most once. A missing receipt eventually fails under
-the existing progress deadline; there is no silent pull fallback. Offer/receipt
+the walk's rule for standing still; there is no silent pull fallback. Offer/receipt
 indexes and admitted-body identities share the explicit 1,048,576 entry ceiling.
 This window bounds instantaneous speculation, not cumulative duplicate bytes
 over an entire cold high-overlap stream, and makes no universal speedup claim.
@@ -704,11 +719,32 @@ Withheld-value demand has a separate 32,768-entry ceiling. Requests and blob fet
 share 64 slots; at most 1,024 unacknowledged values go to landing before reading
 pauses and stream flow control applies.
 
-Incoming frame/value waits and blob fetches have 60-second progress deadlines,
-not total-transfer timeouts. After DONE, peer landing may take as long as the
-connection remains. Actual outgoing byte writes and final finish are separately
+A walk in which nothing moves ends, whatever it waits for: each side by itself
+looks every 20 seconds, and at the third look in a row at which nothing moved it
+resets the stream, so between 60 and 80 seconds after the last movement while
+its runtime runs. Movement is a byte of the walk's stream that crossed either
+way, a value of this walk that landed, and a blob, or a byte of one, that this
+walk fetches. A fetch that still waits for one of the connection's 16 request
+permits, or then for its stream, moves while that line does: permits are given
+in order, and bytes arrive for the requests ahead. Work that is only under way is
+no movement: not a value that waits to land, not a fetch behind 16 requests that
+receive nothing, and once a fetch has its stream only its own bytes are, whatever
+else arrives on the connection. So the bound holds after the peer's DONE or FIN, while
+reading pauses for landing, and for a landing that never answers. There is no
+limit on how long a landing or a fetch may take, only on its standing still: a
+side whose landing or fetch moved on tells the peer so in the next PROGRESS
+frame, at most one every 20 seconds. PROGRESS is a sign of life only. It settles
+nothing, hearing one is no reason to send one, and writing one is no
+movement, so two sides cannot keep each other alive. A side that resets still
+keeps what landed, and its next exchange offers the rest; its blob fetches end
+with the walk. A walk whose driver is lost to a panic ends as unconfirmed.
+
+Blob fetches have a 60-second progress deadline of their own, not a total one,
+which starts once they have their permit. Actual outgoing byte writes and final finish are separately
 progress-bounded/cancellable, including when a driver is retired. A walk takes no
 request permit but uses transport stream credit and counts as connection use.
+Opening it, with its tag and OPEN, and opening a request stream once it has its
+permit, end after 60 seconds: a live peer may allow no further stream.
 Small and scratch/sim gates do not establish many-collection live stream-credit
 liveness or throughput.
 
@@ -879,9 +915,8 @@ connections.
   heard and never before our own ROOT: also when the roots are equal and no
   cell follows, and even after a peer FIN has confirmed the exchange; local
   readiness to finish waits for it. The peer sends no cell before it arrives.
-  That wait is a remote frame owed like any other, under the walk's frame
-  deadline even when replayed cells have already proved the difference, and
-  a peer FIN while it still holds our cells back fails the exchange.
+  A walk in which that never comes ends like any in which nothing moves, also
+  when replayed cells have already proved the difference, and a peer FIN while it still holds our cells back fails the exchange.
 - RIBLT_RESUME says "I hold your first `held` cells for your root R", R being
   the root the peer just announced. The claimant takes the entry for (profile,
   R) out of the cache and claims its length only when R differs from its own

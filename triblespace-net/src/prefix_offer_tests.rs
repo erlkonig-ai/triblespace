@@ -438,7 +438,6 @@ fn prefix_offer_no_receipts_bounds_speculation_without_false_completion() {
             .count(),
         prefix_offer::WINDOW
     );
-    assert!(a.exchange.awaits());
     assert_eq!(a.exchange.outcome(), None);
     assert!(!a.sent.contains(&Frame::Done));
 }
