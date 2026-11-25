@@ -218,6 +218,13 @@ impl Link {
         self.state.closed.load(Ordering::SeqCst)
     }
 
+    /// Retire or close the link, as the tie-break and the accept loop do.
+    #[cfg(test)]
+    pub(crate) fn end(&self, closed: bool) {
+        let ended = if closed { &self.state.closed } else { &self.state.retired };
+        ended.store(true, Ordering::SeqCst);
+    }
+
     /// A link to no connection, whose queued frames the test reads back.
     #[cfg(test)]
     pub(crate) fn detached(id: u64, peer: PeerId) -> (Self, mpsc::Receiver<Frame>) {
@@ -325,8 +332,10 @@ struct State {
     outbox_frames: Mutex<Option<mpsc::Receiver<Frame>>>,
     /// The service heard `ReconEvent::Opened` for this connection.
     announced: AtomicBool,
-    /// The accept loop ended.
+    /// The accept loop ended, or the table dropped the connection.
     closed: AtomicBool,
+    /// This side dropped the connection for a fresh one.
+    replaced: AtomicBool,
 }
 
 impl State {
@@ -353,6 +362,7 @@ impl State {
             outbox_frames: Mutex::new(Some(outbox_frames)),
             announced: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            replaced: AtomicBool::new(false),
         })
     }
 
@@ -509,6 +519,11 @@ impl<C> Connection<C> {
     /// Mark or unmark this as a neighbour connection, which eviction spares.
     pub fn set_neighbour(&self, neighbour: bool) {
         self.state().neighbour.store(neighbour, Ordering::SeqCst);
+    }
+
+    /// Whether this side dropped the connection for a fresh one.
+    pub(crate) fn replaced(&self) -> bool {
+        self.state().replaced.load(Ordering::SeqCst)
     }
 
     /// The connection's `recon/1`, as its service sees it.
@@ -774,6 +789,32 @@ impl<T: Transport, S: Service> ConnectionTable<T, S> {
             connection
                 .conn
                 .close(CLOSE_NORMAL, b"connection invalidated");
+        }
+    }
+
+    /// Drop `link`'s connection so that a fresh one takes its place: its
+    /// streams end, and no work starts on it from here on. Nothing is dialled
+    /// here. It closes before anything replaces it, because two connections
+    /// of one pair are ranked by their diallers, not by age: the peer would
+    /// keep the old one over a fresh dial by the higher key. The peer may
+    /// still hear a fresh OPEN before this close and retire the fresh
+    /// connection; its candidate order, or this side's, then dials again. A
+    /// simulated close reaches both ends at once and cannot show that order.
+    pub(crate) fn replace(&self, link: &Link) {
+        let entry = {
+            let mut table = self.shared.table.lock().unwrap();
+            let entry = table.connections.get(&link.id()).cloned();
+            table.remove(&link.state);
+            entry
+        };
+        if let Some(entry) = entry {
+            info!(
+                peer = %hex::encode(&link.state.peer[..8]),
+                "dropping a connection whose early listings were cut short"
+            );
+            link.state.replaced.store(true, Ordering::SeqCst);
+            link.state.closed.store(true, Ordering::SeqCst);
+            entry.conn.close(CLOSE_NORMAL, b"connection replaced");
         }
     }
 }

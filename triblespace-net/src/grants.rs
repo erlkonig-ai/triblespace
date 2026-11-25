@@ -41,6 +41,11 @@
 //! - Becoming a participant of R (a grant naming this node landed) walks R
 //!   again with every peer whose listed root differs, so the grants skipped
 //!   while this node took no part arrive.
+//! - Before its first observation a node cannot tell what it takes part in,
+//!   so every listed resource counts against the unknown budget. A connection
+//!   whose listing the budget cut short then is dropped at that observation,
+//!   once, and the peer lists everything on the one the candidate order
+//!   makes instead.
 //! - What this side holds of R's grants, and each connected peer's standing
 //!   listing of R, is published into health as grant agreement
 //!   ([`crate::health::GrantHealth`]); a collection's pair reads its grant
@@ -871,6 +876,8 @@ pub(crate) struct Effects {
     pub(crate) fetch: Vec<Fetch>,
     /// Grant walks to open, by peer and resource.
     pub(crate) walks: Vec<(PeerId, CollectionHandle)>,
+    /// Connections to drop, so that what replaces them is listed afresh.
+    pub(crate) drops: Vec<Link>,
 }
 
 /// Metadata blobs to fetch, and the keys to ask, in order: what a grant
@@ -910,6 +917,9 @@ struct Listing {
     /// Listed resources this side took no part in when first heard, charged
     /// to the connection's budget before they are kept.
     unknown: PATCH<32, IdentitySchema, ()>,
+    /// The budget skipped a resource listed before this side's first
+    /// observation, when it takes part in none it can tell.
+    skipped_early: bool,
     /// The resources the connection is peered for, whichever way they flow:
     /// a walk over one keeps all of its grants.
     peered: PATCH<32, IdentitySchema, (), Blake3Merkle>,
@@ -962,6 +972,7 @@ impl Listing {
             listed: PATCH::new(),
             opened: PATCH::new(),
             unknown: PATCH::new(),
+            skipped_early: false,
             peered: PATCH::new(),
             serves: PATCH::new(),
             retries: PATCH::new(),
@@ -1222,6 +1233,7 @@ impl<R: BlobStoreGet + Clone> Grants<R> {
     fn hear(&mut self, id: u64, roots: &[(CollectionHandle, PatchSummary)]) -> Effects {
         let mut effects = Effects::default();
         self.changed = true;
+        let early = self.snapshot.is_none();
         let mut heard = Vec::new();
         for (resource, theirs) in roots {
             let (resource, theirs) = (*resource, *theirs);
@@ -1234,7 +1246,16 @@ impl<R: BlobStoreGet + Clone> Grants<R> {
                 || listing.peered.get(&resource.raw).is_some()
                 || listing.listed.get(&resource.raw).is_some();
             if !known {
+                // Before the first observation this counts resources this
+                // side does take part in, and skips them past the budget:
+                // the first observation drops such a connection, so that all
+                // of them are listed again. Two things stay as they are. A
+                // resource this side joins only after its first observation
+                // (a collection without grants, activated later) may have
+                // been skipped for good. And on a connection that is not
+                // dropped, what was charged early stays charged.
                 if listing.unknown.len() as usize >= MAX_UNKNOWN_RESOURCES_PER_LINK {
+                    listing.skipped_early |= early;
                     continue;
                 }
                 listing.unknown.insert(&PatchEntry::new(&resource.raw));
@@ -1653,7 +1674,27 @@ impl<R: BlobStoreGet + Clone> Grants<R> {
         effects
     }
 
-    /// Take a new store observation: land the waiting grants whose
+    /// Forget the connections whose early listings the budget cut short, and
+    /// return them to be dropped. A peer lists each root once per connection,
+    /// so what was skipped is heard only on another one. One the tie-break
+    /// retired is left to drain.
+    fn take_skipped_early(&mut self) -> Vec<Link> {
+        let mut drops: Vec<Link> = self
+            .listings
+            .values()
+            .filter(|listing| listing.skipped_early)
+            .map(|listing| listing.link.clone())
+            .filter(|link| !link.closed() && !link.retired())
+            .collect();
+        drops.sort_unstable_by_key(Link::id);
+        for link in &drops {
+            self.listings.remove(&link.id());
+        }
+        drops
+    }
+
+    /// Take a new store observation: the first one drops the connections
+    /// whose listings it came too late for. Land the waiting grants whose
     /// descriptor arrived and that start at one of its roots, dropping the
     /// rest of those, fetch what newly waiting stored grants need, and list
     /// changed roots on every connection.
@@ -1661,6 +1702,9 @@ impl<R: BlobStoreGet + Clone> Grants<R> {
         let mut effects = Effects::default();
         let previous = self.snapshot.replace(snapshot.clone());
         self.changed = true;
+        if previous.is_none() {
+            effects.drops = self.take_skipped_early();
+        }
         let mut policies = HashMap::new();
         for (proof, senders) in self
             .waiting
@@ -1766,6 +1810,9 @@ impl<T: Transport, S: Service> Sink<T, S> {
     }
 
     pub(crate) fn apply(&self, effects: Effects) {
+        for link in &effects.drops {
+            self.connections.replace(link);
+        }
         if !effects.land.is_empty() {
             let admissions = self.admissions.clone();
             let proofs = effects.land.into_iter().map(NetEvent::CapabilityProof);
