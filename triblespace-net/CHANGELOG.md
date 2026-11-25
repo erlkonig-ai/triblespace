@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- A peering request or invitation nobody answered no longer holds its place
+  while the connection stands. When a collection's swap comes due (every ten
+  minutes) it is taken back with an UNPEER, be it one of the five asked-for
+  places, the reserved one or an invited inbound place. The answer is still
+  owed, so nothing else for the collection is sent to that peer on the
+  connection before it.
+
 - `telemetry::sync::Publisher` is the sync producer custody used privately:
   open it on an existing source collection with a signer and worker label,
   account reconcile ticks with `reconciled`, and append one sample per subject

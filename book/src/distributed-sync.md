@@ -473,17 +473,24 @@ it has peered, one healthy neighbour of the five, chosen at random, is
 unpeered, so neighbour groups that formed separately during a partition meet
 again after it heals. A candidate that refuses or cannot be dialled is followed
 by the next of the same draw, one at a time, and the end of the draw ends the
-swap with nobody gone. One that never answers is withdrawn when the next swap
-is due. A place of the five that frees meanwhile is the candidate's. While none
+swap with nobody gone. A place of the five that frees meanwhile is the candidate's. While none
 of the five is healthy nobody leaves and no swap begins; a candidate that
 peered by then waits. The holder of the reserved place, below, is not one of
 the five and never leaves for a swap. So a node asks for at most seven
 neighbours per collection: the five, the holder and one candidate.
 
+Nothing holds a place by not answering. When a collection's swap comes due,
+whether its places are full or not, every request and invitation for it that is
+still unanswered is taken back with an UNPEER on the connection that stands: an
+asked-for place, the reserved one, the swap's candidate and an invited inbound
+place are free again within ten minutes, for others the same second. The peer
+still owes its answer, and is sent no other request for C on that connection
+before it.
+
 One more place per collection is reserved for participants of C that no open
 connection reaches, walked in the same tiers and redrawn on the same terms,
 with no provider lookup. Its holder keeps it while it is being dialled or its
-asked-for peering stands; once the holder has been peered for 60 seconds it is
+asked-for peering or request stands; once the holder has been peered for 60 seconds it is
 unpeered when another such participant waits, so the place rotates, and the
 five asked-for places never shrink for it. This is how a new grantee is
 reached when every neighbour set that could reach it is full: nobody dials on
