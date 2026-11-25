@@ -305,7 +305,8 @@ receive-completion evidence disconnected. No wire negotiation is involved.
 
 A connection closes after 120 seconds without a frame on any of its streams,
 sent or received. Push timers cap at 60 seconds, so a connection that
-carries a peering does not go idle. Above 64 connections in one direction the
+carries a peering does not go idle; grant listings repeat too rarely to keep
+one open (*Grant exchange*). Above 64 connections in one direction the
 least recently used one is evicted, draining and unused connections first. A
 neighbour connection, one that carries a peering, is never evicted.
 
@@ -326,7 +327,9 @@ streams.
 A connection's frame queue refuses no frame, so what it holds is bounded by
 what is put on it. A side asked to peer leaves the request unanswered while
 the connection already queues 1,024 frames, at most 64 KiB each, and the
-grant exchange sends a listing only when a root it lists changes; a peer that
+grant exchange sends an entry of its listing only when that root changes, and
+all of it again every few minutes, which it leaves out while the connection
+has frames queued; a peer that
 asks faster than it reads therefore stops being answered rather than growing
 the queue, and an unanswered peering request waits until the stalled stream's end
 closes the connection. A push is not on this queue: it has a stream of its
@@ -471,7 +474,8 @@ accepted, which way C flows, and which side refused the other.
 
 Each neighbour exchanges one kind of one selected collection on a bidirectional
 `walk/1` stream: COMMIT records, DERIVE records, or (between Full neighbours)
-held references. Grants are not pushed on the timer; they travel by grant
+held references. Grants are not pushed on this timer, which is one per selected
+collection, while grants go to nodes that select nothing too; they travel by grant
 walks, which grant gossip opens where listed roots differ (*Grant exchange*). Either side may open it. Each sends its own immutable delta
 against the last agreement on this connection; both directions share the stream.
 Nothing is broadcast or forwarded merely because it arrived.
@@ -966,7 +970,21 @@ offered.
 
 On every connection, when it opens and whenever a listed root changes, each
 side sends on `recon/1` a GRANT_ROOTS listing: for every R the peer takes part
-in, the root and count of this side's grants over R. Where the peer's listed
+in, the root and count of this side's grants over R. Like records, grants are
+anti-entropy: 270 to 300 seconds after it opened or last repeated, at a moment
+drawn afresh, each side has an opportunity to list everything again on the
+connection, so an entry the other side skipped or lost is heard without a new
+connection. An opportunity is passed over while the connection has frames
+queued, so a peer that reads slowly hears a repeat only once one finds the queue
+empty; changed roots are queued at once as ever. An entry that says what
+already stands does nothing at the receiver: it opens no walk, leaves a failed
+one on its backoff, and asks for no blob. A repeat is not suppressed by an
+equal listing of the peer's, which says what the peer holds and not what it
+heard. The times are more than twice the idle deadline apart (*One connection
+per peer*), so that the repeats of both sides together still leave a gap in
+which a connection nothing else crosses closes. One that closes is listed on
+afresh when it is dialled again. Other traffic still holds a connection open,
+DHT lookups of a node that looks for neighbours among it. Where the peer's listed
 root differs from this side's, and differs from what this side last opened a
 walk for, it opens one grant walk over R on that connection: the
 Authorization kind of `walk/1`, Prefix only, over any R. A side takes listings
@@ -976,8 +994,9 @@ more. At most eight grant walks with one peer run at once, and the rest wait
 in order.
 
 Before its first store observation a node cannot tell what it takes part in,
-so every listed resource counts against that bound, and since a peer lists each
-root once per connection, one skipped there would stay unheard. A connection
+so every listed resource counts against that bound, and one skipped there would
+stay unheard until the peer repeats it, or for good if the peer is a build that
+does not. A connection
 whose listing the bound cut short before the first observation is therefore
 dropped when that observation is taken, and the peer lists everything again on
 the connection that replaces it. That happens once: after the first observation
@@ -989,7 +1008,9 @@ A peer that order does not reach is reached when a later one on either side
 does. The repair is eventual; nothing promises a reconnection at once. The old connection closes
 before anything replaces it, because two connections of a pair are ranked by
 their diallers, so a fresh dial by the higher key would lose to the old one.
-Only a grantless collection a node activates later can still have been skipped.
+A grantless collection a node activates later can still have been skipped; the
+next repeat brings it. What is charged to the bound stays charged until the
+connection closes, so repeats neither evict nor add anything to it.
 
 The sender of a walk is a participant of R, and the receiver receives. A side
 joins at most sixteen grant walks one peer opened at once, and charges a walk

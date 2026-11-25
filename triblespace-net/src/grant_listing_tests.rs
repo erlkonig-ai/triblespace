@@ -584,7 +584,7 @@ fn peering_for_r_reopens_a_walk_whose_root_still_differs() {
 }
 
 #[test]
-fn an_evicted_pending_grant_lets_the_next_listing_reopen_its_walk() {
+fn an_evicted_pending_grant_reopens_its_walk_at_the_retry_not_at_a_repeat() {
     let [alice, peer] = [0xA0, 0xAF].map(key);
     let mut bob = Node::new(0xA1);
     bob.observe();
@@ -599,11 +599,9 @@ fn an_evicted_pending_grant_lets_the_next_listing_reopen_its_walk() {
         bob.grants
             .walked(pending(id(&peer), &grant(r, &alice, handle, &subject)), now());
     }
-    assert_eq!(
-        hear(&mut bob, &linked, vec![(r, summary(4))]).walks,
-        [(id(&peer), r)],
-        "eviction cleared what was opened"
-    );
+    assert!(hear(&mut bob, &linked, vec![(r, summary(4))]).walks.is_empty());
+    let due = bob.grants.deadline().expect("the eviction scheduled a retry");
+    assert_eq!(bob.grants.retry(due).walks, [(id(&peer), r)]);
 }
 
 /// Grants over a resident blob larger than any descriptor make a walk's
@@ -1335,6 +1333,271 @@ fn a_listing_heard_while_its_walk_runs_is_walked_after_that_walk_ends() {
     let due = host.grants.deadline().expect("the root heard meanwhile is walked");
     assert_eq!(due, after(base, 1));
     assert_eq!(host.grants.retry(due).walks, [(id(&peer), r)]);
+}
+
+// ---- everything is listed again ----
+
+/// Every connection is listed everything again between four and a half and
+/// five minutes after it opened and after each repeat, at a moment drawn
+/// afresh. A change is sent at once, and moves the repeat neither way. What a
+/// closed connection would have been sent is forgotten with it.
+#[test]
+fn everything_is_listed_again_on_each_connection() {
+    let [alice, bob, stranger] = [0xC0, 0xC1, 0xC2].map(key);
+    let mut host = Node::new(0xC3);
+    let (r, _) = holding(&mut host, &alice, &bob);
+    host.observe();
+    let local = host.snapshot().grants().summary(r);
+    let opened = now();
+    assert_eq!(host.grants.repeat_deadline(), None, "control: no connection");
+    let (mut to_bob, _) = open_to(&mut host, id(&bob), 1);
+    let (mut to_stranger, _) = open_to(&mut host, id(&stranger), 2);
+    assert_eq!(listed(&mut to_bob), [(r, local)]);
+    assert!(listed(&mut to_stranger).is_empty());
+    host.observe();
+    assert!(listed(&mut to_bob).is_empty(), "control: an observation repeats nothing");
+
+    let first = host.grants.repeat_deadline().unwrap();
+    assert!(first >= after(opened, 270) && first < after(now(), 300));
+    host.grants.repeat(after(opened, 269));
+    assert!(listed(&mut to_bob).is_empty(), "not before its time");
+    let mut at = after(opened, 301);
+    let mut spacings = Vec::new();
+    for _ in 0..8 {
+        host.grants.repeat(at);
+        assert_eq!(listed(&mut to_bob), [(r, local)]);
+        assert!(listed(&mut to_stranger).is_empty(), "a stranger is listed nothing");
+        host.grants.repeat(at);
+        assert!(listed(&mut to_bob).is_empty(), "once");
+        let due = host.grants.repeat_deadline().unwrap();
+        assert!(due >= after(at, 270) && due < after(at, 300));
+        spacings.push(due.duration_since(at));
+        at = after(at, 300);
+    }
+    spacings.sort_unstable();
+    spacings.dedup();
+    assert!(spacings.len() > 1, "drawn afresh: {spacings:?}");
+
+    // A changed root goes out at once and leaves the repeat where it was.
+    let due = host.grants.repeat_deadline();
+    let (_, _, _, definition) = unheld(&alice, "listed");
+    host.store
+        .insert_proof(grant(r, &alice, definition, &stranger))
+        .unwrap();
+    host.observe();
+    let changed = host.snapshot().grants().summary(r);
+    assert_ne!(changed, local);
+    assert_eq!(listed(&mut to_bob), [(r, changed)]);
+    assert_eq!(listed(&mut to_stranger), [(r, changed)], "a participant now");
+    assert_eq!(host.grants.repeat_deadline(), due);
+    host.grants.repeat(at);
+    assert_eq!(listed(&mut to_bob), [(r, changed)], "what stands now is repeated");
+    assert_eq!(listed(&mut to_stranger), [(r, changed)], "on each connection");
+
+    host.grants.event(&ReconEvent::Closed(to_bob.link.clone()));
+    host.grants.event(&ReconEvent::Closed(to_stranger.link.clone()));
+    assert_eq!(host.grants.repeat_deadline(), None);
+    host.grants.repeat(after(at, 600));
+    assert!(listed(&mut to_bob).is_empty());
+}
+
+/// Before its first observation a node has nothing to list, at a repeat too.
+/// The connection's time still comes round.
+#[test]
+fn a_repeat_before_the_first_observation_lists_nothing() {
+    let [alice, bob] = [0xC4, 0xC5].map(key);
+    let mut host = Node::new(0xC6);
+    let (r, _) = holding(&mut host, &alice, &bob);
+    let opened = now();
+    let (mut linked, _) = open_to(&mut host, id(&bob), 1);
+    host.grants.repeat(after(opened, 301));
+    assert!(listed(&mut linked).is_empty());
+    assert!(host.grants.repeat_deadline().unwrap() >= after(opened, 571));
+    host.observe();
+    let local = host.snapshot().grants().summary(r);
+    assert_eq!(listed(&mut linked), [(r, local)], "positive control");
+}
+
+/// A connection whose peer has not read what was queued for it is not listed
+/// everything again behind it, however many times come round; what changes is
+/// still queued at once, and once it reads, the next time repeats as ever.
+#[test]
+fn a_repeat_does_not_queue_behind_frames_a_slow_peer_has_not_read() {
+    let [alice, bob] = [0xD1, 0xD2].map(key);
+    let mut host = Node::new(0xD3);
+    let (r, _) = holding(&mut host, &alice, &bob);
+    host.observe();
+    let (mut to_bob, _) = open_to(&mut host, id(&bob), 1);
+    assert_eq!(to_bob.link.queued(), 1, "control: the first listing waits");
+    let mut at = after(now(), 301);
+    for _ in 0..10 {
+        host.grants.repeat(at);
+        assert_eq!(to_bob.link.queued(), 1);
+        at = after(at, 301);
+    }
+    let (_, _, _, definition) = unheld(&alice, "listed");
+    host.store
+        .insert_proof(grant(r, &alice, definition, &key(0xD4)))
+        .unwrap();
+    host.observe();
+    assert_eq!(to_bob.link.queued(), 2, "a change is queued at once");
+    assert_eq!(listed(&mut to_bob).len(), 2);
+    let changed = host.snapshot().grants().summary(r);
+    host.grants.repeat(at);
+    assert_eq!(listed(&mut to_bob), [(r, changed)]);
+}
+
+/// An entry that says what already stands opens no walk, fetches nothing and
+/// changes no health, however often it is heard. A changed one does all
+/// three (positive control).
+#[test]
+fn hearing_what_stands_does_nothing() {
+    let [alice, peer] = [0xC7, 0xC8].map(key);
+    let mut host = Node::new(0xC9);
+    // A grant naming this node waits here for its descriptor.
+    let (_, _, r, handle) = unheld(&alice, "standing");
+    let own = host.key.clone();
+    host.store.insert_proof(grant(r, &alice, handle, &own)).unwrap();
+    host.observe();
+    let health = health_of(&host);
+    let (linked, _) = open_to(&mut host, id(&peer), 1);
+    let first = hear(&mut host, &linked, vec![(r, summary(1))]);
+    assert_eq!(first.walks, [(id(&peer), r)]);
+    assert!(!first.fetch.is_empty(), "control");
+    assert!(host.grants.publish(&health), "control");
+    for _ in 0..50 {
+        let again = hear(&mut host, &linked, vec![(r, summary(1))]);
+        assert!(again.walks.is_empty() && again.fetch.is_empty());
+        assert!(!host.grants.publish(&health), "health is not rebuilt");
+    }
+    let changed = hear(&mut host, &linked, vec![(r, summary(2))]);
+    assert_eq!(changed.walks, [(id(&peer), r)]);
+    assert!(!changed.fetch.is_empty());
+    assert!(host.grants.publish(&health));
+}
+
+/// What stands is acted on again when this node changes, without the peer
+/// changing it: becoming a participant walks it, and a definition found
+/// nowhere is fetched again. Hearing it again in between takes nothing away
+/// from either.
+#[test]
+fn what_stands_is_acted_on_again_when_this_node_changes() {
+    let [alice, peer] = [0xD5, 0xD6].map(key);
+    let mut host = Node::new(0xD7);
+    let (descriptor, _, r, handle) = unheld(&alice, "stands");
+    let own = host.key.clone();
+    host.observe();
+    let (linked, _) = open_to(&mut host, id(&peer), 1);
+    assert_eq!(hear(&mut host, &linked, vec![(r, summary(1))]).walks, [(id(&peer), r)]);
+    host.grants.walked(ended(&peer, r, confirmed()), now());
+    for _ in 0..3 {
+        assert!(hear(&mut host, &linked, vec![(r, summary(1))]).walks.is_empty());
+    }
+    // A grant naming this node arrives without its definition.
+    host.put(&descriptor);
+    host.store.insert_proof(grant(r, &alice, handle, &own)).unwrap();
+    assert_eq!(fetched_from(&host.observe(), handle.raw), Some(id(&peer)));
+    hear(&mut host, &linked, vec![(r, summary(1))]);
+    host.grants.fetch_failed(handle.raw, now());
+    hear(&mut host, &linked, vec![(r, summary(1))]);
+    let due = host.grants.deadline().expect("the fetch is retried");
+    assert_eq!(fetched_from(&host.grants.retry(due), handle.raw), Some(id(&peer)));
+    // With its definition the grant is indexed: this node takes part in R.
+    let (_, definition, _, _) = unheld(&alice, "stands");
+    host.put(&definition);
+    assert_eq!(host.observe().walks, [(id(&peer), r)]);
+}
+
+/// A walk that keeps failing is opened at the same moments whether its peer
+/// lists once or lists the same every second: the walk's backoff, and the
+/// fetch that goes with each of its retries, ask no listing.
+#[test]
+fn repeats_leave_a_failing_walk_on_its_backoff() {
+    let [alice, peer] = [0xCA, 0xCB].map(key);
+    let (_, _, r, handle) = unheld(&alice, "failing");
+    let run = |repeats: bool| {
+        let mut host = Node::new(0xCC);
+        let own = host.key.clone();
+        host.store.insert_proof(grant(r, &alice, handle, &own)).unwrap();
+        host.observe();
+        let (linked, _) = open_to(&mut host, id(&peer), 1);
+        let base = now();
+        let mut log = Vec::new();
+        for step in 0..600 {
+            let at = after(base, step);
+            let mut effects = Effects::default();
+            if step == 0 || repeats {
+                let heard = hear(&mut host, &linked, vec![(r, summary(6))]);
+                effects.walks.extend(heard.walks);
+                effects.fetch.extend(heard.fetch);
+            }
+            if host.grants.deadline().is_some_and(|due| due <= at) {
+                let due = host.grants.retry(at);
+                effects.walks.extend(due.walks);
+                effects.fetch.extend(due.fetch);
+            }
+            for _ in &effects.walks {
+                host.grants.walked(ended(&peer, r, GrantOutcome::Refused), at);
+            }
+            if !effects.walks.is_empty() || !effects.fetch.is_empty() {
+                log.push((step, effects.walks.len(), effects.fetch.len()));
+            }
+        }
+        log
+    };
+    let without = run(false);
+    assert_eq!(without.len(), 15, "control: {without:?}");
+    assert_eq!(run(true), without);
+}
+
+/// A listing of unknown resources heard again and again charges what it
+/// charged the first time: nothing is evicted, nothing more is kept, and the
+/// ones past the budget stay skipped. One that this node has come to take
+/// part in is heard at the next repeat, and frees no slot for another.
+#[test]
+fn repeats_neither_grow_nor_turn_over_the_unknown_budget() {
+    use triblespace_core::patch::Entry;
+    let peer = key(0xCD);
+    let mut host = Node::new(0xD0);
+    let own = host.key.clone();
+    host.observe();
+    let (linked, _) = open_to(&mut host, id(&peer), 1);
+    let joined = {
+        use triblespace_core::collection::{CollectionStoreExt, private_policy};
+        // Known to nobody else and held by no one yet.
+        let mut elsewhere = MemoryRepo::default();
+        elsewhere
+            .collection("joined late", private_policy(own.verifying_key()))
+            .unwrap()
+            .handle()
+    };
+    let mut roots = unknowns(300);
+    roots.push((joined, summary(1)));
+    let walks = hear(&mut host, &linked, roots.clone()).walks.len();
+    assert_eq!(walks, MAX_UNKNOWN_RESOURCES_PER_LINK);
+    for _ in 0..20 {
+        let again = hear(&mut host, &linked, roots.clone());
+        assert!(again.walks.is_empty() && again.fetch.is_empty());
+    }
+    assert!(hear(&mut host, &linked, vec![(handle(299), summary(2))]).walks.is_empty());
+    assert_eq!(hear(&mut host, &linked, vec![(handle(0), summary(2))]).walks.len(), 1);
+
+    // This node activates the last one, a collection it roots.
+    {
+        use triblespace_core::collection::{CollectionStoreExt, private_policy};
+        let held = host
+            .store
+            .collection("joined late", private_policy(own.verifying_key()))
+            .unwrap()
+            .handle();
+        assert_eq!(held, joined);
+    }
+    host.active.insert(&Entry::new(&joined.raw));
+    host.observe();
+    roots[0].1 = summary(2);
+    assert_eq!(hear(&mut host, &linked, roots.clone()).walks, [(id(&peer), joined)]);
+    assert!(hear(&mut host, &linked, roots).walks.is_empty());
+    assert!(hear(&mut host, &linked, vec![(handle(299), summary(2))]).walks.is_empty());
 }
 
 // ---- a grant landed through a peering is completed ----

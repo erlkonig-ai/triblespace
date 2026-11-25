@@ -824,6 +824,10 @@ struct Noted {
     silence: Option<u8>,
     /// Walk streams silenced so far.
     silenced: usize,
+    /// How many more GRANT_ROOTS frames are lost on their way in.
+    losing: usize,
+    /// GRANT_ROOTS frames lost so far.
+    lost: usize,
 }
 
 /// Every frame that crossed a `recon/1` or `walk/1` stream of a [`Tapped`]
@@ -879,6 +883,19 @@ impl Taps {
     /// How many walk streams have been silenced.
     pub fn silenced(&self) -> usize {
         self.0.lock().unwrap().silenced
+    }
+
+    /// Lose the next `frames` GRANT_ROOTS frames that arrive, or none: the
+    /// tapped side reads each as a kind it does not know, which it skips, so
+    /// nothing else on the stream changes. The peer sent it and learns
+    /// nothing.
+    pub fn lose_listings(&self, frames: usize) {
+        self.0.lock().unwrap().losing = frames;
+    }
+
+    /// How many GRANT_ROOTS frames have been lost.
+    pub fn lost(&self) -> usize {
+        self.0.lock().unwrap().lost
     }
 }
 
@@ -1028,7 +1045,33 @@ struct Tap {
     buffer: Vec<u8>,
 }
 
+/// A frame kind no reader knows, which a lost GRANT_ROOTS frame arrives as.
+const KIND_LOST: u8 = 0x7F;
+
 impl Tap {
+    /// Lose the GRANT_ROOTS frames that start in `bytes`, arriving after what
+    /// [`Self::note`] already holds, while any are to be lost.
+    fn lose(&self, bytes: &mut [u8]) {
+        let mut noted = self.taps.0.lock().unwrap();
+        if self.tag.get() != Some(&TAG_RECON) {
+            return;
+        }
+        let held = self.buffer.len();
+        let arrived = [&self.buffer[..], bytes].concat();
+        let mut at = 0;
+        while noted.losing > 0 && at < arrived.len() {
+            if at >= held && arrived[at] == crate::recon::FRAME_GRANT_ROOTS {
+                bytes[at - held] = KIND_LOST;
+                noted.losing -= 1;
+                noted.lost += 1;
+            }
+            let Some(length) = arrived.get(at + 1..at + 5) else {
+                break;
+            };
+            at += 5 + u32::from_be_bytes(length.try_into().unwrap()) as usize;
+        }
+    }
+
     /// Note `bytes` crossing: the tag first, then whole frames of the
     /// framing `recon/1` and `walk/1` share. Other tags are not parsed.
     fn note(&mut self, mut bytes: &[u8]) {
@@ -1161,6 +1204,7 @@ impl AsyncRead for TappedRecv {
         let before = buf.filled().len();
         let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = polled {
+            this.tap.lose(&mut buf.filled_mut()[before..]);
             this.tap.note(&buf.filled()[before..]);
         }
         polled

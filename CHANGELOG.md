@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `triblespace-net`: each side lists its grant roots again on every open
+  connection, with an opportunity every 270 to 300 s that is passed over while
+  the connection has frames queued, so a listing that was skipped or lost is
+  heard without a new connection. Same frames, 72 bytes
+  per resource and direction a round. An entry that says what already stands
+  does nothing at the receiver; until now it reopened a failed walk before its
+  backoff and asked for missing blobs again. A connection nothing else crosses
+  closes when idle as before.
+
 - `triblespace-net`: a node that accepts connections before its first store
   observation no longer loses grant listings beyond the 256-resource bound. It
   drops a connection whose listing was cut short then, once, at that

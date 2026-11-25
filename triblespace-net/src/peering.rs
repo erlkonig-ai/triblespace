@@ -1386,6 +1386,13 @@ pub(crate) async fn run<T: Transport, S: Service, R>(
                 None => std::future::pending().await,
             }
         };
+        let repeat_at = grants.repeat_deadline();
+        let repeat_due = async {
+            match repeat_at {
+                Some(at) => tokio::time::sleep(at.duration_since(crate::clock::mono_now())).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             changed = snapshots.changed() => {
                 if changed.is_err() {
@@ -1411,6 +1418,7 @@ pub(crate) async fn run<T: Transport, S: Service, R>(
                 sink.apply(grants.fetch_failed(handle, crate::clock::mono_now()));
             }
             () = retry_due => sink.apply(grants.retry(crate::clock::mono_now())),
+            () = repeat_due => grants.repeat(crate::clock::mono_now()),
             () = push_due => {
                 for (peer, collection, kind) in schedules.poll(crate::clock::mono_now()) {
                     walks.open(peer, collection, kind);

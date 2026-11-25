@@ -2569,3 +2569,724 @@ fn a_host_that_never_observes_keeps_its_connection() {
         });
     }
 }
+
+// ---------------------------------------------------------------------------
+// Scenario 12: everything is listed again on a connection that stays open.
+// ---------------------------------------------------------------------------
+
+/// The longest time between two listings of everything on a connection
+/// (grants.rs `MIN_REPEAT` and `REPEAT_JITTER`), and some seconds' slack.
+const REPEATED: u64 = 305;
+/// The shortest (grants.rs `MIN_REPEAT`).
+const REPEATS_AFTER: u64 = 270;
+/// When a connection nothing crosses closes (connection.rs
+/// `CONNECTION_IDLE_DEADLINE`).
+const IDLE: u64 = 120;
+
+/// Two hosts start together and sync five collections. The first listing
+/// each sent the other, or only W's, is lost as it arrives, so the hearer's
+/// pairs never turn current although every record and grant is there. The
+/// next repeat heals them, on the connection as it stands.
+#[test]
+fn a_lost_listing_is_heard_at_the_next_repeat() {
+    for both in [false, true] {
+        for s_lower in [true, false] {
+            for seed in 0..SEEDS {
+                run(async |clock| {
+                    let net = SimNet::new(0x6A47_1000 ^ seed, SimConfig::default());
+                    let mut shared = Shared::new(w_and_s(s_lower), 5);
+                    let (w_id, s_id) = (id(&shared.w), id(&shared.s));
+                    let (s_harness, at_s) = net.tap(&shared.s);
+                    let (w_harness, at_w) = net.tap(&shared.w);
+                    // Crossed dials make two connections; what each lists is lost.
+                    at_s.lose_listings(usize::MAX);
+                    at_w.lose_listings(if both { usize::MAX } else { 0 });
+                    let mut wh =
+                        bring_up(w_harness, &shared.w, std::mem::take(&mut shared.wp.store));
+                    let mut sh =
+                        bring_up(s_harness, &shared.s, std::mem::take(&mut shared.sp.store));
+                    wh.activate_collections(shared.collections.iter().copied());
+                    sh.activate_collections(shared.collections.iter().copied());
+                    let started = clock::mono_now();
+                    advance(&clock, &mut [&mut wh, &mut sh], 100).await;
+                    assert!(at_s.lost() >= 1 && (at_w.lost() >= 1) == both);
+                    at_s.lose_listings(0);
+                    at_w.lose_listings(0);
+                    advance(&clock, &mut [&mut wh, &mut sh], 100).await;
+                    assert_eq!(heard(&sh, &shared.collections, w_id), 0, "lost, and not repeated yet");
+                    assert_eq!(pairs(&sh, &shared.collections, w_id)[2], 0, "never current");
+                    for collection in &shared.collections {
+                        assert!(receives_from(&sh, w_id, *collection), "control: they sync");
+                    }
+                    let dials = (net.dial_count(w_id, s_id), net.dial_count(s_id, w_id));
+                    let from = at_s.len();
+                    until(
+                        &clock,
+                        &mut [&mut wh, &mut sh],
+                        REPEATED,
+                        "every listing at both",
+                        |hosts| {
+                            heard(hosts[1], &shared.collections, w_id) == 5
+                                && heard(hosts[0], &shared.collections, s_id) == 5
+                        },
+                    )
+                    .await;
+                    let took = clock::mono_now().duration_since(started);
+                    assert!(took >= Duration::from_secs(REPEATS_AFTER - 5), "{took:?}");
+                    println!("lost at S (and at W: {both}), S lower {s_lower}, seed {seed}: heard after {took:?}");
+                    until(&clock, &mut [&mut wh, &mut sh], 10, "current pairs", |hosts| {
+                        pairs(hosts[1], &shared.collections, w_id)[2] == 5
+                            && pairs(hosts[0], &shared.collections, s_id)[2] == 5
+                    })
+                    .await;
+                    assert!(holds_proof(&mut sh, &shared.missed));
+                    assert_eq!((net.dial_count(w_id, s_id), net.dial_count(s_id, w_id)), dials);
+                    assert_eq!(connections(&at_s, from, w_id), 0, "the same connection");
+                });
+            }
+        }
+    }
+}
+
+/// A changed root whose listing is lost: S thinks it agrees with W and no
+/// walk opens, so the grant W made does not reach S until the next repeat.
+#[test]
+fn a_grant_whose_listing_was_lost_arrives_at_the_next_repeat() {
+    for s_lower in [true, false] {
+        for seed in 0..SEEDS {
+            run(async |clock| {
+                let net = SimNet::new(0x6A47_1040 ^ seed, SimConfig::default());
+                let mut shared = Shared::new(w_and_s(s_lower), 2);
+                let w_id = id(&shared.w);
+                let (s_harness, taps) = net.tap(&shared.s);
+                let mut wh =
+                    bring_up(net.join(&shared.w), &shared.w, std::mem::take(&mut shared.wp.store));
+                let mut sh = bring_up(s_harness, &shared.s, std::mem::take(&mut shared.sp.store));
+                wh.activate_collections(shared.collections.iter().copied());
+                sh.activate_collections(shared.collections.iter().copied());
+                until(&clock, &mut [&mut wh, &mut sh], 60, "agreement", |hosts| {
+                    pairs(hosts[1], &shared.collections, w_id)[2] == 2
+                })
+                .await;
+                // A retry left from the first walks would walk the change.
+                advance(&clock, &mut [&mut wh, &mut sh], 10 + seed * 10).await;
+                taps.lose_listings(usize::MAX);
+                let late = grant(&shared.w, read_capability(), &key(0x9C), shared.collections[0]);
+                wh.store().insert_proof(late.clone()).unwrap();
+                wh.refresh();
+                advance(&clock, &mut [&mut wh, &mut sh], 5).await;
+                assert!(taps.lost() >= 1);
+                taps.lose_listings(0);
+                advance(&clock, &mut [&mut wh, &mut sh], 95).await;
+                assert!(!holds_proof(&mut sh, &late), "S was not told");
+                let took = until(
+                    &clock,
+                    &mut [&mut wh, &mut sh],
+                    REPEATED,
+                    "the late grant at S",
+                    |hosts| holds_proof(hosts[1], &late),
+                )
+                .await;
+                println!("S lower {s_lower}, seed {seed}: {took:?} after the first 100 s");
+            });
+        }
+    }
+}
+
+/// W and S root 300 collections together, over which nobody holds a grant.
+/// S has observed its store but has nothing active, so it can tell nothing
+/// it takes part in: the budget keeps 256 of W's entries and skips 44, and
+/// no first observation is ahead that would drop the connection. S activates
+/// them all later. The next repeat heals the 44 on the same connection.
+#[test]
+fn collections_activated_after_their_listing_was_skipped_are_heard_at_the_next_repeat() {
+    for s_lower in [true, false] {
+        for seed in 0..SEEDS / 2 {
+            run(async |clock| {
+                let net = SimNet::new(0x6A47_1080 ^ seed, SimConfig::default());
+                let [w, s] = w_and_s(s_lower);
+                let (w_id, s_id) = (id(&w), id(&s));
+                let both = || {
+                    AdmissionPolicy::quorum([w.verifying_key(), s.verifying_key()], 1, None).unwrap()
+                };
+                let policy = CollectionPolicy::new(both(), both());
+                let (mut wp, mut sp) = (Pile::new(&w), Pile::new(&s));
+                let collections = (0..UNKNOWN_RESOURCES_PER_LINK + 44)
+                    .map(|index| {
+                        let name = format!("grantless {index}");
+                        let collection = wp.hold(&name, &policy);
+                        assert_eq!(sp.hold(&name, &policy), collection);
+                        wp.select(collection);
+                        sp.select(collection);
+                        collection
+                    })
+                    .collect::<Vec<_>>();
+                let (s_harness, taps) = net.tap(&s);
+                let mut sh = bring_up(s_harness, &s, sp.store);
+                advance(&clock, &mut [&mut sh], 3).await;
+                let mut wh = bring_up(net.join(&w), &w, wp.store);
+                wh.activate_collections(collections.iter().copied());
+                until(&clock, &mut [&mut wh, &mut sh], 60, "W's listing at S", |_| {
+                    listed(&taps, 0, w_id, false).len() == collections.len()
+                })
+                .await;
+                advance(&clock, &mut [&mut wh, &mut sh], 2 + seed).await;
+                let started = clock::mono_now();
+                sh.activate_collections(collections.iter().copied());
+                advance(&clock, &mut [&mut wh, &mut sh], 100).await;
+                assert_eq!(heard(&sh, &collections, w_id), UNKNOWN_RESOURCES_PER_LINK);
+                let dials = (net.dial_count(w_id, s_id), net.dial_count(s_id, w_id));
+                until(&clock, &mut [&mut wh, &mut sh], REPEATED, "all heard", |hosts| {
+                    heard(hosts[1], &collections, w_id) == collections.len()
+                })
+                .await;
+                let took = clock::mono_now().duration_since(started);
+                until(&clock, &mut [&mut wh, &mut sh], 10, "all current", |hosts| {
+                    pairs(hosts[1], &collections, w_id)[2] == collections.len()
+                })
+                .await;
+                println!("S lower {s_lower}, seed {seed}: heard {took:?} after activation");
+                assert_eq!((net.dial_count(w_id, s_id), net.dial_count(s_id, w_id)), dials);
+                assert_eq!(connections(&taps, 0, w_id), 1, "one connection throughout");
+            });
+        }
+    }
+}
+
+/// A peer driven by hand over a connection it dialled: it sends what a test
+/// tells it to, reads what arrives unless told not to, and refuses every walk
+/// at once.
+struct ByHand {
+    conn: triblespace_net::transport::sim::SimConn,
+    recon: SimSendStream,
+    /// Walk streams the host opened, and whether the connection ended.
+    seen: Rc<RefCell<(usize, bool)>>,
+    /// It reads nothing while this is set.
+    deaf: Rc<RefCell<bool>>,
+}
+
+impl ByHand {
+    async fn dial(
+        transport: &triblespace_net::transport::sim::SimTransport,
+        host: PeerId,
+        sequence: u64,
+    ) -> Self {
+        let conn = transport.dial(host, PILE_SYNC_ALPN).await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        send.write_all(&[TAG_RECON]).await.unwrap();
+        send.write_all(&framed(recon::FRAME_OPEN, &sequence.to_be_bytes()))
+            .await
+            .unwrap();
+        let seen = Rc::new(RefCell::new((0, false)));
+        let deaf = Rc::new(RefCell::new(false));
+        let (reader, acceptor, ears) = (seen.clone(), seen.clone(), deaf.clone());
+        tokio::task::spawn_local(async move {
+            let mut arrived = [0; 4096];
+            loop {
+                while *ears.borrow() {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                if !matches!(recv.read(&mut arrived).await, Ok(1..)) {
+                    break;
+                }
+            }
+            reader.borrow_mut().1 = true;
+        });
+        let accepting = conn.clone();
+        tokio::task::spawn_local(async move {
+            while let Some((mut send, _recv)) = accepting.accept_bi().await {
+                acceptor.borrow_mut().0 += 1;
+                send.reset(RESET_WALK_REFUSED);
+            }
+        });
+        Self { conn, recon: send, seen, deaf }
+    }
+
+    async fn frame(&mut self, kind: u8, payload: &[u8]) {
+        // A connection that has ended takes nothing more.
+        let _ = self.recon.write_all(&framed(kind, payload)).await;
+    }
+
+    async fn list(&mut self, roots: &[(CollectionHandle, PatchSummary)]) {
+        for frame in grant_roots_frames(roots) {
+            let (kind, payload) = frame.encode();
+            self.frame(kind, &payload).await;
+        }
+    }
+}
+
+/// 300 resources a key nobody knows lists, each with a grant to `subject`.
+fn junk_listing(root: &SigningKey, subject: &SigningKey) -> Vec<(CollectionHandle, PatchSummary)> {
+    let delivery = delivery_definition().get_handle();
+    (0..UNKNOWN_RESOURCES_PER_LINK + 44)
+        .map(|index| {
+            let mut raw = delivery.raw;
+            raw[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            let resource = CollectionHandle::new(raw);
+            (resource, one_grant(resource, &grant(root, delivery, subject, resource)).0)
+        })
+        .collect()
+}
+
+/// A stranger that lists 300 unknown resources every five seconds for ten
+/// minutes gains nothing over one that listed them once: the same 256 kept
+/// and, over the same time, no more walks, each of which it refuses. Nobody
+/// dials it.
+#[test]
+fn a_stranger_gains_nothing_by_repeating_its_listing() {
+    for seed in 0..SEEDS / 2 {
+        let walks = [false, true].map(|repeats| {
+            let opened = Rc::new(RefCell::new(0));
+            let out = opened.clone();
+            run(async |clock| {
+                let net = SimNet::new(0x6A47_10C0 ^ seed, SimConfig::default());
+                let [s, z] = [0x98, 0x9A].map(key);
+                let mut sp = Pile::new(&s);
+                let own = sp.hold("own", &private_policy(s.verifying_key()));
+                sp.select(own);
+                let mut sh = bring_up(net.join(&s), &s, sp.store);
+                sh.activate_collection(own);
+                advance(&clock, &mut [&mut sh], 2).await;
+                let Harness { transport, mut incoming } = net.join(&z);
+                tokio::task::spawn_local(async move { while incoming.recv().await.is_some() {} });
+                let listing = junk_listing(&z, &s);
+                let mut stranger = ByHand::dial(&transport, id(&s), 1).await;
+                stranger.list(&listing).await;
+                for _ in 0..120 {
+                    advance(&clock, &mut [&mut sh], 5).await;
+                    if repeats {
+                        stranger.list(&listing).await;
+                    }
+                }
+                let kept = sh
+                    .health()
+                    .grants
+                    .iter()
+                    .filter(|grants| grants.peers.iter().any(|peer| peer.listed.is_some()))
+                    .count();
+                assert_eq!(kept, UNKNOWN_RESOURCES_PER_LINK);
+                assert!(!stranger.seen.borrow().1, "control: the connection stood throughout");
+                assert_eq!(net.dial_count(id(&s), id(&z)), 0);
+                *out.borrow_mut() = stranger.seen.borrow().0;
+            });
+            *opened.borrow()
+        });
+        println!("seed {seed}: walks opened to one that listed once {}, every 5 s {}", walks[0], walks[1]);
+        // Each is opened again at 1, 3, 7, 15, 31 and 63 s, then every minute.
+        assert!(walks[0] >= 14 * UNKNOWN_RESOURCES_PER_LINK, "control: {walks:?}");
+        assert!(walks[1] <= walks[0] + UNKNOWN_RESOURCES_PER_LINK, "{walks:?}");
+    }
+}
+
+/// W rooted `resources` of which S holds a grant, as of secret versions, and
+/// which nobody selects; with `peered`, also a collection they sync.
+struct Granted {
+    w: SigningKey,
+    s: SigningKey,
+    wp: Pile,
+    sp: Pile,
+    synced: CollectionHandle,
+    resources: Vec<CollectionHandle>,
+}
+
+impl Granted {
+    fn new([w, s]: [SigningKey; 2], resources: usize) -> Self {
+        let mut wp = Pile::new(&w);
+        let mut sp = Pile::new(&s);
+        let policy = private_policy(w.verifying_key());
+        let synced = wp.hold("synced", &policy);
+        sp.hold("synced", &policy);
+        let reads = grant(&w, read_capability(), &s, synced);
+        let definition = delivery_definition();
+        let delivery = definition.get_handle();
+        for pile in [&mut wp, &mut sp] {
+            pile.insert(&[&reads]);
+            pile.store.put::<SimpleArchive, _>(definition.clone()).unwrap();
+        }
+        let resources = (0..resources)
+            .map(|index| {
+                let descriptor = entity! {
+                    metadata::tag: KIND_TEST_RESOURCE,
+                    metadata::name: format!("version {index}"),
+                    resource_policy*: AdmissionPolicy::direct(w.verifying_key()).binding(delivery),
+                }
+                .facts()
+                .clone();
+                let resource = wp.store.put::<SimpleArchive, _>(descriptor.clone()).unwrap();
+                sp.store.put::<SimpleArchive, _>(descriptor).unwrap();
+                let proof = grant(&w, delivery, &s, resource);
+                wp.insert(&[&proof]);
+                sp.insert(&[&proof]);
+                resource
+            })
+            .collect();
+        Self { w, s, wp, sp, synced, resources }
+    }
+}
+
+/// GRANT_ROOTS frames and their bytes that crossed since the `from`-th frame,
+/// either way.
+fn listings(taps: &Taps, from: usize, peer: PeerId) -> (usize, usize) {
+    taps.since(from, peer, TAG_RECON)
+        .iter()
+        .filter(|crossed| crossed.kind == recon::FRAME_GRANT_ROOTS)
+        .fold((0, 0), |(frames, bytes), crossed| (frames + 1, bytes + crossed.wire_bytes))
+}
+
+/// CPU time this thread used.
+fn cpu() -> Duration {
+    let stat = std::fs::read_to_string("/proc/thread-self/schedstat").unwrap_or_default();
+    Duration::from_nanos(stat.split(' ').next().and_then(|ns| ns.parse().ok()).unwrap_or(0))
+}
+
+/// Two hosts that share 2,000 resources and one collection, agreed, idle for
+/// ten minutes: the listings repeat, and nothing else that has to do with
+/// grants happens. Printed, so that two builds can be compared: what crossed,
+/// and the thread's CPU time, which is both hosts' and the simulation's.
+#[test]
+fn two_thousand_agreed_resources_idle_for_ten_minutes() {
+    run(async |clock| {
+        let net = SimNet::new(0x6A47_1100, SimConfig::default());
+        let mut granted = Granted::new(w_and_s(true), 2000);
+        let (w_id, s_id) = (id(&granted.w), id(&granted.s));
+        granted.wp.select(granted.synced);
+        granted.sp.select(granted.synced);
+        let (s_harness, taps) = net.tap(&granted.s);
+        let mut wh =
+            bring_up(net.join(&granted.w), &granted.w, std::mem::take(&mut granted.wp.store));
+        let mut sh = bring_up(s_harness, &granted.s, std::mem::take(&mut granted.sp.store));
+        wh.activate_collection(granted.synced);
+        sh.activate_collection(granted.synced);
+        until(&clock, &mut [&mut wh, &mut sh], 120, "every resource heard", |hosts| {
+            heard(hosts[1], &granted.resources, w_id) == granted.resources.len()
+                && heard(hosts[0], &granted.resources, s_id) == granted.resources.len()
+        })
+        .await;
+        advance(&clock, &mut [&mut wh, &mut sh], 30).await;
+        let (from, before) = (taps.len(), cpu());
+        let dials = (net.dial_count(w_id, s_id), net.dial_count(s_id, w_id));
+        let totals = |host: &Peer<MemoryRepo>| {
+            host.health()
+                .grants
+                .iter()
+                .flat_map(|grants| &grants.peers)
+                .map(|peer| peer.ends.failed + peer.skipped + peer.pending + peer.retries)
+                .sum::<u64>()
+        };
+        advance(&clock, &mut [&mut wh, &mut sh], 600).await;
+        let used = cpu() - before;
+        let (frames, bytes) = listings(&taps, from, w_id);
+        let other = taps.since(from, w_id, TAG_RECON).len() - frames;
+        println!(
+            "2,000 resources idle 600 s: GRANT_ROOTS {frames} frames, {bytes} B both ways; other \
+             recon frames {other}; grant walk opens {}; record walk opens {}; CPU {used:?}",
+            opens(&taps, from, w_id, WALK_AUTHORIZATION),
+            opens(&taps, from, w_id, WALK_COMMIT) + opens(&taps, from, w_id, WALK_DERIVE),
+        );
+        assert_eq!(opens(&taps, from, w_id, WALK_AUTHORIZATION), 0, "equal roots walk nothing");
+        assert_eq!((totals(&wh), totals(&sh)), (0, 0));
+        assert_eq!((net.dial_count(w_id, s_id), net.dial_count(s_id, w_id)), dials);
+        // Two rounds each way fall in ten minutes: 2,001 entries of 72 B in
+        // three frames with 5 B of framing.
+        let round = 2001 * 72 + 3 * 5;
+        assert_eq!((frames, bytes), (2 * 2 * 3, 2 * 2 * round));
+    });
+}
+
+/// Two hosts with nothing active, of which S has W as its first contact and
+/// W holds `blobs` S can fetch from it: so they connect, and each lists
+/// everything to the other, as [`Granted`] makes them hold it.
+struct Contacts {
+    w_id: PeerId,
+    s_id: PeerId,
+    wh: Peer<MemoryRepo>,
+    sh: Peer<MemoryRepo>,
+    taps: Taps,
+    blobs: Vec<[u8; 32]>,
+}
+
+impl Contacts {
+    async fn new(clock: &Arc<VirtualClock>, seed: u64, s_lower: bool, blobs: usize) -> Self {
+        let net = SimNet::new(seed, SimConfig::default());
+        let mut granted = Granted::new(w_and_s(s_lower), 3);
+        let (s_harness, taps) = net.tap(&granted.s);
+        let blobs = (0..blobs)
+            .map(|index| {
+                let bytes = Bytes::from_source(format!("fetched {index}").into_bytes());
+                granted.wp.store.put::<UnknownBlob, _>(bytes).unwrap().raw
+            })
+            .collect();
+        let mut wh =
+            bring_up(net.join(&granted.w), &granted.w, std::mem::take(&mut granted.wp.store));
+        let daemon = Some(granted.w.verifying_key());
+        let (sender, receiver) = bring_up_cold(s_harness, &granted.s, daemon);
+        let store = std::mem::take(&mut granted.sp.store);
+        let mut sh = Peer::with_wiring(store, sender, receiver);
+        advance(clock, &mut [&mut wh, &mut sh], 2).await;
+        let (w_id, s_id) = (id(&granted.w), id(&granted.s));
+        Self { w_id, s_id, wh, sh, taps, blobs }
+    }
+
+    /// S fetches the next blob, over their connection or a new one.
+    async fn fetch(&mut self, clock: &Arc<VirtualClock>) {
+        let hash = self.blobs.pop().unwrap();
+        let fetch = self.sh.fetch_blob_with_deadline(hash, Duration::from_secs(20));
+        let mut fetch = std::pin::pin!(fetch);
+        for _ in 0..200 {
+            tokio::select! {
+                biased;
+                fetched = &mut fetch => {
+                    assert!(fetched.is_some(), "control: W serves S");
+                    return;
+                }
+                () = SimNet::step(clock, Duration::from_millis(100)) => {
+                    self.wh.refresh();
+                    self.sh.refresh();
+                }
+            }
+        }
+        panic!("control: the fetch never ended");
+    }
+
+    async fn advance(&mut self, clock: &Arc<VirtualClock>, seconds: u64) {
+        advance(clock, &mut [&mut self.wh, &mut self.sh], seconds).await;
+    }
+
+    /// Whether each side reports the other as connected.
+    fn connected(&self) -> [bool; 2] {
+        [(&self.wh, self.s_id), (&self.sh, self.w_id)].map(|(host, other)| {
+            host.health()
+                .grants
+                .iter()
+                .any(|grants| grants.peers.iter().any(|peer| peer.peer == other))
+        })
+    }
+
+    /// How long until neither side reports the other as connected.
+    async fn closed(&mut self, clock: &Arc<VirtualClock>, what: &str) -> Duration {
+        let started = clock::mono_now();
+        for _ in 0..2400 {
+            if self.connected() == [false, false] {
+                return clock::mono_now().duration_since(started);
+            }
+            self.advance(clock, 1).await;
+        }
+        panic!("{what}: never closed");
+    }
+}
+
+/// A connection nothing but listings cross closes at its idle deadline, as
+/// it would without repeats: the first repeat falls after it. (A host that
+/// still looks for neighbours sends the connection DHT lookups, which keep it
+/// open with or without repeats.)
+#[test]
+fn a_connection_only_listings_crossed_closes_when_idle() {
+    for s_lower in [true, false] {
+        for seed in 0..SEEDS {
+            run(async |clock| {
+                let mut hosts = Contacts::new(&clock, 0x6A47_1140 ^ seed, s_lower, 1).await;
+                hosts.fetch(&clock).await;
+                let quiet = clock::mono_now();
+                hosts.advance(&clock, 2).await;
+                assert_eq!(listings(&hosts.taps, 0, hosts.w_id).0, 2, "control: each listed");
+                assert_eq!(hosts.connected(), [true, true]);
+                hosts.closed(&clock, "idle").await;
+                let silent = clock::mono_now().duration_since(quiet);
+                println!("S lower {s_lower}, seed {seed}: closed {silent:?} after the fetch");
+                assert!(silent.abs_diff(Duration::from_secs(IDLE)) < Duration::from_secs(3), "{silent:?}");
+                assert_eq!(listings(&hosts.taps, 0, hosts.w_id).0, 2, "nothing was repeated");
+            });
+        }
+    }
+}
+
+/// Two hosts a fetch every 50 s kept connected long enough for both to have
+/// repeated several times, at whatever phase their moments came to: once the
+/// fetches end, the connection closes within three idle deadlines, one for
+/// each side's last repeat and one of silence.
+#[test]
+fn two_hosts_repeats_alone_do_not_hold_their_connection_open() {
+    let mut taken = Vec::new();
+    for seed in 0..3 * SEEDS {
+        let closed = Rc::new(RefCell::new(Duration::ZERO));
+        let out = closed.clone();
+        run(async |clock| {
+            let mut hosts = Contacts::new(&clock, 0x6A47_1160 ^ seed, seed % 2 == 0, 40).await;
+            // The last fetch falls at every phase of the time between repeats.
+            for _ in 0..30 + seed * 12 / 50 {
+                hosts.fetch(&clock).await;
+                hosts.advance(&clock, 50).await;
+                assert_eq!(hosts.connected(), [true, true], "control");
+            }
+            hosts.advance(&clock, seed * 12 % 50).await;
+            hosts.fetch(&clock).await;
+            assert_eq!(connections(&hosts.taps, 0, hosts.w_id), 1, "control: one throughout");
+            for sent in [true, false] {
+                let listed = hosts.taps.listed(0, hosts.w_id);
+                let times = listed.iter().filter(|listed| listed.sent == sent).count();
+                assert!(times >= 5, "control: {times}");
+            }
+            *out.borrow_mut() = hosts.closed(&clock, "two hosts").await;
+        });
+        taken.push(closed.borrow().as_secs());
+    }
+    println!("closed after the last fetch, in seconds: {taken:?}");
+    assert!(taken.iter().all(|closed| *closed <= 3 * IDLE), "{taken:?}");
+}
+
+/// Repeats alone never keep a connection open, whatever the phase between
+/// the two sides'. A frame of a kind nobody knows every 50 s holds one open
+/// for ten minutes and more while S repeats to a peer driven by hand, which
+/// lists to S at the shortest spacing. Once the other frames stop, at a
+/// moment of every phase of that spacing, the connection closes within three
+/// idle deadlines: one for each side's last repeat and one of silence.
+#[test]
+fn both_sides_repeats_alone_do_not_hold_a_connection_open() {
+    let mut longest = Duration::ZERO;
+    for phase in 0..27 {
+        let closed = Rc::new(RefCell::new(Duration::ZERO));
+        let out = closed.clone();
+        run(async |clock| {
+            let net = SimNet::new(0x6A47_1180 ^ phase, SimConfig::default());
+            let mut granted = Granted::new(w_and_s(phase % 2 == 0), 3);
+            let (w_id, s_id) = (id(&granted.w), id(&granted.s));
+            let (s_harness, taps) = net.tap(&granted.s);
+            let mut sh = bring_up(s_harness, &granted.s, std::mem::take(&mut granted.sp.store));
+            advance(&clock, &mut [&mut sh], 2).await;
+            let Harness { transport, mut incoming } = net.join(&granted.w);
+            tokio::task::spawn_local(async move { while incoming.recv().await.is_some() {} });
+            let listing = granted
+                .resources
+                .iter()
+                .map(|resource| {
+                    let proof = grant(
+                        &granted.w,
+                        delivery_definition().get_handle(),
+                        &granted.s,
+                        *resource,
+                    );
+                    (*resource, one_grant(*resource, &proof).0)
+                })
+                .collect::<Vec<_>>();
+            let mut by_hand = ByHand::dial(&transport, s_id, 1).await;
+            let quiet_at = 600 + phase * 10;
+            for second in 0..2400 {
+                if by_hand.seen.borrow().1 {
+                    break;
+                }
+                if second % REPEATS_AFTER == 0 {
+                    by_hand.list(&listing).await;
+                }
+                if second % 50 == 0 && second < quiet_at {
+                    by_hand.frame(0x7E, &[]).await;
+                }
+                advance(&clock, &mut [&mut sh], 1).await;
+                if second < quiet_at {
+                    assert!(!by_hand.seen.borrow().1, "control: held open meanwhile");
+                } else {
+                    *out.borrow_mut() += Duration::from_secs(1);
+                }
+            }
+            assert!(by_hand.seen.borrow().1, "phase {phase}: repeats held it open");
+            let repeated = taps
+                .listed(0, w_id)
+                .iter()
+                .filter(|listed| listed.sent)
+                .count();
+            assert!(repeated >= 3, "control: S listed {repeated} times");
+            assert_eq!(opens(&taps, 0, w_id, WALK_AUTHORIZATION), 0, "control: they agree");
+        });
+        longest = longest.max(*closed.borrow());
+    }
+    println!("closed at the latest {longest:?} after the last other frame's 50 s");
+    assert!(longest <= Duration::from_secs(3 * IDLE), "{longest:?}");
+}
+
+/// A connection closes amid a repeat, both ways. The peer, driven by hand,
+/// has sent one of the three frames of its own when it closes; and it has
+/// stopped reading, so that S's repeat is written and never arrives. On the next
+/// connection it dials each side lists everything afresh, and S repeats there
+/// in that connection's own time, once.
+#[test]
+fn a_connection_that_closes_amid_a_repeat_is_listed_afresh() {
+    for s_lower in [true, false] {
+        run(async |clock| {
+            let net = SimNet::new(0x6A47_11C0, SimConfig::default());
+            let mut granted = Granted::new(w_and_s(s_lower), 2000);
+            let (w_id, s_id) = (id(&granted.w), id(&granted.s));
+            let (s_harness, taps) = net.tap(&granted.s);
+            let mut sh = bring_up(s_harness, &granted.s, std::mem::take(&mut granted.sp.store));
+            advance(&clock, &mut [&mut sh], 2).await;
+            let Harness { transport, mut incoming } = net.join(&granted.w);
+            tokio::task::spawn_local(async move { while incoming.recv().await.is_some() {} });
+            let delivery = delivery_definition().get_handle();
+            let listing = granted
+                .resources
+                .iter()
+                .map(|resource| {
+                    let proof = grant(&granted.w, delivery, &granted.s, *resource);
+                    (*resource, one_grant(*resource, &proof).0)
+                })
+                .collect::<Vec<_>>();
+            let sent = |from: usize| {
+                taps.listed(from, w_id).iter().filter(|listed| listed.sent).count()
+            };
+            let mut first = ByHand::dial(&transport, s_id, 1).await;
+            first.list(&listing).await;
+            for _ in 0..9 {
+                first.frame(0x7E, &[]).await;
+                advance(&clock, &mut [&mut sh], 25).await;
+            }
+            assert_eq!(heard(&sh, &granted.resources, w_id), 2000, "control");
+            assert_eq!(sent(0), 3, "control: S listed everything once");
+            *first.deaf.borrow_mut() = true;
+            let from = taps.len();
+            first.frame(0x7E, &[]).await;
+            advance(&clock, &mut [&mut sh], 25).await;
+            // S repeats 270 to 300 s after the connection opened.
+            first.frame(0x7E, &[]).await;
+            until(&clock, &mut [&mut sh], 60, "S's repeat", |_| sent(from) > 0).await;
+            assert!(!first.seen.borrow().1, "the connection stands");
+            let (kind, payload) = grant_roots_frames(&listing)[0].encode();
+            first.frame(kind, &payload).await;
+            advance(&clock, &mut [&mut sh], 1).await;
+            first.conn.close(0, b"amid");
+            advance(&clock, &mut [&mut sh], 2).await;
+            assert!(sh.health().grants.iter().all(|grants| grants.peers.is_empty()));
+
+            let again = taps.len();
+            let mut second = ByHand::dial(&transport, s_id, 2).await;
+            second.list(&listing).await;
+            for _ in 0..10 {
+                second.frame(0x7E, &[]).await;
+                advance(&clock, &mut [&mut sh], 26).await;
+            }
+            assert_eq!(heard(&sh, &granted.resources, w_id), 2000);
+            assert_eq!(sent(again), 3, "afresh, and nothing left over");
+            second.frame(0x7E, &[]).await;
+            advance(&clock, &mut [&mut sh], 50).await;
+            assert_eq!(sent(again), 6, "then one repeat");
+        });
+    }
+}
+
+/// A host that never observes a store hears W's repeats for as long as their
+/// connection lives, which W's own lookups keep open: it keeps what it kept,
+/// lists nothing, walks nothing, and neither drops nor reconnects anything.
+#[test]
+fn a_host_that_never_observes_hears_repeats_and_does_nothing() {
+    for s_lower in [true, false] {
+        run(async |clock| {
+            let cold = Cold::new(&clock, 0, s_lower, UNKNOWN_RESOURCES_PER_LINK + 44).await;
+            let Cold { net, w_id, s_id, mut wh, wired, taps, .. } = cold;
+            advance(&clock, &mut [&mut wh], 900).await;
+            assert!(listed(&taps, 0, w_id, true).is_empty(), "it has nothing to list");
+            assert_eq!(opens(&taps, 0, w_id, WALK_AUTHORIZATION), 0);
+            assert!(wired.0.health().grants.is_empty(), "S observed nothing");
+            assert_eq!((net.dial_count(w_id, s_id), net.dial_count(s_id, w_id)), (1, 0));
+            assert_eq!(connections(&taps, 0, w_id), 1);
+            let (frames, _) = listings(&taps, 0, w_id);
+            assert!(frames >= 3, "control: W repeated, {frames} frames in all");
+        });
+    }
+}

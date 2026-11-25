@@ -13,9 +13,11 @@
 //!   unchanged in membership, it is never walked, summarised into a frontier
 //!   or compared.
 //! - [`Grants`] lists on every connection, as `recon/1` GRANT_ROOTS, the
-//!   root and count of R's grants for every R the peer takes part in, and
-//!   opens a grant walk over R ([`crate::walk`]) where the peer's listed
-//!   root differs from this side's.
+//!   root and count of R's grants for every R the peer takes part in: when
+//!   it opens, whenever one changes, and all of them again every few minutes
+//!   ([`MIN_REPEAT`]). It opens a grant walk over R ([`crate::walk`]) where
+//!   the peer's listed root differs from this side's. An entry that still
+//!   stands does nothing when it is heard again.
 //! - A received grant goes through the walk's [`Gate`]: kept when it names
 //!   this node, this node takes part in R, or the link is peered for R
 //!   either way, and skipped otherwise, never failing the walk. A kept grant
@@ -45,7 +47,8 @@
 //!   so every listed resource counts against the unknown budget. A connection
 //!   whose listing the budget cut short then is dropped at that observation,
 //!   once, and the peer lists everything on the one the candidate order
-//!   makes instead.
+//!   makes instead. What is skipped later, or lost on the way, is heard at
+//!   the peer's next repeat.
 //! - What this side holds of R's grants, and each connected peer's standing
 //!   listing of R, is published into health as grant agreement
 //!   ([`crate::health::GrantHealth`]); a collection's pair reads its grant
@@ -74,7 +77,9 @@ use triblespace_core::trible::TribleSet;
 
 use crate::channel::{NetEvent, NetEventBatch};
 use crate::clock::Mono;
-use crate::connection::{ConnectionTable, Link, ReconEvent, Service};
+use crate::connection::{
+    CONNECTION_IDLE_DEADLINE, ConnectionTable, Link, ReconEvent, Service,
+};
 use crate::host::{ActiveCollections, METADATA_BLOB_BYTES, StoreSnapshot};
 use crate::patch_repair::PatchSummary;
 use crate::protocol::{RawHash, op_get_blob_with_limit};
@@ -93,6 +98,18 @@ const MAX_PENDING: usize = 1024;
 /// each failure up to [`MAX_RETRY`].
 const MIN_RETRY: Duration = Duration::from_secs(1);
 const MAX_RETRY: Duration = Duration::from_secs(60);
+/// The least time between two listings of everything on one connection, to
+/// which up to [`REPEAT_JITTER`] is added each time.
+///
+/// It is more than twice [`CONNECTION_IDLE_DEADLINE`] so that repeats alone
+/// never keep a connection open. Each side's repeats are this far apart, so
+/// between two of one side's, both sides' together leave a gap of at least
+/// half of it, and a connection nothing else crosses closes in that gap. On a
+/// fresh connection the first repeat falls after the deadline anyway. The
+/// half minute is the slack for latency: the gap is 135 s against 120 s.
+const MIN_REPEAT: Duration =
+    Duration::from_secs(2 * CONNECTION_IDLE_DEADLINE.as_secs() + 30);
+const REPEAT_JITTER: Duration = Duration::from_secs(30);
 
 /// Resources a connection may list that this side takes no part in (a
 /// non-syncing grantee learns its grants this way). Reset per connection.
@@ -907,6 +924,8 @@ pub(crate) fn sources(presenter: PeerId, proofs: &[CapabilityProof]) -> Vec<Peer
 /// One connection's listing state.
 struct Listing {
     link: Link,
+    /// When everything is listed again.
+    repeat_at: Mono,
     /// The summary last listed to the peer, per R.
     sent: PATCH<32, IdentitySchema, PatchSummary>,
     /// The peer's last listed summary, per R: its standing statement of what
@@ -968,6 +987,7 @@ impl Listing {
     fn new(link: Link) -> Self {
         Self {
             link,
+            repeat_at: next_repeat(crate::clock::mono_now()),
             sent: PATCH::new(),
             listed: PATCH::new(),
             opened: PATCH::new(),
@@ -1020,10 +1040,18 @@ impl Listing {
     }
 }
 
+/// When a connection listed on at `now` is listed everything again.
+fn next_repeat(now: Mono) -> Mono {
+    now + MIN_REPEAT + REPEAT_JITTER.mul_f64(rand::random())
+}
+
 /// The grant exchange of one node (design: grants gossip by participation):
 /// on every connection each side lists, as GRANT_ROOTS, the root and count
 /// of its grants over every resource R the other takes part in, sent on
-/// opening and whenever one changes. Where the peer's listed root differs
+/// opening, whenever one changes, and all of them again every few minutes
+/// ([`MIN_REPEAT`]), so that an entry the other side skipped or lost is heard
+/// on the same connection. Hearing one again that still stands does
+/// nothing. Where the peer's listed root differs
 /// from this side's, a grant walk over R opens, once per connection,
 /// resource and listed root. Nobody dials on a grant's behalf.
 ///
@@ -1190,7 +1218,7 @@ impl<R: BlobStoreGet + Clone> Grants<R> {
                 self.changed = true;
                 if !link.closed() {
                     self.listings.insert(link.id(), Listing::new(link.clone()));
-                    self.list(link.id());
+                    self.list(link.id(), false);
                 }
                 Effects::default()
             }
@@ -1230,9 +1258,10 @@ impl<R: BlobStoreGet + Clone> Grants<R> {
     /// The peer's GRANT_ROOTS: keep each listed root, within the unknown
     /// budget, open a walk where it differs from this side's, and fetch what
     /// grants over a listed R waiting here need from this peer first.
+    /// An entry that says what already stands says nothing: a walk that
+    /// failed keeps its backoff, and nothing is fetched again before it.
     fn hear(&mut self, id: u64, roots: &[(CollectionHandle, PatchSummary)]) -> Effects {
         let mut effects = Effects::default();
-        self.changed = true;
         let early = self.snapshot.is_none();
         let mut heard = Vec::new();
         for (resource, theirs) in roots {
@@ -1242,28 +1271,31 @@ impl<R: BlobStoreGet + Clone> Grants<R> {
             let Some(listing) = self.listings.get_mut(&id) else {
                 return effects;
             };
+            let standing = listing.listed.get(&resource.raw);
+            if standing == Some(&theirs) {
+                continue;
+            }
             let known = takes_part
                 || listing.peered.get(&resource.raw).is_some()
-                || listing.listed.get(&resource.raw).is_some();
+                || standing.is_some();
             if !known {
                 // Before the first observation this counts resources this
                 // side does take part in, and skips them past the budget:
                 // the first observation drops such a connection, so that all
-                // of them are listed again. Two things stay as they are. A
-                // resource this side joins only after its first observation
-                // (a collection without grants, activated later) may have
-                // been skipped for good. And on a connection that is not
-                // dropped, what was charged early stays charged.
+                // of them are listed again at once. A resource this side
+                // joins only later (a collection without grants, activated
+                // after that) and skipped is heard at the peer's next
+                // repeat. On a connection that is not dropped, what was
+                // charged early stays charged.
                 if listing.unknown.len() as usize >= MAX_UNKNOWN_RESOURCES_PER_LINK {
                     listing.skipped_early |= early;
                     continue;
                 }
                 listing.unknown.insert(&PatchEntry::new(&resource.raw));
             }
-            if listing.listed.get(&resource.raw) != Some(&theirs) {
-                // A root change resets the backoff.
-                listing.retries.remove(&resource.raw);
-            }
+            // A root change resets the backoff.
+            listing.retries.remove(&resource.raw);
+            self.changed = true;
             listing
                 .listed
                 .replace(&PatchEntry::with_value(&resource.raw, theirs));
@@ -1372,9 +1404,9 @@ impl<R: BlobStoreGet + Clone> Grants<R> {
     }
 
     /// List to connection `id` the root of every R its peer takes part in
-    /// that changed since it was last listed there. Nothing is listed before
-    /// the first observation.
-    fn list(&mut self, id: u64) {
+    /// that changed since it was last listed there, or of every one with
+    /// `repeat`. Nothing is listed before the first observation.
+    fn list(&mut self, id: u64, repeat: bool) {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -1399,7 +1431,7 @@ impl<R: BlobStoreGet + Clone> Grants<R> {
         let mut roots = Vec::new();
         for resource in resources {
             let summary = index.summary(resource);
-            if listing.sent.get(&resource.raw) != Some(&summary) {
+            if repeat || listing.sent.get(&resource.raw) != Some(&summary) {
                 listing
                     .sent
                     .replace(&PatchEntry::with_value(&resource.raw, summary));
@@ -1461,12 +1493,38 @@ impl<R: BlobStoreGet + Clone> Grants<R> {
                     effects.walks.push((peer, resource));
                 }
             }
-            self.list(id);
+            self.list(id, false);
             for resource in fresh {
                 effects.fetch.extend(self.needed(resource, &[peer]));
             }
         }
         effects
+    }
+
+    /// When a connection is next listed everything again.
+    pub(crate) fn repeat_deadline(&self) -> Option<Mono> {
+        self.listings.values().map(|listing| listing.repeat_at).min()
+    }
+
+    /// List everything again on each connection whose time has come: what
+    /// changed since it was listed was sent then, and what did not may never
+    /// have been heard. A connection with frames still queued passes this
+    /// time over: its peer reads slowly, and repeats would pile up behind
+    /// what it has not read yet.
+    pub(crate) fn repeat(&mut self, now: Mono) {
+        let due: Vec<u64> = self
+            .listings
+            .iter()
+            .filter(|(_, listing)| listing.repeat_at <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in due {
+            let listing = self.listings.get_mut(&id).unwrap();
+            listing.repeat_at = next_repeat(now);
+            if listing.link.queued() == 0 {
+                self.list(id, true);
+            }
+        }
     }
 
     /// When the next retry is due, if one is scheduled.
@@ -1675,9 +1733,9 @@ impl<R: BlobStoreGet + Clone> Grants<R> {
     }
 
     /// Forget the connections whose early listings the budget cut short, and
-    /// return them to be dropped. A peer lists each root once per connection,
-    /// so what was skipped is heard only on another one. One the tie-break
-    /// retired is left to drain.
+    /// return them to be dropped: what was skipped is heard at once on another
+    /// one, and only at the peer's next repeat, if it repeats, on this one.
+    /// One the tie-break retired is left to drain.
     fn take_skipped_early(&mut self) -> Vec<Link> {
         let mut drops: Vec<Link> = self
             .listings
@@ -1776,7 +1834,7 @@ impl<R: BlobStoreGet + Clone> Grants<R> {
             }
         }
         for id in ids {
-            self.list(id);
+            self.list(id, false);
         }
         effects
     }
