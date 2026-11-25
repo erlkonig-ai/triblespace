@@ -465,11 +465,17 @@ at once per host, each with a three-second lookup window. Neighbour sets are
 refilled every second.
 
 Every ten minutes, when a collection's five asked-for places are full and
-another candidate is available, one healthy asked-for neighbour chosen at
-random is unpeered and replaced by the next candidate, so neighbour groups that
-formed separately during a partition meet again after it heals. The holder of
-the reserved place, below, is not one of the five and never leaves for a swap,
-and while none of the five is healthy nobody is asked.
+another candidate is available, a swap asks that candidate past the five. Once
+it has peered, one healthy neighbour of the five, chosen at random, is
+unpeered, so neighbour groups that formed separately during a partition meet
+again after it heals. A candidate that refuses or cannot be dialled is followed
+by the next of the same draw, one at a time, and the end of the draw ends the
+swap with nobody gone. One that never answers is withdrawn when the next swap
+is due. A place of the five that frees meanwhile is the candidate's. While none
+of the five is healthy nobody leaves and no swap begins; a candidate that
+peered by then waits. The holder of the reserved place, below, is not one of
+the five and never leaves for a swap. So a node asks for at most seven
+neighbours per collection: the five, the holder and one candidate.
 
 One more place per collection is reserved for participants of C that no open
 connection reaches, walked in the same tiers and redrawn on the same terms,

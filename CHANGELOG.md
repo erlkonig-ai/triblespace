@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   left one end counting a neighbour that did not count it. A node waits for the
   answer it is owed before it asks or invites again.
 
+- `triblespace-net`: a swap tries its candidate before a neighbour leaves. The
+  candidate is asked past the five; one of them is unpeered once it has peered,
+  and candidates that refuse or cannot be dialled cost no neighbour. A swap
+  goes on through its draw of the candidates and ends with it; until now the
+  place it emptied was filled from the order, the neighbour just ended
+  included. While a candidate is tried a collection has one asked-for peering
+  more.
+
 - `triblespace-net`: frames on a connection's `recon/1` no longer count as its
   use. A connection closes 120 s after the last byte on any other stream, and
   the least recently used one is chosen for eviction by the same clock; becoming

@@ -765,10 +765,8 @@ fn two_neighbour_groups_merge_after_their_partition_heals() {
                 net.heal(*a, *b);
             }
         }
-        // A swap whose replacement fails refills the slot from the order,
-        // which can give it back to the neighbour it swapped out: the
-        // unreachable root heads every fresh draw, so here about one swap in
-        // six merges nothing.
+        // A swap tries the candidates left in its draw. One that begins at
+        // the draw's last, with the unreachable root, merges nothing.
         let healed = clock::mono_now();
         let merged = |hosts: &mut [Peer<MemoryRepo>]| {
             (0..2).all(|group| holds(&mut hosts[group], fresh[1 - group]))
