@@ -335,14 +335,16 @@ dial per redraw of its order, at most one a minute, rather than a loop of
 streams.
 
 A connection's frame queue refuses no frame, so what it holds is bounded by
-what is put on it. A side asked to peer leaves the request unanswered while
-the connection already queues 1,024 frames, at most 64 KiB each, and the
+what is put on it. A side reads `recon/1` no further while
+it queues 1,024 frames for the peer, at most 64 KiB each, and the
 grant exchange sends an entry of its listing only when that root changes, and
 all of it again every minute, which it leaves out while the connection
 has frames queued; a peer that
-asks faster than it reads therefore stops being answered rather than growing
-the queue, and an unanswered peering request waits until the stalled stream's end
-closes the connection. A push is not on this queue: it has a stream of its
+asks faster than it reads therefore waits rather than growing
+the queue, its other requests on the connection with it, and each request is
+answered, in order, or the connection ends. Should both sides stop reading at
+once, with more queued than the stream's window takes, the first writer to wait
+60 seconds for credit closes the connection. A push is not on this queue: it has a stream of its
 own, and QUIC's flow control holds a sender whose receiver stops reading
 (*Walk streams*).
 

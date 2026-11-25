@@ -75,8 +75,8 @@ pub(crate) const CONNECTION_IDLE_DEADLINE: Duration = Duration::from_secs(120);
 /// stream: the peer stopped reading it.
 pub(crate) const RECON_CREDIT_DEADLINE: Duration = Duration::from_secs(60);
 /// Frames a connection may hold queued, at most a 64 KiB frame each, before
-/// a peering request that arrives on it goes unanswered: a peer that asks
-/// faster than it reads gets no more until it reads.
+/// its `recon/1` is read no further: a peer that asks faster than it reads is
+/// answered once it reads, and every frame it asked by is.
 pub(crate) const MAX_QUEUED_REPLIES: usize = 1024;
 /// A retired connection closes this long after it was retired or last used,
 /// once no request stream is in flight on it. The peer keeps using it, and
@@ -334,6 +334,8 @@ struct State {
     /// Frames waiting for the connection's `recon/1` writer, which takes the
     /// receiver and drops it when the stream ends.
     outbox: mpsc::Sender<Frame>,
+    /// Notified with every frame the writer took.
+    taken: Notify,
     outbox_frames: Mutex<Option<mpsc::Receiver<Frame>>>,
     /// The service heard `ReconEvent::Opened` for this connection.
     announced: AtomicBool,
@@ -363,6 +365,7 @@ impl State {
             held: Arc::new(Semaphore::new(MAX_HELD_REQUESTS_PER_CONNECTION)),
             served: Semaphore::new(MAX_SERVED_PER_CONNECTION),
             outbox,
+            taken: Notify::new(),
             outbox_frames: Mutex::new(Some(outbox_frames)),
             announced: AtomicBool::new(false),
             closed: AtomicBool::new(false),
@@ -1335,7 +1338,13 @@ async fn recon<T: Transport, S: Service>(
             state.announced.store(true, Ordering::SeqCst);
             service.recon(ReconEvent::Opened(link.clone())).await;
         }
-        while let Some((kind, payload)) = read_frame(&mut recv).await? {
+        loop {
+            while link.queued() >= MAX_QUEUED_REPLIES {
+                state.taken.notified().await;
+            }
+            let Some((kind, payload)) = read_frame(&mut recv).await? else {
+                return Ok(());
+            };
             if kind == FRAME_OPEN {
                 return Err(FrameError::Violation("recon/1 opened twice"));
             }
@@ -1345,12 +1354,12 @@ async fn recon<T: Transport, S: Service>(
                 Err(Malformed(violation)) => return Err(FrameError::Violation(violation)),
             }
         }
-        Ok(())
     };
     let writer = async {
         // The connection's state holds the sender, so this ends only when a
         // write fails.
         while let Some(frame) = outbox.recv().await {
+            state.taken.notify_one();
             let (kind, payload) = frame.encode();
             let written = write_frame(&mut send, kind, &payload);
             match tokio::time::timeout(RECON_CREDIT_DEADLINE, written).await {
@@ -1452,7 +1461,201 @@ pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
 #[cfg(all(test, feature = "sim"))]
 mod tests {
     use super::*;
-    use crate::transport::sim::SimConn;
+    use crate::recon::Flags;
+    use crate::transport::sim::{SimConn, SimConfig, SimNet, SimTransport};
+    use ed25519_dalek::SigningKey;
+
+    /// A node whose `recon/1` events go through a bounded channel to one task,
+    /// as a host's do, which refuses every peering request; on each connection
+    /// that opens it first asks `asks` times itself. It counts the answers.
+    #[derive(Clone)]
+    struct Refuses(mpsc::Sender<ReconEvent>);
+
+    impl Service for Refuses {
+        async fn serve<W, R>(
+            &self,
+            _: PeerId,
+            _: u8,
+            _: &mut W,
+            _: &mut R,
+        ) -> anyhow::Result<()>
+        where
+            W: SendStream,
+            R: RecvStream,
+        {
+            anyhow::bail!("no request streams here")
+        }
+
+        async fn recon(&self, event: ReconEvent) {
+            let _ = self.0.send(event).await;
+        }
+    }
+
+    struct Refusing {
+        table: ConnectionTable<SimTransport, Refuses>,
+        id: PeerId,
+        /// Every connection opened, in order.
+        links: Arc<Mutex<Vec<Link>>>,
+        answered: Arc<AtomicUsize>,
+        closed: Arc<AtomicUsize>,
+    }
+
+    fn refusing(net: &SimNet, byte: u8, asks: u32) -> Refusing {
+        let mut harness = net.join(&SigningKey::from_bytes(&[byte; 32]));
+        let id = harness.transport.local_id();
+        let (events, mut heard) = mpsc::channel(256);
+        let table = ConnectionTable::new(harness.transport, Refuses(events));
+        let accepting = table.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = harness.incoming.recv().await {
+                accepting.accept(incoming.conn);
+            }
+        });
+        let links = Arc::new(Mutex::new(Vec::new()));
+        let (answered, closed) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let node = Refusing {
+            table,
+            id,
+            links: links.clone(),
+            answered: answered.clone(),
+            closed: closed.clone(),
+        };
+        tokio::spawn(async move {
+            while let Some(event) = heard.recv().await {
+                match event {
+                    ReconEvent::Opened(link) => {
+                        for index in 0..asks {
+                            link.send(request(index));
+                        }
+                        links.lock().unwrap().push(link);
+                    }
+                    ReconEvent::Frame(link, Frame::PeerRequest { collection, .. }) => {
+                        link.send(Frame::PeerRefuse { collection });
+                    }
+                    ReconEvent::Frame(_, Frame::PeerRefuse { .. }) => {
+                        answered.fetch_add(1, Ordering::SeqCst);
+                    }
+                    ReconEvent::Closed(_) => {
+                        closed.fetch_add(1, Ordering::SeqCst);
+                    }
+                    ReconEvent::Frame(..) => {}
+                }
+            }
+        });
+        node
+    }
+
+    fn numbered(index: u32) -> CollectionHandle {
+        let mut raw = [0; 32];
+        raw[..4].copy_from_slice(&index.to_be_bytes());
+        CollectionHandle::new(raw)
+    }
+
+    fn request(index: u32) -> Frame {
+        Frame::PeerRequest {
+            collection: numbered(index),
+            flags: Flags { send: false, full: false },
+            invitation: false,
+            credentials: Vec::new(),
+        }
+    }
+
+    /// Dial `to` as a peer of its own, with the connection's `recon/1`.
+    async fn raw(
+        net: &SimNet,
+        byte: u8,
+        to: PeerId,
+    ) -> (
+        SimConn,
+        <SimConn as Conn>::SendHalf,
+        <SimConn as Conn>::RecvHalf,
+    ) {
+        let harness = net.join(&SigningKey::from_bytes(&[byte; 32]));
+        let conn = harness.transport.dial(to, PILE_SYNC_ALPN).await.unwrap();
+        let (mut send, recv) = conn.open_bi().await.unwrap();
+        send_u8(&mut send, TAG_RECON).await.unwrap();
+        write_frame(&mut send, FRAME_OPEN, &1_u64.to_be_bytes())
+            .await
+            .unwrap();
+        (conn, send, recv)
+    }
+
+    async fn ask<W: AsyncWrite + Unpin>(send: &mut W, index: u32) {
+        let (kind, payload) = request(index).encode();
+        write_frame(send, kind, &payload).await.unwrap();
+    }
+
+    /// A peer that asks without reading is read no further while
+    /// [`MAX_QUEUED_REPLIES`] frames wait for it, others are answered
+    /// meanwhile, and once it reads, every request is answered in order, those
+    /// that waited unread too.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_asks_without_reading_is_answered_once_it_reads() {
+        const ASKS: u32 = 50_000;
+        let net = SimNet::new(0xC0A1, SimConfig::default());
+        let server = refusing(&net, 1, 0);
+        let (_conn, mut send, mut recv) = raw(&net, 2, server.id).await;
+        let asking = tokio::spawn(async move {
+            for index in 0..ASKS {
+                ask(&mut send, index).await;
+            }
+            send
+        });
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        let link = server.links.lock().unwrap()[0].clone();
+        let queued = link.queued();
+        assert!(
+            (MAX_QUEUED_REPLIES..=MAX_QUEUED_REPLIES + 258).contains(&queued),
+            "{queued}"
+        );
+        let (_other, mut to_server, mut from_server) = raw(&net, 3, server.id).await;
+        ask(&mut to_server, 7).await;
+        let answer = tokio::time::timeout(Duration::from_secs(1), read_frame(&mut from_server));
+        let (kind, payload) = answer.await.expect("answered meanwhile").unwrap().unwrap();
+        assert_eq!((kind, payload), Frame::PeerRefuse { collection: numbered(7) }.encode());
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert_eq!(link.queued(), queued, "no growth");
+        for index in 0..ASKS {
+            let (kind, payload) = read_frame(&mut recv).await.unwrap().unwrap();
+            let expected = Frame::PeerRefuse { collection: numbered(index) };
+            assert_eq!((kind, payload), expected.encode(), "{index}");
+        }
+        let _send = asking.await.unwrap();
+        assert!(!link.closed());
+    }
+
+    /// Two nodes that each queue far more than [`MAX_QUEUED_REPLIES`] requests
+    /// for the other at once answer them all while those fit the stream's
+    /// window. Past it both stop reading and neither writer moves: that is the
+    /// end of the connection once one waited [`RECON_CREDIT_DEADLINE`] for
+    /// credit, and no later.
+    #[tokio::test(start_paused = true)]
+    async fn two_nodes_that_stop_reading_at_once_do_not_hold_each_other() {
+        for (asks, answered) in [(25_000, true), (60_000, false)] {
+            let net = SimNet::new(0xC0A2, SimConfig::default());
+            let (left, right) = (refusing(&net, 4, asks), refusing(&net, 5, asks));
+            let started = Instant::now();
+            left.table.connect(right.id).await.unwrap();
+            let all = || {
+                [&left, &right]
+                    .iter()
+                    .all(|node| node.answered.load(Ordering::SeqCst) == asks as usize)
+            };
+            let closed = || {
+                [&left, &right]
+                    .iter()
+                    .all(|node| node.closed.load(Ordering::SeqCst) == 1)
+            };
+            while !all() && !closed() {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                assert!(started.elapsed() < 2 * RECON_CREDIT_DEADLINE, "held");
+            }
+            assert_eq!((all(), closed()), (answered, !answered));
+            if !answered {
+                assert!(started.elapsed() >= RECON_CREDIT_DEADLINE);
+            }
+        }
+    }
 
     #[test]
     fn a_cancelled_old_waiter_cannot_remove_a_replacement_dial() {

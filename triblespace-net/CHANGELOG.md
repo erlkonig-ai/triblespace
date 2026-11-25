@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- A peering request is never dropped: while 1,024 frames wait for a peer, its
+  `recon/1` is read no further, instead of leaving the requests on it unanswered.
+  The asker waited for such an answer, and asked nothing else for that
+  collection, as long as the connection stood.
+
 - Opening a stream ends after 60 s: a walk stream with its tag and Open frame, a
   request stream once its permit is taken, and the request a walk's blob fetch
   writes. A peer that allows no more streams held them, and the walk of its
