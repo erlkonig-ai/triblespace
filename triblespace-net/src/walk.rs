@@ -1513,7 +1513,7 @@ async fn fetch_blob<T: Transport, S: Service>(
     let provider = connection.remote_id();
     let mut opening = std::pin::pin!(connection.open_bi());
     let mut line = connection.line();
-    let (mut send, recv) = loop {
+    let (send, recv) = loop {
         tokio::select! {
             opened = &mut opening => break opened.ok()?,
             () = tokio::time::sleep(PROGRESS_TICK / 2) => {
@@ -1524,6 +1524,7 @@ async fn fetch_blob<T: Transport, S: Service>(
             }
         }
     };
+    let mut send = Progress::new(send, WALK_DEADLINE);
     send_u8(&mut send, TAG_BLOB).await.ok()?;
     let mut recv = Noted(Progress::new(recv, WALK_DEADLINE), arrived);
     fetch_get_blob_stream_with_limit(
@@ -1539,8 +1540,8 @@ async fn fetch_blob<T: Transport, S: Service>(
         .flatten()
 }
 
-/// Stream IO under a deadline on byte progress: a read or write that moves
-/// no byte for `idle` fails, and every byte moved starts the wait again.
+/// Stream IO under a deadline on byte progress: a read, write or shutdown that
+/// moves no byte for `idle` fails, and every byte moved starts the wait again.
 struct Progress<R> {
     inner: R,
     idle: Duration,
@@ -1613,7 +1614,16 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Progress<W> {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        let this = &mut *self;
+        match Pin::new(&mut this.inner).poll_shutdown(cx) {
+            Poll::Pending => this.deadline.as_mut().poll(cx).map(|()| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "no finish within the walk deadline",
+                ))
+            }),
+            ready => ready,
+        }
     }
 }
 
@@ -5325,6 +5335,43 @@ pub(crate) mod tests {
                     sender.health(busy, receiver.peer).is_none_or(|busy| busy.pushes.failed == 0),
                     "its line moved to its end"
                 );
+            }
+        }
+
+        /// A peer that lives and accepts no stream allows 100 of them. Walks
+        /// and requests past those end within a minute of being opened, and no
+        /// collection's walk is left running.
+        #[tokio::test(start_paused = true)]
+        async fn a_peer_that_allows_no_more_streams_holds_no_walk_and_no_request() {
+            let net = SimNet::new(0x3A2C, SimConfig::default());
+            let mut node = Node::new(80);
+            let collections = (0..120)
+                .map(|n| node.hold(&format!("opened {n}"), open()))
+                .collect::<Vec<_>>();
+            for collection in &collections {
+                node.commit(*collection, 1);
+            }
+            node.observe();
+            let mut hung = net.join(&Node::new(81).key);
+            let hung_id = hung.transport.local_id();
+            let sender = Hosted::new(node, &net);
+            let connection = sender.table.connect(hung_id).await.unwrap();
+            let _alive = hung.incoming.recv().await.unwrap();
+            let started = tokio::time::Instant::now();
+            for collection in &collections {
+                sender.walks.open(hung_id, *collection, WalkKind::Commit);
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let request = connection.open_bi().await;
+            assert!(request.is_err() && started.elapsed() < Duration::from_secs(62));
+            let failed = |collection: &CollectionHandle| {
+                sender
+                    .health(*collection, hung_id)
+                    .is_some_and(|health| health.pushes.failed == 1)
+            };
+            while !collections.iter().all(failed) {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                assert!(started.elapsed() < Duration::from_secs(82), "still running");
             }
         }
 

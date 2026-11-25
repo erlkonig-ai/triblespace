@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Opening a stream ends after 60 s: a walk stream with its tag and Open frame, a
+  request stream once its permit is taken, and the request a walk's blob fetch
+  writes. A peer that allows no more streams held them, and the walk of its
+  collection, as long as the connection stood.
+
 - A walk in which nothing moves ends after about a minute (60 to 80 s), whatever
   it waits for: the peer's LANDED or FIN, this side's own landing, a blob.
   Before, it waited for the peer's end as long as the connection stood. A landing

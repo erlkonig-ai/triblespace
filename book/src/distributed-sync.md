@@ -741,6 +741,8 @@ Blob fetches have a 60-second progress deadline of their own, not a total one,
 which starts once they have their permit. Actual outgoing byte writes and final finish are separately
 progress-bounded/cancellable, including when a driver is retired. A walk takes no
 request permit but uses transport stream credit and counts as connection use.
+Opening it, with its tag and OPEN, and opening a request stream once it has its
+permit, end after 60 seconds: a live peer may allow no further stream.
 Small and scratch/sim gates do not establish many-collection live stream-credit
 liveness or throughput.
 

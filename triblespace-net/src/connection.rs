@@ -82,6 +82,10 @@ pub(crate) const MAX_QUEUED_REPLIES: usize = 1024;
 /// once no request stream is in flight on it. The peer keeps using it, and
 /// writing on its `recon/1`, only until it has seen the winner too.
 pub(crate) const DRAIN_GRACE: Duration = Duration::from_secs(2);
+/// Bound on opening a stream, which waits for the peer to allow one more: a
+/// request stream once its permit is taken, and a walk stream with its tag and
+/// Open frame.
+const OPEN_DEADLINE: Duration = Duration::from_secs(60);
 /// Bound on serving one request stream.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(300);
 /// A stream delivers its tag within this bound or is dropped.
@@ -556,7 +560,7 @@ impl<C: Conn> Conn for Connection<C> {
             .acquire_owned()
             .await
             .expect("connection opener permits are never closed");
-        let (send, recv) = self.conn.open_bi().await?;
+        let (send, recv) = tokio::time::timeout(OPEN_DEADLINE, self.conn.open_bi()).await??;
         let request = Arc::new(InFlight::new(
             state,
             Some(permit),
@@ -1247,9 +1251,9 @@ async fn open_recon<C: Conn>(
 }
 
 /// Open a `walk/1` stream on `connection` for a push of C's tree of `kind`:
-/// the tag, then the Open frame. It takes no request permit; its frames
-/// keep the connection from going idle, and it counts as in flight while
-/// either half lives.
+/// the tag, then the Open frame, within [`OPEN_DEADLINE`]. It takes no request
+/// permit; its frames keep the connection from going idle, and it counts as in
+/// flight while either half lives.
 pub(crate) async fn open_walk<C: Conn>(
     connection: &Connection<C>,
     collection: CollectionHandle,
@@ -1258,19 +1262,22 @@ pub(crate) async fn open_walk<C: Conn>(
     offer: Option<walk_stream::OfferRole>,
 ) -> anyhow::Result<(Tracked<C::SendHalf>, Tracked<C::RecvHalf>)> {
     let state = connection.state();
-    let (send, recv) = connection.conn.open_bi().await?;
-    let walk = Arc::new(InFlight::new(state, None, None));
-    let mut send = Tracked::new(send, state, Some(walk.clone()));
-    send_u8(&mut send, TAG_WALK).await?;
-    let (frame, payload) = walk_stream::Frame::Open {
-        collection,
-        kind,
-        algorithm,
-        offer,
-    }
-    .encode();
-    write_frame(&mut send, frame, &payload).await?;
-    Ok((send, Tracked::new(recv, state, Some(walk))))
+    let opened = async {
+        let (send, recv) = connection.conn.open_bi().await?;
+        let walk = Arc::new(InFlight::new(state, None, None));
+        let mut send = Tracked::new(send, state, Some(walk.clone()));
+        send_u8(&mut send, TAG_WALK).await?;
+        let (frame, payload) = walk_stream::Frame::Open {
+            collection,
+            kind,
+            algorithm,
+            offer,
+        }
+        .encode();
+        write_frame(&mut send, frame, &payload).await?;
+        Ok((send, Tracked::new(recv, state, Some(walk))))
+    };
+    tokio::time::timeout(OPEN_DEADLINE, opened).await?
 }
 
 /// Close the connection for a peer that broke the `recon/1` protocol.
