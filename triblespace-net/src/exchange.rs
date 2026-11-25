@@ -1131,6 +1131,23 @@ impl<R: BlobStoreGet + Clone> Exchange<R> {
         }
     }
 
+    /// How it ends should its driver be lost: nothing is known but what it was.
+    pub(crate) fn lost(&self) -> Ended {
+        Ended {
+            sends: self.sends,
+            receives: self.receives,
+            confirmed: false,
+            landed: false,
+            root: self.pinned.summary(),
+            peer_root: None,
+            retain_agreement: false,
+            agreed: None,
+            failure: None,
+            refused: false,
+            skipped: 0,
+        }
+    }
+
     /// Keep the peer cells of an exchange that was cut off: it ended without
     /// an outcome of its own, short of decoding. A confirmed exchange needs
     /// them no more, and one that failed for itself may have failed on them.

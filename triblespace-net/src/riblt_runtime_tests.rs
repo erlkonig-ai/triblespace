@@ -604,6 +604,7 @@ fn driven_exchange(
         peer: peer.id(),
         collection,
         kind: WalkKind::Commit,
+        lost: None,
     };
     let (script, stream) = tokio::io::duplex(capacity);
     let (recv, send) = tokio::io::split(stream);

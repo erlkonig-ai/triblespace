@@ -1295,7 +1295,7 @@ where
         let Some(exchange) = self.walks.start(connection.link().id(), peer, collection, kind) else {
             return not_started(self, NotStarted::StartDeclined);
         };
-        let (driver, acked, replaced) = self.register(key, connection.link().id(), true, &exchange);
+        let (mut driver, acked, replaced) = self.register(key, connection.link().id(), true, &exchange);
         tokio::spawn(async move {
             let (ended, duplicate) = match open_walk(
                 &connection,
@@ -1402,7 +1402,7 @@ where
             recv.stop(RESET_WALK_REFUSED);
             return;
         };
-        let (driver, acked, replaced) = self.register(key, link.id(), false, &exchange);
+        let (mut driver, acked, replaced) = self.register(key, link.id(), false, &exchange);
         tokio::spawn(async move {
             let (ended, duplicate) = drive(&driver, exchange, send, recv, acked, replaced).await;
             driver.ended(ended, duplicate);
@@ -1489,6 +1489,7 @@ where
             peer,
             collection,
             kind,
+            lost: Some(exchange.lost()),
         };
         (driver, acked, replaced)
     }
@@ -1679,10 +1680,22 @@ struct Driver<T: Transport, S, R> {
     peer: PeerId,
     collection: CollectionHandle,
     kind: WalkKind,
+    /// What the task hears if the driver is dropped without its exchange's end,
+    /// as by a panic.
+    lost: Option<Ended>,
+}
+
+impl<T: Transport, S, R> Drop for Driver<T, S, R> {
+    fn drop(&mut self) {
+        if let Some(lost) = self.lost.take() {
+            self.ended(lost, false);
+        }
+    }
 }
 
 impl<T: Transport, S, R> Driver<T, S, R> {
-    fn ended(&self, ended: Ended, duplicate: bool) {
+    fn ended(&mut self, ended: Ended, duplicate: bool) {
+        self.lost = None;
         let _ = self.commands.send(Command::Ended {
             id: self.id,
             peer: self.peer,
@@ -3973,6 +3986,60 @@ pub(crate) mod tests {
 
         include!("connection_close_tests.rs");
 
+        /// A driver that goes without its exchange's end, as by a panic, leaves
+        /// no walk running: the exchange ends unconfirmed and can be opened
+        /// again.
+        #[tokio::test(start_paused = true)]
+        async fn a_lost_driver_leaves_no_walk_running() {
+            let net = SimNet::new(0x3A2F, SimConfig::default());
+            let mut node = Node::new(86);
+            let collection = node.hold("lost driver", open());
+            node.observe();
+            let peer = Node::new(87).id();
+            let harness = net.join(&node.key);
+            let (commands, mut commanded) = mpsc::unbounded_channel();
+            let (_snapshots, snapshot) = watch::channel(Some(node.snapshot()));
+            let (events, mut heard) = mpsc::unbounded_channel();
+            let mut task = Task {
+                connections: ConnectionTable::new(harness.transport, NoRequests),
+                snapshots: snapshot,
+                walks: Walks::new(node.health.clone()),
+                commands: WalksHandle(commands),
+                landing: mpsc::unbounded_channel().0,
+                events,
+                grants: mpsc::unbounded_channel().0,
+                grant_queue: GrantQueue::default(),
+                unknown_joins: PATCH::new(),
+                running: HashMap::new(),
+                next_id: 0,
+            };
+            task.observe(node.snapshot());
+            let kind = WalkKind::Commit;
+            let key = (peer, collection.raw, kind);
+            let exchange = task.walks.start(0, peer, collection, kind).unwrap();
+            let (driver, _acked, _replaced) = task.register(key, 0, true, &exchange);
+            let driving = tokio::spawn(async move {
+                let _driver = driver;
+                panic!("a driver's bug");
+            });
+            assert!(driving.await.unwrap_err().is_panic());
+            assert!(task.running.contains_key(&key));
+            task.command(commanded.try_recv().expect("its end is reported"));
+            assert!(task.running.is_empty());
+            assert_eq!(heard.try_recv(), Ok(Event::Receiving { collection, kind }));
+            assert_eq!(
+                heard.try_recv(),
+                Ok(Event::Received { collection, kind, landed: false })
+            );
+            assert!(commanded.try_recv().is_err(), "once");
+            // One whose end it reported says nothing more.
+            let (mut driver, _acked, _replaced) = task.register(key, 0, true, &exchange);
+            driver.ended(exchange.end(), false);
+            drop(driver);
+            assert!(matches!(commanded.try_recv(), Ok(Command::Ended { .. })));
+            assert!(commanded.try_recv().is_err(), "once");
+        }
+
         async fn stale_completion_is_ignored(deselect: bool) {
             let net = SimNet::new(0x3A29, SimConfig::default());
             let mut node = Node::new(105);
@@ -4223,6 +4290,7 @@ pub(crate) mod tests {
                 peer: Node::new(228).id(),
                 collection,
                 kind: WalkKind::Commit,
+                lost: None,
             };
             let (script, driven) = tokio::io::duplex(128);
             let (mut recv, mut send) = tokio::io::split(script);
@@ -4347,6 +4415,7 @@ pub(crate) mod tests {
                 peer: sender.id(),
                 collection,
                 kind,
+                lost: None,
             };
             let (script, driven) = tokio::io::duplex(1 << 16);
             let (mut recv, mut send) = tokio::io::split(script);
@@ -4415,6 +4484,7 @@ pub(crate) mod tests {
                 peer: Node::new(108).id(),
                 collection,
                 kind,
+                lost: None,
             };
             let (script, driven) = tokio::io::duplex(1 << 20);
             let (mut recv, mut send) = tokio::io::split(script);
@@ -4513,6 +4583,7 @@ pub(crate) mod tests {
                 peer: Node::new(104).id(),
                 collection,
                 kind,
+                lost: None,
             };
             let (script, driven) = tokio::io::duplex(1 << 20);
             let (mut recv, mut send) = tokio::io::split(script);
@@ -4611,6 +4682,7 @@ pub(crate) mod tests {
                 peer: Node::new(104).id(),
                 collection,
                 kind,
+                lost: None,
             };
             let (script, driven) = tokio::io::duplex(1 << 20);
             let (mut recv, mut send) = tokio::io::split(script);

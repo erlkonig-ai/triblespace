@@ -737,7 +737,7 @@ frame, at most one every 20 seconds. PROGRESS is a sign of life only. It settles
 nothing, hearing one is no reason to send one, and writing one is no
 movement, so two sides cannot keep each other alive. A side that resets still
 keeps what landed, and its next exchange offers the rest; its blob fetches end
-with the walk.
+with the walk. A walk whose driver is lost to a panic ends as unconfirmed.
 
 Blob fetches have a 60-second progress deadline of their own, not a total one,
 which starts once they have their permit. Actual outgoing byte writes and final finish are separately
