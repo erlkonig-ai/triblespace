@@ -1753,8 +1753,8 @@ mod tests {
     }
 
     /// C1 holds P, which names H before H is resident. H then arrives as a
-    /// seed of C2. Scanning once, P gains no edge; H joins held(C1) when a
-    /// peer reports it there.
+    /// seed of C2. Nothing reads P again, so H joins held(C1) when a peer
+    /// reports it there, which reads it for C1 as well.
     #[test]
     fn a_late_child_resident_through_another_collection_joins_by_report() {
         let mut store = Store::default();
@@ -1784,7 +1784,7 @@ mod tests {
         let reported = settled(&mut store);
         assert!(held_set(&reported, c1).contains(&h));
         assert!(!held_set(&reported, c1).contains(&[5; 32]));
-        assert_eq!(reads(&store, &h), 1, "H was read once, as C2's seed");
+        assert_eq!(reads(&store, &h), 2, "once as C2's seed, once for C1");
         assert_eq!(reads(&store, &p), 1);
     }
 
@@ -1830,8 +1830,10 @@ mod tests {
         );
     }
 
+    /// Nothing is remembered about a blob one collection read: another that
+    /// reaches it reads it, and its children, for itself.
     #[test]
-    fn a_scanned_shared_intermediate_joins_another_collection_without_a_read() {
+    fn a_shared_intermediate_is_read_once_for_each_collection_that_reaches_it() {
         let mut store = Store::default();
         let c1 = collection(&mut store, "one");
         let c2 = collection(&mut store, "two");
@@ -1848,17 +1850,20 @@ mod tests {
         commit(&mut store, c2, second_payload, metadata);
         let second = settled(&mut store);
         assert!(held_set(&second, c2).is_superset(&BTreeSet::from([second_payload, p, q])));
-        assert_eq!(reads(&store, &p), 1);
-        assert_eq!(reads(&store, &q), 1);
+        assert_eq!(reads(&store, &p), 2);
+        assert_eq!(reads(&store, &q), 2);
+        assert_eq!(reads(&store, &first_payload), 1);
         assert_eq!(reads(&store, &second_payload), 1);
     }
 
-    /// No blob body is read twice, whatever arrives.
+    /// A blob is read once for each collection that reaches it, however many
+    /// records and blobs name it there; a report of a held blob reads it once
+    /// more, and only it.
     #[test]
-    fn each_blob_is_read_at_most_once() {
+    fn a_blob_is_read_once_per_collection_and_once_per_report() {
         let mut store = Store::default();
         let collections: Vec<_> = (0..3)
-            .map(|index| collection(&mut store, &format!("scan-once {index}")))
+            .map(|index| collection(&mut store, &format!("reached {index}")))
             .collect();
         let metadata = blob(&mut store, b"shared metadata");
         let shared = blob(&mut store, b"shared everywhere");
@@ -1870,13 +1875,68 @@ mod tests {
                 let payload = blob_naming(&mut store, &[round, index as u8, 2], &[own, shared]);
                 commit(&mut store, *collection, payload, metadata);
                 payloads.push((payload, own));
-                store.note_held(*collection, Inline::new(shared));
             }
             settled(&mut store);
             settled(&mut store);
         }
-        let counts = store.reads.lock().unwrap().clone();
-        assert!(counts.values().all(|count| *count == 1), "{counts:?}");
+        let mut expected: HashMap<Raw, usize> = payloads
+            .iter()
+            .flat_map(|(payload, own)| [(*payload, 1), (*own, 1)])
+            .chain(collections.iter().map(|collection| (collection.raw, 1)))
+            .collect();
+        expected.extend([(metadata, 3), (shared, 3)]);
+        assert_eq!(*store.reads.lock().unwrap(), expected);
+        store.note_held(collections[0], Inline::new(shared));
+        settled(&mut store);
+        settled(&mut store);
+        expected.insert(shared, 4);
+        assert_eq!(*store.reads.lock().unwrap(), expected);
+    }
+
+    /// A blob C1 holds that fails when C2 reaches it: C1's set stays whole,
+    /// C2 goes without it and what it names until a report says more.
+    #[test]
+    fn a_blob_one_collection_holds_may_fail_for_another() {
+        let mut store = Store::default();
+        let c1 = collection(&mut store, "read it");
+        let c2 = collection(&mut store, "could not");
+        let metadata = blob(&mut store, b"metadata");
+        let q = blob(&mut store, b"leaf");
+        let p = blob_naming(&mut store, b"intermediate", &[q]);
+        commit(&mut store, c1, p, metadata);
+        store.track_held([c1, c2]);
+        let first = settled(&mut store);
+        assert!(held_set(&first, c1).is_superset(&BTreeSet::from([p, q])));
+        store.faults.unreadable.lock().unwrap().insert(p);
+        commit(&mut store, c2, p, metadata);
+        let failed = settled(&mut store);
+        assert_eq!(failed.held(c1), first.held(c1), "nothing is taken back");
+        assert_eq!(held_set(&failed, c2), BTreeSet::from([c2.raw, metadata]));
+        store.faults.unreadable.lock().unwrap().remove(&p);
+        assert!(!held_set(&settled(&mut store), c2).contains(&p));
+        store.note_held(c2, Inline::new(p));
+        assert!(held_set(&settled(&mut store), c2).is_superset(&BTreeSet::from([p, q])));
+    }
+
+    /// A child that became resident after C1 read its parent is in C2's set
+    /// when C2 reads the parent later. C1's set does not gain it from that.
+    #[test]
+    fn a_later_collection_holds_a_child_an_earlier_one_missed() {
+        let mut store = Store::default();
+        let c1 = collection(&mut store, "earlier");
+        let c2 = collection(&mut store, "later");
+        let metadata = blob(&mut store, b"metadata");
+        let h_bytes = unresident_naming(b"late child", &[]);
+        let h = handle_of(&h_bytes);
+        let p = blob_naming(&mut store, b"parent", &[h]);
+        commit(&mut store, c1, p, metadata);
+        store.track_held([c1, c2]);
+        settled(&mut store);
+        store.put::<UnknownBlob, _>(h_bytes).unwrap();
+        commit(&mut store, c2, p, metadata);
+        let both = settled(&mut store);
+        assert!(held_set(&both, c2).is_superset(&BTreeSet::from([p, h])));
+        assert!(!held_set(&settled(&mut store), c1).contains(&h));
     }
 
     #[test]
@@ -2908,8 +2968,8 @@ mod tests {
     /// readable and names Z, which is resident and cannot be read. P joins,
     /// Z stays out. Z is then repaired in place, which no residency
     /// difference shows, and a peer reports P, which is held already. The
-    /// report still expands P's cached edges (design C11) and tries Z again,
-    /// so both end up held, with P not read again.
+    /// report reads P again (design C11) and tries Z again, so both end up
+    /// held.
     #[test]
     fn astras_trace_a_report_of_a_held_parent_retries_its_repaired_child() {
         let mut store = Store::default();
@@ -2930,17 +2990,68 @@ mod tests {
         let reported = settled(&mut store);
         assert!(held_set(&reported, c).is_superset(&BTreeSet::from([p, z])));
         assert_eq!(reads(&store, &z), 2);
-        assert_eq!(
-            reads(&store, &p),
-            1,
-            "P's children come from the edge cache"
-        );
+        assert_eq!(reads(&store, &p), 2, "its first closure, then the report");
     }
 
-    /// A lost blob resets the index (design B5): the held sets, the frontier,
-    /// the unknown sets and the edge cache are forgotten, and every
-    /// collection is recomputed from its roots, its seeds and the peer
-    /// reports, which are kept. A blob that waited in unknown is read again
+    /// As in Astra's trace, but P fails when the report reads it again. P
+    /// stays held and nothing under it is tried: Z is as unknown as before,
+    /// and P reading again is no evidence (Astra's follow-up, 2026-11-25). A
+    /// report made after that retries Z; so does one made while the failed
+    /// read is still in flight, which is then read once more.
+    #[test]
+    fn a_failed_read_of_a_held_parent_keeps_it_held_and_retries_nothing() {
+        for reported_in_flight in [false, true] {
+            let mut store = Store::default();
+            let c = collection(&mut store, "held, then unreadable");
+            let metadata = blob(&mut store, b"metadata");
+            let z = blob(&mut store, b"Z, unreadable, then repaired in place");
+            let p = blob_naming(&mut store, b"P, held, then unreadable", &[z]);
+            commit(&mut store, c, p, metadata);
+            store.faults.unreadable.lock().unwrap().insert(z);
+            store.track_held([c]);
+            let first = held_set(&settled(&mut store), c);
+            assert_eq!(first, BTreeSet::from([c.raw, metadata, p]));
+            store.faults.unreadable.lock().unwrap().remove(&z);
+            store.faults.unreadable.lock().unwrap().insert(p);
+            store.note_held(c, Inline::new(p));
+            if reported_in_flight {
+                store.snapshot().unwrap();
+                let work = store.drive_held().expect("the only driver");
+                let (release, driver) = block_driver_in(&mut store, work, p);
+                store.faults.unreadable.lock().unwrap().remove(&p);
+                store.note_held(c, Inline::new(p));
+                store.snapshot().unwrap();
+                release.send(()).unwrap();
+                let mut held = BTreeSet::new();
+                for _ in 0..1000 {
+                    held = held_set(&store.snapshot().unwrap(), c);
+                    if held.contains(&z) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                assert!(held.contains(&z), "the report in flight is not lost");
+                assert_eq!(reads(&store, &p), 3, "first, failed, and once more");
+                drop(store);
+                driver.join().unwrap();
+                continue;
+            }
+            assert_eq!(held_set(&settled(&mut store), c), first);
+            assert_eq!(reads(&store, &p), 2);
+            assert_eq!(reads(&store, &z), 1, "P was not read, so Z was not tried");
+            store.faults.unreadable.lock().unwrap().remove(&p);
+            let other_metadata = blob(&mut store, b"another metadata");
+            commit(&mut store, c, p, other_metadata);
+            assert!(!held_set(&settled(&mut store), c).contains(&z));
+            assert_eq!(reads(&store, &p), 2, "a held blob is not reached again");
+            store.note_held(c, Inline::new(p));
+            assert!(held_set(&settled(&mut store), c).contains(&z));
+        }
+    }
+
+    /// A lost blob resets the index (design B5): the held sets, the frontier
+    /// and the unknown sets are forgotten, and every collection is recomputed
+    /// from its roots, its seeds and the peer reports, which are kept. A blob that waited in unknown is read again
     /// on the way, and joins if it reads now.
     #[test]
     fn a_reset_recomputes_from_seeds_and_reports_and_forgets_unknown() {
@@ -2978,21 +3089,21 @@ mod tests {
             BTreeSet::from([c.raw, metadata, data, reported, z])
         );
         assert_eq!(reads(&store, &z), 2, "unknown is forgotten by the reset");
-        assert_eq!(reads(&store, &data), 2, "so is the edge cache");
+        assert_eq!(reads(&store, &data), 2, "and its parent is read again");
         assert!(
             !held_set(&first, c).contains(&z),
             "an existing snapshot never changes"
         );
     }
 
-    /// The late child stays a known limitation (design decision,
-    /// 2026-11-14, Astra's R2): H becomes resident after its parent P, which
-    /// C holds, was scanned. No arrival, no new record naming P and no
-    /// report of P brings H in, since P is not read again and its cached
-    /// edges do not name H. A report of H itself does, as does a reset
+    /// The late child is a known limitation (design decision, 2026-11-14,
+    /// Astra's R2): H becomes resident after its parent P, which C holds, was
+    /// read. No arrival and no new record naming P brings H in, since C holds
+    /// P already. A report of P does, since it reads P again, as does a
+    /// report of H itself and a reset
     /// (`a_nested_late_local_child_stays_out_until_a_reset`).
     #[test]
-    fn a_late_child_stays_out_even_when_its_parent_is_reported() {
+    fn a_late_child_joins_when_its_parent_is_reported() {
         let mut store = Store::default();
         let c = collection(&mut store, "late child");
         let metadata = blob(&mut store, b"metadata");
@@ -3006,16 +3117,16 @@ mod tests {
         store.put::<UnknownBlob, _>(h_bytes).unwrap();
         let other_metadata = blob(&mut store, b"another metadata");
         commit(&mut store, c, p, other_metadata);
-        store.note_held(c, Inline::new(p));
         let still = settled(&mut store);
         assert!(
             !held_set(&still, c).contains(&h),
-            "the known limitation: nothing rescans P"
+            "the known limitation: nothing reads P again"
         );
         assert_eq!(reads(&store, &p), 1);
-        store.note_held(c, Inline::new(h));
+        store.note_held(c, Inline::new(p));
         let reported = settled(&mut store);
         assert!(held_set(&reported, c).contains(&h));
+        assert_eq!(reads(&store, &p), 2);
         assert_eq!(reads(&store, &h), 1);
     }
 }

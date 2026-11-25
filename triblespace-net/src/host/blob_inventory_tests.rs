@@ -3,7 +3,7 @@
 //!
 //! The host publishes the store's held set of each active collection; it
 //! scans nothing itself. These tests pin what that means for the serving
-//! overlay: scan-once (a late child is not found by an arrival), rule-3
+//! overlay: a late child is not found by an arrival, rule-3
 //! reports, and reset on removal. A pushed references tree brings a peer's
 //! held set here: what is resident joins as it is, what is not is fetched by
 //! hash first.
@@ -131,7 +131,7 @@ fn held(
 }
 
 /// A child put after its parent was scanned is not found by the arrival:
-/// each blob is scanned once. A peer's report of it in C makes it held, and
+/// nothing reads a held parent again. A peer's report of it in C makes it held, and
 /// only the held digest changes: the root leaves held blobs out.
 #[test]
 fn a_blob_only_child_is_held_after_a_report_not_by_its_arrival() {
