@@ -11,8 +11,9 @@
 //! A side that refuses a request remembers it for the connection. When a
 //! credential, an arriving definition, a new proof or its own selection
 //! admits the asker, or a place frees for a request refused only for want of
-//! room, it invites it: a request in the other direction. The asker never asks
-//! again on its own.
+//! room, it invites it: a request in the other direction. The asker passes a
+//! refuser over for [`ASK_AGAIN`]; after it the refuser is a candidate like any
+//! other, on the same connection.
 //!
 //! A side that asked or invited is owed an answer, also after it withdrew the
 //! request with an UNPEER, and sends no other request for C on the connection
@@ -83,6 +84,9 @@ pub(crate) const MAX_ASKED: usize = 5;
 pub(crate) const MAX_INBOUND_PEERINGS: usize = 16;
 /// How often one healthy asked-for neighbour is replaced.
 pub(crate) const SWAP_INTERVAL: Duration = Duration::from_secs(10 * 60);
+/// A peer that refused a request for a collection is passed over for this
+/// long, then a candidate again on the same connection.
+pub(crate) const ASK_AGAIN: Duration = Duration::from_secs(2 * 60);
 /// An exhausted candidate order is drawn again no sooner than this, unless
 /// its candidates changed. Without it a collection whose candidates are all
 /// unreachable would redial them as fast as the dials fail.
@@ -116,8 +120,8 @@ struct Peering {
     /// definitions whose arrival could admit it, or `Ok` if only room was
     /// lacking.
     refused: Option<(Flags, Result<(), Vec<CapabilityHandle>>)>,
-    /// The peer refused this side's request.
-    refused_by_them: bool,
+    /// When the peer last refused this side's request.
+    refused_by_them: Option<Mono>,
     /// The peer's credentials for the collection that this side validated.
     presented: Vec<CapabilityProof>,
 }
@@ -145,7 +149,7 @@ impl Peering {
         matches!(self.side, Side::Idle)
             && !self.owed
             && self.refused.is_none()
-            && !self.refused_by_them
+            && self.refused_by_them.is_none()
             && self.presented.is_empty()
     }
 }
@@ -186,6 +190,8 @@ struct Mesh {
 pub(crate) struct Peerings<R> {
     local: PeerId,
     snapshot: Option<StoreSnapshot<R>>,
+    /// When the neighbour sets were last refilled.
+    now: Mono,
     links: HashMap<u64, Link>,
     meshes: HashMap<RawHash, Mesh>,
     changed: bool,
@@ -403,6 +409,7 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
         Self {
             local,
             snapshot: None,
+            now: crate::clock::mono_now(),
             links: HashMap::new(),
             meshes: HashMap::new(),
             changed: false,
@@ -576,6 +583,7 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
     /// Ask for the peerings each selected collection's neighbour set lacks,
     /// and swap a neighbour where one is due. Returns the keys to dial.
     pub(crate) fn fill(&mut self, now: Mono) -> Vec<PeerId> {
+        self.now = now;
         let Some(snapshot) = self.snapshot.clone() else {
             return Vec::new();
         };
@@ -747,7 +755,7 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
                     sends,
                     receives,
                     refused_by_me: peering.refused.is_some(),
-                    refused_by_them: peering.refused_by_them,
+                    refused_by_them: peering.refused_by_them.is_some(),
                 });
             }
         }
@@ -797,6 +805,7 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
                 self.revisit(collection, link.id());
             }
             frame => {
+                let now = self.now;
                 let peering = self.peering(collection, link.id());
                 let owed = peering.owed;
                 if let Frame::PeerAccept { .. } | Frame::PeerRefuse { .. } = frame {
@@ -804,7 +813,7 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
                 }
                 peering.side = match (peering.side, frame) {
                     (Side::Asked { asked, mine }, Frame::PeerAccept { flags: theirs, .. }) => {
-                        peering.refused_by_them = false;
+                        peering.refused_by_them = None;
                         peering.refused = None;
                         Side::Peered {
                             asked,
@@ -813,7 +822,7 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
                         }
                     }
                     (Side::Asked { .. }, Frame::PeerRefuse { .. }) => {
-                        peering.refused_by_them = true;
+                        peering.refused_by_them = Some(now);
                         Side::Idle
                     }
                     (Side::Peered { asked, mine, .. }, Frame::PeerFlags { flags: theirs, .. }) => {
@@ -932,7 +941,7 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
                 };
                 peering.refused = None;
                 if invitation {
-                    peering.refused_by_them = false;
+                    peering.refused_by_them = None;
                 }
             }
             decision => {
@@ -1112,7 +1121,7 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
         let targets = mesh
             .peerings
             .iter()
-            .filter(|(_, peering)| !matches!(peering.side, Side::Idle) || peering.refused_by_them)
+            .filter(|(_, peering)| !matches!(peering.side, Side::Idle) || peering.refused_by_them.is_some())
             .filter_map(|(id, _)| self.links.get(id))
             .collect::<Vec<_>>();
         if targets.is_empty() {
@@ -1139,7 +1148,7 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
                 link.send(Frame::Unpeer { collection });
             }
             peering.side = Side::Idle;
-            peering.refused_by_them = false;
+            peering.refused_by_them = None;
         }
         mesh.peerings.retain(|_, peering| !peering.is_empty());
         self.changed = true;
@@ -1304,7 +1313,9 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
     }
 
     /// The next candidate in C's order that is not already a neighbour, being
-    /// dialled, or refusing this side. If `redraw`, the end of the order draws
+    /// dialled, or one that refused this side within [`ASK_AGAIN`] or owes it an
+    /// answer on the connection a request would go on. If `redraw`, the end of
+    /// the order draws
     /// it again once [`MIN_RESHUFFLE_INTERVAL`] has passed, or sooner if its
     /// candidates changed, and a draw that was due looks up C's DHT providers
     /// again. For the `reserved` slot the order is of C's participants, those
@@ -1318,12 +1329,21 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
         reserved: bool,
         redraw: bool,
     ) -> Option<PeerId> {
-        let mesh = self.meshes.get_mut(&collection.raw)?;
+        let mesh = self.meshes.get(&collection.raw)?;
         let skipped = mesh
             .peerings
             .iter()
-            .filter(|(_, peering)| !matches!(peering.side, Side::Idle) || peering.refused_by_them)
-            .filter_map(|(id, _)| self.links.get(id).map(Link::peer))
+            .filter_map(|(id, peering)| Some((self.links.get(id)?, peering)))
+            .filter(|(link, peering)| {
+                let refused = peering.refused_by_them;
+                !matches!(peering.side, Side::Idle)
+                    || refused.is_some_and(|refused| now < refused + ASK_AGAIN)
+                    || peering.owed
+                        && self
+                            .link_to(link.peer())
+                            .is_some_and(|next| next.id() == link.id())
+            })
+            .map(|(link, _)| link.peer())
             .chain(mesh.dialling.iter().copied())
             .chain(
                 self.links
@@ -1332,6 +1352,7 @@ impl<R: BlobStoreGet + Clone> Peerings<R> {
                     .map(Link::peer),
             )
             .collect::<BTreeSet<_>>();
+        let mesh = self.meshes.get_mut(&collection.raw)?;
         let order = if reserved {
             &mut mesh.named
         } else {
@@ -1805,7 +1826,7 @@ mod tests {
         let refused = peering(&owner, reader.id()).unwrap();
         assert!(refused.refused_by_them && !refused.peered && !refused.asked);
         assert!(peering(&reader, owner.id()).unwrap().refused_by_me);
-        // The owner does not ask again, and the reader never asks for C.
+        // The owner does not ask again yet, and the reader never asks for C.
         assert!(owner.peerings.fill(crate::clock::mono_now()).is_empty());
         assert!(reader.peerings.fill(crate::clock::mono_now()).is_empty());
         assert!(carry(&mut owner, &mut reader, &mut wire).is_empty());
@@ -2562,6 +2583,33 @@ mod tests {
         assert_eq!(sent(late)[0], FRAME_PEER_REQUEST);
     }
 
+    /// A peer that owes an answer takes no draw from one that can be asked,
+    /// whatever their order: each swap asks one of those, at once.
+    #[test]
+    fn an_owing_peer_takes_no_draw_from_another() {
+        for _ in 0..30 {
+            let now = crate::clock::mono_now();
+            let (mut node, collection, five, links, owing) = swapping(now);
+            // The others of the draw refuse, so the next swap draws anew.
+            let mut second = 0;
+            loop {
+                let at = now + SWAP_INTERVAL * 2 + PEERING_TICK * second;
+                node.peerings.fill(at);
+                let next = tried(&node, collection, &five);
+                let Some(next) = next.first() else {
+                    break;
+                };
+                refuse(&mut node, collection, &links[next].0);
+                second += 1;
+            }
+            assert_eq!(second, 4);
+            node.peerings.fill(now + SWAP_INTERVAL * 3);
+            let next = tried(&node, collection, &five);
+            assert_eq!(next.len(), 1, "one that does not owe");
+            assert_ne!(next[0], owing);
+        }
+    }
+
     /// So does the reserved slot's holder that connected and never answered:
     /// the next participant no connection reaches is dialled.
     #[test]
@@ -2630,10 +2678,9 @@ mod tests {
     }
 
     /// Two nodes ask, end what they asked for or take it back, and deselect and
-    /// select C, with
-    /// every frame delivered late, in order and one at a time: once all are
-    /// delivered both agree whether they peer, and no answer is owed. Each
-    /// frame may meet its receiver in any state.
+    /// select C, with every frame delivered late, in order and one at a time:
+    /// once all are delivered both agree whether they peer, and no answer is
+    /// owed. Each frame may meet its receiver in any state.
     #[test]
     fn both_ends_agree_whenever_every_frame_arrived() {
         use rand::rngs::StdRng;
@@ -2812,11 +2859,6 @@ mod tests {
             }
         }
         assert_eq!(refused.len(), 5, "every candidate of the draw was tried");
-        // A connection closed and opened anew: the key may be asked again.
-        let (link, _) = &links[&candidate];
-        node.peerings.event(ReconEvent::Closed(link.clone()));
-        let (link, _frames) = Link::detached(200, candidate);
-        node.peerings.event(ReconEvent::Opened(link));
         for second in 10..600 {
             node.peerings
                 .fill(now + SWAP_INTERVAL + PEERING_TICK * second);
@@ -2826,7 +2868,113 @@ mod tests {
             );
         }
         node.peerings.fill(now + SWAP_INTERVAL * 2);
-        assert_eq!(tried(&node, collection, &five), [candidate]);
+        assert_eq!(tried(&node, collection, &five).len(), 1, "the next swap");
+    }
+
+    /// The seconds of the hour in which `end`, which refuses every request, is
+    /// asked, while `others` accept theirs and whatever `meddle` does.
+    fn asked_at(
+        node: &mut Node,
+        collection: CollectionHandle,
+        end: &mut (Link, Receiver<Frame>),
+        others: &[(Link, Receiver<Frame>)],
+        meddle: impl Fn(&mut Node, &Link),
+    ) -> Vec<u32> {
+        let now = crate::clock::mono_now();
+        let mut asked = Vec::new();
+        for second in 0..3600 {
+            node.peerings.fill(now + PEERING_TICK * second);
+            for (link, _) in others {
+                accept(node, collection, link);
+            }
+            if sent(end).contains(&FRAME_PEER_REQUEST) {
+                asked.push(second);
+                refuse(node, collection, &end.0);
+            }
+            meddle(node, &end.0);
+        }
+        asked
+    }
+
+    /// A peer that refused is asked again on the same connection, two minutes
+    /// later at the earliest whatever it sends meanwhile: thirty times an hour
+    /// while a place is free.
+    #[test]
+    fn a_refuser_is_asked_again_every_two_minutes_while_a_place_is_free() {
+        let (mut node, collection) = owner(100..103);
+        let mut end = open(&mut node, 100, 100);
+        let others = [open(&mut node, 101, 101), open(&mut node, 102, 102)];
+        let asked = asked_at(&mut node, collection, &mut end, &others, |node, link| {
+            refuse(node, collection, link);
+            unpeer(node, collection, link);
+            let proof = grant(&key(100), &key(101), read_capability(), collection);
+            let frames = credential_frames(collection, &[proof]);
+            for frame in frames {
+                node.peerings.event(ReconEvent::Frame(link.clone(), frame));
+            }
+        });
+        assert!(
+            asked
+                .windows(2)
+                .all(|pair| PEERING_TICK * (pair[1] - pair[0]) >= ASK_AGAIN),
+            "{asked:?}"
+        );
+        assert_eq!(asked.len(), 30, "{asked:?}");
+    }
+
+    /// While the five places are full, only a swap asks it: at most once each.
+    #[test]
+    fn a_refuser_is_asked_by_each_swap_while_the_places_are_full() {
+        let (mut node, collection) = owner(100..106);
+        let others = (100..105)
+            .map(|byte| open(&mut node, byte.into(), byte))
+            .collect::<Vec<_>>();
+        let mut end = open(&mut node, 105, 105);
+        // The five accept before the sixth can take a place.
+        for (link, _) in &others {
+            node.peerings.ask(collection, link, false);
+            accept(&mut node, collection, link);
+        }
+        let asked = asked_at(&mut node, collection, &mut end, &others, |_, _| {});
+        assert_eq!(asked, [600, 1200, 1800, 2400, 3000]);
+    }
+
+    /// A refuser that holds no such collection keeps no note of the request
+    /// and cannot invite. Once it selects the collection, it is reached by
+    /// asking again.
+    #[test]
+    fn a_refuser_without_the_collection_is_reached_by_asking_again() {
+        let mut owner = Node::new(1);
+        let mut reader = Node::new(2);
+        let open = || CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let collection = owner.hold(open());
+        let read = grant(&owner.key, &reader.key, read_capability(), collection);
+        owner.learn(read);
+        owner.select(collection, true);
+        reader.observe();
+        owner
+            .peerings
+            .providers(collection, vec![reader.id()]);
+        let mut wire = connect(&mut owner, &mut reader, 1);
+        let now = crate::clock::mono_now();
+        owner.peerings.fill(now);
+        let refused = [("left", FRAME_PEER_REQUEST), ("right", FRAME_PEER_REFUSE)];
+        let carried = carry(&mut owner, &mut reader, &mut wire);
+        assert_eq!(kinds(&carried), refused);
+        assert!(reader.health().is_empty(), "no note");
+        assert_eq!(reader.hold(open()), collection);
+        reader.select(collection, true);
+        assert!(carry(&mut owner, &mut reader, &mut wire).is_empty());
+        for second in 1..120 {
+            owner.peerings.fill(now + PEERING_TICK * second);
+            assert!(carry(&mut owner, &mut reader, &mut wire).is_empty());
+        }
+        for second in 120..181 {
+            owner.peerings.fill(now + PEERING_TICK * second);
+            carry(&mut owner, &mut reader, &mut wire);
+        }
+        assert!(peering(&owner, reader.id()).is_some_and(|peering| peering.peered));
+        assert!(peering(&reader, owner.id()).is_some_and(|peering| peering.peered));
     }
 
     /// Candidates that cannot be dialled cost a dial each and no neighbour;

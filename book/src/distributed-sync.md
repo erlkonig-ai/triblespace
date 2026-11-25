@@ -438,7 +438,7 @@ credentials' root and delegated keys among connected peers. When a
 credential, a fetched definition, a new proof or the refuser's own selection
 admits a refused request, the refuser sends an invitation: a PEER_REQUEST with
 the invitation bit, which counts against the receiver's room for inbound
-peerings. The asker never asks again on its own. A request that was admitted
+peerings. The asker asks again as *Neighbours* says. A request that was admitted
 and refused only for want of room is invited once a place is free, at the next
 refill of the neighbour sets, if it is still admitted. The invitation holds that
 place until it is answered, and each remembered request is invited once.
@@ -459,8 +459,13 @@ fresh for each order. Readers come first because a signer that cannot read
 does not relay; free DHT keys come last. The position in that order is the
 only retry state: a refusal, a failed dial or an ended peering (its
 connection closed, as it does when its `recon/1` ends) moves on to the next
-candidate. A key that refused is not asked again on that connection, and
-the others come round again only when the order is redrawn. Reaching the end
+candidate. A key that refused is passed over for two minutes, and then is a
+candidate again on the same connection, without which a refuser that keeps no
+note of the request, because it does not hold C, could not be reached. So a
+refuser is asked at most 30 times an hour for a collection while a place is
+free, and only by the swaps, at most six times, while all are taken; nothing it
+sends shortens that. Otherwise candidates come round again only when the order
+is redrawn. Reaching the end
 redraws it with a new salt, no sooner than 60 seconds after the last draw
 unless the candidates changed. A redraw that is not merely of changed
 candidates also looks up C's DHT providers again, at most three such lookups

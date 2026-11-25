@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- A peer that refused a peering request is asked again on the same connection,
+  two minutes later at the earliest, when a place is free or a swap draws it.
+  Before, it was passed over as long as the connection stood, so a refuser that
+  did not hold the collection, and so kept no note of the request, was never
+  reached on it.
+
 - A peering request or invitation nobody answered no longer holds its place
   while the connection stands. When a collection's swap comes due (every ten
   minutes) it is taken back with an UNPEER, be it one of the five asked-for
