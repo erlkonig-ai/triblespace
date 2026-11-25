@@ -14,7 +14,7 @@
 //!   or compared.
 //! - [`Grants`] lists on every connection, as `recon/1` GRANT_ROOTS, the
 //!   root and count of R's grants for every R the peer takes part in: when
-//!   it opens, whenever one changes, and all of them again every few minutes
+//!   it opens, whenever one changes, and all of them again every minute
 //!   ([`MIN_REPEAT`]). It opens a grant walk over R ([`crate::walk`]) where
 //!   the peer's listed root differs from this side's. An entry that still
 //!   stands does nothing when it is heard again.
@@ -77,9 +77,7 @@ use triblespace_core::trible::TribleSet;
 
 use crate::channel::{NetEvent, NetEventBatch};
 use crate::clock::Mono;
-use crate::connection::{
-    CONNECTION_IDLE_DEADLINE, ConnectionTable, Link, ReconEvent, Service,
-};
+use crate::connection::{ConnectionTable, Link, ReconEvent, Service};
 use crate::host::{ActiveCollections, METADATA_BLOB_BYTES, StoreSnapshot};
 use crate::patch_repair::PatchSummary;
 use crate::protocol::{RawHash, op_get_blob_with_limit};
@@ -98,18 +96,12 @@ const MAX_PENDING: usize = 1024;
 /// each failure up to [`MAX_RETRY`].
 const MIN_RETRY: Duration = Duration::from_secs(1);
 const MAX_RETRY: Duration = Duration::from_secs(60);
-/// The least time between two listings of everything on one connection, to
-/// which up to [`REPEAT_JITTER`] is added each time.
-///
-/// It is more than twice [`CONNECTION_IDLE_DEADLINE`] so that repeats alone
-/// never keep a connection open. Each side's repeats are this far apart, so
-/// between two of one side's, both sides' together leave a gap of at least
-/// half of it, and a connection nothing else crosses closes in that gap. On a
-/// fresh connection the first repeat falls after the deadline anyway. The
-/// half minute is the slack for latency: the gap is 135 s against 120 s.
-const MIN_REPEAT: Duration =
-    Duration::from_secs(2 * CONNECTION_IDLE_DEADLINE.as_secs() + 30);
-const REPEAT_JITTER: Duration = Duration::from_secs(30);
+/// The least time between two opportunities to list everything on one
+/// connection, to which up to [`REPEAT_JITTER`] is added each time. One is
+/// passed over while frames are queued. Listings are no use of their
+/// connection, so they keep none open however often they repeat.
+const MIN_REPEAT: Duration = Duration::from_secs(45);
+const REPEAT_JITTER: Duration = Duration::from_secs(15);
 
 /// Resources a connection may list that this side takes no part in (a
 /// non-syncing grantee learns its grants this way). Reset per connection.
@@ -1048,7 +1040,7 @@ fn next_repeat(now: Mono) -> Mono {
 /// The grant exchange of one node (design: grants gossip by participation):
 /// on every connection each side lists, as GRANT_ROOTS, the root and count
 /// of its grants over every resource R the other takes part in, sent on
-/// opening, whenever one changes, and all of them again every few minutes
+/// opening, whenever one changes, and all of them again every minute
 /// ([`MIN_REPEAT`]), so that an entry the other side skipped or lost is heard
 /// on the same connection. Hearing one again that still stands does
 /// nothing. Where the peer's listed root differs

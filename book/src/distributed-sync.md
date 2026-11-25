@@ -291,8 +291,8 @@ nanoseconds, so a restarted node's dials outrank the ones it made before. When
 a pair holds two connections, both sides keep the same one: of crossed dials,
 the one dialled by the lower key; of two dials by one side, the one with the
 higher sequence number. The loser drains: nothing new is opened on it, and it
-closes once no request stream is in flight on it and no frame has crossed it
-for two seconds. What this side had asked to peer for on it, it asks for again
+closes once no request stream is in flight on it and two seconds have passed
+since it was retired or last used. What this side had asked to peer for on it, it asks for again
 on the connection kept.
 
 A close notification names the connection that ended, even if it waited in the
@@ -303,10 +303,20 @@ lost it. Queued grant requests and unknown-resource charges remain peer-scoped
 while a current connection survives; the last close clears them and marks
 receive-completion evidence disconnected. No wire negotiation is involved.
 
-A connection closes after 120 seconds without a frame on any of its streams,
-sent or received. Push timers cap at 60 seconds, so a connection that
-carries a peering does not go idle; grant listings repeat too rarely to keep
-one open (*Grant exchange*). Above 64 connections in one direction the
+A connection closes after 120 seconds without use: bytes, sent or received, on
+any of its streams but `recon/1` (the first byte a peer sends on a stream, which
+says which it is, counts on any). Frames on `recon/1` are the connection's own
+bookkeeping, not its use, so grant listings can repeat as often as records do
+and hold nothing open (*Grant exchange*), and a peer that writes only there
+holds nothing open either. Becoming a neighbour connection, below, is use; a
+request to peer and a refusal are not. Pushes are: in each interval of
+at most 60 seconds both sides of a peering open theirs, which carry at least
+the stream's opening frame, whatever flows, however equal the trees, and though
+the other side refuses them. So two opportunities of one side are at most 90
+seconds apart, and a connection that carries a peering does not go idle unless
+every walk on it stalls. Other requests are use too, DHT lookups of a node that
+looks for neighbours among them. A peer built before this rule counts its
+`recon/1` frames as use and does not close first; this side does. Above 64 connections in one direction the
 least recently used one is evicted, draining and unused connections first. A
 neighbour connection, one that carries a peering, is never evicted.
 
@@ -328,7 +338,7 @@ A connection's frame queue refuses no frame, so what it holds is bounded by
 what is put on it. A side asked to peer leaves the request unanswered while
 the connection already queues 1,024 frames, at most 64 KiB each, and the
 grant exchange sends an entry of its listing only when that root changes, and
-all of it again every few minutes, which it leaves out while the connection
+all of it again every minute, which it leaves out while the connection
 has frames queued; a peer that
 asks faster than it reads therefore stops being answered rather than growing
 the queue, and an unanswered peering request waits until the stalled stream's end
@@ -971,7 +981,7 @@ offered.
 On every connection, when it opens and whenever a listed root changes, each
 side sends on `recon/1` a GRANT_ROOTS listing: for every R the peer takes part
 in, the root and count of this side's grants over R. Like records, grants are
-anti-entropy: 270 to 300 seconds after it opened or last repeated, at a moment
+anti-entropy: 45 to 60 seconds after it opened or last repeated, at a moment
 drawn afresh, each side has an opportunity to list everything again on the
 connection, so an entry the other side skipped or lost is heard without a new
 connection. An opportunity is passed over while the connection has frames
@@ -980,11 +990,9 @@ empty; changed roots are queued at once as ever. An entry that says what
 already stands does nothing at the receiver: it opens no walk, leaves a failed
 one on its backoff, and asks for no blob. A repeat is not suppressed by an
 equal listing of the peer's, which says what the peer holds and not what it
-heard. The times are more than twice the idle deadline apart (*One connection
-per peer*), so that the repeats of both sides together still leave a gap in
-which a connection nothing else crosses closes. One that closes is listed on
-afresh when it is dialled again. Other traffic still holds a connection open,
-DHT lookups of a node that looks for neighbours among it. Where the peer's listed
+heard. Repeats are no use of their connection (*One connection per peer*), so
+one that nothing else crosses closes; it is listed on afresh when it is dialled
+again. Where the peer's listed
 root differs from this side's, and differs from what this side last opened a
 walk for, it opens one grant walk over R on that connection: the
 Authorization kind of `walk/1`, Prefix only, over any R. A side takes listings

@@ -626,47 +626,158 @@ async fn recon_protocol_violations_close_the_connection() {
     assert!(dialled.open_bi().await.is_err());
 }
 
+/// A stream of a tag nobody knows: one byte of use, and no service.
+async fn using(conn: &SimConn) {
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    send_u8(&mut send, 0x7E).await.unwrap();
+}
+
+/// Frames on `recon/1` alone, either way, keep no connection open past the
+/// idle deadline; use of any other stream does, for that long again.
 #[tokio::test(start_paused = true)]
-async fn recon_frames_keep_a_connection_open_past_the_idle_deadline() {
+async fn recon_frames_do_not_keep_a_connection_open_past_the_idle_deadline() {
     let net = network(Duration::from_secs(1));
     let server = Node::join(&net, &key(1));
-    let quiet = net.join(&key(2));
-    let chatty = net.join(&key(3));
-    let (quiet_id, chatty_id) = (quiet.transport.local_id(), chatty.transport.local_id());
-    let quiet = quiet
-        .transport
-        .dial(server.peer, PILE_SYNC_ALPN)
-        .await
-        .unwrap();
-    let chatty = chatty
-        .transport
-        .dial(server.peer, PILE_SYNC_ALPN)
-        .await
-        .unwrap();
-    let _quiet_recon = open_recon(&quiet, 1).await;
-    let mut chatty_recon = open_recon(&chatty, 1).await;
-    settle().await;
-    assert!(server.table.current(quiet_id).is_some());
-
-    // Frames every fifty seconds, on recon/1 alone, keep one connection open
-    // well past the deadline; the other closes after it without a frame.
-    for _ in 0..5 {
-        tokio::time::sleep(Duration::from_secs(50)).await;
-        write_frame(&mut chatty_recon, 0x7F, b"a later frame kind")
-            .await
-            .unwrap();
+    let [quiet, chatty, used] = [2, 3, 4].map(|index| net.join(&key(index)));
+    let ids = [&quiet, &chatty, &used].map(|harness| harness.transport.local_id());
+    let mut conns = Vec::new();
+    let mut recons = Vec::new();
+    for harness in [&quiet, &chatty, &used] {
+        let conn = harness.transport.dial(server.peer, PILE_SYNC_ALPN).await.unwrap();
+        let (mut send, recv) = conn.open_bi().await.unwrap();
+        send_u8(&mut send, TAG_RECON).await.unwrap();
+        write_frame(&mut send, FRAME_OPEN, &1u64.to_be_bytes()).await.unwrap();
+        recons.push((send, recv));
+        conns.push(conn);
     }
     settle().await;
-    assert!(server.table.current(quiet_id).is_none());
-    assert!(quiet.accept_bi().await.is_none());
-    assert!(server.table.current(chatty_id).is_some());
-    assert!(answers_empty(&chatty).await);
+    let current = |id| server.table.current(id).map(|connection| connection.link());
+    let chatted = current(ids[1]).unwrap();
+    assert!(current(ids[0]).is_some() && current(ids[2]).is_some());
 
+    // A frame each way every second on one; a byte of use at 100 s on another.
+    for second in 0..130 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let _ = write_frame(&mut recons[1].0, 0x7F, b"a later frame kind").await;
+        if second == 90 {
+            assert!(current(ids[1]).is_some(), "control");
+            assert!(matches!(recons[1].1.read(&mut [0; 64]).await, Ok(1..)), "control");
+        }
+        chatted.send(crate::recon::Frame::Unpeer {
+            collection: CollectionHandle::new([3; 32]),
+        });
+        if second == 100 {
+            using(&conns[2]).await;
+        }
+    }
+    settle().await;
+    assert!(current(ids[0]).is_none());
+    assert!(conns[0].accept_bi().await.is_none());
+    assert!(current(ids[1]).is_none(), "recon/1 held it open");
+    assert!(conns[1].accept_bi().await.is_none());
+    assert!(current(ids[2]).is_some());
+    assert!(answers_empty(&conns[2]).await);
+
+    tokio::time::sleep(CONNECTION_IDLE_DEADLINE - Duration::from_secs(3)).await;
+    assert!(current(ids[2]).is_some());
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(current(ids[2]).is_none());
+}
+
+/// Becoming a neighbour's connection is use, once: a peering made just before
+/// the connection would close as idle has time for its first push. Being told
+/// so again is none, and neither is ceasing to be one.
+#[tokio::test(start_paused = true)]
+async fn becoming_a_neighbour_is_use_once() {
+    let net = network(Duration::from_millis(10));
+    let server = Node::join(&net, &key(1));
+    let client = net.join(&key(2));
+    let conn = client.transport.dial(server.peer, PILE_SYNC_ALPN).await.unwrap();
+    let _recon = open_recon(&conn, 1).await;
+    settle().await;
+    let link = server.table.current(client.transport.local_id()).unwrap().link();
     tokio::time::sleep(CONNECTION_IDLE_DEADLINE - Duration::from_secs(1)).await;
-    assert!(server.table.current(chatty_id).is_some());
+    assert!(!link.closed(), "control");
+    link.set_neighbour(true);
+    for _ in 0..CONNECTION_IDLE_DEADLINE.as_secs() - 1 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!link.closed(), "becoming one was use");
+        link.set_neighbour(true);
+    }
+    link.set_neighbour(false);
     tokio::time::sleep(Duration::from_secs(2)).await;
-    assert!(server.table.current(chatty_id).is_none());
-    assert!(chatty.accept_bi().await.is_none());
+    assert!(link.closed(), "nothing since was");
+}
+
+/// `recon/1` frames do not make a connection the more recently used one: of
+/// the others, the one unused longest is evicted, whatever it wrote there.
+#[tokio::test(start_paused = true)]
+async fn recon_frames_do_not_spare_a_connection_from_eviction() {
+    let net = network(Duration::from_millis(10));
+    let center = Node::join(&net, &key(100_000));
+    let harnesses = (0..MAX_CONNECTIONS + 1)
+        .map(|index| net.join(&key(index)))
+        .collect::<Vec<_>>();
+    let mut held = Vec::new();
+    for (index, harness) in harnesses.iter().enumerate() {
+        if index == MAX_CONNECTIONS {
+            let (_, recon) = &mut held[0];
+            write_frame(recon, 0x7F, b"a later frame kind").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let conn = harness.transport.dial(center.peer, PILE_SYNC_ALPN).await.unwrap();
+        let recon = open_recon(&conn, 1).await;
+        held.push((conn, recon));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let current = |index: usize| center.table.current(harnesses[index].transport.local_id());
+    assert_eq!(center.table.len(), MAX_CONNECTIONS);
+    assert!(current(0).is_none(), "the one unused longest");
+    assert!(current(1).is_some());
+}
+
+/// The drain's grace runs from the retirement, however long the loser went
+/// unused before it, and a later retirement of it changes nothing. A request
+/// across it keeps it as long as the request moves, and the grace again after
+/// its last byte.
+#[tokio::test(start_paused = true)]
+async fn a_long_unused_connection_drains_from_its_retirement() {
+    for transfers in [false, true] {
+        let net = network(Duration::from_millis(10));
+        let server = Node::join(&net, &key(1));
+        let client = net.join(&key(2));
+        let dial = || client.transport.dial(server.peer, PILE_SYNC_ALPN);
+        let older = dial().await.unwrap();
+        let mut older_recon = open_recon(&older, 1).await;
+        tokio::time::sleep(Duration::from_secs(100)).await;
+        let loser = server.table.current(client.transport.local_id()).unwrap().link();
+
+        let newer = dial().await.unwrap();
+        let mut held = None;
+        if transfers {
+            held = Some(held_find_value(&older).await);
+        }
+        let _newer_recon = open_recon(&newer, 2).await;
+        tokio::time::sleep(DRAIN_GRACE / 2).await;
+        assert!(loser.retired() && !loser.closed(), "the grace runs from here");
+        write_frame(&mut older_recon, 0x7F, b"before it saw the winner").await.unwrap();
+        // A third dial ranks the pair again.
+        let third = dial().await.unwrap();
+        let _third_recon = open_recon(&third, 3).await;
+        if let Some((mut send, mut recv)) = held {
+            // The request is still open when the grace would have run out.
+            tokio::time::sleep(DRAIN_GRACE).await;
+            assert!(!loser.closed(), "a request is in flight");
+            send.shutdown().await.unwrap();
+            while matches!(recv.read(&mut [0; 64]).await, Ok(1..)) {}
+            tokio::time::sleep(DRAIN_GRACE / 2).await;
+            assert!(!loser.closed(), "the grace after its last byte");
+            tokio::time::sleep(DRAIN_GRACE).await;
+        } else {
+            tokio::time::sleep(DRAIN_GRACE * 3 / 4).await;
+        }
+        assert!(loser.closed(), "transfers {transfers}");
+    }
 }
 
 /// Only a connection this node dialled makes its peer a route. An accepted
@@ -720,7 +831,7 @@ async fn a_retired_connection_with_a_stalled_request_still_goes_idle() {
     let (_stalled_send, mut stalled_recv) = held_find_value(&older).await;
     settle().await;
     let newer = dial().await.unwrap();
-    let mut newer_recon = open_recon(&newer, 2).await;
+    let _newer_recon = open_recon(&newer, 2).await;
     settle().await;
     assert_eq!(
         server
@@ -735,9 +846,7 @@ async fn a_retired_connection_with_a_stalled_request_still_goes_idle() {
     // the idle deadline every connection has.
     tokio::time::sleep(DRAIN_GRACE * 10).await;
     assert_eq!(server.table.len(), 2);
-    write_frame(&mut newer_recon, 0x7F, b"keep the winner")
-        .await
-        .unwrap();
+    using(&newer).await;
     tokio::time::sleep(CONNECTION_IDLE_DEADLINE - DRAIN_GRACE * 5).await;
     assert_eq!(server.table.len(), 1);
     assert!(
@@ -889,6 +998,11 @@ async fn a_peer_that_stops_reading_recon_loses_the_connection() {
         "the idle connection closed"
     );
 
+    // Use, so that only the credit deadline can close it below.
+    let connection = dialler.current(acceptor.transport().local_id()).unwrap();
+    let (mut send, _recv) = connection.open_bi().await.unwrap();
+    send_u8(&mut send, 0x7E).await.unwrap();
+    settle().await;
     // The acceptor's service stops taking frames, so its recon/1 reader
     // stops reading: forty thousand frames exhaust the stream's credit.
     for _ in 0..40_000 {

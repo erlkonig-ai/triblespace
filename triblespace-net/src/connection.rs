@@ -15,8 +15,8 @@
 //! sides keep the same one: of crossed dials, the one dialled by the lower
 //! key; of two dials by one side, the higher sequence number. The loser
 //! drains: nothing new is opened on it, and it closes once no request stream
-//! is in flight on it and no frame has crossed it for [`DRAIN_GRACE`], or
-//! like any other connection when it goes idle.
+//! is in flight on it and it has not been used for [`DRAIN_GRACE`] since it
+//! was retired, or like any other connection when it goes idle.
 //!
 //! A connection carries exactly one `recon/1` stream, the dialler's; a second
 //! one, or one the acceptor opens, is a protocol violation. Its frames go
@@ -37,10 +37,11 @@
 //! stream, opened or accepted, counts as in use on its connection like a
 //! request stream: a draining connection waits for it.
 //!
-//! A connection closes after [`CONNECTION_IDLE_DEADLINE`] without a frame on
-//! any of its streams, sent or received. Above [`MAX_CONNECTIONS`] in one
-//! direction, the least recently used connection is evicted. A neighbour
-//! connection is never evicted.
+//! A connection closes after [`CONNECTION_IDLE_DEADLINE`] without use: bytes,
+//! sent or received, on any stream but its `recon/1`, which is the
+//! connection's own bookkeeping and lists grants on it for as long as it
+//! stands. Above [`MAX_CONNECTIONS`] in one direction, the least recently used
+//! connection is evicted. A neighbour connection is never evicted.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -67,7 +68,8 @@ use crate::walk_stream;
 
 /// Bound on a dial, including its opening `recon/1` frame.
 const DIAL_DEADLINE: Duration = Duration::from_secs(10);
-/// A connection closes after this long without a frame on any stream.
+/// A connection closes after this long without a byte on any stream but its
+/// `recon/1`.
 pub(crate) const CONNECTION_IDLE_DEADLINE: Duration = Duration::from_secs(120);
 /// A `recon/1` writer that waited this long for stream credit resets the
 /// stream: the peer stopped reading it.
@@ -76,9 +78,9 @@ pub(crate) const RECON_CREDIT_DEADLINE: Duration = Duration::from_secs(60);
 /// a peering request that arrives on it goes unanswered: a peer that asks
 /// faster than it reads gets no more until it reads.
 pub(crate) const MAX_QUEUED_REPLIES: usize = 1024;
-/// A retired connection closes after this long without a frame once no
-/// request stream is in flight on it. The peer keeps using it only until it
-/// has seen the winner too.
+/// A retired connection closes this long after it was retired or last used,
+/// once no request stream is in flight on it. The peer keeps using it, and
+/// writing on its `recon/1`, only until it has seen the winner too.
 pub(crate) const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// Bound on serving one request stream.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(300);
@@ -199,8 +201,11 @@ impl Link {
     }
 
     /// Mark or unmark this as a neighbour connection, which eviction spares.
+    /// Becoming one is use: the peering's first push has a few seconds' wait.
     pub fn set_neighbour(&self, neighbour: bool) {
-        self.state.neighbour.store(neighbour, Ordering::SeqCst);
+        if !self.state.neighbour.swap(neighbour, Ordering::SeqCst) && neighbour {
+            self.state.touch();
+        }
     }
 
     /// Frames queued and not yet taken by a `recon/1` writer.
@@ -309,8 +314,9 @@ struct State {
     /// and from the opening `recon/1` frame for accepted ones.
     sequence: OnceLock<u64>,
     epoch: Instant,
-    /// Nanoseconds after `epoch` of the last frame sent or received.
-    last_frame: AtomicU64,
+    /// Nanoseconds after `epoch` of the last use: a byte sent or received on
+    /// any stream but `recon/1`, becoming a neighbour's, or the retirement.
+    last_use: AtomicU64,
     /// Request and walk streams open on the connection, in either
     /// direction.
     in_flight: AtomicUsize,
@@ -348,7 +354,7 @@ impl State {
             dialler: if dialled { local } else { peer },
             sequence: OnceLock::new(),
             epoch: Instant::now(),
-            last_frame: AtomicU64::new(0),
+            last_use: AtomicU64::new(0),
             in_flight: AtomicUsize::new(0),
             handles: AtomicUsize::new(0),
             retired: AtomicBool::new(false),
@@ -368,20 +374,20 @@ impl State {
 
     fn touch(&self) {
         let elapsed = self.epoch.elapsed().as_nanos() as u64;
-        self.last_frame.fetch_max(elapsed, Ordering::Relaxed);
+        self.last_use.fetch_max(elapsed, Ordering::Relaxed);
     }
 
-    fn last_frame(&self) -> Instant {
-        self.epoch + Duration::from_nanos(self.last_frame.load(Ordering::Relaxed))
+    fn last_use(&self) -> Instant {
+        self.epoch + Duration::from_nanos(self.last_use.load(Ordering::Relaxed))
     }
 
-    /// When the connection closes unless a frame crosses it first. A retired
+    /// When the connection closes unless it is used first. A retired
     /// connection waits only [`DRAIN_GRACE`] once no request stream is in
     /// flight on it.
     fn deadline(&self) -> Instant {
         let drained =
             self.retired.load(Ordering::SeqCst) && self.in_flight.load(Ordering::SeqCst) == 0;
-        self.last_frame()
+        self.last_use()
             + if drained {
                 DRAIN_GRACE
             } else {
@@ -394,8 +400,14 @@ impl State {
         self.in_flight.load(Ordering::SeqCst) > 0 || self.handles.load(Ordering::SeqCst) > 0
     }
 
+    /// Called under the table's lock. The drain's grace runs from here however
+    /// long the connection went unused, since the peer may still be writing on
+    /// its `recon/1`: so the touch comes first, and the accept loop never sees
+    /// a retired connection without it.
     fn retire(&self) {
-        if !self.retired.swap(true, Ordering::SeqCst) {
+        if !self.retired.load(Ordering::SeqCst) {
+            self.touch();
+            self.retired.store(true, Ordering::SeqCst);
             self.changed.notify_waiters();
         }
     }
@@ -518,7 +530,7 @@ impl<C> Connection<C> {
 
     /// Mark or unmark this as a neighbour connection, which eviction spares.
     pub fn set_neighbour(&self, neighbour: bool) {
-        self.state().neighbour.store(neighbour, Ordering::SeqCst);
+        self.link().set_neighbour(neighbour);
     }
 
     /// Whether this side dropped the connection for a fresh one.
@@ -571,7 +583,7 @@ impl<C: Conn> Conn for Connection<C> {
     }
 }
 
-/// A stream half whose frames keep its connection from going idle.
+/// A stream half whose bytes use its connection: every stream's but `recon/1`'s.
 pub struct Tracked<S> {
     inner: S,
     state: Arc<State>,
@@ -937,7 +949,7 @@ impl<C: Conn> Table<C> {
                 (
                     !entry.state.retired.load(Ordering::SeqCst),
                     entry.state.in_use(),
-                    entry.state.last_frame(),
+                    entry.state.last_use(),
                     entry.state.id,
                 )
             })?
@@ -1131,7 +1143,8 @@ async fn stream<T: Transport, S: Service>(
             } else if state.recon.swap(true, Ordering::SeqCst) {
                 violation(&conn, "a second recon/1 stream");
             } else {
-                recon(shared, conn, state, send, recv).await;
+                // Its tag was use; what follows is bookkeeping.
+                recon(shared, conn, state, send.inner, recv.inner).await;
             }
         }
         TAG_DHT | TAG_BLOB => {
@@ -1240,20 +1253,20 @@ fn tag_name(tag: u8) -> &'static str {
 }
 
 /// Open a `recon/1` stream on a connection this node dialled, with the
-/// opening frame that carries its sequence number.
+/// opening frame that carries its sequence number. Its bytes are no use of
+/// the connection, so its halves are not [`Tracked`].
 async fn open_recon<C: Conn>(
     conn: &C,
-    state: &Arc<State>,
-) -> anyhow::Result<(Tracked<C::SendHalf>, Tracked<C::RecvHalf>)> {
+    state: &State,
+) -> anyhow::Result<(C::SendHalf, C::RecvHalf)> {
     let sequence = *state
         .sequence
         .get()
         .expect("a dialled connection knows its sequence");
-    let (send, recv) = conn.open_bi().await?;
-    let mut send = Tracked::new(send, state, None);
+    let (mut send, recv) = conn.open_bi().await?;
     send_u8(&mut send, TAG_RECON).await?;
     write_frame(&mut send, FRAME_OPEN, &sequence.to_be_bytes()).await?;
-    Ok((send, Tracked::new(recv, state, None)))
+    Ok((send, recv))
 }
 
 /// Open a `walk/1` stream on `connection` for a push of C's tree of `kind`:
@@ -1304,8 +1317,8 @@ async fn recon<T: Transport, S: Service>(
     shared: Weak<Shared<T, S>>,
     conn: T::Conn,
     state: Arc<State>,
-    mut send: Tracked<<T::Conn as Conn>::SendHalf>,
-    mut recv: Tracked<<T::Conn as Conn>::RecvHalf>,
+    mut send: <T::Conn as Conn>::SendHalf,
+    mut recv: <T::Conn as Conn>::RecvHalf,
 ) {
     let Some(service) = shared.upgrade().map(|table| table.service.clone()) else {
         return;
@@ -1373,7 +1386,7 @@ async fn recon<T: Transport, S: Service>(
         Ok(()) => "recon/1 ended",
         Err(FrameError::Violation(broken)) => return violation(&conn, broken),
         Err(FrameError::Transport(error)) => {
-            // At info, with the connection's age and silence: on 2026-10-27
+            // At info, with the connection's age and disuse: on 2026-10-27
             // every walk on a connection ended at once under this reason,
             // and the error saying why was only visible at debug. Debug
             // form, because the Display of a lost stream is only "connection
@@ -1384,7 +1397,7 @@ async fn recon<T: Transport, S: Service>(
                 peer = %hex::encode(&state.peer[..8]),
                 dialled = state.dialled,
                 age = ?state.epoch.elapsed(),
-                silent = ?state.last_frame().elapsed(),
+                unused = ?state.last_use().elapsed(),
                 "recon/1 stream failed"
             );
             "recon/1 failed"

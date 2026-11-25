@@ -1337,9 +1337,8 @@ fn a_listing_heard_while_its_walk_runs_is_walked_after_that_walk_ends() {
 
 // ---- everything is listed again ----
 
-/// Every connection is listed everything again between four and a half and
-/// five minutes after it opened and after each repeat, at a moment drawn
-/// afresh. A change is sent at once, and moves the repeat neither way. What a
+/// Every connection is listed everything again between 45 and 60 seconds
+/// after it opened and after each repeat, at a moment drawn afresh. A change is sent at once, and moves the repeat neither way. What a
 /// closed connection would have been sent is forgotten with it.
 #[test]
 fn everything_is_listed_again_on_each_connection() {
@@ -1358,10 +1357,10 @@ fn everything_is_listed_again_on_each_connection() {
     assert!(listed(&mut to_bob).is_empty(), "control: an observation repeats nothing");
 
     let first = host.grants.repeat_deadline().unwrap();
-    assert!(first >= after(opened, 270) && first < after(now(), 300));
-    host.grants.repeat(after(opened, 269));
+    assert!(first >= after(opened, 45) && first < after(now(), 60));
+    host.grants.repeat(after(opened, 44));
     assert!(listed(&mut to_bob).is_empty(), "not before its time");
-    let mut at = after(opened, 301);
+    let mut at = after(opened, 61);
     let mut spacings = Vec::new();
     for _ in 0..8 {
         host.grants.repeat(at);
@@ -1370,9 +1369,9 @@ fn everything_is_listed_again_on_each_connection() {
         host.grants.repeat(at);
         assert!(listed(&mut to_bob).is_empty(), "once");
         let due = host.grants.repeat_deadline().unwrap();
-        assert!(due >= after(at, 270) && due < after(at, 300));
+        assert!(due >= after(at, 45) && due < after(at, 60));
         spacings.push(due.duration_since(at));
-        at = after(at, 300);
+        at = after(at, 60);
     }
     spacings.sort_unstable();
     spacings.dedup();
@@ -1410,9 +1409,9 @@ fn a_repeat_before_the_first_observation_lists_nothing() {
     let (r, _) = holding(&mut host, &alice, &bob);
     let opened = now();
     let (mut linked, _) = open_to(&mut host, id(&bob), 1);
-    host.grants.repeat(after(opened, 301));
+    host.grants.repeat(after(opened, 61));
     assert!(listed(&mut linked).is_empty());
-    assert!(host.grants.repeat_deadline().unwrap() >= after(opened, 571));
+    assert!(host.grants.repeat_deadline().unwrap() >= after(opened, 106));
     host.observe();
     let local = host.snapshot().grants().summary(r);
     assert_eq!(listed(&mut linked), [(r, local)], "positive control");

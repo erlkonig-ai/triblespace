@@ -7,8 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `triblespace-net`: frames on a connection's `recon/1` no longer count as its
+  use. A connection closes 120 s after the last byte on any other stream, and
+  the least recently used one is chosen for eviction by the same clock; becoming
+  a neighbour connection counts, and a retired connection drains from its
+  retirement. The `recon/1 stream failed` line reports `unused` in place of
+  `silent`.
 - `triblespace-net`: each side lists its grant roots again on every open
-  connection, with an opportunity every 270 to 300 s that is passed over while
+  connection, with an opportunity every 45 to 60 s that is passed over while
   the connection has frames queued, so a listing that was skipped or lost is
   heard without a new connection. Same frames, 72 bytes
   per resource and direction a round. An entry that says what already stands
