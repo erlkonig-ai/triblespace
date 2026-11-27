@@ -15,7 +15,6 @@ use std::fmt;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::inline::encodings::hash::Handle;
-use crate::inline::{Inline, InlineEncoding};
 use crate::repo::{BlobStoreGet, StoreChanges, StoreRead, StoreSnapshot};
 use crate::trible::Fragment;
 
@@ -306,8 +305,9 @@ where
 
     /// The parent foundations no taken attachment reaches: a node whose
     /// attachment is not built yet, cannot be represented, or waits for a
-    /// dependency. Read these raw, build them, or report them as a gap;
-    /// membership never implies that their bytes are here.
+    /// dependency. Attached reads report these as a gap; explicit writer
+    /// upkeep can build and publish their images. Membership never implies
+    /// that their bytes are here.
     pub fn residual(&self) -> &Support<SimpleArchive> {
         &self.residual
     }
@@ -315,11 +315,9 @@ where
     /// Reconstruct one caller-chosen logical value from the attachments
     /// taken, and nothing else.
     ///
-    /// The residual is not part of it, so beside a read that does include
-    /// the residual -- the facts of the same parent, say -- it answers for
-    /// less than they do. [`Self::read`] is the whole read; this is the
-    /// cover alone, for a caller that reads the residual some other way or
-    /// reports it.
+    /// The residual is not part of it. [`Self::read`] uses the same stored
+    /// cover and returns the residual alongside the value, so callers can
+    /// distinguish a complete attached observation from a partial one.
     pub fn view<V>(&self) -> Result<V, TryFromCoverError<R::GetError<Infallible>, V::Error>>
     where
         R: BlobStoreGet,
@@ -464,12 +462,12 @@ impl<V> AttachedRead<V> {
     }
 }
 
-/// Failure to read an attached collection with its residual
+/// Failure to read an attached collection's stored cover
 /// ([`AttachedSnapshot::read_with`]).
 #[derive(Debug)]
 pub enum AttachedReadError<GetError, ViewError> {
     /// A descriptor or an attachment could not be read, or the view could
-    /// not be formed from the attachments and the images built.
+    /// not be formed from the stored attachments.
     View(TryFromCoverError<GetError, ViewError>),
     /// The attached descriptor does not name the mapping read through.
     Mapping(super::CollectionOperationError),

@@ -1482,9 +1482,10 @@ pub trait CollectionSnapshotExt: StoreRead + Sized {
     /// representation dependencies are here -- and otherwise the
     /// attachments of the highest nodes beneath it that have one, found
     /// through the host's own merges. The parent foundations no taken
-    /// attachment reaches are the [`AttachedSnapshot::residual`]: read those
-    /// nodes raw, or report them. Supports and usability come from this one
-    /// observation.
+    /// attachment reaches are the [`AttachedSnapshot::residual`], reported as
+    /// unread by attached reads. Explicit writer upkeep can publish their
+    /// attachments for a later observation. Supports and usability come from
+    /// this one observation.
     fn attached<E>(
         &self,
         attached: Collection<E>,
@@ -1500,7 +1501,8 @@ pub trait CollectionSnapshotExt: StoreRead + Sized {
     /// parent descriptors even when frozen residency says absent. A fetching
     /// reader may acquire those exact bytes. Selection otherwise uses the same
     /// frozen records/proofs and resident attachment cover as `attached`;
-    /// `read_acquiring` subsequently reads its fixed residual.
+    /// `read_acquiring` reads only that fixed stored cover and reports the
+    /// entire residual without mapping or fetching its source bodies.
     fn attached_acquiring<E>(
         &self,
         attached: Collection<E>,

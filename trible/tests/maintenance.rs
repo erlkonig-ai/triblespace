@@ -1294,6 +1294,9 @@ fn search_reads_existing_bm25_support_and_snippets_after_source_growth() {
         .unwrap();
     pile.close().unwrap();
     assert_success(&fixture.run("maintain", &[index.handle()]));
+    // Make the fact index partial after the next arrival, rather than taking
+    // the explicitly unindexed whole-source path.
+    assert_success(&fixture.run("maintain-all", &[fixture.rank9.handle()]));
 
     let mut writer = fixture.open();
     writer
@@ -1313,6 +1316,29 @@ fn search_reads_existing_bm25_support_and_snippets_after_source_growth() {
     let before = records(&fixture.path);
     let bytes = std::fs::metadata(&fixture.path).unwrap().len();
 
+    let mut command = trible();
+    command
+        .args(["pile", "collection", "search"])
+        .arg(&fixture.path)
+        .arg(handle_text(index.handle()))
+        .args(["first", "--snippet"])
+        .arg("--key")
+        .arg(&fixture.key);
+    let output = Command::from_std(command)
+        .timeout(Duration::from_secs(30))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no stored fact attachment"), "{stderr}");
+    assert_eq!(records(&fixture.path), before);
+    assert_eq!(std::fs::metadata(&fixture.path).unwrap().len(), bytes);
+
+    // Update only the fact index. The BM25 support still deliberately omits
+    // the new document: this search must keep its original hit and snippet.
+    assert_success(&fixture.run("maintain-all", &[fixture.rank9.handle()]));
+    let before = records(&fixture.path);
+    let bytes = std::fs::metadata(&fixture.path).unwrap().len();
     let mut command = trible();
     command
         .args(["pile", "collection", "search"])

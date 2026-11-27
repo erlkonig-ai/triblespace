@@ -2729,9 +2729,9 @@ fn unsearched(host: Option<VerifyingKey>, residual: usize) -> String {
 /// fact index: a Rank9 attachment, else a raw Succinct one, that is
 /// attached to the source alone and whose cover reaches at least one
 /// foundation for the key the read believes. The cover's archives are read
-/// in place from the pile's mapping; each residual foundation whose bytes
-/// are here is built in memory as one more segment, the ordinary attached
-/// read. `None`, saying why on stderr, when the source has no such index
+/// in place from the pile's mapping; a partial fact cover is refused with a
+/// maintenance hint rather than silently omitting facts or building an index.
+/// `None`, saying why on stderr, when the source has no such index
 /// here: the caller then reads the source's facts whole.
 fn attached_source_facts(
     snapshot: &PileSnapshot,

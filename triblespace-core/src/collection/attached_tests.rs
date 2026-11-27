@@ -1271,9 +1271,9 @@ fn lattice_nodes<R: StoreRead>(
 /// anything it needs resident (a Rank9 attachment's raw child).
 type Build<T> = fn(&mut MemoryRepo, &Blob<SimpleArchive>) -> Inline<Handle<T>>;
 
-/// Attach `lattice`'s nodes at random, read the attached cover, build the
-/// residual in memory, and return that cover beside the cover of the
-/// union's single image, both over `attached`.
+/// Attach `lattice`'s nodes at random, explicitly build remaining images for
+/// the cover-equivalence fixture, and return that cover beside the cover of
+/// the union's single image, both over `attached`.
 fn covers<T>(
     lattice: &mut Lattice,
     attached: Collection<T>,
@@ -1857,6 +1857,16 @@ fn staged_upkeep_requires_publication_and_preserves_scope() {
         prepare().publish(&mut foreign, &host()),
         Err(CollectionRealizationError::HostMismatch { .. })
     ));
+    // Even a signer matching the destination cannot republish work prepared
+    // for another host. The diagnostic names the captured host it conflicts
+    // with, not a misleading equal host/signer pair.
+    assert!(matches!(
+        prepare().publish(&mut foreign, &other()),
+        Err(CollectionRealizationError::HostMismatch { host: Some(prepared_host), signer })
+            if prepared_host == Inline::new(host().verifying_key().to_bytes())
+                && signer == Inline::new(other().verifying_key().to_bytes())
+    ));
+    assert_eq!(foreign.snapshot().unwrap().records().unwrap().count(), 0);
     assert_eq!(prepare().publish(&mut store, &host()).unwrap(), 1);
     let count = store.snapshot().unwrap().records().unwrap().count();
     assert_eq!(prepare().publish(&mut store, &host()).unwrap(), 1);

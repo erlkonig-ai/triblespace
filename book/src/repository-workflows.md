@@ -355,11 +355,12 @@ For an attached collection, first select once with `attached_acquiring` through
 the acquiring reader. This exact-gets its target and parent descriptors instead
 of requiring their residency in the frozen index. Then call `read_acquiring`,
 or `succinctarchive_union::read_attached_acquiring`
-for fact shards. These read the fixed attached cover and demand its exact
-residual foundations without a frozen-residency precheck. They do not maintain,
-publish, or replace a selected view after obtaining bytes. The result carries
-`unread` support for unavailable bytes/dependencies or an unrepresentable
-mapping. A complete operational value requires checking `unread`; taking only
+for fact shards. These read only the fixed stored attached cover and return
+every residual foundation as `unread`, even when its source bytes are resident.
+They never run a mapping, maintain, publish, or replace a selected view after
+obtaining bytes. Explicit writer upkeep can use an acquiring reader for the
+mapping's named dependencies; a later fresh observation sees its published MAPs.
+A complete operational value requires checking `unread`; taking only
 `into_value` is an explicit partial-read choice. This says nothing about peer
 records which have not yet arrived or bulk synchronization completion.
 
@@ -602,19 +603,32 @@ SimpleArchive node --MAP--> SuccinctArchiveBlob
 An attached collection has no carry, no `COMMIT`, `DERIVE` or `MERGE` of its
 own, and no policy: every host builds its own attachments, and a store believes
 only the `MAP`s its own host signed, so another host's that reach it stay
-inert. A read's residual -- foundations no usable attachment reaches -- is not
-missing data: `AttachedSnapshot::read` builds their images in memory for the
-view, and names what it cannot build in `AttachedRead::unread`. Those images
-are exactly what maintenance would attach, and `AttachedRead::built` hands them
-back with the foundation each maps: `keep_attached(read.built(), &host)` stores
-them and publishes the host's `MAP`s, so the next read takes them instead of
-building them, and the store's records now name the attached collection. A
-read that must not grow with the lag builds at most a budget of residual input
-(`read_within`, `read_within_with`): in the residual's order until the next
-foundation does not fit, at least one, the rest unread and not looked at. Using an index this way is what declares it: an attached
-descriptor that no record names is an ordinary blob, and a maintainer that
-finds its targets by `CollectionRead::collections` finds it from its first
-kept `MAP` on. Maintenance carries the
+inert. A read's residual -- foundations no usable attachment reaches -- does
+not say whether their source bytes are here. `AttachedSnapshot::read` returns
+only the stored cover and names the entire residual in `AttachedRead::unread`;
+neither generic nor specialized attached reads build an index.
+
+Foreground writers can use `ensure_attached_within` (or the explicit mapping
+and reader variants) to store images and host-signed MAPs for residual
+foundations. Its budget counts the source bytes of successfully prepared
+images, not attempted mappings: missing dependencies stay pending without
+starving later independent foundations. One successful foundation may exceed
+the budget, including a zero budget. This does not bound failed work, mapping
+dependencies, output sizes, or a single oversized input. It does not merge
+foundations into a larger input.
+
+When mapping runs on an owned blocking worker, `prepare_attached_within` and
+`prepare_attached_within_with` return opaque upkeep work. Join the worker, then
+`publish` through the original writer; no query value is available from the
+prepared work. Publication rechecks the captured host, stores each image before
+its MAP, and leaves completed MAPs valid if later publication fails. Missing
+work and concurrent arrivals require a fresh observation after publication;
+an old read stays unchanged. A missing or different host refuses publication.
+
+The first durable MAP names the attached collection: an attached descriptor
+that no record names is an ordinary blob, and a maintainer that finds its
+targets by `CollectionRead::collections` finds it from that MAP on.
+Maintenance carries the
 root first and then attaches the frontier the carry leaves, so a merged node's
 attachment is mapped from the merged node's bytes and nothing is built for a
 node the carry is about to consume. A mapping that reads another attached
@@ -645,9 +659,9 @@ A read walks the root's frontier widest first and takes a node's attachment
 when it is usable: a `MAP` the host signed whose bytes, and the bytes of every
 attachment it depends on, are here. Otherwise it descends through the host's
 merges to the nodes that produced it. A foundation no usable attachment
-reaches is the read's *residual*: read it from its own bytes
-(`succinctarchive_union::read_attached` does this for Succinct and Rank9),
-build its attachment, or report it. Attachments combine idempotently, so a
+reaches is the read's *residual*. Attached reads report it as unread. Explicit
+writer upkeep may build and publish its attachment; querying raw source facts
+is a separate operation, not an attached-read fallback. Attachments combine idempotently, so a
 cover of attachments answers every query as the attachment of the union of
 its nodes would, for every mapping this crate defines, each built from single
 facts. A mapping whose image aggregates facts of several entities (a

@@ -50,9 +50,9 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::UnknownBlob;
-use crate::blob::Blob;
+use crate::blob::{Blob, BlobEncoding};
 use crate::inline::encodings::hash::Handle;
-use crate::inline::Inline;
+use crate::inline::{Inline, InlineEncoding};
 use crate::patch::Entry;
 use crate::repo::{BlobStoreGet, BlobStoreMeta, Store, StoreRead};
 use crate::trible::Fragment;
@@ -388,6 +388,33 @@ fn publish<S: Store>(
         .map_err(|error| CollectionRealizationError::storage(operation, error))?;
     frontier.include_record(record);
     Ok(())
+}
+
+/// Persist the image before publishing its host-signed MAP. Callers that
+/// continue planning on an operation frontier include the returned record
+/// there; staged upkeep needs only the durable publication.
+fn publish_attachment<S, E>(
+    store: &mut S,
+    signing_key: &SigningKey,
+    attached: CollectionHandle,
+    node: CollectionData,
+    image: Blob<E>,
+) -> Result<CollectionRecord, CollectionRealizationError>
+where
+    S: Store,
+    E: BlobEncoding,
+    Handle<E>: InlineEncoding,
+{
+    let attachment = Handle::<E>::to_hash(image.get_handle());
+    store
+        .put::<E, _>(image)
+        .map_err(|error| CollectionRealizationError::storage("store an attachment", error))?;
+    let record =
+        CollectionRecord::Map(CollectionMap::sign(signing_key, attached, node, attachment));
+    store
+        .insert(record)
+        .map_err(|error| CollectionRealizationError::storage("publish attachment MAP", error))?;
+    Ok(record)
 }
 
 /// Sign exactly eight distinct, canonically ordered nodes. The historical
@@ -939,8 +966,8 @@ where
 /// its budget of failed fetches, and runs the operation again if it asked
 /// for any ([`super::exact_derived`]). Nothing is lost by not waiting: an
 /// attachment is an index of its node and never the only way to read it --
-/// what no taken attachment covers is the reader's residual, read from the
-/// parent's own foundations -- so an absent dependency costs lag, never a
+/// what no taken attachment covers is the reader's named residual -- so an
+/// absent dependency costs lag, never a
 /// wrong or a falsely complete read. The node itself gets no MAP while its
 /// dependency is absent, and its finer nodes are mapped in its place where
 /// their own dependencies are here; each such attachment is complete for its
@@ -1019,21 +1046,9 @@ where
         drop(snapshot);
         match output {
             Ok(output) => {
-                let attachment = data_identity::<M::Target>(&output);
-                store.put::<M::Target, _>(output).map_err(|error| {
-                    CollectionRealizationError::storage("store an attachment", error)
-                })?;
-                publish(
-                    store,
-                    frontier,
-                    CollectionRecord::Map(CollectionMap::sign(
-                        signing_key,
-                        attached.handle(),
-                        node,
-                        attachment,
-                    )),
-                    "publish attachment MAP",
-                )?;
+                let record =
+                    publish_attachment(store, signing_key, attached.handle(), node, output)?;
+                frontier.include_record(record);
                 Ok(true)
             }
             Err(CollectionOperationError::Capacity(_)) => Ok(false),
@@ -1081,26 +1096,19 @@ impl PreparedAttachmentUpkeep {
         let scope = BTreeSet::from([self.parent, self.attached]);
         let host = index_of(&snapshot, &scope)?.host();
         let signer = Inline::new(signing_key.verifying_key().to_bytes());
-        if host != Some(signer) || signer != self.host {
+        if signer != self.host {
+            return Err(CollectionRealizationError::HostMismatch {
+                host: Some(self.host),
+                signer,
+            });
+        }
+        if host != Some(signer) {
             return Err(CollectionRealizationError::HostMismatch { host, signer });
         }
         drop(snapshot);
         let count = self.images.len();
         for (node, image) in self.images {
-            let attachment = Handle::<UnknownBlob>::to_hash(image.get_handle());
-            store.put::<UnknownBlob, _>(image).map_err(|error| {
-                CollectionRealizationError::storage("store bounded attachment", error)
-            })?;
-            store
-                .insert(CollectionRecord::Map(CollectionMap::sign(
-                    signing_key,
-                    self.attached,
-                    node,
-                    attachment,
-                )))
-                .map_err(|error| {
-                    CollectionRealizationError::storage("publish bounded attachment MAP", error)
-                })?;
+            publish_attachment(store, signing_key, self.attached, node, image)?;
         }
         Ok(count)
     }

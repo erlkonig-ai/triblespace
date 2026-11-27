@@ -651,7 +651,7 @@ mod tests {
 
     /// The cover-query equivalence law for BM25 attachments: over random
     /// commits and host merges (overlapping inputs included), with an
-    /// attachment present at random nodes and the residual built in memory,
+    /// attachments at random nodes and explicitly built residual images,
     /// the attached cover scores every query exactly as the index of the
     /// union of every foundation does.
     ///
@@ -855,8 +855,8 @@ mod tests {
     /// The named case: one document present in two nodes, each attached by
     /// a MAP, read back through the attached cover the store selects. The
     /// cover counts the document once, so its document frequency is not
-    /// summed, and the scores are the union's. The same read with one of
-    /// the two nodes left unattached builds it in memory and answers alike.
+    /// summed, and the scores are the union's. Leaving one node unattached
+    /// names a gap; publishing its image makes a fresh stored read complete.
     #[test]
     fn a_document_present_in_two_nodes_is_counted_once() {
         use ed25519_dalek::SigningKey;
