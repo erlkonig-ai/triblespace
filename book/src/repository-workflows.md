@@ -608,17 +608,22 @@ not say whether their source bytes are here. `AttachedSnapshot::read` returns
 only the stored cover and names the entire residual in `AttachedRead::unread`;
 neither generic nor specialized attached reads build an index.
 
-Foreground writers can use `ensure_attached_within` (or the explicit mapping
-and reader variants) to store images and host-signed MAPs for residual
-foundations. Its budget counts the source bytes of successfully prepared
-images, not attempted mappings: missing dependencies stay pending without
-starving later independent foundations. One successful foundation may exceed
-the budget, including a zero budget. This does not bound failed work, mapping
-dependencies, output sizes, or a single oversized input. It does not merge
-foundations into a larger input.
+Foreground writers use the existing `ensure_attached` operation, or its
+`ensure_attached_limited` / `ensure_attached_limited_with` forms with an
+`AttachmentLimit`. The original calls default to `Full`. `SourceBytes(n)`
+counts successfully mapped source bytes across acquisition retries, not failed
+attempts. An oversized merged node is descended to finer nodes. One first
+successful leaf may exceed the limit, including a zero limit, so it cannot
+starve forever. Missing dependencies spend no successful-source allowance.
+This does not bound failed work, mapping dependencies, output sizes, memory or
+a single oversized leaf. Ensure publishes no new merge; ordinary maintenance
+may carry the source before using this same attachment producer.
 
-When mapping runs on an owned blocking worker, `prepare_attached_within` and
-`prepare_attached_within_with` return opaque upkeep work. Join the worker, then
+When mapping runs on an owned blocking worker, `prepare_attached` and
+`prepare_attached_with` run that same producer and return opaque upkeep work.
+The owning async upkeep API uses its existing named-child acquisition loop;
+the staged form instead uses the supplied reader, with no internal retry.
+Join the worker, then
 `publish` through the original writer; no query value is available from the
 prepared work. Publication rechecks the captured host, stores each image before
 its MAP, and leaves completed MAPs valid if later publication fails. Missing

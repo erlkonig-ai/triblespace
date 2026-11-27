@@ -3452,15 +3452,14 @@ mod tests {
             "pending read writes nothing"
         );
         let mut writer = crate::cli::pile::open_refreshed_with(&path, Some(authority)).unwrap();
-        writer
-            .ensure_attached_within(succinct, &signer, u64::MAX)
-            .unwrap();
-        writer
-            .ensure_attached_within(facts, &signer, u64::MAX)
-            .unwrap();
-        writer
-            .ensure_attached_within(latest, &signer, u64::MAX)
-            .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                writer.ensure_attached(succinct, &signer).await.unwrap();
+                writer.ensure_attached(facts, &signer).await.unwrap();
+                writer.ensure_attached(latest, &signer).await.unwrap();
+            });
         writer.close().unwrap();
         let before = std::fs::read(&path).unwrap();
         let frame = reader.sample_at(now_ns).unwrap();

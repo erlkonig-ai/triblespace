@@ -74,6 +74,87 @@ use super::{
 /// base of the tier logarithm.
 pub const MERGE_FAN_IN: usize = super::records::MERGE_INPUTS;
 
+/// Work allowed in one attachment upkeep operation, across acquisition retries.
+/// This bounds successful source bytes, not allocations or dependency/output
+/// bytes. An oversized merged node is descended; one oversized leaf may make
+/// progress when no image has yet succeeded. Failed mappings spend nothing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AttachmentLimit {
+    #[default]
+    Full,
+    SourceBytes(u64),
+}
+
+pub(super) struct AttachmentBudget {
+    limit: AttachmentLimit,
+    spent: u64,
+    completed: usize,
+}
+
+impl AttachmentBudget {
+    pub(super) fn new(limit: AttachmentLimit) -> Self {
+        Self {
+            limit,
+            spent: 0,
+            completed: 0,
+        }
+    }
+
+    fn permits(&self, bytes: u64, has_finer: bool) -> bool {
+        match self.limit {
+            AttachmentLimit::Full => true,
+            AttachmentLimit::SourceBytes(maximum) => {
+                bytes <= maximum.saturating_sub(self.spent) || (self.completed == 0 && !has_finer)
+            }
+        }
+    }
+}
+
+enum AttachmentStep {
+    Deferred,
+    Completed(u64),
+    Rejected(CollectionOperationError),
+}
+
+enum AttachmentImage<T: CollectionEncoding> {
+    Deferred,
+    Ready(u64, Blob<T>),
+    Rejected(CollectionOperationError),
+}
+
+/// The common input-price and mapper boundary. The caller decides whether to
+/// publish immediately or retain opaque work until its blocking task joins.
+fn attachment_image<R, M>(
+    reader: &R,
+    mapping: &M,
+    node: CollectionData,
+    siblings: &[CollectionData],
+    has_finer: bool,
+    budget: &AttachmentBudget,
+) -> Result<AttachmentImage<M::Target>, CollectionRealizationError>
+where
+    R: StoreRead,
+    M: MapMapping,
+{
+    let handle = Handle::<SimpleArchive>::from_hash(node);
+    let Some(metadata) = reader.metadata(handle).map_err(|error| {
+        CollectionRealizationError::storage("inspect a parent node's residency", error)
+    })?
+    else {
+        return Ok(AttachmentImage::Deferred);
+    };
+    if !budget.permits(metadata.length, has_finer) {
+        return Ok(AttachmentImage::Deferred);
+    }
+    let input: Blob<SimpleArchive> = reader.get(handle).map_err(|error| {
+        CollectionRealizationError::storage("load a parent node to attach", error)
+    })?;
+    Ok(match mapping.map(&input, siblings, reader) {
+        Ok(image) => AttachmentImage::Ready(metadata.length, image),
+        Err(error) => AttachmentImage::Rejected(error),
+    })
+}
+
 /// Which tier a node carries in: `floor(log_8 |support|)`.
 fn tier(support: u64) -> u32 {
     support.max(1).ilog(MERGE_FAN_IN as u64)
@@ -992,17 +1073,66 @@ pub(super) fn attach_frontier<S, M>(
     unfetched: &Unfetched,
     wanted: &mut Vec<Vec<CollectionData>>,
     frontier: &mut OperationFrontier<S::Snapshot>,
+    budget: &mut AttachmentBudget,
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store,
     M: MapMapping,
 {
     let planning = open(store, frontier, "open attachment planning snapshot")?;
-    let bound: BoundAttachment<M> = bind_attached(&planning, attached)?;
+    visit_attachments::<_, M, _>(
+        &planning,
+        attached,
+        signing_key,
+        unfetched,
+        wanted,
+        budget,
+        |node, mapping, siblings, has_finer, budget| {
+            let snapshot = open(store, frontier, "open attachment mapping snapshot")?;
+            let image = attachment_image(&snapshot, mapping, node, siblings, has_finer, budget)?;
+            drop(snapshot);
+            Ok(match image {
+                AttachmentImage::Deferred => AttachmentStep::Deferred,
+                AttachmentImage::Rejected(error) => AttachmentStep::Rejected(error),
+                AttachmentImage::Ready(bytes, output) => {
+                    let record =
+                        publish_attachment(store, signing_key, attached.handle(), node, output)?;
+                    frontier.include_record(record);
+                    AttachmentStep::Completed(bytes)
+                }
+            })
+        },
+    )
+}
+
+/// One frontier walk for immediate and staged maintenance. Only the execution
+/// boundary differs; host scope, sibling selection, limits and missing-child
+/// handling are shared. No query value is produced by this operation.
+fn visit_attachments<R, M, F>(
+    planning: &R,
+    attached: Collection<M::Target>,
+    signing_key: &SigningKey,
+    unfetched: &Unfetched,
+    wanted: &mut Vec<Vec<CollectionData>>,
+    budget: &mut AttachmentBudget,
+    mut attempt: F,
+) -> Result<(), CollectionRealizationError>
+where
+    R: StoreRead,
+    M: MapMapping,
+    F: FnMut(
+        CollectionData,
+        &M,
+        &[CollectionData],
+        bool,
+        &AttachmentBudget,
+    ) -> Result<AttachmentStep, CollectionRealizationError>,
+{
+    let bound: BoundAttachment<M> = bind_attached(planning, attached)?;
     let parent = bound.parent.handle();
     let mut scope = BTreeSet::from([parent, attached.handle()]);
     scope.extend(bound.siblings.iter().copied());
-    let index = index_of(&planning, &scope)?;
+    let index = index_of(planning, &scope)?;
     let coverage = index.published().clone();
     let signer = Inline::new(signing_key.verifying_key().to_bytes());
     let host = index.host();
@@ -1010,7 +1140,7 @@ where
     // beneath it often need the same blob, and asking for it once is enough.
     let mut named = BTreeSet::new();
     walk(&coverage, parent, |node, _| {
-        if usable_attachment::<_, M::Target>(&planning, &coverage, attached.handle(), node)?
+        if usable_attachment::<_, M::Target>(planning, &coverage, attached.handle(), node)?
             .is_some()
         {
             return Ok(true);
@@ -1023,44 +1153,31 @@ where
         }
         let mut siblings = Vec::with_capacity(bound.siblings.len());
         for sibling in &bound.siblings {
-            match resident_attachment(&planning, &coverage, *sibling, node)? {
+            match resident_attachment(planning, &coverage, *sibling, node)? {
                 Some(attachment) => siblings.push(attachment),
                 None => return Ok(false),
             }
         }
-        let snapshot = open(store, frontier, "open attachment mapping snapshot")?;
-        let handle = Handle::<SimpleArchive>::from_hash(node);
-        let held = snapshot
-            .metadata(handle)
-            .map_err(|error| {
-                CollectionRealizationError::storage("inspect a parent node's residency", error)
-            })?
-            .is_some();
-        if !held {
-            return Ok(false);
-        }
-        let input: Blob<SimpleArchive> = snapshot.get(handle).map_err(|error| {
-            CollectionRealizationError::storage("load a parent node to attach", error)
-        })?;
-        let output = bound.mapping.map(&input, &siblings, &snapshot);
-        drop(snapshot);
-        match output {
-            Ok(output) => {
-                let record =
-                    publish_attachment(store, signing_key, attached.handle(), node, output)?;
-                frontier.include_record(record);
+        let has_finer = coverage
+            .producers(parent, node)
+            .any(|inputs| inputs.iter().any(|input| input != node));
+        match attempt(node, &bound.mapping, &siblings, has_finer, budget)? {
+            AttachmentStep::Completed(bytes) => {
+                budget.spent = budget.spent.saturating_add(bytes);
+                budget.completed += 1;
                 Ok(true)
             }
-            Err(CollectionOperationError::Capacity(_)) => Ok(false),
+            AttachmentStep::Deferred
+            | AttachmentStep::Rejected(CollectionOperationError::Capacity(_)) => Ok(false),
             // Wanted, and the node descended meanwhile; once asked for and
             // not got, only descended.
-            Err(CollectionOperationError::MissingDependency(member)) => {
+            AttachmentStep::Rejected(CollectionOperationError::MissingDependency(member)) => {
                 if !unfetched.contains(&member) && named.insert(member) {
                     wanted.push(vec![member]);
                 }
                 Ok(false)
             }
-            Err(CollectionOperationError::Fatal(reason)) => {
+            AttachmentStep::Rejected(CollectionOperationError::Fatal(reason)) => {
                 Err(CollectionRealizationError::Derive {
                     input: node,
                     reason,
@@ -1114,131 +1231,75 @@ impl PreparedAttachmentUpkeep {
     }
 }
 
-/// Prepare bounded durable upkeep on one frozen reader, for publication after
+/// Prepare the attachment maintenance pass on one frozen reader, for publication after
 /// an owned blocking task settles. The reader may be an existing acquiring
 /// adapter: only the mapping's explicit dependency reads use that facility.
-/// Resident source bytes alone determine the per-foundation input budget.
-/// A zero budget permits one successful foundation; subsequent inputs must
-/// fit. Failed mappings do not spend this successful-source-byte budget, so a
-/// missing dependency cannot starve later buildable foundations. Attempted
-/// work, output/dependency sizes and a single oversized input are not bounded.
+/// This is the same producer used by `ensure_attached_limited_with`, with
+/// publication deferred until the caller joins its worker. The limit has the
+/// same semantics; missing work remains pending, with no internal acquisition
+/// retry. An acquiring reader can demand the mapping's named dependencies.
 ///
 /// This never publishes or returns a queryable index. Missing input/dependency
 /// work remains pending. Call `publish` on the result, then select afresh.
-pub fn prepare_attached_within_with<M, R>(
+pub fn prepare_attached_with<M, R>(
     reader: &R,
     attached: Collection<M::Target>,
     signing_key: &SigningKey,
-    input_byte_budget: u64,
+    limit: AttachmentLimit,
 ) -> Result<PreparedAttachmentUpkeep, CollectionRealizationError>
 where
     M: MapMapping,
     R: StoreRead,
 {
-    prepare_attached_within_reading::<R, M, R>(
-        attached,
-        signing_key,
-        input_byte_budget,
-        reader,
-        reader,
-    )
-}
-
-/// Prepare bounded durable upkeep through the encoding's canonical mapping.
-/// See [`prepare_attached_within_with`] for budget and publication semantics.
-pub fn prepare_attached_within<T, R>(
-    reader: &R,
-    attached: Collection<T>,
-    signing_key: &SigningKey,
-    input_byte_budget: u64,
-) -> Result<PreparedAttachmentUpkeep, CollectionRealizationError>
-where
-    T: super::CollectionAttachment,
-    R: StoreRead,
-{
-    prepare_attached_within_with::<super::CanonicalAttachment<T>, R>(
-        reader,
-        attached,
-        signing_key,
-        input_byte_budget,
-    )
-}
-
-/// Explicit per-foundation upkeep, bounded by resident source bytes. Control
-/// evidence is frozen in `planning`; only complete images are published.
-pub(super) fn prepare_attached_within_reading<P, M, R>(
-    attached: Collection<M::Target>,
-    signing_key: &SigningKey,
-    input_byte_budget: u64,
-    planning: &P,
-    reader: &R,
-) -> Result<PreparedAttachmentUpkeep, CollectionRealizationError>
-where
-    P: StoreRead,
-    M: MapMapping,
-    R: StoreRead,
-{
-    use super::CollectionSnapshotExt;
-    let bound = bind_attached::<_, M>(planning, attached)?;
-    let selected = planning.attached(attached)?;
-    let mut scope = BTreeSet::from([bound.parent.handle(), attached.handle()]);
-    scope.extend(bound.siblings.iter().copied());
-    let index = index_of(planning, &scope)?;
+    let bound = bind_attached::<_, M>(reader, attached)?;
+    let scope = BTreeSet::from([bound.parent.handle(), attached.handle()]);
+    let index = index_of(reader, &scope)?;
     let signer = Inline::new(signing_key.verifying_key().to_bytes());
     let host = index.host();
     if host != Some(signer) {
         return Err(CollectionRealizationError::HostMismatch { host, signer });
     }
-    let coverage = index.published();
-    let mut spent = 0u64;
     let mut prepared = PreparedAttachmentUpkeep {
         attached: attached.handle(),
         parent: bound.parent.handle(),
         host: signer,
         images: Vec::new(),
     };
-    for foundation in selected.residual().members() {
-        let node = Handle::<SimpleArchive>::to_hash(foundation);
-        let Some(metadata) = planning.metadata(foundation).map_err(|error| {
-            CollectionRealizationError::storage("inspect residual input size", error)
-        })?
-        else {
-            continue;
-        };
-        if !prepared.images.is_empty() && metadata.length > input_byte_budget.saturating_sub(spent)
-        {
-            break;
-        }
-        let mut siblings = Vec::with_capacity(bound.siblings.len());
-        for sibling in &bound.siblings {
-            match resident_attachment(planning, coverage, *sibling, node)? {
-                Some(image) => siblings.push(image),
-                None => break,
-            }
-        }
-        if siblings.len() != bound.siblings.len() {
-            continue;
-        }
-        let input: Blob<SimpleArchive> = planning.get(foundation).map_err(|error| {
-            CollectionRealizationError::storage("read residual upkeep input", error)
-        })?;
-        let output = match bound.mapping.map(&input, &siblings, reader) {
-            Ok(output) => output,
-            Err(
-                CollectionOperationError::Capacity(_)
-                | CollectionOperationError::MissingDependency(_),
-            ) => continue,
-            Err(CollectionOperationError::Fatal(reason)) => {
-                return Err(CollectionRealizationError::Derive {
-                    input: node,
-                    reason,
-                });
-            }
-        };
-        spent = spent.saturating_add(metadata.length);
-        prepared.images.push((node, output.transmute()));
-    }
+    visit_attachments::<_, M, _>(
+        reader,
+        attached,
+        signing_key,
+        &Unfetched::default(),
+        &mut Vec::new(),
+        &mut AttachmentBudget::new(limit),
+        |node, mapping, siblings, has_finer, budget| {
+            Ok(
+                match attachment_image(reader, mapping, node, siblings, has_finer, budget)? {
+                    AttachmentImage::Deferred => AttachmentStep::Deferred,
+                    AttachmentImage::Rejected(error) => AttachmentStep::Rejected(error),
+                    AttachmentImage::Ready(bytes, image) => {
+                        prepared.images.push((node, image.transmute()));
+                        AttachmentStep::Completed(bytes)
+                    }
+                },
+            )
+        },
+    )?;
     Ok(prepared)
+}
+
+/// The canonical mapping form of [`prepare_attached_with`].
+pub fn prepare_attached<T, R>(
+    reader: &R,
+    attached: Collection<T>,
+    signing_key: &SigningKey,
+    limit: AttachmentLimit,
+) -> Result<PreparedAttachmentUpkeep, CollectionRealizationError>
+where
+    T: super::CollectionAttachment,
+    R: StoreRead,
+{
+    prepare_attached_with::<super::CanonicalAttachment<T>, R>(reader, attached, signing_key, limit)
 }
 
 /// One mapping bound to its target and its immediate source.

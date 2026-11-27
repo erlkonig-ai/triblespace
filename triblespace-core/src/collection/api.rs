@@ -1788,14 +1788,7 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         Self: Store + AsyncBlobStoreAcquire + Send,
         Handle<M::Target>: InlineEncoding,
     {
-        async move {
-            super::exact_derived::acquire_attached_lineage(self, attached).await?;
-            super::exact_derived::attach_acquiring_with::<Self, M>(self, attached, signing_key)
-                .await?;
-            self.snapshot().map_err(|error| {
-                CollectionRealizationError::storage("freeze post-attach snapshot", error)
-            })
-        }
+        self.ensure_attached_limited_with::<M>(attached, signing_key, super::AttachmentLimit::Full)
     }
 
     /// Maintain one attached collection: carry its parent first, then give
@@ -1835,102 +1828,67 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
             let (parent, _, _) = super::maintenance::attached_lineage(&snapshot, attached)?;
             drop(snapshot);
             realize_root(self, parent, signing_key, true).await?;
-            super::exact_derived::attach_acquiring_with::<Self, M>(self, attached, signing_key)
-                .await?;
+            super::exact_derived::attach_acquiring_with::<Self, M>(
+                self,
+                attached,
+                signing_key,
+                super::AttachmentLimit::Full,
+            )
+            .await?;
             self.snapshot().map_err(|error| {
                 CollectionRealizationError::storage("freeze post-attach snapshot", error)
             })
         }
     }
 
-    /// Durably attach a bounded prefix of resident residual foundations.
-    /// This never carries or maps a merged node. The budget counts source bytes
-    /// of successfully prepared images; a missing dependency does not spend it.
-    /// The first success may exceed `input_byte_budget`, so even a zero budget
-    /// can make progress. Attempted work, dependency/output bytes, memory and
-    /// a single oversized input are not bounded by this policy.
-    ///
-    /// Missing inputs or siblings remain residual. Successful images and their
-    /// host-signed MAPs are stored before returning their count. A later failure
-    /// does not undo earlier completed attachments. Read a fresh snapshot to
-    /// observe them; an earlier read is unchanged. No acquisition is performed.
-    fn ensure_attached_within<T>(
-        &mut self,
+    /// The existing durable attachment operation with an explicit work limit.
+    /// No new merge is published. Oversized merged inputs descend to finer
+    /// nodes; the first successful leaf may exceed a source-byte limit, so a
+    /// single large leaf is not permanently starved. Missing work spends no
+    /// successful-source budget. The same budget survives acquisition retries.
+    /// This is not a memory, output-byte or failed-work bound.
+    fn ensure_attached_limited<'a, T>(
+        &'a mut self,
         attached: Collection<T>,
-        signing_key: &SigningKey,
-        input_byte_budget: u64,
-    ) -> Result<usize, CollectionRealizationError>
+        signing_key: &'a SigningKey,
+        limit: super::AttachmentLimit,
+    ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + 'a
     where
         T: CollectionAttachment,
-        Self: Store,
+        Self: Store + AsyncBlobStoreAcquire + Send,
         Handle<T>: InlineEncoding,
     {
-        self.ensure_attached_within_with::<CanonicalAttachment<T>>(
-            attached,
-            signing_key,
-            input_byte_budget,
-        )
+        self.ensure_attached_limited_with::<CanonicalAttachment<T>>(attached, signing_key, limit)
     }
 
-    /// Bounded durable upkeep through an explicit mapping.
-    fn ensure_attached_within_with<M>(
-        &mut self,
+    /// [`Self::ensure_attached_limited`] through an explicit mapping.
+    /// Mapping runs synchronously within each poll, as with unbounded upkeep;
+    /// callers offloading that CPU work use the same producer through
+    /// [`super::prepare_attached_with`], join it, then publish on their writer.
+    fn ensure_attached_limited_with<'a, M>(
+        &'a mut self,
         attached: Collection<M::Target>,
-        signing_key: &SigningKey,
-        input_byte_budget: u64,
-    ) -> Result<usize, CollectionRealizationError>
+        signing_key: &'a SigningKey,
+        limit: super::AttachmentLimit,
+    ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + 'a
     where
         M: MapMapping,
-        Self: Store,
+        Self: Store + AsyncBlobStoreAcquire + Send,
         Handle<M::Target>: InlineEncoding,
     {
-        let snapshot = self.snapshot().map_err(|error| {
-            CollectionRealizationError::storage("observe bounded attachment upkeep", error)
-        })?;
-        let prepared = super::maintenance::prepare_attached_within_reading::<_, M, _>(
-            attached,
-            signing_key,
-            input_byte_budget,
-            &snapshot,
-            &snapshot,
-        )?;
-        drop(snapshot);
-        prepared.publish(self, signing_key)
-    }
-
-    /// Bounded durable upkeep whose mapping reads dependencies through an
-    /// explicit frozen reader. An existing acquiring reader can request those
-    /// named bytes. No retry or acquisition engine is introduced here.
-    ///
-    /// Selection, host identity and resident source-byte budgeting come from
-    /// the store's own frozen snapshot; `reader` supplies only the mapping's
-    /// immutable dependency reads. Its owner/runtime must remain alive, and a
-    /// synchronous acquiring reader must run outside an async executor task.
-    fn ensure_attached_within_reading<M, R>(
-        &mut self,
-        attached: Collection<M::Target>,
-        signing_key: &SigningKey,
-        input_byte_budget: u64,
-        reader: &R,
-    ) -> Result<usize, CollectionRealizationError>
-    where
-        M: MapMapping,
-        R: StoreRead,
-        Self: Store,
-        Handle<M::Target>: InlineEncoding,
-    {
-        let snapshot = self.snapshot().map_err(|error| {
-            CollectionRealizationError::storage("observe bounded attachment upkeep", error)
-        })?;
-        let prepared = super::maintenance::prepare_attached_within_reading::<_, M, R>(
-            attached,
-            signing_key,
-            input_byte_budget,
-            &snapshot,
-            reader,
-        )?;
-        drop(snapshot);
-        prepared.publish(self, signing_key)
+        async move {
+            super::exact_derived::acquire_attached_lineage(self, attached).await?;
+            super::exact_derived::attach_acquiring_with::<Self, M>(
+                self,
+                attached,
+                signing_key,
+                limit,
+            )
+            .await?;
+            self.snapshot().map_err(|error| {
+                CollectionRealizationError::storage("freeze post-attach snapshot", error)
+            })
+        }
     }
 
     /// Ensure one collection for the key: "derive what you wrote".

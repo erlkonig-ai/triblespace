@@ -12,7 +12,7 @@
 //! [`registered_targets`] lists the collections a store's records name whose
 //! algorithm a registration runs. A collection is named by a record once it
 //! has one: an attached collection from its first durable `MAP` (for example,
-//! through [`super::CollectionStoreExt::ensure_attached_within`]), a derived
+//! through [`super::CollectionStoreExt::ensure_attached`]), a derived
 //! one from its first leaf. Ordinary attached reads publish no records.
 //!
 //! A mapping may need what only some hosts have, a bound model say; its

@@ -1003,7 +1003,13 @@ mod tests {
         );
         assert_eq!(read.value().query().unwrap().doc_count(), 0);
 
-        assert_eq!(store.ensure_attached_within(target, &key, 0).unwrap(), 0);
+        let pending = futures::executor::block_on(store.ensure_attached_limited(
+            target,
+            &key,
+            triblespace_core::collection::AttachmentLimit::SourceBytes(0),
+        ))
+        .unwrap();
+        assert_eq!(pending.attached(target).unwrap().residual().len(), 1);
         store.put::<UTF8String, _>(text).unwrap();
         let arrived = store
             .snapshot()
@@ -1014,7 +1020,12 @@ mod tests {
             .unwrap();
         assert_eq!(arrived.unread().len(), 1, "arrival does not build an index");
         assert_eq!(arrived.value().query().unwrap().doc_count(), 0);
-        assert_eq!(store.ensure_attached_within(target, &key, 0).unwrap(), 1);
+        futures::executor::block_on(store.ensure_attached_limited(
+            target,
+            &key,
+            triblespace_core::collection::AttachmentLimit::SourceBytes(0),
+        ))
+        .unwrap();
         let after = store.snapshot().unwrap();
         assert!(
             !attached.is_current(&after),

@@ -6690,6 +6690,9 @@ mod attach_dependencies {
             &Unfetched::default(),
             &mut wanted,
             &mut frontier,
+            &mut crate::collection::maintenance::AttachmentBudget::new(
+                crate::collection::AttachmentLimit::Full,
+            ),
         )
         .unwrap();
         drop(frontier);
@@ -6719,6 +6722,7 @@ mod attach_dependencies {
             &mut holders,
             attached,
             &host(),
+            crate::collection::AttachmentLimit::Full,
         ))
         .unwrap();
         assert_eq!(holders.asked.len(), 3, "each absence asked once");
@@ -6738,6 +6742,7 @@ mod attach_dependencies {
             &mut holders,
             attached,
             &host(),
+            crate::collection::AttachmentLimit::Full,
         ))
         .unwrap();
         let mut asked = holders.asked.clone();
@@ -6751,6 +6756,41 @@ mod attach_dependencies {
             "every dependency was asked for before any node was attached"
         );
         assert_eq!(holders.maps, 3);
+        assert!(residual(&mut holders.inner, attached).is_empty());
+    }
+
+    #[test]
+    fn attachment_source_budget_survives_dependency_acquisition_retries() {
+        let (store, _, attached, payloads) = rooted(2);
+        let mut holders = Holders::new(store);
+        for payload in &payloads {
+            holders.offer(&witness(payload));
+        }
+        block_on(attach_acquiring_with::<_, Witnessed>(
+            &mut holders,
+            attached,
+            &host(),
+            crate::collection::AttachmentLimit::SourceBytes(0),
+        ))
+        .unwrap();
+        assert_eq!(
+            holders.asked.len(),
+            2,
+            "both missing dependencies were acquired"
+        );
+        assert_eq!(
+            holders.maps, 1,
+            "retry does not reset the first-success allowance"
+        );
+        assert_eq!(residual(&mut holders.inner, attached).len(), 1);
+        block_on(attach_acquiring_with::<_, Witnessed>(
+            &mut holders,
+            attached,
+            &host(),
+            crate::collection::AttachmentLimit::SourceBytes(0),
+        ))
+        .unwrap();
+        assert_eq!(holders.maps, 2);
         assert!(residual(&mut holders.inner, attached).is_empty());
     }
 
@@ -6768,6 +6808,7 @@ mod attach_dependencies {
                 &mut holders,
                 attached,
                 &host(),
+                crate::collection::AttachmentLimit::Full,
             ))
             .unwrap();
             assert_eq!(holders.asked.len(), OPTIONAL_FETCH_FAILURES);
@@ -6813,6 +6854,7 @@ mod attach_dependencies {
             &mut holders,
             attached,
             &host(),
+            crate::collection::AttachmentLimit::Full,
         ))
         .unwrap();
         assert_eq!(holders.asked, vec![data(&witness(&merged_payload))]);
@@ -6829,6 +6871,7 @@ mod attach_dependencies {
             &mut holders,
             attached,
             &host(),
+            crate::collection::AttachmentLimit::Full,
         ))
         .unwrap();
         assert_eq!(holders.maps, MERGE_FAN_IN + 1, "the merged node attached");

@@ -42,6 +42,40 @@ fn other() -> SigningKey {
     SigningKey::from_bytes(&[92; 32])
 }
 
+/// Count durable MAP additions, not a producer's reported work count.
+fn upkeep_with<M: super::MapMapping>(
+    store: &mut MemoryRepo,
+    target: Collection<M::Target>,
+    key: &SigningKey,
+    bytes: u64,
+) -> Result<usize, CollectionRealizationError> {
+    let maps = |store: &mut MemoryRepo| {
+        store
+            .snapshot()
+            .unwrap()
+            .records()
+            .unwrap()
+            .filter(|record| matches!(record, Ok(CollectionRecord::Map(_))))
+            .count()
+    };
+    let before = maps(store);
+    block_on(store.ensure_attached_limited_with::<M>(
+        target,
+        key,
+        super::AttachmentLimit::SourceBytes(bytes),
+    ))?;
+    Ok(maps(store) - before)
+}
+
+fn upkeep<T: CollectionAttachment>(
+    store: &mut MemoryRepo,
+    target: Collection<T>,
+    key: &SigningKey,
+    bytes: u64,
+) -> Result<usize, CollectionRealizationError> {
+    upkeep_with::<super::CanonicalAttachment<T>>(store, target, key, bytes)
+}
+
 fn policy() -> CollectionPolicy {
     CollectionPolicy::new(
         AdmissionPolicy::direct(host().verifying_key()),
@@ -658,12 +692,7 @@ fn a_register_read_waits_for_durable_upkeep() {
         store.snapshot().unwrap().records().unwrap().count(),
         snapshot.records().unwrap().count()
     );
-    assert_eq!(
-        store
-            .ensure_attached_within(register, &host(), u64::MAX)
-            .unwrap(),
-        1
-    );
+    assert_eq!(upkeep(&mut store, register, &host(), u64::MAX).unwrap(), 1);
     let after = store.snapshot().unwrap();
     let complete = after
         .attached(register)
@@ -707,12 +736,7 @@ fn a_register_nothing_attached_is_pending_until_upkeep() {
     let read = attached.read::<LwwIndex>().unwrap();
     assert_eq!(read.unread().len(), 3);
     assert_eq!(read.value().query().unwrap().winner(id(100)), None);
-    assert_eq!(
-        store
-            .ensure_attached_within(register, &host(), u64::MAX)
-            .unwrap(),
-        3
-    );
+    assert_eq!(upkeep(&mut store, register, &host(), u64::MAX).unwrap(), 3);
     let fresh = store
         .snapshot()
         .unwrap()
@@ -747,24 +771,9 @@ fn a_read_through_a_mapping_with_siblings_names_its_residual_unread() {
     let facts = succinctarchive_union::read_attached(&attached).unwrap();
     assert_eq!(facts.unread().len(), 1);
     assert_eq!(facts.value().iter().count(), 0);
-    assert_eq!(
-        store
-            .ensure_attached_within(rank9, &host(), u64::MAX)
-            .unwrap(),
-        0
-    );
-    assert_eq!(
-        store
-            .ensure_attached_within(succinct, &host(), u64::MAX)
-            .unwrap(),
-        1
-    );
-    assert_eq!(
-        store
-            .ensure_attached_within(rank9, &host(), u64::MAX)
-            .unwrap(),
-        1
-    );
+    assert_eq!(upkeep(&mut store, rank9, &host(), u64::MAX).unwrap(), 0);
+    assert_eq!(upkeep(&mut store, succinct, &host(), u64::MAX).unwrap(), 1);
+    assert_eq!(upkeep(&mut store, rank9, &host(), u64::MAX).unwrap(), 1);
     let after = store.snapshot().unwrap().attached(rank9).unwrap();
     let persisted = succinctarchive_union::read_attached(&after).unwrap();
     assert!(persisted.unread().is_empty());
@@ -1337,9 +1346,7 @@ where
     T: CollectionAttachment,
     V: TryFromCover<T>,
 {
-    store
-        .ensure_attached_within(attached, &host(), u64::MAX)
-        .unwrap();
+    upkeep(store, attached, &host(), u64::MAX).unwrap();
     let snapshot = store.snapshot().unwrap();
     let read = snapshot.attached(attached).unwrap().read::<V>().unwrap();
     assert!(read.unread().is_empty());
@@ -1448,14 +1455,8 @@ fn rank9_covers_answer_like_the_union() {
             through_union.iter().collect::<TribleSet>(),
             "seed {seed}"
         );
-        lattice
-            .store
-            .ensure_attached_within(succinct, &host(), u64::MAX)
-            .unwrap();
-        lattice
-            .store
-            .ensure_attached_within(attached, &host(), u64::MAX)
-            .unwrap();
+        upkeep(&mut lattice.store, succinct, &host(), u64::MAX).unwrap();
+        upkeep(&mut lattice.store, attached, &host(), u64::MAX).unwrap();
         let snapshot = lattice.store.snapshot().unwrap();
         let read =
             succinctarchive_union::read_attached(&snapshot.attached(attached).unwrap()).unwrap();
@@ -1761,10 +1762,7 @@ fn bounded_upkeep_is_the_next_reads_cover() {
             .len(),
         3
     );
-    assert_eq!(
-        store.ensure_attached_within(attached, &host(), 0).unwrap(),
-        1
-    );
+    assert_eq!(upkeep(&mut store, attached, &host(), 0).unwrap(), 1);
     let after = store.snapshot().unwrap();
     assert!(after.collections().unwrap().contains(&attached.handle()));
     let first = after.attached(attached).unwrap();
@@ -1774,9 +1772,7 @@ fn bounded_upkeep_is_the_next_reads_cover() {
         order[1..]
     );
     assert_eq!(
-        store
-            .ensure_attached_within(attached, &host(), lengths[1])
-            .unwrap(),
+        upkeep(&mut store, attached, &host(), lengths[1]).unwrap(),
         1
     );
     assert_eq!(
@@ -1789,16 +1785,8 @@ fn bounded_upkeep_is_the_next_reads_cover() {
             .len(),
         1
     );
-    assert_eq!(
-        store
-            .ensure_attached_within(attached, &host(), u64::MAX)
-            .unwrap(),
-        1
-    );
-    assert_eq!(
-        store.ensure_attached_within(attached, &host(), 0).unwrap(),
-        0
-    );
+    assert_eq!(upkeep(&mut store, attached, &host(), u64::MAX).unwrap(), 1);
+    assert_eq!(upkeep(&mut store, attached, &host(), 0).unwrap(), 0);
     let last = store
         .snapshot()
         .unwrap()
@@ -1817,6 +1805,38 @@ fn bounded_upkeep_is_the_next_reads_cover() {
     );
 }
 
+#[test]
+fn bounded_maintenance_descends_an_oversized_merge_and_advances_large_leaves() {
+    let (mut store, root, attached) = succinct_root("bounded-frontier");
+    let foundations: BTreeSet<_> = (1..=8)
+        .map(|n| commit(&mut store, root, row(n, 1, 1)))
+        .collect();
+    block_on(store.maintain(root, &host())).unwrap();
+    let before = store.snapshot().unwrap();
+    let coverage = CoverageRead::coverage(&before, &BTreeSet::from([root.handle()])).unwrap();
+    let merged: Vec<_> = coverage.frontier(root.handle()).collect();
+    assert_eq!(merged.len(), 1);
+    assert!(!foundations.contains(&merged[0]));
+    for left in (0..8).rev() {
+        // Even at zero bytes, one leaf advances; the oversized merge itself
+        // is never built under this policy, including after all leaves exist.
+        assert_eq!(upkeep(&mut store, attached, &host(), 0).unwrap(), 1);
+        let snapshot = store.snapshot().unwrap();
+        assert_eq!(snapshot.attached(attached).unwrap().residual().len(), left);
+        for record in snapshot.records().unwrap() {
+            if let CollectionRecord::Map(map) = record.unwrap() {
+                assert!(foundations.contains(&map.node()));
+            }
+        }
+    }
+    assert_eq!(upkeep(&mut store, attached, &host(), 0).unwrap(), 0);
+    assert_eq!(before.attached(attached).unwrap().residual().len(), 8);
+    // The unchanged default still maps the frontier when explicitly asked.
+    let full = block_on(store.ensure_attached(attached, &host())).unwrap();
+    assert_eq!(full.attached(attached).unwrap().cover().len(), 1);
+    assert!(full.attached(attached).unwrap().residual().is_empty());
+}
+
 /// No query value exists between preparing writer work and publishing it.
 /// Concurrent arrivals stay pending; replay is idempotent and the host is
 /// checked again at publication, before any bytes or MAPs are stored.
@@ -1826,8 +1846,13 @@ fn staged_upkeep_requires_publication_and_preserves_scope() {
     commit(&mut store, root, row(1, 2, 3));
     let snapshot = store.snapshot().unwrap();
     let prepare = || {
-        super::prepare_attached_within::<SuccinctArchiveBlob, _>(&snapshot, attached, &host(), 0)
-            .unwrap()
+        super::prepare_attached::<SuccinctArchiveBlob, _>(
+            &snapshot,
+            attached,
+            &host(),
+            super::AttachmentLimit::SourceBytes(0),
+        )
+        .unwrap()
     };
     assert_eq!(
         store
@@ -1889,7 +1914,7 @@ fn bounded_upkeep_with_another_host_stores_nothing() {
     let raw = succinctarchive_union::derive_element(&row(1, 1, 1).to_blob()).unwrap();
     let before = store.snapshot().unwrap().records().unwrap().count();
     assert!(matches!(
-        store.ensure_attached_within(attached, &other(), u64::MAX),
+        upkeep(&mut store, attached, &other(), u64::MAX),
         Err(CollectionRealizationError::HostMismatch { .. })
     ));
     let snapshot = store.snapshot().unwrap();
@@ -1942,10 +1967,7 @@ fn stored_reads_do_not_invoke_even_a_resident_residual_mapping() {
         assert_eq!(read.unread().len(), 1);
         assert_eq!(read.value().iter().count(), 0);
     }
-    assert_eq!(
-        store.ensure_attached_within(attached, &host(), 0).unwrap(),
-        1
-    );
+    block_on(store.ensure_attached(attached, &host())).unwrap();
     let fresh = store
         .snapshot()
         .unwrap()
@@ -1997,9 +2019,7 @@ fn missing_first_dependency_does_not_starve_bounded_durable_progress() {
         .collect();
     HOLE.set(Some(order[0]));
     assert_eq!(
-        store
-            .ensure_attached_within_with::<Hole>(attached, &host(), 0)
-            .unwrap(),
+        upkeep_with::<Hole>(&mut store, attached, &host(), 0).unwrap(),
         1
     );
     let fresh = store.snapshot().unwrap().attached(attached).unwrap();
@@ -2009,16 +2029,12 @@ fn missing_first_dependency_does_not_starve_bounded_durable_progress() {
     );
     assert_eq!(fresh.cover().len(), 1);
     assert_eq!(
-        store
-            .ensure_attached_within_with::<Hole>(attached, &host(), 0)
-            .unwrap(),
+        upkeep_with::<Hole>(&mut store, attached, &host(), 0).unwrap(),
         0
     );
     HOLE.set(None);
     assert_eq!(
-        store
-            .ensure_attached_within_with::<Hole>(attached, &host(), 0)
-            .unwrap(),
+        upkeep_with::<Hole>(&mut store, attached, &host(), 0).unwrap(),
         1
     );
     let done = store
@@ -2060,9 +2076,7 @@ fn a_registration_finds_and_maintains_what_the_records_name() {
 
     drop(snapshot);
     assert_eq!(
-        store
-            .ensure_attached_within_with::<Read>(attached, &host(), 0)
-            .unwrap(),
+        upkeep_with::<Read>(&mut store, attached, &host(), 0).unwrap(),
         1
     );
 

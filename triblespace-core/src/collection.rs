@@ -101,7 +101,8 @@ pub use exact_derived::CollectionRealizationError;
 pub use generation::*;
 pub use held::{HeldBlobs, HeldRead, HeldStore, HeldWork};
 pub use maintenance::{
-    prepare_attached_within, prepare_attached_within_with, PreparedAttachmentUpkeep, MERGE_FAN_IN,
+    prepare_attached, prepare_attached_with, AttachmentLimit, PreparedAttachmentUpkeep,
+    MERGE_FAN_IN,
 };
 pub use policy::*;
 pub use records::*;

@@ -393,7 +393,7 @@ where
     }
 
     /// Validate the named mapping, then read only persisted attachments.
-    /// Use `ensure_attached_within_with` on the owning store for bounded
+    /// Use `ensure_attached_limited_with` on the owning store for bounded
     /// durable construction, and take a fresh observation after it finishes.
     pub fn read_with<M, V>(
         &self,

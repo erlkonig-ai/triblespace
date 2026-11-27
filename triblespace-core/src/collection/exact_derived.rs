@@ -1052,11 +1052,13 @@ pub(crate) async fn attach_acquiring_with<S, M>(
     store: &mut S,
     attached: Collection<M::Target>,
     signing_key: &SigningKey,
+    limit: super::AttachmentLimit,
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store + AsyncBlobStoreAcquire,
     M: MapMapping,
 {
+    let mut budget = super::maintenance::AttachmentBudget::new(limit);
     acquiring(store, |store, unfetched, wanted, frontier| {
         super::maintenance::attach_frontier::<S, M>(
             store,
@@ -1065,6 +1067,7 @@ where
             unfetched,
             wanted,
             frontier,
+            &mut budget,
         )
     })
     .await
