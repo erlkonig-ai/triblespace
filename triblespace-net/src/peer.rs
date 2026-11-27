@@ -148,6 +148,10 @@ enum HostState {
     Running,
     /// Startup is attempted once per peer. Local operations remain available.
     Failed(String),
+    /// Resident only, by construction ([`Peer::local`]): no host exists or
+    /// ever starts. A blob that is not here is missing, at once; explicit
+    /// network operations are refused.
+    LocalOnly,
     Closed,
 }
 
@@ -165,6 +169,11 @@ impl<R> SharedHost<R> {
             HostState::Running => return Ok(()),
             HostState::Failed(error) => {
                 return Err(PeerOpenError::HostStartup(anyhow::anyhow!(error.clone())));
+            }
+            HostState::LocalOnly => {
+                return Err(PeerOpenError::HostStartup(anyhow::anyhow!(
+                    "peer is local-only"
+                )));
             }
             HostState::Closed => {
                 return Err(PeerOpenError::HostStartup(anyhow::anyhow!(
@@ -573,6 +582,27 @@ where
         Self::assemble_shared(store, sender, receiver, None, HostState::Dormant(startup))
     }
 
+    /// A resident-only peer: no host is wired to a network, none ever
+    /// starts, and nothing is dialled or discovered.
+    ///
+    /// Resident reads, snapshots, local writes, flush, and close behave as on
+    /// a [`lazy`](Self::lazy) peer. A blob that is not here is missing at
+    /// once: [`acquire`](Self::acquire) answers `Ok(None)` and a snapshot's
+    /// [`get`](PeerSnapshot::get) [`PeerGetError::Missing`], without waiting.
+    /// Explicit network operations (collection activation, exact fetches)
+    /// are refused as they are on a closed peer, and
+    /// [`acquires_remotely`](AsyncBlobStoreAcquire::acquires_remotely) is
+    /// `false`, so a miss says only that the bytes are not here.
+    ///
+    /// [`id`](Self::id) names a fresh key no endpoint binds: there is no
+    /// network identity to choose.
+    pub fn local(store: S) -> Self {
+        let key = SigningKey::from_bytes(&rand::random());
+        let id = crate::identity::iroh_secret(&key).public().into();
+        let (sender, receiver, _wiring) = host::wire(id);
+        Self::assemble(store, sender, receiver, None, HostState::LocalOnly)
+    }
+
     /// Attach a store to a caller-owned host, most commonly the deterministic
     /// simulator.
     pub fn with_wiring(store: S, sender: NetSender<S::Snapshot>, receiver: NetReceiver) -> Self {
@@ -635,6 +665,15 @@ where
 
     fn start_host(&mut self) -> Result<(), PeerOpenError> {
         self.host.lock().expect("host mutex").start()
+    }
+
+    /// Whether this peer was built resident-only ([`Self::local`]) and has
+    /// not been closed since.
+    pub(crate) fn is_local(&self) -> bool {
+        matches!(
+            self.host.lock().expect("host mutex").state,
+            HostState::LocalOnly
+        )
     }
 
     fn host_is_running(&self) -> bool {
@@ -1205,9 +1244,10 @@ where
         Peer::acquire(self, handle)
     }
 
-    /// A peer asks the network for what is not here.
+    /// A peer asks the network for what is not here, unless it is
+    /// [`local`](Peer::local).
     fn acquires_remotely(&self) -> bool {
-        true
+        !self.is_local()
     }
 }
 
@@ -2400,6 +2440,96 @@ mod tests {
             1
         );
         peer.close().unwrap();
+    }
+
+    /// A local peer reads and writes what is here, answers a miss as
+    /// missing at once, refuses the network, and closes like any peer.
+    #[test]
+    fn a_local_peer_answers_misses_as_missing_and_never_starts_a_host() {
+        use triblespace_core::repo::is_missing_blob;
+
+        let bytes = Bytes::from_source(b"resident local bytes".to_vec());
+        let mut store = MemoryRepo::default();
+        let resident = store.put::<UnknownBlob, _>(bytes.clone()).unwrap();
+        let collection = store
+            .collection(
+                "local-only",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap()
+            .handle();
+        let missing = MemoryRepo::default()
+            .put::<UnknownBlob, _>(Bytes::from_source(b"elsewhere".to_vec()))
+            .unwrap();
+        let mut peer = Peer::local(store);
+        let local = |peer: &Peer<MemoryRepo>| {
+            matches!(peer.host.lock().unwrap().state, HostState::LocalOnly)
+                && peer.host.lock().unwrap().started.is_none()
+                && peer.bound_sockets().is_empty()
+        };
+        assert!(!peer.acquires_remotely());
+
+        // Resident bytes and later local writes read as on any peer.
+        assert_eq!(
+            futures::executor::block_on(peer.acquire(resident)).unwrap(),
+            Some(bytes)
+        );
+        let later = peer
+            .put::<UnknownBlob, _>(Bytes::from_source(b"written here".to_vec()))
+            .unwrap();
+        let snapshot = peer.snapshot().unwrap();
+        assert!(snapshot.contains_blob(later).unwrap());
+
+        // A miss is missing, from the writer and from a snapshot.
+        assert_eq!(
+            futures::executor::block_on(peer.acquire(missing)).unwrap(),
+            None
+        );
+        let error =
+            futures::executor::block_on(snapshot.get::<Bytes, UnknownBlob>(missing)).unwrap_err();
+        assert!(matches!(error, PeerGetError::Missing(_)), "{error}");
+        assert!(is_missing_blob(&error));
+        assert!(local(&peer));
+
+        // Explicit network operations are refused, and start nothing.
+        let refused = peer.start_host().unwrap_err();
+        assert!(refused.to_string().contains("local-only"), "{refused}");
+        assert_eq!(
+            futures::executor::block_on(peer.fetch_blob(missing.raw)),
+            None
+        );
+        peer.activate_collection(collection);
+        assert!(peer.sender.current_snapshot().is_none());
+        assert_eq!(peer.serving_snapshot_rebuilds(), 0);
+        assert!(local(&peer));
+
+        // Shutdown closes it; a closed peer is no longer local.
+        peer.shutdown_and_join().unwrap();
+        assert!(matches!(peer.host.lock().unwrap().state, HostState::Closed));
+        assert!(peer.acquires_remotely());
+        let closed = futures::executor::block_on(peer.acquire(missing)).unwrap_err();
+        assert!(closed.to_string().contains("closed"), "{closed}");
+        assert!(peer.snapshot().unwrap().contains_blob(later).unwrap());
+        peer.close().unwrap();
+    }
+
+    #[test]
+    fn a_local_leech_acquires_nothing_it_does_not_hold() {
+        let mut leech = Leech::local(MemoryRepo::default());
+        let missing = MemoryRepo::default()
+            .put::<UnknownBlob, _>(Bytes::from_source(b"elsewhere".to_vec()))
+            .unwrap();
+        assert!(!AsyncBlobStoreAcquire::acquires_remotely(&leech));
+        assert_eq!(
+            futures::executor::block_on(leech.acquire(missing)).unwrap(),
+            None
+        );
+        assert!(matches!(
+            leech.peer.host.lock().unwrap().state,
+            HostState::LocalOnly
+        ));
+        leech.shutdown_and_join().unwrap();
+        leech.close().unwrap();
     }
 
     #[test]

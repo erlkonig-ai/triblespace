@@ -15,7 +15,10 @@ use super::*;
 /// endpoint-bound bearer exchange and requested-handle verification. Neither H
 /// nor a local L-to-H mapping is exposed as a public inventory.
 ///
-/// Construction is deliberately dormant, with no conversion from an arbitrary
+/// A [`local`](Self::local) leech has no network at all: a blob that is not
+/// here is missing at once, and nothing ever starts a host.
+///
+/// Construction is deliberately dormant or local, with no conversion from an arbitrary
 /// running peer and no mutable access to its serving controls. A zero publication
 /// budget on an ordinary peer, or a pile that selects no collection, is not this
 /// boundary: those peers still serve their resident inventory.
@@ -56,6 +59,14 @@ where
         }
     }
 
+    /// A resident-only leech that never starts a host, dials, or discovers
+    /// ([`Peer::local`]): exact misses answer `Ok(None)` at once.
+    pub fn local(store: S) -> Self {
+        Self {
+            peer: Peer::local(store),
+        }
+    }
+
     pub fn id(&self) -> EndpointId {
         self.peer.id()
     }
@@ -71,7 +82,8 @@ where
     }
 
     /// Stop and join a started exact-acquisition host before closing storage.
-    /// A dormant leech stays dormant; retained readers cannot start it later.
+    /// A dormant or local leech starts nothing; retained readers cannot start
+    /// it later.
     pub fn shutdown_and_join(&mut self) -> anyhow::Result<()> {
         self.peer.shutdown_and_join()
     }
@@ -152,9 +164,10 @@ where
         Leech::acquire(self, handle)
     }
 
-    /// A leech asks the network for what is not here.
+    /// A leech asks the network for what is not here, unless it is
+    /// [`local`](Leech::local).
     fn acquires_remotely(&self) -> bool {
-        true
+        !self.peer.is_local()
     }
 }
 

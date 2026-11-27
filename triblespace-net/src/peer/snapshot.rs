@@ -24,7 +24,7 @@ use triblespace_core::repo::{
     StoreSnapshot, WantRead,
 };
 
-use super::{Latest, PeerAcquireError, SharedHost};
+use super::{HostState, Latest, PeerAcquireError, SharedHost};
 use crate::host::INTERACTIVE_FETCH_DEADLINE;
 use crate::protocol::RawHash;
 
@@ -216,6 +216,10 @@ where
                 .upgrade()
                 .ok_or_else(|| PeerAcquireError("peer is closed".into()))?;
             let mut host = host.lock().expect("host mutex");
+            // Nothing beyond the store to ask: the blob is missing.
+            if matches!(host.state, HostState::LocalOnly) {
+                return Ok(None);
+            }
             host.start()
                 .map_err(|error| PeerAcquireError(error.to_string()))?;
             host.sender.clone()
