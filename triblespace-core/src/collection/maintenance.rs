@@ -1160,6 +1160,7 @@ where
         }
         let has_finer = coverage
             .producers(parent, node)
+            .into_iter()
             .any(|inputs| inputs.iter().any(|input| input != node));
         match attempt(node, &bound.mapping, &siblings, has_finer, budget)? {
             AttachmentStep::Completed(bytes) => {
