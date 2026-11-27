@@ -113,42 +113,60 @@ pub enum YardCommand {
         #[arg(long)]
         allow_corrupt: bool,
     },
-    /// Write the union of every pile in YARD as one deduplicated pile.
+    /// Write the union of every pile in YARD as one normalized pile.
     ///
     /// Membership and aliasing are as for `yard diff`. With --live, LIVE is
     /// an input too, read at the prefix its snapshot accepts, and the
     /// result is self-contained. Inputs are read LIVE first, then members by
     /// name.
     ///
-    /// Every distinct item of the inputs is written once, byte for byte, in
-    /// the order first met, under its native contract: blobs by hash, with a
-    /// hash-valid occurrence (a corrupt one is harmless when any input holds
-    /// a valid copy); COMMIT, MERGE, DERIVE, MAP, AUTH proofs and WANTs by
-    /// their native identity; retired kinds by their exact bytes. Frames this
-    /// reader cannot interpret cannot be assumed idempotent and are written
-    /// at every occurrence, in input order. No state is projected, unlike
-    /// `pile compact`.
+    /// Every distinct item of the inputs is written once, in the order first
+    /// met, under its native contract: blobs by hash, with a hash-valid
+    /// occurrence (a corrupt one is harmless when any input holds a valid
+    /// copy); COMMIT, MERGE, DERIVE, MAP, AUTH proofs and WANTs by their
+    /// native identity; current-framed retired kinds by their exact bytes.
+    /// Current-framed frames of a kind this reader cannot interpret cannot
+    /// be assumed idempotent and are written at every occurrence, in input
+    /// order. No state is projected, unlike `pile compact`.
     ///
-    /// WHAT IS LOST: the replay order and repeats of legacy pin heads and
-    /// tombstones and retired WANT assert/retract frames. Each distinct such
-    /// record is kept once (a pin head by pin and head, a tombstone by pin,
-    /// a retired WANT frame by its exact bytes), so different records all
-    /// survive, but a pin log head A, tombstone, head A packs as A and the
-    /// tombstone, and replaying it ends deleted. Use `yard diff`, or keep
-    /// the inputs, when that history matters.
+    /// The output is in the current framing throughout. A blob in a legacy
+    /// framing (V1, unenveloped V3, the 36-byte envelope) is re-encoded as a
+    /// current BLOB record: same payload, same hash. Every legacy pin head
+    /// and tombstone, every retired WANT assert and retract, in any framing,
+    /// and every other record in a legacy framing is kept as an ordinary
+    /// blob whose payload is the record's exact bytes, at the boundary the
+    /// reader decoded: the 64-byte V1 branch record, the 256-byte current
+    /// pin frame, and so on. Its handle is the BLAKE3 hash of those bytes,
+    /// so each distinct historical record is recovered by hash, and
+    /// identical ones collapse. Two encodings of the same pin and head are
+    /// two records. Such a blob is never replayed, and packing a pack copies
+    /// it as the blob it is, so nothing nests.
+    ///
+    /// To recover one: `trible pile blob get PACKED blake3:HEX rec.pile`
+    /// writes the record's bytes, which on their own are a one-record pile
+    /// (`trible pile diagnose record-at rec.pile 0` decodes it).
+    ///
+    /// WHAT IS LOST: the replay order and repeats of those historical
+    /// records, and with them what replaying them meant: a pin log head A,
+    /// tombstone, head A packs as two blobs and no pin. Use `yard diff`, or
+    /// keep the inputs, when that history matters. A legacy-envelope record
+    /// that the reader exposes as opaque is kept as bytes; the pack does not
+    /// read it as a current signed fact.
     ///
     /// Nothing present in the inputs is dropped for what it means: a pin
-    /// removal is kept as evidence beside the heads it followed, and never
-    /// removes a head or a blob, so the union can be read under today's
-    /// monotonic model. Coverage is of the bytes supplied: a payload a pin
-    /// names but no input holds cannot be recovered from the pin.
+    /// removal is kept beside the heads it followed and never removes a head
+    /// or a blob. Coverage is of the bytes supplied: a payload a pin names
+    /// but no input holds cannot be recovered from the pin.
     ///
     /// The output is written to a hidden sibling and verified there: every
-    /// distinct input item is in it, it holds nothing no input holds (an
-    /// exact union), and its uninterpreted frames are the inputs', occurrence
-    /// for occurrence, in input order. YARD is then listed again and every
-    /// input stat'ed unchanged, and only then is INTO published by hard
-    /// link, never replacing a file. Inputs are never modified or removed.
+    /// distinct input item is in it (a wrapped record as a hash-valid blob
+    /// of its exact bytes), it holds nothing no input holds (an exact
+    /// union), no frame of it is a historical record or a legacy-framed
+    /// blob as written, and its uninterpreted frames are the inputs',
+    /// occurrence for occurrence, in input order. YARD is then listed again
+    /// and every input stat'ed unchanged, and only then is INTO published by
+    /// hard link, never replacing a file. Inputs are never modified or
+    /// removed.
     ///
     /// --check PACKED verifies an existing pack against the current inputs
     /// the same way, PACKED excluded: a pack holding items of an input that
@@ -632,8 +650,9 @@ fn pack(
     }
     print_listing(yard, &listing, &members);
     println!(
-        "legacy pin and retired WANT frames are kept once each, without their order; \
-         uninterpreted frames at every occurrence, in input order"
+        "historical records (legacy pins, retired WANTs, other legacy-framed records) are kept \
+         once each as blobs of their exact bytes, without their order; legacy-framed blobs are \
+         re-encoded; uninterpreted current frames at every occurrence, in input order"
     );
     let statics: Vec<&Side> = members.iter().chain(checked_side.iter()).collect();
     let unchanged = || require_unchanged(yard, output, &listing, &statics, live_side.as_ref());
@@ -653,7 +672,7 @@ fn pack(
             out,
             Some(inputs.as_slice()),
             allow_corrupt,
-            KeepEvery::Unknown,
+            KeepEvery::Normalized,
         )?;
         println!(
             "check {} = union of {} input(s)",
@@ -685,7 +704,7 @@ fn pack(
                     out,
                     temporary,
                     allow_corrupt,
-                    KeepEvery::Unknown,
+                    KeepEvery::Normalized,
                 )?;
                 println!(
                     "written: {} frames of {} input(s)",

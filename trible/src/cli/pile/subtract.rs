@@ -36,7 +36,8 @@ use triblespace_core::id::RawId;
 use triblespace_core::inline::encodings::hash::{Blake3, Handle};
 use triblespace_core::inline::Inline;
 use triblespace_core::repo::pile::{
-    GetBlobError, PileFile, PileFileSnapshot, PileRecord, PileRecordContent, PileRecords,
+    blob_record_bytes, GetBlobError, PileFile, PileFileSnapshot, PileRecord, PileRecordContent,
+    PileRecords,
 };
 use triblespace_core::repo::{BlobStoreGet, SnapshotSource, WantRequest};
 
@@ -88,7 +89,14 @@ enum Item {
         hash: [u8; 32],
         data_offset: usize,
         data_len: usize,
+        /// A blob in a legacy framing that a normalized pack re-encodes as a
+        /// current BLOB record: same payload, same hash.
+        reframe: bool,
     },
+    /// A historical record a normalized pack keeps as an ordinary blob whose
+    /// payload is the record's exact frame bytes, named by their BLAKE3
+    /// digest: recoverable by handle, never replayed.
+    Wrapped { digest: [u8; 32] },
     Record {
         identity: Identity,
         opaque: bool,
@@ -97,8 +105,66 @@ enum Item {
     },
 }
 
-/// The kind label and comparison identity of one decoded frame.
-fn classify(record: &PileRecord, frame: &[u8]) -> (&'static str, Item) {
+/// Whether a normalized pack wraps this record as a blob of its exact
+/// frame bytes: every legacy pin head and tombstone and every retired WANT
+/// assert or retract in any framing, whose meaning was their replay order,
+/// and every other record not in the current framing (V1, unenveloped V3,
+/// the 36-byte legacy envelope) unless its content is native. Blobs,
+/// COMMIT/MERGE/DERIVE/MAP, AUTH proofs and current WANTs keep their native
+/// contracts; current-framed retired and unknown kinds stay as they are.
+fn wraps(record: &PileRecord, current: bool) -> bool {
+    match record.content {
+        PileRecordContent::Branch { .. }
+        | PileRecordContent::BranchTombstone { .. }
+        | PileRecordContent::RetiredWantAssert { .. }
+        | PileRecordContent::RetiredWantRetract { .. } => true,
+        PileRecordContent::Blob { .. }
+        | PileRecordContent::Collection { .. }
+        | PileRecordContent::CapabilityProof { .. }
+        | PileRecordContent::Want { .. } => false,
+        _ => !current,
+    }
+}
+
+/// The kind label and comparison identity of one decoded frame; `current`
+/// says whether the frame is in the current framing. Under
+/// [`KeepEvery::Normalized`] the records [`wraps`] names become
+/// [`Item::Wrapped`] and legacy-framed blobs are marked for re-encoding.
+fn classify(
+    record: &PileRecord,
+    frame: &[u8],
+    current: bool,
+    keep: KeepEvery,
+) -> (&'static str, Item) {
+    let normalized = keep == KeepEvery::Normalized;
+    let (label, item) = classify_native(record, frame);
+    match item {
+        Item::Blob {
+            hash,
+            data_offset,
+            data_len,
+            ..
+        } => (
+            label,
+            Item::Blob {
+                hash,
+                data_offset,
+                data_len,
+                reframe: normalized && !current,
+            },
+        ),
+        _ if normalized && wraps(record, current) => (
+            label,
+            Item::Wrapped {
+                digest: Blake3::digest(frame),
+            },
+        ),
+        item => (label, item),
+    }
+}
+
+/// The kind label and native comparison identity of one decoded frame.
+fn classify_native(record: &PileRecord, frame: &[u8]) -> (&'static str, Item) {
     let exact = || Identity::Frame(Blake3::digest(frame));
     let known = |identity| Item::Record {
         identity,
@@ -122,6 +188,7 @@ fn classify(record: &PileRecord, frame: &[u8]) -> (&'static str, Item) {
                 hash: hash.raw,
                 data_offset,
                 data_len,
+                reframe: false,
             },
         ),
         PileRecordContent::Collection { record } => {
@@ -196,8 +263,13 @@ pub(super) struct Side {
     pub(super) stamp: Stamp,
     records: HashSet<Identity>,
     /// Order-sensitive log frames and opaque/unknown frames, in file order,
-    /// each marked whether it is opaque.
-    logged: Vec<(Identity, bool)>,
+    /// each marked whether it is opaque and whether a normalized pack wraps it.
+    logged: Vec<(Identity, bool, bool)>,
+    /// BLAKE3 digests of the exact frames a normalized pack wraps as blobs.
+    wrapped: HashSet<[u8; 32]>,
+    /// How many frames a normalized pack never contains (records it wraps,
+    /// blobs in a legacy framing), and the first [`LISTED`] as (offset, kind).
+    unnormalized: (u64, Vec<(usize, &'static str)>),
     snapshot: Option<PileFileSnapshot>,
     file: Option<PileFile>,
 }
@@ -212,6 +284,8 @@ impl Side {
             stamp: Stamp::default_for(path),
             records: HashSet::new(),
             logged: Vec::new(),
+            wrapped: HashSet::new(),
+            unnormalized: (0, Vec::new()),
             snapshot: None,
             file: Some(file),
         };
@@ -230,25 +304,43 @@ impl Side {
         let bytes = scan.bytes().clone();
         while let Some(record) = scan.next() {
             let record = record.map_err(|error| super::pile_read_error(path, error))?;
-            if !matches!(record.content, PileRecordContent::Blob { .. }) {
-                let frame = &bytes[record.offset..record.offset + record.len];
-                if let (
-                    _,
+            let current = scan.has_current_framing(&record);
+            let frame = &bytes[record.offset..record.offset + record.len];
+            match classify(&record, frame, current, KeepEvery::Log) {
+                (kind, Item::Blob { .. }) => {
+                    if !current {
+                        side.note_unnormalized(record.offset, kind);
+                    }
+                }
+                (
+                    kind,
                     Item::Record {
                         identity,
                         ordered,
                         opaque,
                     },
-                ) = classify(&record, frame)
-                {
+                ) => {
+                    let wrappable = wraps(&record, current);
+                    if wrappable {
+                        side.wrapped.insert(Blake3::digest(frame));
+                        side.note_unnormalized(record.offset, kind);
+                    }
                     if ordered || opaque {
-                        side.logged.push((identity, opaque));
+                        side.logged.push((identity, opaque, wrappable));
                     }
                     side.records.insert(identity);
                 }
+                (_, Item::Wrapped { .. }) => unreachable!("only a normalized pack wraps"),
             }
         }
         Ok(side)
+    }
+
+    fn note_unnormalized(&mut self, offset: usize, kind: &'static str) {
+        self.unnormalized.0 += 1;
+        if self.unnormalized.1.len() < LISTED as usize {
+            self.unnormalized.1.push((offset, kind));
+        }
     }
 
     fn snapshot(&self) -> &PileFileSnapshot {
@@ -270,9 +362,12 @@ impl Side {
     fn log(&self, keep: KeepEvery) -> Vec<Identity> {
         self.logged
             .iter()
-            // An entry is opaque or else an order-sensitive log frame.
-            .filter(|(_, opaque)| keep.every(!opaque, *opaque))
-            .map(|(identity, _)| *identity)
+            // An entry is opaque or else an order-sensitive log frame; a
+            // normalized pack keeps what it wraps as a blob instead.
+            .filter(|(_, opaque, wrappable)| {
+                keep.every(!opaque, *opaque) && !(keep == KeepEvery::Normalized && *wrappable)
+            })
+            .map(|(identity, _, _)| *identity)
             .collect()
     }
 
@@ -310,9 +405,13 @@ impl Drop for Side {
     }
 }
 
-/// The first side of `sides` holding a hash-valid occurrence of `hash`.
-fn blob_holder(sides: &[&Side], hash: [u8; 32]) -> Option<usize> {
-    sides.iter().position(|side| side.has_valid_blob(hash))
+/// The first side of `sides` holding the bytes named by `hash` under
+/// `keep`: a hash-valid blob, or, for a normalized pack, also a frame it
+/// wraps whose exact bytes hash to `hash`.
+fn content_holder(sides: &[&Side], hash: [u8; 32], keep: KeepEvery) -> Option<usize> {
+    sides.iter().position(|side| {
+        side.has_valid_blob(hash) || (keep == KeepEvery::Normalized && side.wrapped.contains(&hash))
+    })
 }
 
 /// The first side of `sides` holding a record of `identity`.
@@ -548,10 +647,12 @@ pub(super) enum KeepEvery {
     /// The log, and frames this reader cannot interpret, which it cannot
     /// assume idempotent (`yard diff`).
     LogAndUnknown,
-    /// Frames this reader cannot interpret only: legacy pins and retired
-    /// WANT logs become set members, kept once by their exact bytes
-    /// (`yard pack`).
-    Unknown,
+    /// A normalized archival pack (`yard pack`): current-framed frames of
+    /// unknown kind at every occurrence; every historical record [`wraps`]
+    /// names becomes an ordinary blob of its exact frame bytes, kept once by
+    /// their hash; legacy-framed blobs are re-encoded as current BLOB
+    /// records. The output is then in the current framing throughout.
+    Normalized,
 }
 
 impl KeepEvery {
@@ -559,7 +660,7 @@ impl KeepEvery {
         match self {
             Self::Log => ordered,
             Self::LogAndUnknown => ordered || opaque,
-            Self::Unknown => opaque,
+            Self::Normalized => opaque,
         }
     }
 }
@@ -579,6 +680,9 @@ pub(super) struct Tally {
     pub(super) bytes: usize,
     counts: BTreeMap<&'static str, KindCounts>,
     opaque_kept: (u64, u64),
+    /// A normalized pack: historical records written as blobs of their
+    /// exact bytes (count, record bytes), and legacy-framed blobs re-encoded.
+    normalized: Option<((u64, u64), u64)>,
     pub(super) corrupt: usize,
     pub(super) written: u64,
     /// Inputs whose scan stopped early at a malformed frame (--allow-corrupt).
@@ -605,6 +709,13 @@ impl Tally {
             "opaque/unknown frames kept: {} ({} bytes)",
             self.opaque_kept.0, self.opaque_kept.1
         );
+        if let Some(((wrapped, wrapped_bytes), reframed)) = self.normalized {
+            println!(
+                "historical records kept as blobs of their exact bytes: {wrapped} \
+                 ({wrapped_bytes} record bytes)"
+            );
+            println!("legacy-framed blobs re-encoded in the current framing: {reframed}");
+        }
         println!("corrupt blob frames skipped: {}", self.corrupt);
         println!("bytes written: {}", self.written);
     }
@@ -644,10 +755,18 @@ pub(super) fn copy_new(
     allow_corrupt: bool,
     keep: KeepEvery,
 ) -> Result<Tally> {
+    let normalized = keep == KeepEvery::Normalized;
     let mut tally = Tally {
         covered: vec![0; baseline.len()],
+        normalized: normalized.then_some(((0, 0), 0)),
         ..Tally::default()
     };
+    // One stamp for every record this run encodes rather than copies: an
+    // insertion time is a local fact about the file written, as for `put`.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
     let mut kept_blobs: HashSet<[u8; 32]> = HashSet::new();
     let mut kept_records: HashSet<Identity> = HashSet::new();
     let mut corrupt: Vec<(usize, usize, [u8; 32])> = Vec::new();
@@ -673,28 +792,66 @@ pub(super) fn copy_new(
             };
             tally.frames += 1;
             let frame = &bytes[record.offset..record.offset + record.len];
-            let (kind, item) = classify(&record, frame);
+            let current = scan.has_current_framing(&record);
+            let (kind, item) = classify(&record, frame, current, keep);
             let count = tally.counts.entry(kind).or_default();
             count.read += 1;
-            let keep = match item {
+            // Bytes to write in place of the frame, for an encoded record.
+            let mut encoded: Option<Vec<u8>> = None;
+            let encode = |payload: &[u8]| {
+                blob_record_bytes(stamp, payload).ok_or_else(|| {
+                    anyhow!(
+                        "record at byte {} of {} is too large for a blob record",
+                        record.offset,
+                        path.display()
+                    )
+                })
+            };
+            let write = match item {
                 Item::Blob {
                     hash,
                     data_offset,
                     data_len,
+                    reframe,
                 } => {
+                    let payload = &bytes[data_offset..data_offset + data_len];
                     if kept_blobs.contains(&hash) {
                         count.repeated += 1;
                         false
-                    } else if let Some(holder) = blob_holder(baseline, hash) {
+                    } else if let Some(holder) = content_holder(baseline, hash, keep) {
                         count.present += 1;
                         tally.covered[holder] += 1;
                         false
-                    } else if Blake3::digest(&bytes[data_offset..data_offset + data_len]) == hash {
+                    } else if Blake3::digest(payload) == hash {
                         kept_blobs.insert(hash);
+                        if reframe {
+                            encoded = Some(encode(payload)?);
+                            if let Some((_, reframed)) = tally.normalized.as_mut() {
+                                *reframed += 1;
+                            }
+                        }
                         true
                     } else {
                         corrupt.push((input, record.offset, hash));
                         false
+                    }
+                }
+                Item::Wrapped { digest } => {
+                    if kept_blobs.contains(&digest) {
+                        count.repeated += 1;
+                        false
+                    } else if let Some(holder) = content_holder(baseline, digest, keep) {
+                        count.present += 1;
+                        tally.covered[holder] += 1;
+                        false
+                    } else {
+                        kept_blobs.insert(digest);
+                        encoded = Some(encode(frame)?);
+                        if let Some(((wrapped, wrapped_bytes), _)) = tally.normalized.as_mut() {
+                            *wrapped += 1;
+                            *wrapped_bytes += frame.len() as u64;
+                        }
+                        true
                     }
                 }
                 Item::Record {
@@ -726,11 +883,12 @@ pub(super) fn copy_new(
                     }
                 }
             };
-            if keep {
+            if write {
+                let written = encoded.as_deref().unwrap_or(frame);
                 count.kept += 1;
-                out.write_all(frame)
+                out.write_all(written)
                     .with_context(|| format!("write {}", out_path.display()))?;
-                tally.written += frame.len() as u64;
+                tally.written += written.len() as u64;
             }
         }
         paths.push(path);
@@ -948,6 +1106,9 @@ fn check(
     verdict.and(closed)
 }
 
+/// How many missing, extra or unnormalized items a check lists by name.
+const LISTED: u64 = 100;
+
 /// What the shared checker found.
 #[derive(Default)]
 pub(super) struct Checked {
@@ -965,6 +1126,9 @@ pub(super) struct Checked {
     pub(super) covered: Vec<u64>,
     /// With provenance: output items no input holds.
     pub(super) extra: Option<u64>,
+    /// A normalized pack: output frames it must not contain (a raw record it
+    /// wraps, or a blob in a legacy framing).
+    pub(super) unnormalized: Option<u64>,
 }
 
 /// Confirm that every blob and record of `inputs` is in `baseline` or `out`,
@@ -986,7 +1150,6 @@ pub(super) fn check_union(
         out_logged: out.log(keep),
         ..Checked::default()
     };
-    const LISTED: u64 = 100;
 
     for Input { path, mut scan } in inputs {
         let bytes = scan.bytes().clone();
@@ -1007,16 +1170,29 @@ pub(super) fn check_union(
             };
             checked.frames += 1;
             let frame = &bytes[record.offset..record.offset + record.len];
-            let (kind, item) = classify(&record, frame);
+            let current = scan.has_current_framing(&record);
+            let (kind, item) = classify(&record, frame, current, keep);
             let count = checked.counts.entry(kind).or_default();
             count.read += 1;
             let (holder, in_out, identity) = match item {
+                Item::Wrapped { digest } => {
+                    // Only a hash-valid blob in the output holds it; the raw
+                    // frame there would not be a normalized pack.
+                    let holder = content_holder(baseline, digest, keep);
+                    let in_out = holder.is_none() && out.has_valid_blob(digest);
+                    (
+                        holder,
+                        in_out,
+                        format!("exact frame, as blob {}", hex::encode_upper(digest)),
+                    )
+                }
                 Item::Blob {
                     hash,
                     data_offset,
                     data_len,
+                    ..
                 } => {
-                    let holder = blob_holder(baseline, hash);
+                    let holder = content_holder(baseline, hash, keep);
                     let in_out = holder.is_none() && out.has_valid_blob(hash);
                     if holder.is_none()
                         && !in_out
@@ -1065,6 +1241,17 @@ pub(super) fn check_union(
         }
     }
 
+    if keep == KeepEvery::Normalized {
+        for (offset, kind) in &out.unnormalized.1 {
+            println!(
+                "UNNORMALIZED {kind} at byte {offset} of {}: a pack keeps it only as a \
+                 current-framed blob",
+                out.path.display()
+            );
+        }
+        checked.unnormalized = Some(out.unnormalized.0);
+    }
+
     if let Some(holders) = provenance {
         let mut extra = 0u64;
         let mut scan = out.scan();
@@ -1072,11 +1259,17 @@ pub(super) fn check_union(
         while let Some(record) = scan.next() {
             let record = record.map_err(|error| super::pile_read_error(&out.path, error))?;
             let frame = &bytes[record.offset..record.offset + record.len];
-            let (kind, item) = classify(&record, frame);
+            let current = scan.has_current_framing(&record);
+            let (kind, item) = classify(&record, frame, current, keep);
             let (held, identity) = match item {
                 Item::Blob { hash, .. } => (
-                    blob_holder(holders, hash).is_some(),
+                    content_holder(holders, hash, keep).is_some(),
                     format!("blob {}", hex::encode_upper(hash)),
+                ),
+                // Counted above as unnormalized; held when an input holds it.
+                Item::Wrapped { digest } => (
+                    content_holder(holders, digest, keep).is_some(),
+                    format!("exact frame {}", hex::encode_upper(digest)),
                 ),
                 Item::Record { identity, .. } => (
                     record_holder(holders, &identity).is_some(),
@@ -1110,6 +1303,9 @@ impl Checked {
         println!("missing: {}", self.missing);
         if let Some(extra) = self.extra {
             println!("extra: {extra}");
+        }
+        if let Some(unnormalized) = self.unnormalized {
+            println!("unnormalized: {unnormalized}");
         }
         for (source, error) in &self.stopped {
             println!(
@@ -1155,6 +1351,12 @@ impl Checked {
         }
         if let Some(extra) = self.extra.filter(|extra| *extra > 0) {
             bail!("{extra} item(s) of {diff} are held by none of {source}");
+        }
+        if let Some(unnormalized) = self.unnormalized.filter(|count| *count > 0) {
+            bail!(
+                "{unnormalized} frame(s) of {diff} are historical records or legacy-framed \
+                 blobs as written, not current-framed blobs: not a normalized pack"
+            );
         }
         if self.corrupt > 0 && !allow_corrupt {
             bail!(

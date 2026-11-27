@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `trible`: `yard pack` writes a normalized archive. Its output is in the
+  current framing throughout. Legacy-framed blobs are re-encoded as current
+  BLOB records with the same payload and hash. Every legacy pin head and
+  tombstone, every retired WANT frame (in any framing), and every other record
+  in a legacy framing is kept as an ordinary blob of its exact record bytes,
+  so each distinct historical record can be recovered by its BLAKE3 hash
+  (`trible pile blob get`). Two encodings of the same pin are two records.
+  Until now a pack compared pins by their decoded pin and head, so it kept
+  one encoding and its check passed without the other. The checker requires
+  each wrapped record to be a hash-valid blob, and it refuses a pack that
+  holds a historical record or a legacy-framed blob as written. Packing a
+  pack copies the wrapped records as the blobs they are. `yard diff` and
+  `pile subtract` are unchanged. `triblespace-core` gains
+  `repo::pile::blob_record_bytes`, which returns the exact BLOB record that
+  `put` appends.
+
 - `trible`: a new `trible yard` command keeps old piles as differences in a
   folder of piles. `yard diff YARD OLD --live LIVE --into NEW` writes only what
   OLD adds to the live pile and every pile already in the folder, and

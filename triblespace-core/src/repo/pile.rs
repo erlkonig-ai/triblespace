@@ -1144,6 +1144,23 @@ impl BlobRecordHeader {
     }
 }
 
+/// The exact bytes [`PileFile`] appends for a blob of `payload` stamped
+/// `timestamp`: a current BLOB record (fixed 256-byte header, payload, zero
+/// post-padding to a 256-byte multiple). For tools that write a pile as a
+/// plain byte stream, such as an archival pack, so they reuse this encoder
+/// instead of carrying their own. `None` when the payload is too large for
+/// the `u32` span.
+pub fn blob_record_bytes(timestamp: u64, payload: &[u8]) -> Option<Vec<u8>> {
+    let span_blocks = envelope_blocks_for_payload(payload.len())?;
+    let hash = Inline::<Hash<Blake3>>::new(Blake3::digest(payload));
+    let header = BlobRecordHeader::new(span_blocks, timestamp, payload.len() as u64, hash);
+    let mut bytes = Vec::with_capacity(span_blocks as usize * ENVELOPE_BLOCK_LEN);
+    bytes.extend_from_slice(header.as_bytes());
+    bytes.extend_from_slice(payload);
+    bytes.resize(bytes.len() + block_post_pad(payload.len()), 0);
+    Some(bytes)
+}
+
 /// Pin head: `64..80` pin id, `96..128` head handle.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
@@ -12546,6 +12563,41 @@ mod tests {
         let mut reopened: Pile = Pile::open(&tmp_pile).unwrap();
         reopened.amputate().unwrap();
         reopened.close().unwrap();
+    }
+
+    /// `blob_record_bytes` is the record `put` appends, timestamp aside.
+    #[test]
+    fn blob_record_bytes_is_what_put_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "encoded.pile");
+        let sizes = [0usize, 1, 255, 256, 257, 1000];
+        let mut pile: Pile = Pile::open(&path).unwrap();
+        for &sz in &sizes {
+            let data: Vec<u8> = (0..sz).map(|i| (i % 251) as u8).collect();
+            pile.put::<UnknownBlob, _>(Blob::<UnknownBlob>::new(Bytes::from_source(data)))
+                .unwrap();
+        }
+        pile.close().unwrap();
+        let written = std::fs::read(&path).unwrap();
+        let mut at = 0;
+        for record in PileRecords::open(&path).unwrap() {
+            let record = record.unwrap();
+            let PileRecordContent::Blob {
+                timestamp,
+                data_offset,
+                data_len,
+                ..
+            } = record.content
+            else {
+                panic!("only blobs were put");
+            };
+            let encoded =
+                blob_record_bytes(timestamp, &written[data_offset..data_offset + data_len])
+                    .unwrap();
+            assert_eq!(encoded, written[record.offset..record.offset + record.len]);
+            at += record.len;
+        }
+        assert_eq!(at, written.len());
     }
 
     #[test]
