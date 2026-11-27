@@ -25,7 +25,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::fs;
-use std::io::{BufWriter, Write as _};
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use anybytes::Bytes;
@@ -183,70 +183,104 @@ fn classify(record: &PileRecord, frame: &[u8]) -> (&'static str, Item) {
     }
 }
 
-/// A pile the source is compared against: its record identities and one
-/// snapshot answering hash-verified blob presence.
-struct Side {
-    path: PathBuf,
-    len: usize,
+/// One pile read through one frozen, read-only snapshot: the identities of
+/// its records and hash-verified blob presence both come from the same
+/// mapping, bounded to the prefix the snapshot accepted. Bytes a writer
+/// appends afterwards are never read, and a path re-pointed meanwhile does
+/// not change what this side holds.
+pub(super) struct Side {
+    pub(super) path: PathBuf,
+    /// Length of the accepted prefix every lookup is answered from.
+    pub(super) len: usize,
+    /// The opened file as its handle reported it when the snapshot was taken.
+    pub(super) stamp: Stamp,
     records: HashSet<Identity>,
-    /// Order-sensitive log frames, in file order.
-    logged: Vec<Identity>,
-    snapshot: PileFileSnapshot,
-    file: PileFile,
+    /// Order-sensitive log frames and opaque/unknown frames, in file order,
+    /// each marked whether it is opaque.
+    logged: Vec<(Identity, bool)>,
+    snapshot: Option<PileFileSnapshot>,
+    file: Option<PileFile>,
 }
 
 impl Side {
-    fn open(path: &Path) -> Result<Self> {
-        // Record identities come from one raw scan of a fixed prefix; the
-        // blob snapshot below is taken afterwards and covers at least it.
-        let mut scan =
-            PileRecords::open(path).map_err(|error| super::pile_read_error(path, error))?;
+    pub(super) fn open(path: &Path) -> Result<Self> {
+        let file =
+            PileFile::open_read_only(path).map_err(|error| super::pile_read_error(path, error))?;
+        let mut side = Self {
+            path: path.to_path_buf(),
+            len: 0,
+            stamp: Stamp::default_for(path),
+            records: HashSet::new(),
+            logged: Vec::new(),
+            snapshot: None,
+            file: Some(file),
+        };
+        // On any error below, dropping `side` closes the file.
+        let file = side.file.as_mut().expect("just opened");
+        let snapshot = file
+            .snapshot()
+            .map_err(|error| super::pile_read_error(path, error))?;
+        let metadata = file
+            .backing_file_metadata()
+            .with_context(|| format!("stat {}", path.display()))?;
+        side.stamp = Stamp::of(&metadata, path)?;
+        side.len = snapshot.prefix_len();
+        let mut scan = snapshot.raw_records();
+        side.snapshot = Some(snapshot);
         let bytes = scan.bytes().clone();
-        let mut records = HashSet::new();
-        let mut logged = Vec::new();
         while let Some(record) = scan.next() {
             let record = record.map_err(|error| super::pile_read_error(path, error))?;
             if !matches!(record.content, PileRecordContent::Blob { .. }) {
                 let frame = &bytes[record.offset..record.offset + record.len];
-                if let (_, Item::Record { identity, ordered, .. }) = classify(&record, frame) {
-                    if ordered {
-                        logged.push(identity);
+                if let (
+                    _,
+                    Item::Record {
+                        identity,
+                        ordered,
+                        opaque,
+                    },
+                ) = classify(&record, frame)
+                {
+                    if ordered || opaque {
+                        side.logged.push((identity, opaque));
                     }
-                    records.insert(identity);
+                    side.records.insert(identity);
                 }
             }
         }
-        drop(scan);
-        drop(bytes);
+        Ok(side)
+    }
 
-        let mut file =
-            PileFile::open_read_only(path).map_err(|error| super::pile_read_error(path, error))?;
-        let snapshot = match file.snapshot() {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                let _ = file.close();
-                return Err(super::pile_read_error(path, error));
-            }
-        };
-        let len = file
-            .backing_file_metadata()
-            .with_context(|| format!("stat {}", path.display()))?
-            .len() as usize;
-        Ok(Self {
-            path: path.to_path_buf(),
-            len,
-            records,
-            logged,
-            snapshot,
-            file,
-        })
+    fn snapshot(&self) -> &PileFileSnapshot {
+        self.snapshot.as_ref().expect("side snapshot taken at open")
+    }
+
+    /// The raw records of exactly the accepted prefix, from the same mapping.
+    pub(super) fn scan(&self) -> PileRecords {
+        self.snapshot().raw_records()
+    }
+
+    /// Bytes of the file past the accepted prefix when the snapshot was taken:
+    /// a torn tail, or an append still in flight.
+    pub(super) fn unaccepted(&self) -> u64 {
+        self.stamp.len.saturating_sub(self.len as u64)
+    }
+
+    /// The frames `keep` copies at every occurrence, in file order.
+    fn log(&self, keep: KeepEvery) -> Vec<Identity> {
+        self.logged
+            .iter()
+            // An entry is opaque or else an order-sensitive log frame.
+            .filter(|(_, opaque)| keep.every(!opaque, *opaque))
+            .map(|(identity, _)| *identity)
+            .collect()
     }
 
     /// Whether this pile holds an occurrence of `hash` whose payload
     /// validates, read exactly as an ordinary blob read is.
     fn has_valid_blob(&self, hash: [u8; 32]) -> bool {
         match self
-            .snapshot
+            .snapshot()
             .get::<Bytes, UnknownBlob>(Inline::<Handle<UnknownBlob>>::new(hash))
         {
             Ok(_) => true,
@@ -255,11 +289,92 @@ impl Side {
         }
     }
 
-    fn close(self) -> Result<()> {
-        drop(self.snapshot);
-        self.file
-            .close()
-            .map_err(|error| anyhow!("close {}: {error:?}", self.path.display()))
+    pub(super) fn close(mut self) -> Result<()> {
+        drop(self.snapshot.take());
+        match self.file.take() {
+            Some(file) => file
+                .close()
+                .map_err(|error| anyhow!("close {}: {error:?}", self.path.display())),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for Side {
+    fn drop(&mut self) {
+        drop(self.snapshot.take());
+        if let Some(file) = self.file.take() {
+            // Read-only: nothing to persist, only the handle to release.
+            let _ = file.close();
+        }
+    }
+}
+
+/// The first side of `sides` holding a hash-valid occurrence of `hash`.
+fn blob_holder(sides: &[&Side], hash: [u8; 32]) -> Option<usize> {
+    sides.iter().position(|side| side.has_valid_blob(hash))
+}
+
+/// The first side of `sides` holding a record of `identity`.
+fn record_holder(sides: &[&Side], identity: &Identity) -> Option<usize> {
+    sides
+        .iter()
+        .position(|side| side.records.contains(identity))
+}
+
+/// What a file looked like when it was opened: which file, how long, and
+/// when it last changed. A static input whose stamp differs later was
+/// replaced, rewritten or truncated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Stamp {
+    pub(super) identity: FileIdentity,
+    pub(super) len: u64,
+    modified: Option<std::time::SystemTime>,
+    /// Inode change time (seconds, nanoseconds) where there is one.
+    changed: Option<(i64, i64)>,
+}
+
+impl Stamp {
+    pub(super) fn of(metadata: &fs::Metadata, path: &Path) -> Result<Self> {
+        #[cfg(unix)]
+        let changed = {
+            use std::os::unix::fs::MetadataExt as _;
+            Some((metadata.ctime(), metadata.ctime_nsec()))
+        };
+        #[cfg(not(unix))]
+        let changed = None;
+        Ok(Self {
+            identity: opened_identity(metadata, path)?,
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            changed,
+        })
+    }
+
+    /// The stamp of whatever `path` names now.
+    pub(super) fn now(path: &Path) -> Result<Self> {
+        let metadata = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+        Self::of(&metadata, path)
+    }
+
+    #[cfg(unix)]
+    fn default_for(_path: &Path) -> Self {
+        Self {
+            identity: (0, 0),
+            len: 0,
+            modified: None,
+            changed: None,
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn default_for(path: &Path) -> Self {
+        Self {
+            identity: path.to_path_buf(),
+            len: 0,
+            modified: None,
+            changed: None,
+        }
     }
 }
 
@@ -311,7 +426,7 @@ fn require_distinct(paths: &[&Path]) -> Result<()> {
 }
 
 #[derive(Default)]
-struct KindCounts {
+pub(super) struct KindCounts {
     read: u64,
     kept: u64,
     present: u64,
@@ -319,14 +434,14 @@ struct KindCounts {
 }
 
 #[derive(Default)]
-struct CheckCounts {
+pub(super) struct CheckCounts {
     read: u64,
     in_minus: u64,
     in_diff: u64,
     missing: u64,
 }
 
-fn row(kind: &str, columns: [String; 4]) {
+pub(super) fn row(kind: &str, columns: [String; 4]) {
     let [a, b, c, d] = columns;
     println!("  {kind:<26} {a:>12} {b:>12} {c:>12} {d:>12}");
 }
@@ -423,20 +538,249 @@ pub(super) fn publish(temporary: &Path, into: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Which frames the shared writer copies at every occurrence, in input
+/// order, instead of once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum KeepEvery {
+    /// Legacy pins and retired WANT logs, whose meaning is their order
+    /// (`pile subtract`, `pile compact --dropped-into`).
+    Log,
+    /// The log, and frames this reader cannot interpret, which it cannot
+    /// assume idempotent (`yard diff`).
+    LogAndUnknown,
+    /// Frames this reader cannot interpret only: legacy pins and retired
+    /// WANT logs become set members, kept once by their exact bytes
+    /// (`yard pack`).
+    Unknown,
+}
+
+impl KeepEvery {
+    fn every(self, ordered: bool, opaque: bool) -> bool {
+        match self {
+            Self::Log => ordered,
+            Self::LogAndUnknown => ordered || opaque,
+            Self::Unknown => opaque,
+        }
+    }
+}
+
+/// One input of the shared writer and checker: a raw scan of a pile and the
+/// path it is reported under.
+pub(super) struct Input {
+    pub(super) path: PathBuf,
+    pub(super) scan: PileRecords,
+}
+
+/// What the shared writer copied, for the reports.
+#[derive(Default)]
+pub(super) struct Tally {
+    pub(super) frames: u64,
+    /// Bytes the input scans covered, summed.
+    pub(super) bytes: usize,
+    counts: BTreeMap<&'static str, KindCounts>,
+    opaque_kept: (u64, u64),
+    pub(super) corrupt: usize,
+    pub(super) written: u64,
+    /// Inputs whose scan stopped early at a malformed frame (--allow-corrupt).
+    pub(super) stopped: Vec<(PathBuf, String)>,
+    /// How many items each baseline side supplied, by position.
+    pub(super) covered: Vec<u64>,
+}
+
+impl Tally {
+    /// The per-kind table and the trailing counts, as `pile subtract` prints
+    /// them; `present` names the baseline column.
+    pub(super) fn print_table(&self, present: &str) {
+        row(
+            "kind",
+            ["read", "kept", present, "repeated"].map(String::from),
+        );
+        for (kind, count) in &self.counts {
+            row(
+                kind,
+                [count.read, count.kept, count.present, count.repeated].map(|n| n.to_string()),
+            );
+        }
+        println!(
+            "opaque/unknown frames kept: {} ({} bytes)",
+            self.opaque_kept.0, self.opaque_kept.1
+        );
+        println!("corrupt blob frames skipped: {}", self.corrupt);
+        println!("bytes written: {}", self.written);
+    }
+
+    pub(super) fn warn_stopped(&self, into: &Path) {
+        for (source, error) in &self.stopped {
+            let warning = format!(
+                "WARNING: the scan of {} stopped early ({error}); everything after that byte is \
+                 NOT represented in {}",
+                source.display(),
+                into.display()
+            );
+            println!("{warning}");
+            eprintln!("{warning}");
+        }
+    }
+}
+
+/// Copy into `out`, in input order, every frame of `inputs` whose content
+/// neither `baseline` nor an earlier copied frame already holds. This is the
+/// one writer behind `pile subtract`, `pile compact --dropped-into`,
+/// `yard diff` and `yard pack`.
+///
+/// A blob is held only by a hash-valid occurrence, and copied only after its
+/// own payload matches its header; an occurrence failing its hash is
+/// harmless when a valid copy is in the baseline or reaches `out` from
+/// another frame of any input, and refuses otherwise unless `allow_corrupt`.
+/// The frames `keep` names are copied at every occurrence, so `out` repeats
+/// them in input order; every other frame is copied once. Opaque and unknown
+/// frames are compared by their exact bytes and never dropped otherwise.
+pub(super) fn copy_new(
+    inputs: Vec<Input>,
+    baseline: &[&Side],
+    baseline_label: &str,
+    out: &mut impl std::io::Write,
+    out_path: &Path,
+    allow_corrupt: bool,
+    keep: KeepEvery,
+) -> Result<Tally> {
+    let mut tally = Tally {
+        covered: vec![0; baseline.len()],
+        ..Tally::default()
+    };
+    let mut kept_blobs: HashSet<[u8; 32]> = HashSet::new();
+    let mut kept_records: HashSet<Identity> = HashSet::new();
+    let mut corrupt: Vec<(usize, usize, [u8; 32])> = Vec::new();
+    let mut paths = Vec::new();
+
+    for Input { path, mut scan } in inputs {
+        let input = paths.len();
+        let bytes = scan.bytes().clone();
+        tally.bytes += bytes.len();
+        while let Some(record) = scan.next() {
+            let record = match record {
+                Ok(record) => record,
+                Err(error) if allow_corrupt => {
+                    tally.stopped.push((path.clone(), error.to_string()));
+                    break;
+                }
+                Err(error) => {
+                    return Err(super::pile_read_error(&path, error).context(format!(
+                        "refusing: {} is not fully readable",
+                        path.display()
+                    )))
+                }
+            };
+            tally.frames += 1;
+            let frame = &bytes[record.offset..record.offset + record.len];
+            let (kind, item) = classify(&record, frame);
+            let count = tally.counts.entry(kind).or_default();
+            count.read += 1;
+            let keep = match item {
+                Item::Blob {
+                    hash,
+                    data_offset,
+                    data_len,
+                } => {
+                    if kept_blobs.contains(&hash) {
+                        count.repeated += 1;
+                        false
+                    } else if let Some(holder) = blob_holder(baseline, hash) {
+                        count.present += 1;
+                        tally.covered[holder] += 1;
+                        false
+                    } else if Blake3::digest(&bytes[data_offset..data_offset + data_len]) == hash {
+                        kept_blobs.insert(hash);
+                        true
+                    } else {
+                        corrupt.push((input, record.offset, hash));
+                        false
+                    }
+                }
+                Item::Record {
+                    ordered, opaque, ..
+                } if keep.every(ordered, opaque) => {
+                    if opaque {
+                        tally.opaque_kept.0 += 1;
+                        tally.opaque_kept.1 += frame.len() as u64;
+                    }
+                    true
+                }
+                Item::Record {
+                    identity, opaque, ..
+                } => {
+                    if kept_records.contains(&identity) {
+                        count.repeated += 1;
+                        false
+                    } else if let Some(holder) = record_holder(baseline, &identity) {
+                        count.present += 1;
+                        tally.covered[holder] += 1;
+                        false
+                    } else {
+                        kept_records.insert(identity);
+                        if opaque {
+                            tally.opaque_kept.0 += 1;
+                            tally.opaque_kept.1 += frame.len() as u64;
+                        }
+                        true
+                    }
+                }
+            };
+            if keep {
+                count.kept += 1;
+                out.write_all(frame)
+                    .with_context(|| format!("write {}", out_path.display()))?;
+                tally.written += frame.len() as u64;
+            }
+        }
+        paths.push(path);
+    }
+
+    // A corrupt occurrence is harmless when a valid copy of the same blob
+    // reached the output from a later frame, of this input or another.
+    corrupt.retain(|(_, _, hash)| !kept_blobs.contains(hash));
+    if !corrupt.is_empty() && !allow_corrupt {
+        let listed: Vec<String> = corrupt
+            .iter()
+            .take(20)
+            .map(|(input, offset, hash)| {
+                format!(
+                    "{} byte {offset} (header names {})",
+                    paths[*input].display(),
+                    hex::encode_upper(hash)
+                )
+            })
+            .collect();
+        bail!(
+            "refusing: {} blob frame(s) fail hash validation and neither {baseline_label} nor \
+             another frame holds a valid copy: {}{}; rerun with --allow-corrupt to omit them",
+            corrupt.len(),
+            listed.join(", "),
+            if corrupt.len() > 20 { ", ..." } else { "" }
+        );
+    }
+    tally.corrupt = corrupt.len();
+    Ok(tally)
+}
+
+/// Flush and sync a written output, returning its file.
+pub(super) fn finish(out: BufWriter<fs::File>, path: &Path) -> Result<fs::File> {
+    let file = out
+        .into_inner()
+        .map_err(|error| anyhow!("flush {}: {}", path.display(), error.error()))?;
+    file.sync_all()
+        .with_context(|| format!("sync {}", path.display()))?;
+    Ok(file)
+}
+
 /// What one written difference holds, for the report.
 pub(super) struct Difference {
     source: PathBuf,
     minus: PathBuf,
     into: PathBuf,
     source_prefix: Option<u64>,
-    frames: u64,
-    source_bytes: usize,
     minus_bytes: usize,
-    counts: BTreeMap<&'static str, KindCounts>,
-    opaque_kept: (u64, u64),
-    corrupt: usize,
-    written: u64,
-    stopped: Option<String>,
+    tally: Tally,
 }
 
 /// Write SOURCE (or its first `source_prefix` bytes) minus MINUS into the
@@ -459,7 +803,7 @@ pub(super) fn write_difference(
     require_distinct(&[source, minus])?;
 
     let minus_side = Side::open(minus)?;
-    let opened = open_source(source, source_prefix).and_then(|scan| {
+    let scan = open_source(source, source_prefix).and_then(|scan| {
         let Some(expected) = expected_source else {
             return Ok(scan);
         };
@@ -476,156 +820,42 @@ pub(super) fn write_difference(
                 }
             ),
         }
-    });
-    let mut scan = match opened {
-        Ok(scan) => scan,
-        Err(error) => {
-            let _ = minus_side.close();
-            return Err(error);
-        }
-    };
-    let bytes = scan.bytes().clone();
+    })?;
 
-    let created = temporary_sibling(into, "subtract").and_then(|temporary| {
-        let file = super::compact::create_fresh_destination(&temporary)
-            .with_context(|| format!("create {}", temporary.display()))?;
-        Ok((temporary, file))
-    });
-    let (temporary, file) = match created {
-        Ok(created) => created,
-        Err(error) => {
-            let _ = minus_side.close();
-            return Err(error);
-        }
-    };
+    let temporary = temporary_sibling(into, "subtract")?;
+    let file = super::compact::create_fresh_destination(&temporary)
+        .with_context(|| format!("create {}", temporary.display()))?;
     let mut out = BufWriter::with_capacity(8 << 20, file);
 
-    let mut counts: BTreeMap<&'static str, KindCounts> = BTreeMap::new();
-    let mut kept_blobs: HashSet<[u8; 32]> = HashSet::new();
-    let mut kept_records: HashSet<Identity> = HashSet::new();
-    let mut corrupt: Vec<(usize, [u8; 32])> = Vec::new();
-    let mut opaque_kept = (0u64, 0u64);
-    let mut written = 0u64;
-    let mut frames = 0u64;
-    let mut stopped = None;
-
-    let result = (|| -> Result<()> {
-        while let Some(record) = scan.next() {
-            let record = match record {
-                Ok(record) => record,
-                Err(error) if allow_corrupt => {
-                    stopped = Some(error.to_string());
-                    break;
-                }
-                Err(error) => {
-                    return Err(super::pile_read_error(source, error).context(format!(
-                        "refusing: {} is not fully readable",
-                        source.display()
-                    )))
-                }
-            };
-            frames += 1;
-            let frame = &bytes[record.offset..record.offset + record.len];
-            let (kind, item) = classify(&record, frame);
-            let count = counts.entry(kind).or_default();
-            count.read += 1;
-            let keep = match item {
-                Item::Blob {
-                    hash,
-                    data_offset,
-                    data_len,
-                } => {
-                    if kept_blobs.contains(&hash) {
-                        count.repeated += 1;
-                        false
-                    } else if minus_side.has_valid_blob(hash) {
-                        count.present += 1;
-                        false
-                    } else if Blake3::digest(&bytes[data_offset..data_offset + data_len]) == hash {
-                        kept_blobs.insert(hash);
-                        true
-                    } else {
-                        corrupt.push((record.offset, hash));
-                        false
-                    }
-                }
-                Item::Record {
-                    ordered: true,
-                    opaque,
-                    ..
-                } => {
-                    if opaque {
-                        opaque_kept.0 += 1;
-                        opaque_kept.1 += frame.len() as u64;
-                    }
-                    true
-                }
-                Item::Record {
-                    identity, opaque, ..
-                } => {
-                    if kept_records.contains(&identity) {
-                        count.repeated += 1;
-                        false
-                    } else if minus_side.records.contains(&identity) {
-                        count.present += 1;
-                        false
-                    } else {
-                        kept_records.insert(identity);
-                        if opaque {
-                            opaque_kept.0 += 1;
-                            opaque_kept.1 += frame.len() as u64;
-                        }
-                        true
-                    }
-                }
-            };
-            if keep {
-                count.kept += 1;
-                out.write_all(frame)
-                    .with_context(|| format!("write {}", temporary.display()))?;
-                written += frame.len() as u64;
-            }
-        }
-
-        // A corrupt occurrence is harmless when a valid copy of the same blob
-        // reached the difference from a later frame.
-        corrupt.retain(|(_, hash)| !kept_blobs.contains(hash));
-        if !corrupt.is_empty() && !allow_corrupt {
-            let listed: Vec<String> = corrupt
-                .iter()
-                .take(20)
-                .map(|(offset, hash)| {
-                    format!("byte {offset} (header names {})", hex::encode_upper(hash))
-                })
-                .collect();
-            bail!(
-                "refusing: {} blob frame(s) of {} fail hash validation and neither {} nor \
-                 another frame holds a valid copy: {}{}; rerun with --allow-corrupt to omit them",
-                corrupt.len(),
-                source.display(),
-                minus.display(),
-                listed.join(", "),
-                if corrupt.len() > 20 { ", ..." } else { "" }
-            );
-        }
-
-        let file = out
-            .into_inner()
-            .map_err(|error| anyhow!("flush {}: {}", temporary.display(), error.error()))?;
-        file.sync_all()
-            .with_context(|| format!("sync {}", temporary.display()))?;
-        drop(file);
-        publish(&temporary, into)
+    let result = (|| -> Result<Tally> {
+        let input = Input {
+            path: source.to_path_buf(),
+            scan,
+        };
+        let label = minus.display().to_string();
+        let tally = copy_new(
+            vec![input],
+            &[&minus_side],
+            &label,
+            &mut out,
+            &temporary,
+            allow_corrupt,
+            KeepEvery::Log,
+        )?;
+        drop(finish(out, &temporary)?);
+        publish(&temporary, into)?;
+        Ok(tally)
     })();
-    drop(scan);
-    if let Err(error) = result {
-        let _ = minus_side.close();
-        return Err(if temporary.exists() {
-            super::compact::cleanup_incomplete_destination(&temporary, error)
-        } else {
-            error
-        });
-    }
+    let tally = match result {
+        Ok(tally) => tally,
+        Err(error) => {
+            return Err(if temporary.exists() {
+                super::compact::cleanup_incomplete_destination(&temporary, error)
+            } else {
+                error
+            })
+        }
+    };
 
     let minus_bytes = minus_side.len;
     minus_side.close()?;
@@ -634,14 +864,8 @@ pub(super) fn write_difference(
         minus: minus.to_path_buf(),
         into: into.to_path_buf(),
         source_prefix,
-        frames,
-        source_bytes: bytes.len(),
         minus_bytes,
-        counts,
-        opaque_kept,
-        corrupt: corrupt.len(),
-        written,
-        stopped,
+        tally,
     })
 }
 
@@ -663,38 +887,14 @@ impl Difference {
         println!(
             "scope: {} frames of {}'s {}, against {}'s {} bytes \
              (blob presence hash-verified there; records by identity, see --help)",
-            self.frames,
+            self.tally.frames,
             self.source.display(),
-            extent(self.source_bytes, self.source_prefix),
+            extent(self.tally.bytes, self.source_prefix),
             self.minus.display(),
             self.minus_bytes,
         );
-        row(
-            "kind",
-            ["read", "kept", "in MINUS", "repeated"].map(String::from),
-        );
-        for (kind, count) in &self.counts {
-            row(
-                kind,
-                [count.read, count.kept, count.present, count.repeated].map(|n| n.to_string()),
-            );
-        }
-        println!(
-            "opaque/unknown frames kept: {} ({} bytes)",
-            self.opaque_kept.0, self.opaque_kept.1
-        );
-        println!("corrupt blob frames skipped: {}", self.corrupt);
-        println!("bytes written: {}", self.written);
-        if let Some(error) = &self.stopped {
-            let warning = format!(
-                "WARNING: the scan of {} stopped early ({error}); everything after that byte is \
-                 NOT represented in {}",
-                self.source.display(),
-                self.into.display()
-            );
-            println!("{warning}");
-            eprintln!("{warning}");
-        }
+        self.tally.print_table("in MINUS");
+        self.tally.warn_stopped(&self.into);
     }
 }
 
@@ -707,169 +907,262 @@ fn check(
 ) -> Result<()> {
     require_distinct(&[source, minus, diff])?;
     let minus_side = Side::open(minus)?;
-    let diff_side = match Side::open(diff) {
-        Ok(side) => side,
-        Err(error) => {
-            let _ = minus_side.close();
-            return Err(error);
-        }
+    let diff_side = Side::open(diff)?;
+    let input = Input {
+        path: source.to_path_buf(),
+        scan: open_source(source, source_prefix)?,
     };
-    let result = check_against(
-        source,
-        source_prefix,
-        &minus_side,
+    let checked = check_union(
+        vec![input],
+        &[&minus_side],
         &diff_side,
+        None,
         allow_corrupt,
-    );
-    let closed = minus_side.close().and(diff_side.close());
-    result.and(closed)
-}
-
-fn check_against(
-    source: &Path,
-    source_prefix: Option<u64>,
-    minus: &Side,
-    diff: &Side,
-    allow_corrupt: bool,
-) -> Result<()> {
-    let mut scan = open_source(source, source_prefix)?;
-    let bytes = scan.bytes().clone();
-    let mut counts: BTreeMap<&'static str, CheckCounts> = BTreeMap::new();
-    let mut missing = 0u64;
-    let mut corrupt = 0u64;
-    let mut frames = 0u64;
-    let mut stopped = None;
-    let mut logged = Vec::new();
-    const LISTED: u64 = 100;
-
-    while let Some(record) = scan.next() {
-        let record = match record {
-            Ok(record) => record,
-            Err(error) if allow_corrupt => {
-                stopped = Some(error.to_string());
-                break;
-            }
-            Err(error) => {
-                return Err(super::pile_read_error(source, error).context(format!(
-                    "refusing: {} is not fully readable",
-                    source.display()
-                )))
-            }
-        };
-        frames += 1;
-        let frame = &bytes[record.offset..record.offset + record.len];
-        let (kind, item) = classify(&record, frame);
-        let count = counts.entry(kind).or_default();
-        count.read += 1;
-        let (in_minus, in_diff, identity) = match item {
-            Item::Blob {
-                hash,
-                data_offset,
-                data_len,
-            } => {
-                let in_minus = minus.has_valid_blob(hash);
-                let in_diff = !in_minus && diff.has_valid_blob(hash);
-                if !in_minus
-                    && !in_diff
-                    && Blake3::digest(&bytes[data_offset..data_offset + data_len]) != hash
-                {
-                    corrupt += 1;
-                    println!(
-                        "corrupt in SOURCE, no valid copy elsewhere: blob frame at byte {} names {}",
-                        record.offset,
-                        hex::encode_upper(hash)
-                    );
-                    continue;
-                }
-                (
-                    in_minus,
-                    in_diff,
-                    format!("blob {}", hex::encode_upper(hash)),
-                )
-            }
-            Item::Record {
-                identity, ordered, ..
-            } => {
-                if ordered {
-                    logged.push(identity);
-                }
-                let in_minus = minus.records.contains(&identity);
-                let in_diff = !in_minus && diff.records.contains(&identity);
-                (in_minus, in_diff, identity.to_string())
-            }
-        };
-        if in_minus {
-            count.in_minus += 1;
-        } else if in_diff {
-            count.in_diff += 1;
-        } else {
-            count.missing += 1;
-            missing += 1;
-            if missing <= LISTED {
-                println!(
-                    "MISSING {kind} at byte {} of SOURCE: {identity}",
-                    record.offset
-                );
-            }
-        }
-    }
-
+        KeepEvery::Log,
+    )?;
     println!(
         "check {} = {} + {}",
         source.display(),
-        minus.path.display(),
-        diff.path.display()
+        minus_side.path.display(),
+        diff_side.path.display()
     );
     println!(
-        "scope: {frames} frames of {}'s {}; {} observed as {} bytes, {} as {} bytes",
+        "scope: {} frames of {}'s {}; {} observed as {} bytes, {} as {} bytes",
+        checked.frames,
         source.display(),
-        extent(bytes.len(), source_prefix),
-        minus.path.display(),
-        minus.len,
-        diff.path.display(),
-        diff.len
+        extent(checked.bytes, source_prefix),
+        minus_side.path.display(),
+        minus_side.len,
+        diff_side.path.display(),
+        diff_side.len
     );
-    row(
-        "kind",
-        ["read", "in MINUS", "in DIFF", "missing"].map(String::from),
+    checked.print_table("in MINUS", "in DIFF");
+    let source_label = source.display().to_string();
+    let verdict = checked.verdict(
+        &source_label,
+        &minus_side.path.display().to_string(),
+        &diff_side.path.display().to_string(),
+        allow_corrupt,
     );
-    for (kind, count) in &counts {
-        let columns = [count.read, count.in_minus, count.in_diff, count.missing];
-        row(kind, columns.map(|n| n.to_string()));
+    let closed = minus_side.close().and(diff_side.close());
+    verdict.and(closed)
+}
+
+/// What the shared checker found.
+#[derive(Default)]
+pub(super) struct Checked {
+    pub(super) frames: u64,
+    pub(super) bytes: usize,
+    counts: BTreeMap<&'static str, CheckCounts>,
+    pub(super) missing: u64,
+    pub(super) corrupt: u64,
+    pub(super) stopped: Vec<(PathBuf, String)>,
+    /// The inputs' order-sensitive log frames, concatenated in input order.
+    logged: Vec<Identity>,
+    /// The output's order-sensitive log frames.
+    out_logged: Vec<Identity>,
+    /// Items each baseline side supplied, by position.
+    pub(super) covered: Vec<u64>,
+    /// With provenance: output items no input holds.
+    pub(super) extra: Option<u64>,
+}
+
+/// Confirm that every blob and record of `inputs` is in `baseline` or `out`,
+/// by the identities `copy_new` compares, and that `out`'s order-sensitive
+/// frames (those `keep` copies at every occurrence) are exactly the inputs'
+/// concatenated in input order. With
+/// `provenance`, also confirm the converse: every frame of `out` is held by
+/// one of those piles (normally the inputs), so `out` holds nothing else.
+pub(super) fn check_union(
+    inputs: Vec<Input>,
+    baseline: &[&Side],
+    out: &Side,
+    provenance: Option<&[&Side]>,
+    allow_corrupt: bool,
+    keep: KeepEvery,
+) -> Result<Checked> {
+    let mut checked = Checked {
+        covered: vec![0; baseline.len()],
+        out_logged: out.log(keep),
+        ..Checked::default()
+    };
+    const LISTED: u64 = 100;
+
+    for Input { path, mut scan } in inputs {
+        let bytes = scan.bytes().clone();
+        checked.bytes += bytes.len();
+        while let Some(record) = scan.next() {
+            let record = match record {
+                Ok(record) => record,
+                Err(error) if allow_corrupt => {
+                    checked.stopped.push((path.clone(), error.to_string()));
+                    break;
+                }
+                Err(error) => {
+                    return Err(super::pile_read_error(&path, error).context(format!(
+                        "refusing: {} is not fully readable",
+                        path.display()
+                    )))
+                }
+            };
+            checked.frames += 1;
+            let frame = &bytes[record.offset..record.offset + record.len];
+            let (kind, item) = classify(&record, frame);
+            let count = checked.counts.entry(kind).or_default();
+            count.read += 1;
+            let (holder, in_out, identity) = match item {
+                Item::Blob {
+                    hash,
+                    data_offset,
+                    data_len,
+                } => {
+                    let holder = blob_holder(baseline, hash);
+                    let in_out = holder.is_none() && out.has_valid_blob(hash);
+                    if holder.is_none()
+                        && !in_out
+                        && Blake3::digest(&bytes[data_offset..data_offset + data_len]) != hash
+                    {
+                        checked.corrupt += 1;
+                        println!(
+                            "corrupt in {}, no valid copy elsewhere: blob frame at byte {} names {}",
+                            path.display(),
+                            record.offset,
+                            hex::encode_upper(hash)
+                        );
+                        continue;
+                    }
+                    (holder, in_out, format!("blob {}", hex::encode_upper(hash)))
+                }
+                Item::Record {
+                    identity,
+                    ordered,
+                    opaque,
+                } => {
+                    if keep.every(ordered, opaque) {
+                        checked.logged.push(identity);
+                    }
+                    let holder = record_holder(baseline, &identity);
+                    let in_out = holder.is_none() && out.records.contains(&identity);
+                    (holder, in_out, identity.to_string())
+                }
+            };
+            if let Some(holder) = holder {
+                count.in_minus += 1;
+                checked.covered[holder] += 1;
+            } else if in_out {
+                count.in_diff += 1;
+            } else {
+                count.missing += 1;
+                checked.missing += 1;
+                if checked.missing <= LISTED {
+                    println!(
+                        "MISSING {kind} at byte {} of {}: {identity}",
+                        record.offset,
+                        path.display()
+                    );
+                }
+            }
+        }
     }
-    println!("corrupt blob frames without a valid copy: {corrupt}");
-    println!("missing: {missing}");
-    if let Some(error) = &stopped {
+
+    if let Some(holders) = provenance {
+        let mut extra = 0u64;
+        let mut scan = out.scan();
+        let bytes = scan.bytes().clone();
+        while let Some(record) = scan.next() {
+            let record = record.map_err(|error| super::pile_read_error(&out.path, error))?;
+            let frame = &bytes[record.offset..record.offset + record.len];
+            let (kind, item) = classify(&record, frame);
+            let (held, identity) = match item {
+                Item::Blob { hash, .. } => (
+                    blob_holder(holders, hash).is_some(),
+                    format!("blob {}", hex::encode_upper(hash)),
+                ),
+                Item::Record { identity, .. } => (
+                    record_holder(holders, &identity).is_some(),
+                    identity.to_string(),
+                ),
+            };
+            if !held {
+                extra += 1;
+                if extra <= LISTED {
+                    println!(
+                        "EXTRA {kind} at byte {} of {}: {identity} is held by no input",
+                        record.offset,
+                        out.path.display()
+                    );
+                }
+            }
+        }
+        checked.extra = Some(extra);
+    }
+    Ok(checked)
+}
+
+impl Checked {
+    pub(super) fn print_table(&self, present: &str, out: &str) {
+        row("kind", ["read", present, out, "missing"].map(String::from));
+        for (kind, count) in &self.counts {
+            let columns = [count.read, count.in_minus, count.in_diff, count.missing];
+            row(kind, columns.map(|n| n.to_string()));
+        }
+        println!("corrupt blob frames without a valid copy: {}", self.corrupt);
+        println!("missing: {}", self.missing);
+        if let Some(extra) = self.extra {
+            println!("extra: {extra}");
+        }
+        for (source, error) in &self.stopped {
+            println!(
+                "WARNING: the scan of {} stopped early ({error}); later bytes were not checked",
+                source.display()
+            );
+        }
         println!(
-            "WARNING: the scan of {} stopped early ({error}); later bytes were not checked",
-            source.display()
+            "order-sensitive log frames: {} in SOURCE, {} in DIFF, sequence {}",
+            self.logged.len(),
+            self.out_logged.len(),
+            if self.logged == self.out_logged {
+                "identical"
+            } else {
+                "DIFFERS"
+            }
         );
     }
-    let log_matches = logged == diff.logged;
-    println!(
-        "order-sensitive log frames: {} in SOURCE, {} in DIFF, sequence {}",
-        logged.len(),
-        diff.logged.len(),
-        if log_matches { "identical" } else { "DIFFERS" }
-    );
-    if !log_matches {
-        bail!(
-            "the order-sensitive log (legacy pins, retired WANTs) of {} is not reproduced \
-             in order by {}: replaying the difference would end in a different state",
-            source.display(),
-            diff.path.display()
-        );
+
+    /// Refuse unless the check proved what it set out to.
+    pub(super) fn verdict(
+        &self,
+        source: &str,
+        minus: &str,
+        diff: &str,
+        allow_corrupt: bool,
+    ) -> Result<()> {
+        if self.logged != self.out_logged {
+            bail!(
+                "the order-sensitive frames (legacy pins and retired WANTs, and in yard \
+                 commands uninterpreted frames) of {source} are not reproduced occurrence for \
+                 occurrence by {diff}: replaying it would end in a different state"
+            );
+        }
+        if self.missing > 0 && minus.is_empty() {
+            bail!("{} item(s) of {source} are not in {diff}", self.missing);
+        }
+        if self.missing > 0 {
+            bail!(
+                "{} item(s) of {source} are in neither {minus} nor {diff}",
+                self.missing
+            );
+        }
+        if let Some(extra) = self.extra.filter(|extra| *extra > 0) {
+            bail!("{extra} item(s) of {diff} are held by none of {source}");
+        }
+        if self.corrupt > 0 && !allow_corrupt {
+            bail!(
+                "{} corrupt blob frame(s) of {source} have no valid copy anywhere; pass \
+                 --allow-corrupt to accept",
+                self.corrupt
+            );
+        }
+        Ok(())
     }
-    if missing > 0 {
-        bail!(
-            "{missing} item(s) of {} are in neither {} nor {}",
-            source.display(),
-            minus.path.display(),
-            diff.path.display()
-        );
-    }
-    if corrupt > 0 && !allow_corrupt {
-        bail!("{corrupt} corrupt blob frame(s) of {} have no valid copy anywhere; pass --allow-corrupt to accept", source.display());
-    }
-    Ok(())
 }

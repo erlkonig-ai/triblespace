@@ -6,6 +6,7 @@ use std::io;
 use tracing_subscriber::EnvFilter;
 
 use trible::cli;
+use trible::cli::pile::yard::YardCommand;
 use trible::cli::pile::PileCommand;
 use trible::cli::store::StoreCommand;
 
@@ -25,6 +26,11 @@ enum TribleCli {
     Pile {
         #[command(subcommand)]
         cmd: PileCommand,
+    },
+    /// Keep old piles as differences in a folder of piles (a yard).
+    Yard {
+        #[command(subcommand)]
+        cmd: YardCommand,
     },
     /// Inspect remote object stores.
     Store {
@@ -58,6 +64,7 @@ fn main() -> Result<()> {
             clap_complete::generate(shell, &mut cmd, bin_name, &mut io::stdout());
         }
         TribleCli::Pile { cmd } => cli::pile::run(cmd)?,
+        TribleCli::Yard { cmd } => cli::pile::yard::run(cmd)?,
         TribleCli::Store { cmd } => cli::store::run(cmd)?,
     }
     Ok(())

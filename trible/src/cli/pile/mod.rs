@@ -18,6 +18,7 @@ mod repair;
 mod signing;
 mod subtract;
 mod verify;
+pub mod yard;
 
 #[derive(Parser)]
 pub enum PileCommand {

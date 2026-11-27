@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `trible`: a new `trible yard` command keeps old piles as differences in a
+  folder of piles. `yard diff YARD OLD --live LIVE --into NEW` writes only what
+  OLD adds to the live pile and every pile already in the folder, and
+  `yard pack YARD [--live LIVE] --into NEW` writes the folder's union once.
+  Both verify the written file before publishing it, list the folder and stat
+  every input again, and never replace, delete or open for writing; `--check`
+  verifies an existing one. Frames this reader cannot interpret are kept at
+  every occurrence by both. A pack keeps each distinct legacy pin and retired
+  WANT record once and loses their replay order and repeats; a diff keeps
+  them as `pile subtract` does. `pile subtract` now reads each side from one snapshot and shares
+  the same writer and checker; its output is unchanged.
+
 - `triblespace-core`: the held index keeps no edge cache. A blob is read for
   each collection that reaches it, where one read used to serve all of them,
   and the parent-child edges and the set of scanned blobs are gone from memory.
