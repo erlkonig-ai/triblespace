@@ -384,6 +384,12 @@ impl CapabilityProof {
     pub fn root_key(&self) -> VerifyingKey {
         parse_key(&self.bytes.header.root).expect("proof root was validated at construction")
     }
+    /// The root key exactly as encoded in the header, without decompressing
+    /// the point. Construction validated it as a canonical, non-weak key, so
+    /// these are the bytes `root_key().to_bytes()` returns.
+    fn root_bytes(&self) -> &[u8; PUBLIC_KEY_LEN] {
+        &self.bytes.header.root
+    }
     pub fn leaf_key(&self) -> VerifyingKey {
         self.edges()
             .next_back()
@@ -712,11 +718,13 @@ where
     let mut definitions = BTreeMap::new();
     let mut undefined = Vec::new();
     for proof in proofs {
-        let root = proof.root_key().to_bytes();
-        if !roots.contains(&root)
-            || support.contains(&root)
-            || proof.resource() != request.resource()
-        {
+        // Byte comparisons only: `roots` holds canonical, non-weak keys, so a
+        // proof's header root matches one exactly when its decoded key would.
+        if proof.resource() != request.resource() {
+            continue;
+        }
+        let root = *proof.root_bytes();
+        if !roots.contains(&root) || support.contains(&root) {
             continue;
         }
         let walked = visit_prefixes(proof, reader, &mut definitions, |prefix, definition| {
@@ -792,8 +800,11 @@ where
         .collect();
     let mut definitions = BTreeMap::new();
     for proof in proofs {
-        let root = proof.root_key().to_bytes();
-        if !roots.contains(&root) || proof.resource() != request.resource() {
+        if proof.resource() != request.resource() {
+            continue;
+        }
+        let root = *proof.root_bytes();
+        if !roots.contains(&root) {
             continue;
         }
         let _ = visit_prefixes(proof, reader, &mut definitions, |prefix, definition| {
