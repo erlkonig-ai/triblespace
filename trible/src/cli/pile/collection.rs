@@ -1943,18 +1943,28 @@ mod tests {
     use triblespace_core::collection::{CollectionPolicy, CollectionStoreExt};
     use triblespace_core::repo::memoryrepo::MemoryRepo;
 
-    fn eight_input_merge(collection: CollectionHandle) -> triblespace_core::collection::CollectionMerge {
+    fn eight_input_merge(
+        collection: CollectionHandle,
+    ) -> triblespace_core::collection::CollectionMerge {
         let members: Vec<Blob<SimpleArchive>> = ["a", "b", "c", "d", "e", "f", "g", "h"]
-            .into_iter().map(|name| {
+            .into_iter()
+            .map(|name| {
                 triblespace_core::prelude::entity! { metadata::name: name }
-                    .facts().clone().to_blob()
-            }).collect();
+                    .facts()
+                    .clone()
+                    .to_blob()
+            })
+            .collect();
         let joined = triblespace_core::collection::simplearchive_union::join_all(&members).unwrap();
         triblespace_core::collection::CollectionMerge::sign(
-            &SigningKey::from_bytes(&[1; 32]), collection,
-            members.iter().map(|blob| Handle::<SimpleArchive>::to_hash(blob.get_handle())),
+            &SigningKey::from_bytes(&[1; 32]),
+            collection,
+            members
+                .iter()
+                .map(|blob| Handle::<SimpleArchive>::to_hash(blob.get_handle())),
             Handle::<SimpleArchive>::to_hash(joined.get_handle()),
-        ).unwrap()
+        )
+        .unwrap()
     }
 
     fn direct_policy(root: ed25519_dalek::VerifyingKey) -> CollectionPolicy {
@@ -2749,14 +2759,20 @@ fn attached_source_facts(
         }
         let residual = view.residual().len();
         if residual > 0 {
-            eprintln!(
-                "{residual} source foundation(s) have no fact attachment yet and are read from \
-                 their bytes; run 'collection maintain' on {}",
+            anyhow::bail!(
+                "{residual} source foundation(s) have no stored fact attachment; run \
+                 'collection maintain' on {} before this indexed read",
                 handle_hex(handle)
             );
         }
         let facts = succinctarchive_union::read_attached(&view)
             .map_err(|error| anyhow!("read source fact index: {error}"))?;
+        if !facts.unread().is_empty() {
+            anyhow::bail!(
+                "stored fact index leaves {} source foundation(s) unread",
+                facts.unread().len()
+            );
+        }
         Ok(Some(facts.into_value()))
     }
 

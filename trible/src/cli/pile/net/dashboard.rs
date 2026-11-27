@@ -13,8 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{
-    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchive, SuccinctArchiveBlob,
-    UnionArchive,
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::encodings::UnknownBlob;
@@ -22,8 +21,8 @@ use triblespace_core::blob::Blob;
 use triblespace_core::collection::descriptor;
 use triblespace_core::collection::lww_register::{LwwIndex, LwwQuery, LwwRegisterBlob};
 use triblespace_core::collection::{
-    AdmissionPolicy, AttachedSnapshot, Collection, CollectionHandle, CollectionPolicy, CollectionSnapshot,
-    CollectionSnapshotExt, CollectionStoreExt, TryFromCoverError,
+    AdmissionPolicy, AttachedSnapshot, Collection, CollectionHandle, CollectionPolicy,
+    CollectionSnapshot, CollectionSnapshotExt, CollectionStoreExt, TryFromCoverError,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::Inline;
@@ -188,8 +187,8 @@ impl SelectedSource {
 /// projection makes a few hundred point lookups per observer, and over the
 /// plain Succinct attachment those took about 240 ms each on sky's live
 /// pile (2026-11-18) against well under one ms here. Nothing is maintained
-/// or published: a foundation no believed MAP reaches yet is read raw for
-/// this observation.
+/// or published: a foundation no believed MAP reaches yet makes this
+/// indexed observation explicitly unavailable until upkeep.
 ///
 /// A pile without those two attachments has nothing to read through. Then
 /// the collection is decoded in full, as before, and the frame says so
@@ -239,7 +238,12 @@ impl HealthSource {
     fn attachments(
         &self,
         snapshot: &PileSnapshot,
-    ) -> ReadResult<Option<(Collection<Rank9AcceleratedSuccinctArchiveBlob>, Collection<LwwRegisterBlob>)>> {
+    ) -> ReadResult<
+        Option<(
+            Collection<Rank9AcceleratedSuccinctArchiveBlob>,
+            Collection<LwwRegisterBlob>,
+        )>,
+    > {
         let root = Collection::<SimpleArchive>::open(snapshot, self.handle())
             .map_err(|_| ReadFailure::OpenCollection)?;
         let mut descriptors = MemoryRepo::default();
@@ -273,12 +277,9 @@ impl HealthSource {
         now_ns: i128,
         max_age: Duration,
     ) -> ReadResult<Vec<ObserverReport>> {
-        let current = self
-            .indexed
-            .as_ref()
-            .is_some_and(|indexed| {
-                indexed.facts.is_current(snapshot) && indexed.latest.is_current(snapshot)
-            });
+        let current = self.indexed.as_ref().is_some_and(|indexed| {
+            indexed.facts.is_current(snapshot) && indexed.latest.is_current(snapshot)
+        });
         if !current {
             self.indexed = None;
             self.unindexed = false;
@@ -290,29 +291,14 @@ impl HealthSource {
                     let latest = snapshot
                         .attached(latest)
                         .map_err(|_| ReadFailure::ObserveCollection)?;
-                    // The accelerated archive's mapping reads its Succinct
-                    // sibling, so a read cannot build the foundations no MAP
-                    // reaches yet (a report landed since the last upkeep):
-                    // those are read raw and joined as one more segment.
-                    let mut archive = facts
+                    // A missing attachment may hold a newer report. Report the
+                    // gap instead of constructing an index during observation.
+                    if !facts.residual().is_empty() {
+                        return Err(ReadFailure::MemberUnavailable);
+                    }
+                    let archive = facts
                         .view::<UnionArchive<OrderedUniverse>>()
                         .map_err(|_| ReadFailure::InvalidFacts)?;
-                    if !facts.residual().is_empty() {
-                        let mut residual = TribleSet::new();
-                        for foundation in facts.residual().members() {
-                            // A foundation whose bytes are not here may hold
-                            // an observer's newest report, so the read is
-                            // unavailable, as a missing member of the full
-                            // decode is.
-                            let set: TribleSet = snapshot
-                                .get(foundation)
-                                .map_err(|_| ReadFailure::MemberUnavailable)?;
-                            residual += set;
-                        }
-                        archive = archive.union(&UnionArchive::new(vec![
-                            SuccinctArchive::<OrderedUniverse>::from(&residual),
-                        ]));
-                    }
                     let (index, unread_latest) = latest
                         .read::<LwwIndex>()
                         .map_err(|_| ReadFailure::InvalidFacts)?
@@ -335,7 +321,10 @@ impl HealthSource {
                 }
             }
         }
-        let indexed = self.indexed.as_ref().expect("indexed observation installed");
+        let indexed = self
+            .indexed
+            .as_ref()
+            .expect("indexed observation installed");
         Ok(dashboard::observe_latest_health(
             &indexed.archive,
             &indexed.winners,
@@ -799,7 +788,9 @@ fn observe_lattice<R: triblespace_core::repo::StoreRead>(
             (None, Some(parent)) => (CollectionKind::Attached, Some(parent.raw)),
             (None, None) => (CollectionKind::Root, None),
         };
-        let mapping = facts.as_ref().and_then(|facts| mapping_name(snapshot, facts));
+        let mapping = facts
+            .as_ref()
+            .and_then(|facts| mapping_name(snapshot, facts));
         let name = facts.as_ref().and_then(|facts| {
             let named = descriptor::name(facts).ok().flatten()?;
             let blob: Blob<UTF8String> = snapshot.get(named).ok()?;
@@ -1264,8 +1255,10 @@ fn observe_attached<R: triblespace_core::repo::StoreRead>(
 
     // node handle -> anchor member, per collection already placed. The
     // selection's own nodes are its members.
-    let mut placed: std::collections::BTreeMap<[u8; 32], std::collections::BTreeMap<[u8; 32], usize>> =
-        std::collections::BTreeMap::new();
+    let mut placed: std::collections::BTreeMap<
+        [u8; 32],
+        std::collections::BTreeMap<[u8; 32], usize>,
+    > = std::collections::BTreeMap::new();
     placed.insert(
         members.collection,
         members
@@ -1294,7 +1287,9 @@ fn observe_attached<R: triblespace_core::repo::StoreRead>(
                 }
                 let target = CollectionHandle::new(child.handle);
                 let records = snapshot
-                    .select_records(&BTreeSet::from([CollectionRecordSelector::Collection(target)]))
+                    .select_records(&BTreeSet::from([CollectionRecordSelector::Collection(
+                        target,
+                    )]))
                     .map_err(|_| ReadFailure::RefreshPile)?;
                 let anchors = &placed[parent];
                 let mut layer = AttachedLayer {
@@ -1330,7 +1325,9 @@ fn observe_attached<R: triblespace_core::repo::StoreRead>(
                             .unwrap_or(false),
                     });
                 }
-                layer.marks.sort_unstable_by_key(|mark| (mark.anchor, mark.attachment));
+                layer
+                    .marks
+                    .sort_unstable_by_key(|mark| (mark.anchor, mark.attachment));
                 layer.marks.dedup();
                 placed.insert(child.handle, own);
                 next.push(child.handle);
@@ -2232,23 +2229,28 @@ mod tests {
     }
 
     /// The same records in `store`, whatever key it was opened as.
-    fn member_fixture_in(
-        mut store: MemoryRepo,
-    ) -> (MemoryRepo, [u8; 32], [[u8; 32]; 8], [u8; 32]) {
+    fn member_fixture_in(mut store: MemoryRepo) -> (MemoryRepo, [u8; 32], [[u8; 32]; 8], [u8; 32]) {
         use triblespace_core::collection::CollectionStore;
         let signer = member_host();
         let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
         let collection: Collection<SimpleArchive> = store.collection("members", policy).unwrap();
         let commits = ["a", "b", "c", "d", "e", "f", "g", "h"].map(|name| {
-            store.commit(collection, &signer, entity! { metadata::name: name }).unwrap()
+            store
+                .commit(collection, &signer, entity! { metadata::name: name })
+                .unwrap()
         });
         // A real join equation. Its result blob is deliberately not stored:
         // an endorsed merge whose bytes were collected is ordinary, and it is
         // exactly the case the drawing must not show as complete.
         let snapshot = store.snapshot().unwrap();
-        let blobs: Vec<Blob<SimpleArchive>> = commits.iter().map(|commit| {
-            snapshot.get(Handle::<SimpleArchive>::from_hash(commit.data())).unwrap()
-        }).collect();
+        let blobs: Vec<Blob<SimpleArchive>> = commits
+            .iter()
+            .map(|commit| {
+                snapshot
+                    .get(Handle::<SimpleArchive>::from_hash(commit.data()))
+                    .unwrap()
+            })
+            .collect();
         let joined = triblespace_core::collection::simplearchive_union::join_all(&blobs).unwrap();
         let result = Handle::<SimpleArchive>::to_hash(joined.get_handle());
         assert!(!snapshot.contains_blob(joined.get_handle()).unwrap());
@@ -2354,7 +2356,10 @@ mod tests {
         assert_eq!(
             members.joins,
             {
-                let mut expected: Vec<_> = inputs.iter().map(|input| (at(*input), at(result))).collect();
+                let mut expected: Vec<_> = inputs
+                    .iter()
+                    .map(|input| (at(*input), at(result)))
+                    .collect();
                 expected.sort_unstable();
                 expected
             },
@@ -2538,18 +2543,30 @@ mod tests {
         // inserted, which is the only reason the test passed -- it contradicts
         // the premise rather than establishing it.
         let orphan_blob: Blob<SimpleArchive> = entity! { metadata::name: "orphan" }
-            .facts().clone().to_blob();
+            .facts()
+            .clone()
+            .to_blob();
         let orphan = Handle::<SimpleArchive>::to_hash(orphan_blob.get_handle());
         let snapshot = store.snapshot().unwrap();
-        let mut blobs: Vec<Blob<SimpleArchive>> = inputs.iter().map(|input| {
-            snapshot.get(Handle::<SimpleArchive>::from_hash(Inline::new(*input))).unwrap()
-        }).collect();
+        let mut blobs: Vec<Blob<SimpleArchive>> = inputs
+            .iter()
+            .map(|input| {
+                snapshot
+                    .get(Handle::<SimpleArchive>::from_hash(Inline::new(*input)))
+                    .unwrap()
+            })
+            .collect();
         drop(snapshot);
         blobs.push(orphan_blob);
-        let waiting_blob = triblespace_core::collection::simplearchive_union::join_all(&blobs).unwrap();
+        let waiting_blob =
+            triblespace_core::collection::simplearchive_union::join_all(&blobs).unwrap();
         let waiting_result = Handle::<SimpleArchive>::to_hash(waiting_blob.get_handle());
-        let waiting_inputs: Vec<_> = inputs[..6].iter().copied().map(Inline::new)
-            .chain([Inline::new(result), orphan]).collect();
+        let waiting_inputs: Vec<_> = inputs[..6]
+            .iter()
+            .copied()
+            .map(Inline::new)
+            .chain([Inline::new(result), orphan])
+            .collect();
         let merge = CollectionMerge::sign(
             &signer,
             CollectionHandle::new(collection),
@@ -2568,7 +2585,9 @@ mod tests {
             members.members.iter().any(|m| m.handle == orphan.raw),
             "and it is still drawn"
         );
-        assert!(inputs.iter().all(|input| members.members.iter().any(|m| m.handle == *input)));
+        assert!(inputs
+            .iter()
+            .all(|input| members.members.iter().any(|m| m.handle == *input)));
 
         let at = |handle: [u8; 32]| {
             members
@@ -2578,11 +2597,16 @@ mod tests {
                 .expect("member projected")
         };
         let waiting_result = waiting_result.raw;
-        let mut driven: Vec<_> = inputs.iter().map(|input| (at(*input), at(result))).collect();
+        let mut driven: Vec<_> = inputs
+            .iter()
+            .map(|input| (at(*input), at(result)))
+            .collect();
         driven.sort_unstable();
         assert_eq!(members.joins, driven, "the driven join is solid");
-        let mut waiting: Vec<_> = waiting_inputs.iter()
-            .map(|input| (at(input.raw), at(waiting_result))).collect();
+        let mut waiting: Vec<_> = waiting_inputs
+            .iter()
+            .map(|input| (at(input.raw), at(waiting_result)))
+            .collect();
         waiting.sort_unstable();
         assert_eq!(
             members.waiting, waiting,
@@ -2610,17 +2634,33 @@ mod tests {
         // set and its actual union. It is ignored for its signer, not because
         // an input is absent or the claimed result was invented.
         let extra_blob: Blob<SimpleArchive> = entity! { metadata::name: "extra" }
-            .facts().clone().to_blob();
+            .facts()
+            .clone()
+            .to_blob();
         let extra = Handle::<SimpleArchive>::to_hash(store.put(extra_blob).unwrap());
-        store.insert(CollectionRecord::Commit(CollectionCommit::sign(
-            &stranger, CollectionHandle::new(collection), extra, empty_metadata_handle(),
-        ))).unwrap();
-        let foreign_inputs: Vec<_> = inputs[..7].iter().copied().map(Inline::new)
-            .chain([extra]).collect();
+        store
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                &stranger,
+                CollectionHandle::new(collection),
+                extra,
+                empty_metadata_handle(),
+            )))
+            .unwrap();
+        let foreign_inputs: Vec<_> = inputs[..7]
+            .iter()
+            .copied()
+            .map(Inline::new)
+            .chain([extra])
+            .collect();
         let snapshot = store.snapshot().unwrap();
-        let blobs: Vec<Blob<SimpleArchive>> = foreign_inputs.iter().map(|input| {
-            snapshot.get(Handle::<SimpleArchive>::from_hash(*input)).unwrap()
-        }).collect();
+        let blobs: Vec<Blob<SimpleArchive>> = foreign_inputs
+            .iter()
+            .map(|input| {
+                snapshot
+                    .get(Handle::<SimpleArchive>::from_hash(*input))
+                    .unwrap()
+            })
+            .collect();
         let joined = triblespace_core::collection::simplearchive_union::join_all(&blobs).unwrap();
         let foreign = Handle::<SimpleArchive>::to_hash(joined.get_handle());
         drop(snapshot);
@@ -2642,7 +2682,13 @@ mod tests {
             "another key's join result is not a member here"
         );
         let handles: BTreeSet<[u8; 32]> = members.members.iter().map(|m| m.handle).collect();
-        assert_eq!(handles, inputs.into_iter().chain([extra.raw, result]).collect::<BTreeSet<_>>());
+        assert_eq!(
+            handles,
+            inputs
+                .into_iter()
+                .chain([extra.raw, result])
+                .collect::<BTreeSet<_>>()
+        );
         assert_eq!(members.joins.len(), 8, "only the host's join is drawn");
         assert!(
             members.waiting.is_empty(),
@@ -2652,8 +2698,7 @@ mod tests {
 
         // Opened as no key, the same records believe no MERGE at all: the
         // commits are the whole lattice and nothing joins them.
-        let (mut keyless, collection, inputs, result) =
-            member_fixture_in(MemoryRepo::default());
+        let (mut keyless, collection, inputs, result) = member_fixture_in(MemoryRepo::default());
         let snapshot = keyless.snapshot().unwrap();
         let members = observe_members(&snapshot, collection, MEMBER_LIMIT).unwrap();
         let handles: BTreeSet<[u8; 32]> = members.members.iter().map(|m| m.handle).collect();
@@ -3336,8 +3381,7 @@ mod tests {
             AdmissionPolicy::direct(authority),
         );
         let mut writer = crate::cli::pile::open_refreshed_with(&path, Some(authority)).unwrap();
-        let health: Collection<SimpleArchive> =
-            writer.collection("swarm-health", policy).unwrap();
+        let health: Collection<SimpleArchive> = writer.collection("swarm-health", policy).unwrap();
         let session = genid();
         let nodes = [genid(), genid()];
         let mut all = TribleSet::new();
@@ -3376,7 +3420,7 @@ mod tests {
                 drop(writer.maintain_attached(facts, &signer).await.unwrap());
                 drop(writer.maintain_attached(latest, &signer).await.unwrap());
             });
-        // Written after the upkeep: no MAP reaches it, so the read takes it raw.
+        // Written after upkeep: a stored-only read must report pending.
         report(&mut writer, &nodes[0], 104.0);
         writer.close().unwrap();
         let before = std::fs::read(&path).unwrap();
@@ -3396,6 +3440,29 @@ mod tests {
         };
         let mut reader = Reader::open_as(&options, Some(authority)).unwrap();
         let now_ns = 106_000_000_000;
+        let frame = reader.sample_at(now_ns).unwrap();
+        assert!(frame.health.is_empty());
+        assert!(frame
+            .warnings
+            .iter()
+            .any(|warning| warning == "Health reports unreadable: selected member unavailable"));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "pending read writes nothing"
+        );
+        let mut writer = crate::cli::pile::open_refreshed_with(&path, Some(authority)).unwrap();
+        writer
+            .ensure_attached_within(succinct, &signer, u64::MAX)
+            .unwrap();
+        writer
+            .ensure_attached_within(facts, &signer, u64::MAX)
+            .unwrap();
+        writer
+            .ensure_attached_within(latest, &signer, u64::MAX)
+            .unwrap();
+        writer.close().unwrap();
+        let before = std::fs::read(&path).unwrap();
         let frame = reader.sample_at(now_ns).unwrap();
         let source = reader.health.as_ref().unwrap();
         assert!(source.indexed.is_some(), "read through the attachments");
@@ -3420,7 +3487,11 @@ mod tests {
             .unwrap();
         assert_eq!(newest.created_ns, 104_000_000_000);
         reader.close().unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), before, "the read wrote nothing");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "the read wrote nothing"
+        );
     }
 
     #[test]

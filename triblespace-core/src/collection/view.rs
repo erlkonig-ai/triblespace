@@ -8,17 +8,15 @@
 //! is [`CollectionSnapshot::missing_from`]. Logical values remain
 //! caller-chosen projections reconstructed through [`TryFromCover`].
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
-use crate::blob::encodings::UnknownBlob;
-use crate::blob::{Blob, BlobEncoding, Bytes, TryFromBlob};
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
-use crate::repo::{BlobStoreGet, BlobStoreMeta, StoreChanges, StoreRead, StoreSnapshot};
+use crate::repo::{BlobStoreGet, StoreChanges, StoreRead, StoreSnapshot};
 use crate::trible::Fragment;
 
 use super::observed_store::{DependencyTracker, ObservedStore};
@@ -335,10 +333,9 @@ where
         V::try_from_cover(&self.cover, &descriptor.fragment, &observed)
     }
 
-    /// Reconstruct one caller-chosen logical value over everything the
-    /// parent stands on in this observation, through the canonical mapping
-    /// the attached descriptor names: [`Self::read_with`] for
-    /// [`CollectionAttachment`](super::CollectionAttachment).
+    /// Read only the stored attached cover. Every foundation outside that
+    /// cover remains explicitly unread, even when its source bytes are resident.
+    /// This never runs a mapping or publishes an attachment.
     pub fn read<V>(
         &self,
     ) -> Result<AttachedRead<V>, AttachedReadError<R::GetError<Infallible>, V::Error>>
@@ -350,11 +347,9 @@ where
         self.read_with::<super::encoding::CanonicalAttachment<E>, V>()
     }
 
-    /// Read this exact selected cover and residual through an acquiring reader.
-    /// Missing residual bytes are requested by handle, not skipped on the
-    /// snapshot's frozen residency. Unavailable inputs remain explicit unread
-    /// members; other read and mapping failures are returned. No records,
-    /// proofs, cover, or support are refreshed and no work is published.
+    /// Read the same stored cover through the supplied reader. An acquiring
+    /// reader may get selected attachment bytes; residual source bytes are
+    /// neither requested nor mapped. Upkeep is an explicit store operation.
     pub fn read_acquiring<V>(
         &self,
     ) -> Result<AttachedRead<V>, AttachedReadError<R::GetError<Infallible>, V::Error>>
@@ -363,10 +358,11 @@ where
         E: super::CollectionAttachment,
         V: TryFromCover<E>,
     {
-        self.read_with_acquiring::<super::encoding::CanonicalAttachment<E>, V>()
+        self.read::<V>()
     }
 
-    /// The explicit-mapping form of [`Self::read_acquiring`].
+    /// Stored-only read with an explicit mapping, validating its descriptor
+    /// without invoking the mapping.
     pub fn read_with_acquiring<M, V>(
         &self,
     ) -> Result<AttachedRead<V>, AttachedReadError<R::GetError<Infallible>, V::Error>>
@@ -375,7 +371,7 @@ where
         M: MapMapping<Target = E>,
         V: TryFromCover<E>,
     {
-        self.read_mode::<M, V>(true, None)
+        self.read_with::<M, V>()
     }
 
     /// Wrap only the byte reader of this already-selected observation.
@@ -398,29 +394,9 @@ where
         }
     }
 
-    /// Reconstruct one caller-chosen logical value over everything the
-    /// parent stands on in this observation: the attachments taken, and an
-    /// image of every residual foundation built in memory through `M`.
-    ///
-    /// This is the reader's half of "read raw, build, or report a gap": a
-    /// residual foundation whose bytes are here is mapped the way
-    /// maintenance would map it, and the view is formed over the cover and
-    /// those images together, so, by the mapping's cover-query law
-    /// ([`MapMapping`]), it answers like the view of the parent's whole
-    /// support and never less than a fact read of the same observation. A
-    /// mapping whose law is a premise about its input answers so only where
-    /// the premise holds; where it does not, nothing here is unread to show
-    /// it. Nothing is stored or published; the images are handed back in
-    /// [`AttachedRead::built`] for a caller that keeps them. What cannot be built
-    /// here -- bytes not here, a dependency the mapping names not here, a
-    /// node the mapping cannot represent or interpret, or any node at all
-    /// when the mapping reads sibling attachments -- is named in
-    /// [`AttachedRead::unread`], never read as absent. The mapping's reads
-    /// join this observation's read-set, so a dependency arriving moves it
-    /// off current.
-    ///
-    /// `M` must be the mapping the attached descriptor names; one it does
-    /// not bind is [`AttachedReadError::Mapping`].
+    /// Validate the named mapping, then read only persisted attachments.
+    /// Use `ensure_attached_within_with` on the owning store for bounded
+    /// durable construction, and take a fresh observation after it finishes.
     pub fn read_with<M, V>(
         &self,
     ) -> Result<AttachedRead<V>, AttachedReadError<R::GetError<Infallible>, V::Error>>
@@ -429,223 +405,36 @@ where
         M: MapMapping<Target = E>,
         V: TryFromCover<E>,
     {
-        self.read_mode::<M, V>(false, None)
-    }
-
-    /// [`Self::read_within_with`] through the canonical mapping the attached
-    /// descriptor names: [`Self::read`] with a build budget.
-    pub fn read_within<V>(
-        &self,
-        budget: u64,
-    ) -> Result<AttachedRead<V>, AttachedReadError<R::GetError<Infallible>, V::Error>>
-    where
-        R: StoreRead,
-        E: super::CollectionAttachment,
-        V: TryFromCover<E>,
-    {
-        self.read_within_with::<super::encoding::CanonicalAttachment<E>, V>(budget)
-    }
-
-    /// [`Self::read_with`], building at most `budget` bytes of residual
-    /// input: the resident residual foundations are mapped in the
-    /// residual's own order while the bytes mapped so far and the next
-    /// foundation's fit in `budget` (the lengths of the foundations' own
-    /// bytes). The first foundation that maps is built whatever its length,
-    /// so a read with a residual always builds something when anything can
-    /// be built; the first that does not fit ends the build, and the rest of
-    /// the residual is not looked at. What is left out is
-    /// [`AttachedRead::unread`] like any other gap, so a caller tells a
-    /// bounded read from a complete one the usual way.
-    ///
-    /// This is the read for an operation that should not grow with how far
-    /// the attached collection lags its parent, such as a search: what it
-    /// builds can be kept as the host's attachments
-    /// ([`super::CollectionStoreExt::keep_attached`]), and the next read
-    /// starts from there.
-    pub fn read_within_with<M, V>(
-        &self,
-        budget: u64,
-    ) -> Result<AttachedRead<V>, AttachedReadError<R::GetError<Infallible>, V::Error>>
-    where
-        R: StoreRead,
-        M: MapMapping<Target = E>,
-        V: TryFromCover<E>,
-    {
-        self.read_mode::<M, V>(false, Some(budget))
-    }
-
-    fn read_mode<M, V>(
-        &self,
-        acquire: bool,
-        budget: Option<u64>,
-    ) -> Result<AttachedRead<V>, AttachedReadError<R::GetError<Infallible>, V::Error>>
-    where
-        R: StoreRead,
-        M: MapMapping<Target = E>,
-        V: TryFromCover<E>,
-    {
         let observed =
             ObservedStore::with_tracker(self.snapshot.clone(), self.dependencies.clone());
-        let attached = self.cover.collection();
-        let parent = self.support.collection();
-        let descriptor = super::api::load_collection_descriptor(&observed, attached.handle())
-            .map_err(|error| AttachedReadError::View(error.into()))?;
-        let parent_descriptor = super::api::load_collection_descriptor(&observed, parent.handle())
-            .map_err(|error| AttachedReadError::View(error.into()))?;
-        let mapping = M::bind(&parent_descriptor.fragment, &descriptor.fragment)
+        let descriptor =
+            super::api::load_collection_descriptor(&observed, self.cover.collection().handle())
+                .map_err(|error| AttachedReadError::View(error.into()))?;
+        let parent_descriptor =
+            super::api::load_collection_descriptor(&observed, self.support.collection().handle())
+                .map_err(|error| AttachedReadError::View(error.into()))?;
+        M::bind(&parent_descriptor.fragment, &descriptor.fragment)
             .map_err(AttachedReadError::Mapping)?;
-        // A sibling's attachment of a residual node is not built here: the
-        // sibling's own mapping is not known to this read.
-        let builds = mapping.siblings().is_empty();
-        let mut images: HashMap<[u8; 32], Bytes> = HashMap::new();
-        let mut built = Vec::new();
-        let mut unread = Vec::new();
-        // Under a budget the residual is built in its own order until the
-        // next foundation's bytes no longer fit; the rest is unread without
-        // being looked at, so the work is bounded by the budget, never by
-        // how far the attached collection lags.
-        let mut spent: u64 = 0;
-        let mut stopped = false;
-        for foundation in self.residual.members() {
-            let member = Handle::<SimpleArchive>::to_hash(foundation);
-            if !builds || stopped {
-                unread.push(member);
-                continue;
-            }
-            let failed = |reason: String| AttachedReadError::Residual { member, reason };
-            let length = if acquire {
-                0
-            } else {
-                match observed
-                    .metadata(foundation)
-                    .map_err(|error| failed(error.to_string()))?
-                {
-                    Some(metadata) => metadata.length,
-                    None => {
-                        unread.push(member);
-                        continue;
-                    }
-                }
-            };
-            if let Some(budget) = budget {
-                if !built.is_empty() && spent.saturating_add(length) > budget {
-                    stopped = true;
-                    unread.push(member);
-                    continue;
-                }
-            }
-            let failed = |reason: String| AttachedReadError::Residual { member, reason };
-            let node: Blob<SimpleArchive> = match observed.get(foundation) {
-                Ok(node) => node,
-                Err(error) if acquire && crate::repo::is_missing_blob(&error) => {
-                    unread.push(member);
-                    continue;
-                }
-                Err(error) => return Err(failed(error.to_string())),
-            };
-            match mapping.map(&node, &[], &observed) {
-                Ok(image) => {
-                    spent = spent.saturating_add(length);
-                    built.push(BuiltAttachment {
-                        attached: attached.handle(),
-                        node: member,
-                        image: image.clone().transmute(),
-                    });
-                    images.insert(image.get_handle().raw, image.bytes);
-                }
-                Err(super::CollectionOperationError::Fatal(reason)) if acquire => {
-                    return Err(failed(reason));
-                }
-                Err(_) => unread.push(member),
-            }
-        }
-        let cover = Cover::from_members(
-            attached,
-            self.cover
-                .members()
-                .chain(images.keys().map(|raw| Inline::new(*raw))),
-        );
-        let reader = WithImages {
-            base: &observed,
-            images: &images,
-        };
-        let value = V::try_from_cover(&cover, &descriptor.fragment, &reader)
-            .map_err(|error| AttachedReadError::View(error.into_base()))?;
-        Ok(AttachedRead::new(value, Support::from_data(parent, unread)).with_built(built))
+        let value = V::try_from_cover(&self.cover, &descriptor.fragment, &observed)
+            .map_err(AttachedReadError::View)?;
+        Ok(AttachedRead::new(value, self.residual.clone()))
     }
 }
 
-/// A logical value an attached collection gives over its parent's whole
-/// support in one observation ([`AttachedSnapshot::read`]), and the residual
-/// foundations it could not include.
+/// The logical value of stored attachments in one observation, and every
+/// parent foundation those attachments leave unread.
 #[derive(Clone, Debug)]
 pub struct AttachedRead<V> {
     value: V,
     unread: Support<SimpleArchive>,
-    built: Vec<BuiltAttachment>,
-}
-
-/// One attachment a read built in memory for a residual foundation of the
-/// attached collection's parent ([`AttachedRead::built`]): the image the
-/// mapping gives that node, exactly what maintenance would attach to it.
-/// Only a read makes one, so keeping it
-/// ([`super::CollectionStoreExt::keep_attached`]) can only name a node
-/// the attached collection's own mapping was run on.
-#[derive(Clone, Debug)]
-pub struct BuiltAttachment {
-    attached: CollectionHandle,
-    node: CollectionData,
-    image: Blob<UnknownBlob>,
-}
-
-impl BuiltAttachment {
-    /// The attached collection the image belongs to.
-    pub fn attached(&self) -> CollectionHandle {
-        self.attached
-    }
-
-    /// The parent foundation the image maps.
-    pub fn node(&self) -> CollectionData {
-        self.node
-    }
-
-    /// The image's identity, which a `MAP` names as the node's attachment.
-    pub fn attachment(&self) -> CollectionData {
-        Inline::new(self.image.get_handle().raw)
-    }
-
-    /// The image's bytes.
-    pub fn image(&self) -> &Blob<UnknownBlob> {
-        &self.image
-    }
 }
 
 impl<V> AttachedRead<V> {
     pub(crate) fn new(value: V, unread: Support<SimpleArchive>) -> Self {
-        Self {
-            value,
-            unread,
-            built: Vec::new(),
-        }
+        Self { value, unread }
     }
 
-    fn with_built(mut self, built: Vec<BuiltAttachment>) -> Self {
-        self.built = built;
-        self
-    }
-
-    /// The images this read built in memory for residual foundations, one
-    /// per foundation it included that way, in the order built. Empty for
-    /// a read of a cover with no residual, and for reads that read their
-    /// residual raw rather than through the attached mapping
-    /// (`succinctarchive_union::read_attached`). Nothing is stored until a
-    /// caller keeps them ([`super::CollectionStoreExt::keep_attached`]).
-    pub fn built(&self) -> &[BuiltAttachment] {
-        &self.built
-    }
-
-    /// The value, over the attachments taken and every residual foundation
-    /// read here.
+    /// The value of the stored attachments selected here.
     pub fn value(&self) -> &V {
         &self.value
     }
@@ -655,14 +444,8 @@ impl<V> AttachedRead<V> {
         self.value
     }
 
-    /// The residual foundations the value leaves out, each a gap: its bytes
-    /// are not here, a dependency its mapping names is not here, or the
-    /// mapping cannot represent or interpret it here. The rest of the
-    /// residual is in the value. Empty when every foundation the parent
-    /// stands on in this observation went into the value; whether the value
-    /// then answers like their union is the mapping's cover-query law, which
-    /// for some mappings is a premise about the input that nothing here
-    /// checks ([`MapMapping`]).
+    /// Parent foundations not covered by the stored attachments. Resident
+    /// source bytes do not make a foundation visible through an index.
     pub fn unread(&self) -> &Support<SimpleArchive> {
         &self.unread
     }
@@ -677,7 +460,6 @@ impl<V> AttachedRead<V> {
         AttachedRead {
             value: transform(self.value),
             unread: self.unread,
-            built: self.built,
         }
     }
 }
@@ -691,13 +473,6 @@ pub enum AttachedReadError<GetError, ViewError> {
     View(TryFromCoverError<GetError, ViewError>),
     /// The attached descriptor does not name the mapping read through.
     Mapping(super::CollectionOperationError),
-    /// The store could not read a residual foundation whose bytes are here.
-    Residual {
-        /// The parent foundation.
-        member: CollectionData,
-        /// What went wrong.
-        reason: String,
-    },
 }
 
 impl<GetError, ViewError> fmt::Display for AttachedReadError<GetError, ViewError>
@@ -712,11 +487,6 @@ where
                 formatter,
                 "attached descriptor does not bind the mapping read through: {source}"
             ),
-            Self::Residual { member, reason } => write!(
-                formatter,
-                "read residual foundation {}: {reason}",
-                hex::encode_upper(member.raw),
-            ),
         }
     }
 }
@@ -730,89 +500,6 @@ where
         match self {
             Self::View(source) => Some(source),
             Self::Mapping(source) => Some(source),
-            Self::Residual { .. } => None,
-        }
-    }
-}
-
-/// A store read with images built in memory beside it: a get of one of the
-/// images answers from memory, every other get from the store.
-struct WithImages<'a, R> {
-    base: &'a R,
-    images: &'a HashMap<[u8; 32], Bytes>,
-}
-
-/// A get through [`WithImages`]: an in-memory image that did not decode as
-/// asked, or the store's own failure.
-#[derive(Debug)]
-enum WithImagesGetError<Decode, Base> {
-    Decode(Decode),
-    Base(Base),
-}
-
-impl<Decode: fmt::Display, Base: fmt::Display> fmt::Display for WithImagesGetError<Decode, Base> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Decode(source) => write!(formatter, "decode an image built in memory: {source}"),
-            Self::Base(source) => source.fmt(formatter),
-        }
-    }
-}
-
-impl<Decode, Base> Error for WithImagesGetError<Decode, Base>
-where
-    Decode: Error + 'static,
-    Base: Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Decode(source) => Some(source),
-            Self::Base(source) => Some(source),
-        }
-    }
-}
-
-impl<R: BlobStoreGet> BlobStoreGet for WithImages<'_, R> {
-    type GetError<E: Error + Send + Sync + 'static> = WithImagesGetError<E, R::GetError<E>>;
-
-    fn get<T, S>(
-        &self,
-        handle: Inline<Handle<S>>,
-    ) -> Result<T, Self::GetError<<T as TryFromBlob<S>>::Error>>
-    where
-        S: BlobEncoding + 'static,
-        T: TryFromBlob<S>,
-        Handle<S>: InlineEncoding,
-    {
-        match self.images.get(&handle.raw) {
-            Some(bytes) => T::try_from_blob(Blob::with_handle(bytes.clone(), handle))
-                .map_err(WithImagesGetError::Decode),
-            None => self.base.get(handle).map_err(WithImagesGetError::Base),
-        }
-    }
-}
-
-impl<Base, ViewError> TryFromCoverError<WithImagesGetError<Infallible, Base>, ViewError> {
-    /// The same failure, as the store's own: an in-memory image never fails
-    /// to be read as the blob it is.
-    fn into_base(self) -> TryFromCoverError<Base, ViewError> {
-        let base = |source: WithImagesGetError<Infallible, Base>| match source {
-            WithImagesGetError::Decode(never) => match never {},
-            WithImagesGetError::Base(source) => source,
-        };
-        match self {
-            Self::DescriptorGet { collection, source } => TryFromCoverError::DescriptorGet {
-                collection,
-                source: base(source),
-            },
-            Self::InvalidDescriptor { collection, source } => {
-                TryFromCoverError::InvalidDescriptor { collection, source }
-            }
-            Self::MemberGet { member, source } => TryFromCoverError::MemberGet {
-                member,
-                source: base(source),
-            },
-            Self::View(source) => TryFromCoverError::View(source),
         }
     }
 }

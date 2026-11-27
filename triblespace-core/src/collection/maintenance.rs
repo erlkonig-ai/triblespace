@@ -1056,6 +1056,183 @@ where
     Ok(())
 }
 
+/// Opaque work prepared for durable attachment upkeep, never a query view.
+/// Dropping it publishes nothing. Publication checks the destination's host
+/// again; completed MAPs are idempotent and remain valid across later arrivals.
+pub struct PreparedAttachmentUpkeep {
+    attached: CollectionHandle,
+    parent: CollectionHandle,
+    host: Inline<crate::inline::encodings::ed25519::ED25519PublicKey>,
+    images: Vec<(CollectionData, Blob<UnknownBlob>)>,
+}
+
+impl PreparedAttachmentUpkeep {
+    /// Store the prepared images and host-signed MAPs. This exposes no logical
+    /// value; only a fresh stored observation can show which gaps are closed.
+    /// If publication fails, earlier completed MAPs remain valid.
+    pub fn publish<S: Store>(
+        self,
+        store: &mut S,
+        signing_key: &SigningKey,
+    ) -> Result<usize, CollectionRealizationError> {
+        let snapshot = store.snapshot().map_err(|error| {
+            CollectionRealizationError::storage("observe attachment publication host", error)
+        })?;
+        let scope = BTreeSet::from([self.parent, self.attached]);
+        let host = index_of(&snapshot, &scope)?.host();
+        let signer = Inline::new(signing_key.verifying_key().to_bytes());
+        if host != Some(signer) || signer != self.host {
+            return Err(CollectionRealizationError::HostMismatch { host, signer });
+        }
+        drop(snapshot);
+        let count = self.images.len();
+        for (node, image) in self.images {
+            let attachment = Handle::<UnknownBlob>::to_hash(image.get_handle());
+            store.put::<UnknownBlob, _>(image).map_err(|error| {
+                CollectionRealizationError::storage("store bounded attachment", error)
+            })?;
+            store
+                .insert(CollectionRecord::Map(CollectionMap::sign(
+                    signing_key,
+                    self.attached,
+                    node,
+                    attachment,
+                )))
+                .map_err(|error| {
+                    CollectionRealizationError::storage("publish bounded attachment MAP", error)
+                })?;
+        }
+        Ok(count)
+    }
+}
+
+/// Prepare bounded durable upkeep on one frozen reader, for publication after
+/// an owned blocking task settles. The reader may be an existing acquiring
+/// adapter: only the mapping's explicit dependency reads use that facility.
+/// Resident source bytes alone determine the per-foundation input budget.
+/// A zero budget permits one successful foundation; subsequent inputs must
+/// fit. Failed mappings do not spend this successful-source-byte budget, so a
+/// missing dependency cannot starve later buildable foundations. Attempted
+/// work, output/dependency sizes and a single oversized input are not bounded.
+///
+/// This never publishes or returns a queryable index. Missing input/dependency
+/// work remains pending. Call `publish` on the result, then select afresh.
+pub fn prepare_attached_within_with<M, R>(
+    reader: &R,
+    attached: Collection<M::Target>,
+    signing_key: &SigningKey,
+    input_byte_budget: u64,
+) -> Result<PreparedAttachmentUpkeep, CollectionRealizationError>
+where
+    M: MapMapping,
+    R: StoreRead,
+{
+    prepare_attached_within_reading::<R, M, R>(
+        attached,
+        signing_key,
+        input_byte_budget,
+        reader,
+        reader,
+    )
+}
+
+/// Prepare bounded durable upkeep through the encoding's canonical mapping.
+/// See [`prepare_attached_within_with`] for budget and publication semantics.
+pub fn prepare_attached_within<T, R>(
+    reader: &R,
+    attached: Collection<T>,
+    signing_key: &SigningKey,
+    input_byte_budget: u64,
+) -> Result<PreparedAttachmentUpkeep, CollectionRealizationError>
+where
+    T: super::CollectionAttachment,
+    R: StoreRead,
+{
+    prepare_attached_within_with::<super::CanonicalAttachment<T>, R>(
+        reader,
+        attached,
+        signing_key,
+        input_byte_budget,
+    )
+}
+
+/// Explicit per-foundation upkeep, bounded by resident source bytes. Control
+/// evidence is frozen in `planning`; only complete images are published.
+pub(super) fn prepare_attached_within_reading<P, M, R>(
+    attached: Collection<M::Target>,
+    signing_key: &SigningKey,
+    input_byte_budget: u64,
+    planning: &P,
+    reader: &R,
+) -> Result<PreparedAttachmentUpkeep, CollectionRealizationError>
+where
+    P: StoreRead,
+    M: MapMapping,
+    R: StoreRead,
+{
+    use super::CollectionSnapshotExt;
+    let bound = bind_attached::<_, M>(planning, attached)?;
+    let selected = planning.attached(attached)?;
+    let mut scope = BTreeSet::from([bound.parent.handle(), attached.handle()]);
+    scope.extend(bound.siblings.iter().copied());
+    let index = index_of(planning, &scope)?;
+    let signer = Inline::new(signing_key.verifying_key().to_bytes());
+    let host = index.host();
+    if host != Some(signer) {
+        return Err(CollectionRealizationError::HostMismatch { host, signer });
+    }
+    let coverage = index.published();
+    let mut spent = 0u64;
+    let mut prepared = PreparedAttachmentUpkeep {
+        attached: attached.handle(),
+        parent: bound.parent.handle(),
+        host: signer,
+        images: Vec::new(),
+    };
+    for foundation in selected.residual().members() {
+        let node = Handle::<SimpleArchive>::to_hash(foundation);
+        let Some(metadata) = planning.metadata(foundation).map_err(|error| {
+            CollectionRealizationError::storage("inspect residual input size", error)
+        })?
+        else {
+            continue;
+        };
+        if !prepared.images.is_empty() && metadata.length > input_byte_budget.saturating_sub(spent)
+        {
+            break;
+        }
+        let mut siblings = Vec::with_capacity(bound.siblings.len());
+        for sibling in &bound.siblings {
+            match resident_attachment(planning, coverage, *sibling, node)? {
+                Some(image) => siblings.push(image),
+                None => break,
+            }
+        }
+        if siblings.len() != bound.siblings.len() {
+            continue;
+        }
+        let input: Blob<SimpleArchive> = planning.get(foundation).map_err(|error| {
+            CollectionRealizationError::storage("read residual upkeep input", error)
+        })?;
+        let output = match bound.mapping.map(&input, &siblings, reader) {
+            Ok(output) => output,
+            Err(
+                CollectionOperationError::Capacity(_)
+                | CollectionOperationError::MissingDependency(_),
+            ) => continue,
+            Err(CollectionOperationError::Fatal(reason)) => {
+                return Err(CollectionRealizationError::Derive {
+                    input: node,
+                    reason,
+                });
+            }
+        };
+        spent = spent.saturating_add(metadata.length);
+        prepared.images.push((node, output.transmute()));
+    }
+    Ok(prepared)
+}
+
 /// One mapping bound to its target and its immediate source.
 struct Bound<M> {
     source: CollectionHandle,
@@ -1404,7 +1581,12 @@ where
             keyed.push((schedule(&key, entry.0, length), entry));
         }
         keyed.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok::<_, CollectionRealizationError>(keyed.into_iter().map(|(_, entry)| entry).collect::<Vec<_>>())
+        Ok::<_, CollectionRealizationError>(
+            keyed
+                .into_iter()
+                .map(|(_, entry)| entry)
+                .collect::<Vec<_>>(),
+        )
     };
     let own = scheduled(own)?;
     let foreign = scheduled(foreign)?;
@@ -1780,7 +1962,13 @@ mod tests {
             assert!(sorted.windows(2).all(|w| class(w[0].1) <= class(w[1].1)));
             // 64 and 100 bytes are one class (7 bits): 32 foundations, then
             // the 16 large ones, then the 16 not here.
-            assert_eq!(sorted[..32].iter().filter(|(_, l)| l.is_some_and(|l| l < 128)).count(), 32);
+            assert_eq!(
+                sorted[..32]
+                    .iter()
+                    .filter(|(_, l)| l.is_some_and(|l| l < 128))
+                    .count(),
+                32
+            );
             assert!(sorted[32..48].iter().all(|(_, l)| *l == Some(20_797_056)));
             assert!(sorted[48..].iter().all(|(_, l)| l.is_none()));
         }
@@ -1821,7 +2009,10 @@ mod tests {
         let other = Inline::new([9; 32]);
         index.apply(
             &CollectionRecord::Commit(CollectionCommit::sign(
-                &host, collection, other, empty_metadata_handle(),
+                &host,
+                collection,
+                other,
+                empty_metadata_handle(),
             )),
             &AdmitEveryRecord,
         );

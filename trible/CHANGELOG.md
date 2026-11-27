@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- Indexed search and dashboard health report missing persisted attachments
+  instead of constructing transient residual fact indexes during reads.
+
 - `pile net sync` telemetry uses `triblespace_net::telemetry::sync::Publisher`;
   its flags, records, errors and cadence are unchanged.
   `process::process_cpu_ns` now re-exports `triblespace_net::telemetry::process_cpu_ns`.

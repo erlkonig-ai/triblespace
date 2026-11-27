@@ -930,12 +930,12 @@ mod tests {
             TryFromCover::try_from_cover(&target.cover([expected]), &descriptor, &snapshot)
                 .unwrap();
 
-        // One node attached, the other residual and built by the read.
+        // One node attached; a stored read names the other as pending.
         let attached = snapshot.attached(target).unwrap();
         assert_eq!(attached.cover().len(), 1);
         assert_eq!(attached.residual().len(), 1);
-        let read = attached.read::<TextView>().unwrap();
-        assert!(read.unread().is_empty());
+        let pending = attached.read::<TextView>().unwrap();
+        assert_eq!(pending.unread().len(), 1);
         drop(snapshot);
 
         // Both attached: the cover the store selects holds both nodes.
@@ -945,6 +945,8 @@ mod tests {
         assert_eq!(attached.cover().len(), 2);
         assert!(attached.residual().is_empty());
         let through_cover: TextView = attached.view().unwrap();
+        let read = attached.read::<TextView>().unwrap();
+        assert!(read.unread().is_empty());
 
         // Three texts, whichever entities name them, in either node.
         for view in [&through_cover, read.value()] {
@@ -960,10 +962,10 @@ mod tests {
     }
 
     /// A residual node whose text is not here is named unread, not read as
-    /// a shorter document; the text arriving moves the read off current,
-    /// and the next read includes it.
+    /// a shorter document. Arrival alone builds nothing; explicit bounded
+    /// upkeep persists an image before a fresh read includes it.
     #[test]
-    fn a_residual_node_whose_text_is_absent_is_unread_until_it_arrives() {
+    fn a_residual_node_whose_text_arrives_waits_for_durable_upkeep() {
         use ed25519_dalek::SigningKey;
         use triblespace_core::collection::{
             AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
@@ -1001,11 +1003,22 @@ mod tests {
         );
         assert_eq!(read.value().query().unwrap().doc_count(), 0);
 
+        assert_eq!(store.ensure_attached_within(target, &key, 0).unwrap(), 0);
         store.put::<UTF8String, _>(text).unwrap();
+        let arrived = store
+            .snapshot()
+            .unwrap()
+            .attached(target)
+            .unwrap()
+            .read::<TextView>()
+            .unwrap();
+        assert_eq!(arrived.unread().len(), 1, "arrival does not build an index");
+        assert_eq!(arrived.value().query().unwrap().doc_count(), 0);
+        assert_eq!(store.ensure_attached_within(target, &key, 0).unwrap(), 1);
         let after = store.snapshot().unwrap();
         assert!(
             !attached.is_current(&after),
-            "the text the read asked for moves it off current"
+            "publication changes the selected cover"
         );
         let read = after.attached(target).unwrap().read::<TextView>().unwrap();
         assert!(read.unread().is_empty());

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Attached reads now use persisted covers only and name every residual
+  foundation as unread, including resident source bytes. Bounded explicit
+  upkeep prepares and publishes per-foundation images without carrying a
+  merged frontier; acquiring callers may stage opaque upkeep work on their
+  existing blocking worker, publish it, then take a fresh observation.
+  Read-time `read_within`, `built` and `keep_attached` are replaced by these
+  writer operations. Source-byte budgets count successfully prepared images,
+  allow one oversized success, and do not bound failed work or dependencies.
+
 - `triblespace-core`: the held index keeps no edge cache. A blob is read for
   each collection that reaches it, where one read used to serve all of them,
   and the parent-child edges and the set of scanned blobs are gone from memory.

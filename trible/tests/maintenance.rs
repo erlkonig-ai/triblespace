@@ -779,16 +779,16 @@ fn maintain_all_carries_a_reached_root_once_before_its_views() {
         drop(snapshot);
         pile.close().unwrap();
         // Read as no key, the same pile believes no MERGE and no MAP: the
-        // attached cover is empty, every commit is residual and read from
-        // its bytes, and the facts are the same.
+        // attached cover is empty and every commit is explicitly unread.
+        // A hostless reader never constructs its own transient fact index.
         let mut pile = Pile::open(&fixture.path).unwrap();
         let snapshot = pile.snapshot().unwrap();
         let wide = snapshot.attached(fixture.rank9).unwrap();
         assert_eq!(wide.cover().len(), 0);
         assert_eq!(wide.residual().len(), 8);
         let read = read_attached(&wide).unwrap();
-        assert!(read.unread().is_empty());
-        assert_eq!(read.value().iter().collect::<TribleSet>(), expected);
+        assert_eq!(read.unread().len(), 8);
+        assert_eq!(read.value().iter().count(), 0);
         drop(read);
         drop(wide);
         drop(snapshot);

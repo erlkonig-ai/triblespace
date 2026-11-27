@@ -132,7 +132,7 @@ fn reader(
 }
 
 #[test]
-fn acquiring_residual_keeps_fixed_support_and_passive_reads_do_not_fetch() {
+fn attached_reads_never_fetch_or_build_residuals_even_with_an_acquiring_reader() {
     let (mut source, root, attached) = fixture();
     let ids = source
         .attach::<EntityIdSetBlob>(root, metadata::tag.id())
@@ -157,30 +157,28 @@ fn acquiring_residual_keeps_fixed_support_and_passive_reads_do_not_fetch() {
         .is_none());
     assert!(requests.lock().unwrap().is_empty());
     let acquired = succinctarchive_union::read_attached_acquiring(&selected).unwrap();
-    assert_eq!(acquired.value().iter().collect::<TribleSet>(), first);
-    assert!(acquired.unread().is_empty());
+    assert_eq!(acquired.value().iter().count(), 0);
+    assert_eq!(acquired.unread().len(), 1);
     assert_eq!(selected.residual().len(), 1);
     assert!(!reader
         .contains_blob(Inline::<Handle<SimpleArchive>>::new(payload))
         .unwrap());
-    assert!(requests.lock().unwrap().iter().all(|raw| *raw == payload));
+    assert!(requests.lock().unwrap().is_empty());
     let projected = reader
         .attached(ids)
         .unwrap()
         .read_acquiring::<EntityIdSet>()
         .unwrap();
-    assert_eq!(
-        projected.value().iter().collect::<Vec<_>>(),
-        vec![Id::new([12; 16]).unwrap()]
-    );
-    assert!(projected.unread().is_empty());
+    assert_eq!(projected.value().iter().count(), 0);
+    assert_eq!(projected.unread().len(), 1);
+    assert!(requests.lock().unwrap().is_empty());
     let selected_root = reader.collection_acquiring(root).unwrap();
     assert_eq!(selected_root.support().unwrap().len(), 1);
     assert_eq!(selected_root.view::<TribleSet>().unwrap(), first);
 }
 
 #[test]
-fn acquiring_unavailable_is_unread_but_faults_are_errors() {
+fn attached_residual_is_unread_without_getting_its_body() {
     let (mut source, root, attached) = fixture();
     let first = facts(31);
     let payload = IntoBlob::<SimpleArchive>::to_blob(first.clone())
@@ -201,10 +199,16 @@ fn acquiring_unavailable_is_unread_but_faults_are_errors() {
     snapshot.fail = Some(payload);
     let failed_reader =
         super::AcquiringReader::new(snapshot, Arc::new(tokio::runtime::Runtime::new().unwrap()));
-    let error =
+    let read =
         succinctarchive_union::read_attached_acquiring(&failed_reader.attached(attached).unwrap())
-            .err()
-            .expect("backend fault must not become unread");
+            .unwrap();
+    assert_eq!(read.unread().len(), 1, "residual get is never attempted");
+    let error = failed_reader
+        .collection_acquiring(root)
+        .unwrap()
+        .view::<TribleSet>()
+        .err()
+        .expect("an actual source read must still report the backend fault");
     assert!(error.to_string().contains("injected storage failure"));
 }
 
@@ -226,8 +230,16 @@ fn acquiring_attached_selection_gets_missing_lineage_descriptors() {
         );
         let selected = acquiring.attached_acquiring(attached).unwrap();
         let read = succinctarchive_union::read_attached_acquiring(&selected).unwrap();
-        assert_eq!(read.value().iter().collect::<TribleSet>(), expected);
-        assert!(read.unread().is_empty());
+        assert_eq!(read.value().iter().count(), 0);
+        assert_eq!(read.unread().len(), 1);
+        assert_eq!(
+            acquiring
+                .collection_acquiring(root)
+                .unwrap()
+                .view::<TribleSet>()
+                .unwrap(),
+            expected
+        );
         assert!(requests.lock().unwrap().contains(&missing));
         assert!(!acquiring
             .contains_blob(Inline::<Handle<SimpleArchive>>::new(missing))
@@ -262,7 +274,8 @@ fn acquiring_missing_write_definition_retries_only_frozen_parked_records() {
     let reader = reader(snapshot.clone());
     let selected = reader.attached(attached).unwrap();
     let read = succinctarchive_union::read_attached_acquiring(&selected).unwrap();
-    assert_eq!(read.value().iter().collect::<TribleSet>(), first);
+    assert_eq!(read.value().iter().count(), 0);
+    assert_eq!(read.unread().len(), 1);
     let selected_support = selected.support().clone();
     let retained = selected.into_frozen();
     assert_eq!(retained.support(), &selected_support);

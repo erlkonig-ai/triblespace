@@ -1841,66 +1841,94 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         }
     }
 
-    /// Keep what a read built: store each image an attached read built in
-    /// memory for a residual foundation ([`super::AttachedRead::built`]) and
-    /// publish the host's `MAP` naming it as that foundation's attachment.
-    /// The next read then takes it instead of building it again, and the
-    /// store's records name the attached collection, so a maintainer that
-    /// finds attached collections by their records finds this one.
+    /// Durably attach a bounded prefix of resident residual foundations.
+    /// This never carries or maps a merged node. The budget counts source bytes
+    /// of successfully prepared images; a missing dependency does not spend it.
+    /// The first success may exceed `input_byte_budget`, so even a zero budget
+    /// can make progress. Attempted work, dependency/output bytes, memory and
+    /// a single oversized input are not bounded by this policy.
     ///
-    /// An image is exactly what maintenance would attach to that node, so
-    /// keeping it is a partial [`Self::ensure_attached`] over the
-    /// foundations the read happened to build: nothing is carried and no
-    /// node is mapped here. A foundation later merged by the host is still
-    /// reached through its own `MAP` until maintenance attaches the merge.
-    ///
-    /// Every `MAP` is signed by `signing_key`, which must be the store's
-    /// host ([`CollectionRealizationError::HostMismatch`] otherwise, before
-    /// anything is stored): another key's `MAP`s are believed nowhere.
-    /// Keeping the same images twice publishes the same records, an
-    /// idempotent insert. Returns how many attachments were kept.
-    fn keep_attached(
+    /// Missing inputs or siblings remain residual. Successful images and their
+    /// host-signed MAPs are stored before returning their count. A later failure
+    /// does not undo earlier completed attachments. Read a fresh snapshot to
+    /// observe them; an earlier read is unchanged. No acquisition is performed.
+    fn ensure_attached_within<T>(
         &mut self,
-        built: &[super::BuiltAttachment],
+        attached: Collection<T>,
         signing_key: &SigningKey,
+        input_byte_budget: u64,
     ) -> Result<usize, CollectionRealizationError>
     where
+        T: CollectionAttachment,
         Self: Store,
+        Handle<T>: InlineEncoding,
     {
-        if built.is_empty() {
-            return Ok(0);
-        }
+        self.ensure_attached_within_with::<CanonicalAttachment<T>>(
+            attached,
+            signing_key,
+            input_byte_budget,
+        )
+    }
+
+    /// Bounded durable upkeep through an explicit mapping.
+    fn ensure_attached_within_with<M>(
+        &mut self,
+        attached: Collection<M::Target>,
+        signing_key: &SigningKey,
+        input_byte_budget: u64,
+    ) -> Result<usize, CollectionRealizationError>
+    where
+        M: MapMapping,
+        Self: Store,
+        Handle<M::Target>: InlineEncoding,
+    {
         let snapshot = self.snapshot().map_err(|error| {
-            CollectionRealizationError::storage("observe the host to keep attachments", error)
+            CollectionRealizationError::storage("observe bounded attachment upkeep", error)
         })?;
-        let scope: BTreeSet<CollectionHandle> = built
-            .iter()
-            .map(super::BuiltAttachment::attached)
-            .collect();
-        let host = crate::collection::CoverageRead::index(&snapshot, &scope)
-            .map_err(|error| CollectionRealizationError::storage("settle coverage index", error))?
-            .host();
+        let prepared = super::maintenance::prepare_attached_within_reading::<_, M, _>(
+            attached,
+            signing_key,
+            input_byte_budget,
+            &snapshot,
+            &snapshot,
+        )?;
         drop(snapshot);
-        let signer = Inline::new(signing_key.verifying_key().to_bytes());
-        if host != Some(signer) {
-            return Err(CollectionRealizationError::HostMismatch { host, signer });
-        }
-        for kept in built {
-            self.put::<crate::blob::encodings::UnknownBlob, _>(kept.image().clone())
-                .map_err(|error| {
-                    CollectionRealizationError::storage("store a kept attachment", error)
-                })?;
-            self.insert(super::CollectionRecord::Map(super::CollectionMap::sign(
-                signing_key,
-                kept.attached(),
-                kept.node(),
-                kept.attachment(),
-            )))
-            .map_err(|error| {
-                CollectionRealizationError::storage("publish a kept attachment MAP", error)
-            })?;
-        }
-        Ok(built.len())
+        prepared.publish(self, signing_key)
+    }
+
+    /// Bounded durable upkeep whose mapping reads dependencies through an
+    /// explicit frozen reader. An existing acquiring reader can request those
+    /// named bytes. No retry or acquisition engine is introduced here.
+    ///
+    /// Selection, host identity and resident source-byte budgeting come from
+    /// the store's own frozen snapshot; `reader` supplies only the mapping's
+    /// immutable dependency reads. Its owner/runtime must remain alive, and a
+    /// synchronous acquiring reader must run outside an async executor task.
+    fn ensure_attached_within_reading<M, R>(
+        &mut self,
+        attached: Collection<M::Target>,
+        signing_key: &SigningKey,
+        input_byte_budget: u64,
+        reader: &R,
+    ) -> Result<usize, CollectionRealizationError>
+    where
+        M: MapMapping,
+        R: StoreRead,
+        Self: Store,
+        Handle<M::Target>: InlineEncoding,
+    {
+        let snapshot = self.snapshot().map_err(|error| {
+            CollectionRealizationError::storage("observe bounded attachment upkeep", error)
+        })?;
+        let prepared = super::maintenance::prepare_attached_within_reading::<_, M, R>(
+            attached,
+            signing_key,
+            input_byte_budget,
+            &snapshot,
+            reader,
+        )?;
+        drop(snapshot);
+        prepared.publish(self, signing_key)
     }
 
     /// Ensure one collection for the key: "derive what you wrote".

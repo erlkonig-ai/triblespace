@@ -100,7 +100,9 @@ pub use encoding::*;
 pub use exact_derived::CollectionRealizationError;
 pub use generation::*;
 pub use held::{HeldBlobs, HeldRead, HeldStore, HeldWork};
-pub use maintenance::MERGE_FAN_IN;
+pub use maintenance::{
+    prepare_attached_within, prepare_attached_within_with, PreparedAttachmentUpkeep, MERGE_FAN_IN,
+};
 pub use policy::*;
 pub use records::*;
 pub use registration::*;
