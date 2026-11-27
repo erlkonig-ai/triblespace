@@ -1998,6 +1998,157 @@ mod tests {
         assert!(is_canonical_edwards_y(&modulus));
     }
 
+    /// Pins quorum decisions over a mix of proofs: decoys for other
+    /// resources, a grant from an unconfigured root, and one matching grant,
+    /// in several orders, together with the key boundaries around them. Roots
+    /// that are weak, noncanonical, or not a curve point never become a
+    /// proof's root, and as trust roots they refuse every decision.
+    #[test]
+    fn quorum_decisions_over_mixed_proofs_and_key_boundaries_are_pinned() {
+        let mut staging = MemoryRepo::default();
+        let read = definition(&mut staging, &[ACTION_READ], &[]);
+        let root = key(1);
+        let second_root = key(5);
+        let stranger = key(6);
+        let subject = key(2);
+        let other = key(3);
+
+        let decoys: Vec<CapabilityProof> = (10..40u8)
+            .map(|byte| CapabilityProof::new(resource(byte), &root, read, subject.verifying_key()))
+            .collect();
+        let unconfigured =
+            CapabilityProof::new(resource(9), &stranger, read, subject.verifying_key());
+        let for_other = CapabilityProof::new(resource(9), &root, read, other.verifying_key());
+        let matching = CapabilityProof::new(resource(9), &root, read, subject.verifying_key());
+        let second = CapabilityProof::new(resource(9), &second_root, read, subject.verifying_key());
+
+        // A proof's root is exactly its header bytes, as a key.
+        for proof in decoys
+            .iter()
+            .chain([&unconfigured, &for_other, &matching, &second])
+        {
+            assert_eq!(proof.root_key().to_bytes(), proof.bytes.header.root);
+            assert_eq!(&proof.as_bytes()[64..96], &proof.bytes.header.root);
+        }
+
+        let mut repo = MemoryRepo::default();
+        let cold = repo.snapshot().unwrap();
+        let facts: TribleSet = staging.snapshot().unwrap().get(read).unwrap();
+        assert_eq!(repo.put::<SimpleArchive, _>(facts).unwrap(), read);
+        let warm = repo.snapshot().unwrap();
+
+        let decide = |reader: &_, proofs: &[&CapabilityProof], roots: &[VerifyingKey], count| {
+            capability_quorum_decide(
+                reader,
+                proofs.iter().copied(),
+                roots.iter().copied(),
+                subject.verifying_key(),
+                read_request(),
+                threshold(count),
+            )
+        };
+        let audience = |proofs: &[&CapabilityProof], roots: &[VerifyingKey], count| {
+            capability_quorum_authorized_subjects(
+                &warm,
+                proofs.iter().copied(),
+                roots.iter().copied(),
+                read_request(),
+                threshold(count),
+            )
+        };
+        let one = [root.verifying_key()];
+        let two = [root.verifying_key(), second_root.verifying_key()];
+        let decoy_refs: Vec<&CapabilityProof> = decoys.iter().collect();
+        let mut without: Vec<&CapabilityProof> = decoy_refs.clone();
+        without.extend([&unconfigured, &for_other]);
+        let mut with_last = without.clone();
+        with_last.push(&matching);
+        let mut with_first = vec![&matching];
+        with_first.extend(without.iter().copied());
+
+        // Decoys, a stranger's grant and a grant to someone else never admit,
+        // and decoys naming the subject behind an unread definition are not
+        // worth waiting for: they are for another resource.
+        assert_eq!(decide(&warm, &without, &one, 1), QuorumOutcome::Unmet);
+        assert_eq!(decide(&cold, &decoy_refs, &one, 1), QuorumOutcome::Unmet);
+        assert_eq!(
+            decide(&cold, &with_last, &one, 1),
+            QuorumOutcome::Undefined(vec![read])
+        );
+        assert_eq!(decide(&warm, &with_last, &one, 1), QuorumOutcome::Met);
+        assert_eq!(decide(&warm, &with_first, &one, 1), QuorumOutcome::Met);
+        // A configured root counts once however many of its proofs match.
+        let mut twice = with_last.clone();
+        twice.push(&matching);
+        assert_eq!(decide(&warm, &twice, &two, 2), QuorumOutcome::Unmet);
+        let mut both = with_last.clone();
+        both.push(&second);
+        assert_eq!(decide(&warm, &both, &two, 2), QuorumOutcome::Met);
+        // The stranger's grant counts only once the stranger is configured.
+        assert_eq!(
+            decide(&warm, &without, &[stranger.verifying_key()], 1),
+            QuorumOutcome::Met
+        );
+
+        let set = |keys: Vec<VerifyingKey>| -> BTreeSet<[u8; 32]> {
+            keys.iter().map(VerifyingKey::to_bytes).collect()
+        };
+        let keys = |keys: &[&SigningKey]| -> BTreeSet<[u8; 32]> {
+            keys.iter()
+                .map(|key| key.verifying_key().to_bytes())
+                .collect()
+        };
+        assert_eq!(set(audience(&without, &one, 1)), keys(&[&root, &other]));
+        assert_eq!(
+            set(audience(&with_last, &one, 1)),
+            keys(&[&root, &other, &subject])
+        );
+        assert_eq!(set(audience(&decoy_refs, &one, 1)), keys(&[&root]));
+        assert_eq!(set(audience(&both, &two, 2)), keys(&[&subject]));
+
+        // Key boundaries. The identity point is weak; its alias y = 1 + p is
+        // also noncanonical; and some encodings are not curve points at all.
+        let identity = {
+            let mut bytes = [0; 32];
+            bytes[0] = 1;
+            bytes
+        };
+        let alias = {
+            let mut bytes = [0xff; 32];
+            bytes[0] = 0xee;
+            bytes[31] = 0x7f;
+            bytes
+        };
+        let off_curve = (2..=255u8)
+            .map(|byte| {
+                let mut bytes = [0; 32];
+                bytes[0] = byte;
+                bytes
+            })
+            .find(|bytes| VerifyingKey::from_bytes(bytes).is_err())
+            .expect("some small y is not on the curve");
+        for bad in [identity, alias, off_curve] {
+            let mut bytes = matching.as_bytes().to_vec();
+            bytes[64..96].copy_from_slice(&bad);
+            assert_eq!(
+                CapabilityProof::from_bytes(&bytes),
+                Err(CapabilityProofDecodeError::InvalidKey { key: 0 })
+            );
+            assert_eq!(
+                CapabilityProof::from_owned_bytes(Bytes::from_source(bytes)),
+                Err(CapabilityProofDecodeError::InvalidKey { key: 0 })
+            );
+        }
+        for bad in [identity, alias] {
+            let weak = VerifyingKey::from_bytes(&bad).expect("decompresses");
+            assert!(!is_valid_capability_principal(&weak));
+            for roots in [vec![weak], vec![root.verifying_key(), weak]] {
+                assert_eq!(decide(&warm, &with_last, &roots, 1), QuorumOutcome::Unmet);
+                assert!(audience(&with_last, &roots, 1).is_empty());
+            }
+        }
+    }
+
     #[test]
     fn legacy_action_fixture_is_inert_and_structurally_recognizable() {
         assert!(legacy_action_proof_is_structural(
