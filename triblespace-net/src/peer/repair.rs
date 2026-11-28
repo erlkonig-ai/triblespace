@@ -324,6 +324,20 @@ impl<T: BlobStoreList> BlobStoreList for RepairingSnapshot<T> {
         Self: 'a;
     type Err = T::Err;
 
+    fn blob_locators(
+        &self,
+    ) -> Result<triblespace_core::blob::locator::BlobLocatorIndex, Self::Err> {
+        self.0.blob_locators()
+    }
+
+    fn find_blob(&self, locator: [u8; 32]) -> Result<Option<[u8; 32]>, Self::Err> {
+        self.0.find_blob(locator)
+    }
+
+    fn find_blobs(&self, locators: &[[u8; 32]]) -> Result<Vec<Option<[u8; 32]>>, Self::Err> {
+        self.0.find_blobs(locators)
+    }
+
     fn blobs<'a>(&'a self) -> Self::Iter<'a> {
         self.0.blobs()
     }

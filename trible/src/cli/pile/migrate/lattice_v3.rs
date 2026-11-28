@@ -1334,17 +1334,14 @@ fn filter_into(source_path: &Path, destination_path: &Path, options: &Options) -
 #[cfg(all(test, feature = "search"))]
 mod tests {
     use super::*;
-    use triblespace_core::blob::encodings::entity_id_set::EntityIdSetBlob;
-    use triblespace_core::blob::encodings::succinctarchive::{
-        Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
-    };
-    use triblespace_core::collection::latest::LatestBlob;
-    use triblespace_core::collection::lww_register::LwwRegisterBlob;
+    use triblespace_core::blob::encodings::entity_id_set::genid_attribute_values;
+    use triblespace_core::collection::latest::latest_states;
+    use triblespace_core::collection::lww_register::register_coordinates;
+    use triblespace_core::collection::succinctarchive_union::{raw_to_rank9, simple_to_succinct};
     use triblespace_core::collection::{
         AdmissionPolicy, Collection, CollectionPolicy, CollectionStoreExt,
     };
     use triblespace_search::nvfp4::{NvFp4CosineSet, NvFp4EmbeddingAttribute, NVFP4_COSINE_SET};
-    use triblespace_search::portable_bm25::PortableBM25Blob;
     use triblespace_search::schemas::Embedding;
     use triblespace_search::text_bm25::{Bm25Tokenizer, TextAttributeToBm25};
 
@@ -1368,34 +1365,34 @@ mod tests {
         let automaton = super::super::super::path_text::parse("7A77D4CF7DF3D0CCC1371212DD15FBE3")
             .unwrap()
             .compile();
-        let succinct = pile.attach::<SuccinctArchiveBlob>(root, ()).unwrap();
+        let succinct = pile.attach(root, simple_to_succinct()).unwrap();
         let attached = [
             ("succinct", succinct.handle()),
             (
                 "rank9",
-                pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(root, succinct)
-                    .unwrap()
-                    .handle(),
+                pile.attach(root, raw_to_rank9(succinct)).unwrap().handle(),
             ),
             (
                 "entity id set",
-                pile.attach::<EntityIdSetBlob>(root, attribute)
+                pile.attach(root, genid_attribute_values(attribute))
                     .unwrap()
                     .handle(),
             ),
             (
                 "latest",
-                pile.attach::<LatestBlob>(root, attribute).unwrap().handle(),
+                pile.attach(root, latest_states(attribute))
+                    .unwrap()
+                    .handle(),
             ),
             (
                 "lww",
-                pile.attach::<LwwRegisterBlob>(root, (attribute, orders))
+                pile.attach(root, register_coordinates(attribute, orders))
                     .unwrap()
                     .handle(),
             ),
             (
                 "bm25",
-                pile.attach::<PortableBM25Blob>(
+                pile.attach(
                     root,
                     TextAttributeToBm25 {
                         attribute,
@@ -1407,7 +1404,7 @@ mod tests {
             ),
             (
                 "path",
-                pile.attach::<triblespace_paths::PathSummaryBlob>(root, automaton)
+                pile.attach(root, triblespace_paths::regular_path(automaton))
                     .unwrap()
                     .handle(),
             ),

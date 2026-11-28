@@ -37,7 +37,7 @@ use triblespace_core::repo::{
 };
 use triblespace_core::trible::TribleSet;
 
-use crate::bearer::{BearerLocatorIndex, blob_locator, locator_index, update_locator_index};
+use crate::bearer::{BearerLocatorIndex, blob_locator};
 use crate::channel::{NetEvent, NetEventBatch};
 use crate::collection_activation::{CollectionRepairOverlay, CollectionRepairOverlayError};
 use crate::collection_delta::update_collection_record_patch;
@@ -288,11 +288,12 @@ impl<R> StoreSnapshot<R> {
     {
         let mut collections = CollectionSnapshotIndex::new();
         let bearer_locators = match (previous_store, previous) {
-            (Some(previous_store), Some(previous)) if changes.contains(StoreChanges::BLOBS) => {
-                update_locator_index(&snapshot, previous_store, &previous.bearer_locators)?
+            (Some(_), Some(previous)) if !changes.contains(StoreChanges::BLOBS) => {
+                previous.bearer_locators.clone()
             }
-            (_, Some(previous)) => previous.bearer_locators.clone(),
-            _ => locator_index(&snapshot)?,
+            _ => snapshot
+                .blob_locators()
+                .map_err(|error| anyhow::anyhow!("cannot observe bearer locators: {error:?}"))?,
         };
         // The selection lives in the configuration collection, whose writes
         // are records.

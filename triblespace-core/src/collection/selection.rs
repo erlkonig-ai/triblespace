@@ -89,7 +89,8 @@ use crate::trible::TribleSet;
 use super::simplearchive_union::FactViewError;
 use super::{
     descriptor, private_policy, Collection, CollectionCommit, CollectionCommitError,
-    CollectionHandle, CollectionReadError, CollectionStore, CollectionStoreExt,
+    CollectionHandle, CollectionReadError, CollectionSnapshotExt, CollectionStore,
+    CollectionStoreExt,
 };
 
 /// The name of every pile's own configuration collection.
@@ -131,9 +132,11 @@ where
     {
         return Ok(TribleSet::new());
     }
-    Collection::<SimpleArchive>::from_handle(handle)
-        .read::<TribleSet, _>(snapshot)
-        .map_err(ConfigReadError::Read)
+    snapshot
+        .collection(Collection::<SimpleArchive>::from_handle(handle))
+        .map_err(|error| ConfigReadError::Read(CollectionReadError::Realization(error)))?
+        .view()
+        .map_err(|error| ConfigReadError::Read(CollectionReadError::View(error)))
 }
 
 attributes! {
@@ -242,9 +245,11 @@ where
     <S as SnapshotSource>::Snapshot: StoreRead,
 {
     let snapshot = store.snapshot().map_err(SelectionWriteError::Snapshot)?;
-    let facts = config
-        .read::<TribleSet, _>(&snapshot)
-        .map_err(SelectionWriteError::Read)?;
+    let facts: TribleSet = snapshot
+        .collection(config)
+        .map_err(|error| SelectionWriteError::Read(CollectionReadError::Realization(error)))?
+        .view()
+        .map_err(|error| SelectionWriteError::Read(CollectionReadError::View(error)))?;
     let order = ObservationOrder::new(&facts, metadata::supersedes.id());
     let heads: BTreeSet<Id> = find!(
         state: Id,
@@ -315,9 +320,11 @@ where
     <S as SnapshotSource>::Snapshot: StoreRead,
 {
     let snapshot = store.snapshot().map_err(SelectionWriteError::Snapshot)?;
-    let facts = config
-        .read::<TribleSet, _>(&snapshot)
-        .map_err(SelectionWriteError::Read)?;
+    let facts: TribleSet = snapshot
+        .collection(config)
+        .map_err(|error| SelectionWriteError::Read(CollectionReadError::Realization(error)))?
+        .view()
+        .map_err(|error| SelectionWriteError::Read(CollectionReadError::View(error)))?;
     let order = ObservationOrder::new(&facts, metadata::supersedes.id());
     let heads: BTreeSet<Id> = find!(
         state: Id,
@@ -466,7 +473,7 @@ mod tests {
 
     fn read(store: &mut MemoryRepo, config: Collection<SimpleArchive>) -> TribleSet {
         let snapshot = store.snapshot().unwrap();
-        config.read::<TribleSet, _>(&snapshot).unwrap()
+        snapshot.collection(config).unwrap().view().unwrap()
     }
 
     /// Every state of `collection`'s register in `facts`, superseded or not.

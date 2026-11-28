@@ -295,6 +295,13 @@ impl CollectionEncoding for PathSummaryBlob {
     }
 }
 
+/// Summarize each graph node for the given path automaton.
+pub fn regular_path(
+    automaton: Automaton,
+) -> impl triblespace_core::collection::MapMapping<Target = PathSummaryBlob> {
+    triblespace_core::collection::CanonicalAttachment::<PathSummaryBlob>::new(automaton)
+}
+
 impl CollectionAttachment for PathSummaryBlob {
     type Argument = Automaton;
 
@@ -730,12 +737,12 @@ mod tests {
         CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
     };
     use triblespace_core::collection::simplearchive_union;
-    use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy};
+    use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
     use triblespace_core::id::ExclusiveId;
     use triblespace_core::inline::RawInline;
     use triblespace_core::metadata;
     use triblespace_core::prelude::entity;
-    use triblespace_core::repo::{BlobStoreGet, SnapshotSource};
+    use triblespace_core::repo::{memoryrepo::MemoryRepo, BlobStoreGet, SnapshotSource};
     use triblespace_core::trible::Fragment;
     use triblespace_core::trible::{Trible, TribleSet};
 
@@ -901,7 +908,9 @@ mod tests {
             ],
         )
         .unwrap();
-        let source = collection_of(&source_collection());
+        let mut store = MemoryRepo::default();
+        let parent = store.collection("edges", policy()).unwrap();
+        let source = parent.handle();
         let descriptor = summary_descriptor(source, &automaton);
 
         let expected_automaton = PathAutomatonBlob::encode(&automaton);
@@ -912,9 +921,15 @@ mod tests {
         assert_eq!(attached_mapping.facts(), historical_mapping.facts());
         assert_eq!(attached_mapping.root(), historical_mapping.root());
 
-        let mut attachments = descriptor.blobs().clone();
-        let attachment_snapshot = attachments.snapshot().unwrap();
-        let attached: Blob<PathAutomatonBlob> = attachment_snapshot.get(expected_handle).unwrap();
+        let target = store
+            .attach(parent, regular_path(automaton.clone()))
+            .unwrap();
+        let expected = archive(descriptor.facts());
+        assert_eq!(target.handle(), expected.get_handle());
+        let snapshot = store.snapshot().unwrap();
+        let registered: Blob<SimpleArchive> = snapshot.get(target.handle()).unwrap();
+        assert_eq!(registered.bytes, expected.bytes);
+        let attached: Blob<PathAutomatonBlob> = snapshot.get(expected_handle).unwrap();
         assert_eq!(attached.bytes, expected_automaton.bytes);
 
         assert_eq!(

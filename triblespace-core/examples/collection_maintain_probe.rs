@@ -12,11 +12,9 @@
 
 use std::path::Path;
 use std::time::Instant;
+use triblespace_core::collection::succinctarchive_union::{raw_to_rank9, simple_to_succinct};
 
 use ed25519_dalek::SigningKey;
-use triblespace_core::blob::encodings::succinctarchive::{
-    Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
-};
 use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
 use triblespace_core::id::Id;
 use triblespace_core::metadata;
@@ -60,10 +58,10 @@ fn main() {
         .collection("probe-facts", policy(&key))
         .expect("root collection");
     let succinct = pile
-        .attach::<SuccinctArchiveBlob>(source, ())
+        .attach(source, simple_to_succinct())
         .expect("succinct attachment");
     let rank9 = pile
-        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
+        .attach(source, raw_to_rank9(succinct))
         .expect("rank9 attachment");
 
     match mode {

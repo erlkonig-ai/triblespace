@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Collection views now use `snapshot.collection(target)?.view()?` or
+  `snapshot.attached(target)?.view()?`. Check the attached selection's
+  `residual()` for unread foundations. Acquiring readers use
+  `collection_acquiring` or `attached_acquiring` before calling `view`.
+- `store.attach(parent, mapping)` registers the recipe passed by the caller.
+  Built-in recipes include `simple_to_succinct()`, `raw_to_rank9(raw)`,
+  and `TextAttributeToBm25 { attribute, tokenizer }`. Existing attachment
+  descriptors retain their identities.
+
+- Native Pile, MemoryRepo and Yard snapshots share a lazy resident locator-to-handle
+  index with network serving and provider announcements. A local lookup tracks
+  the locator even when it misses. Later snapshots can update the index from
+  blob additions and removals while existing snapshots retain their old results.
+
+- Derived snapshots expose descriptor-scoped source-locator coverage without
+  requiring the source collection to be present. Locator covers use PATCH set
+  algebra, retain any locally known source handles as a partial association,
+  and can resolve only their unknown members through a snapshot's local blob
+  locator index.
+
 - Attached reads now use persisted covers only and name every residual
   foundation as unread, including resident source bytes. Existing durable
   attachment upkeep now accepts Full or successful-source-byte limits, using

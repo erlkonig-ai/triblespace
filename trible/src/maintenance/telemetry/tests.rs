@@ -1,4 +1,5 @@
 use super::*;
+use triblespace_core::blob::encodings::entity_id_set::genid_attribute_values;
 use triblespace_core::collection::{CollectionCommit, CollectionDerive, CollectionMerge};
 use triblespace_core::prelude::*;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -32,7 +33,7 @@ impl<S: Store> Fixture<S> {
         );
         let source = store.collection("observed source", policy.clone()).unwrap();
         let target = store
-            .attach::<EntityIdSetBlob>(source, metadata::supersedes.id())
+            .attach(source, genid_attribute_values(metadata::supersedes.id()))
             .unwrap();
         let reports = store
             .collection("maintenance observations", policy)

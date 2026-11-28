@@ -6,9 +6,8 @@
 use ed25519_dalek::SigningKey;
 use futures::executor::block_on;
 use rand::rngs::OsRng;
-use triblespace::core::blob::encodings::succinctarchive::{
-    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
-};
+use triblespace::core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
+use triblespace::core::collection::succinctarchive_union::{raw_to_rank9, simple_to_succinct};
 use triblespace::core::collection::{
     AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
 };
@@ -62,10 +61,10 @@ fn main() {
     // attaches what the carry leaves, the Succinct index first. The snapshot
     // returned by the last step observes all of that work.
     let raw = pile
-        .attach::<SuccinctArchiveBlob>(collection, ())
+        .attach(collection, simple_to_succinct())
         .expect("attach the Succinct index");
     let accelerated = pile
-        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(collection, raw)
+        .attach(collection, raw_to_rank9(raw))
         .expect("attach the Rank9 accelerator");
     block_on(pile.maintain_attached(raw, &signing_key)).expect("maintain Succinct attachments");
     let snapshot = block_on(pile.maintain_attached(accelerated, &signing_key))

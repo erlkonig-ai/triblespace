@@ -151,6 +151,18 @@ where
         Self: 'a;
     type Err = R::Err;
 
+    fn blob_locators(&self) -> Result<crate::blob::locator::BlobLocatorIndex, Self::Err> {
+        self.residency.blob_locators()
+    }
+
+    fn find_blob(&self, locator: [u8; 32]) -> Result<Option<[u8; 32]>, Self::Err> {
+        self.residency.find_blob(locator)
+    }
+
+    fn find_blobs(&self, locators: &[[u8; 32]]) -> Result<Vec<Option<[u8; 32]>>, Self::Err> {
+        self.residency.find_blobs(locators)
+    }
+
     fn blobs<'a>(&'a self) -> Self::Iter<'a> {
         self.residency.blobs()
     }

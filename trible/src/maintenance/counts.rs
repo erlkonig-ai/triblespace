@@ -15,7 +15,7 @@
 use super::*;
 use std::any::TypeId;
 use std::sync::{Arc, Mutex};
-use triblespace_core::blob::encodings::entity_id_set::EntityIdSet;
+use triblespace_core::blob::encodings::entity_id_set::{genid_attribute_values, EntityIdSet};
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::BlobEncoding;
 use triblespace_core::capability::{CapabilityProof, CapabilityProofId};
@@ -450,7 +450,7 @@ impl Fixture {
         let sources = ["hot receipt source", "quiet receipt source"]
             .map(|name| pile.collection(name, policy.clone()).unwrap());
         let targets = sources.map(|source| {
-            pile.attach::<EntityIdSetBlob>(source, metadata::supersedes.id())
+            pile.attach(source, genid_attribute_values(metadata::supersedes.id()))
                 .unwrap()
         });
         let other = pile.collection("unselected source", policy).unwrap();

@@ -290,6 +290,18 @@ impl<S: CapabilityProofRead> CapabilityProofRead for AcquiringReader<S> {
 
 impl<S: BlobStoreList> BlobStoreList for AcquiringReader<S> {
     type Err = S::Err;
+
+    fn blob_locators(&self) -> Result<crate::blob::locator::BlobLocatorIndex, Self::Err> {
+        self.frozen.blob_locators()
+    }
+
+    fn find_blob(&self, locator: [u8; 32]) -> Result<Option<[u8; 32]>, Self::Err> {
+        self.frozen.find_blob(locator)
+    }
+
+    fn find_blobs(&self, locators: &[[u8; 32]]) -> Result<Vec<Option<[u8; 32]>>, Self::Err> {
+        self.frozen.find_blobs(locators)
+    }
     type Iter<'a>
         = S::Iter<'a>
     where

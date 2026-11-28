@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use triblespace_core::collection::CollectionRead;
 use triblespace_core::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
-use triblespace_core::repo::{BlobStorePut, SnapshotSource, WantRead};
+use triblespace_core::repo::{BlobStoreList, BlobStorePut, SnapshotSource, WantRead};
 
 use tokio::io::AsyncWriteExt as _;
 
@@ -1106,7 +1106,7 @@ async fn background_publication_retries_past_a_stale_issued_batch() {
     );
 
     let now = crate::clock::mono_now();
-    let locators = locator_index(&fixture.store.snapshot().unwrap()).unwrap();
+    let locators = fixture.store.snapshot().unwrap().blob_locators().unwrap();
     let mut publisher = ProviderPublisher::new(now);
     publisher.install(
         ProviderObservation::from_locators(&locators).into_set(),

@@ -312,8 +312,13 @@ where
     ) -> Result<usize, CollectionRealizationError> {
         let (source, target) = open_derived::<M, R>(snapshot, handle)?;
         let source = snapshot.collection::<M::Source>(source)?;
-        let target = snapshot.collection::<M::Target>(target)?;
-        Ok(target.missing_from(&source)?.len())
+        let target = snapshot.derived::<M::Target>(target)?;
+        let source = source.support()?.locators();
+        let represented = target.represented(&source)?;
+        Ok(source
+            .difference(&represented)
+            .map_err(|error| CollectionRealizationError::InvalidCover(error.to_string()))?
+            .len())
     }
 
     fn maintain<'a, S>(

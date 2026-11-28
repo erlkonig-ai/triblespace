@@ -126,7 +126,7 @@ mod readme_example {
         storage.commit(library, &key, initial)?;
 
         let snapshot = storage.snapshot()?;
-        let catalog: TribleSet = library.read(&snapshot)?;
+        let catalog: TribleSet = snapshot.collection(library)?.view()?;
         let title = "Dune";
 
         for (first, last, quote) in find!(
@@ -174,7 +174,7 @@ mod readme_example {
         )?;
 
         let snapshot = storage.snapshot()?;
-        let catalog: TribleSet = library.read(&snapshot)?;
+        let catalog: TribleSet = snapshot.collection(library)?.view()?;
         let mut names = Vec::new();
         for first in find!(
             first,

@@ -142,8 +142,7 @@ append order is never an implicit winner.
 
 ```rust,ignore
 let snapshot = storage.snapshot()?;
-let admitted = library.admitted(&snapshot)?;
-let facts: TribleSet = library.read(&snapshot)?;
+let facts: TribleSet = snapshot.collection(library)?.view()?;
 let title = "Dune";
 
 for (first, last, quote) in find!(
@@ -176,9 +175,9 @@ for (first, last, quote) in find!(
 backend state at one coherent known prefix. `library.admitted(&snapshot)` reads
 the coverage index in that same observation and returns the exact semantic
 payload cover: the union of what the collection's frontier stands for, whether
-or not every byte is here. `library.read(&snapshot)` attaches that frontier
+or not every byte is here. `snapshot.collection(library)?.view()?` selects
 from the same index and constructs the logical value from the nodes whose
-bytes are resident, through the same immutable snapshot; a node whose bytes
+bytes are resident. A node whose bytes
 are elsewhere is descended through the `MERGE` that produced it, so the value
 stands on whatever is local and the support says exactly what that is.
 Snapshots carry no clock: later proof or content arrivals require a new

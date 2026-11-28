@@ -1079,7 +1079,7 @@ mod tests {
     use triblespace_core::inline::Inline;
     use triblespace_core::inline::encodings::hash::Handle;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
-    use triblespace_core::repo::{BlobStorePut, SnapshotSource};
+    use triblespace_core::repo::{BlobStoreList, BlobStorePut, SnapshotSource};
 
     use super::*;
 
@@ -1165,7 +1165,7 @@ mod tests {
             put_blob(&mut store, 23).raw,
         ];
         let snapshot = store.snapshot().unwrap();
-        let locators = crate::bearer::locator_index(&snapshot).unwrap();
+        let locators = snapshot.blob_locators().unwrap();
         let observation = ProviderObservation::from_locators(&locators);
         assert_eq!(observation, ProviderObservation::from_blob_handles(handles));
         let set = observation.into_set();
@@ -1173,6 +1173,10 @@ mod tests {
         assert_eq!(set.leases, locators);
         for handle in handles {
             assert_eq!(set.identity(&blob_locator(handle)), Some(handle));
+            assert!(std::ptr::eq(
+                set.leases.get(&blob_locator(handle)).unwrap(),
+                locators.get(&blob_locator(handle)).unwrap(),
+            ));
             assert!(
                 !set.contains(&handle),
                 "raw bearer handles are not directory keys"
@@ -1189,7 +1193,7 @@ mod tests {
         let mut store = MemoryRepo::default();
         let resident = put_blob(&mut store, 44);
         let snapshot = store.snapshot().unwrap();
-        let mut locators = crate::bearer::locator_index(&snapshot).unwrap();
+        let mut locators = snapshot.blob_locators().unwrap();
         let mut observed = ProviderObservation::from_locators(&locators).into_set();
         assert_eq!(observed.leases, locators);
 

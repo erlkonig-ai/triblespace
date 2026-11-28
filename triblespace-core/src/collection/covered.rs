@@ -49,8 +49,8 @@ use crate::repo::{
 use super::coverage::{Coverage, CoverageIndex, StoreWriters};
 use super::held::{HeldBlobs, HeldIndex, HeldRead, HeldSource, HeldStore, HeldView, HeldWork};
 use super::{
-    CollectionHandle, CollectionRead, CollectionRecord,
-    CollectionRecordSelector, CollectionStore, CoverageRead,
+    CollectionHandle, CollectionRead, CollectionRecord, CollectionRecordSelector, CollectionStore,
+    CoverageRead,
 };
 
 /// What a snapshot exposes so the index can be fed by difference.
@@ -86,6 +86,7 @@ pub struct Covered<S: SnapshotSource> {
     /// The held-blob index, outside the coverage memo and behind its own
     /// lock, so a scan never stalls a coverage read.
     held: std::sync::Arc<HeldIndex<S::Snapshot>>,
+    locators: std::sync::Arc<crate::blob::locator::LocatorCache<S::Snapshot>>,
 }
 
 /// What a snapshot has decided so far: the index, and the collections whose
@@ -115,6 +116,7 @@ impl<S: SnapshotSource> Covered<S> {
             host,
             last: None,
             held: std::sync::Arc::default(),
+            locators: std::sync::Arc::default(),
         }
     }
 
@@ -153,6 +155,13 @@ where
             last: self.last.clone(),
             // A clone diverges from here on, keeping what was learned.
             held: std::sync::Arc::new((*self.held).clone()),
+            // Before the first observation this cold cell is not bound to any
+            // inventory. Diverging store clones must not warm each other's cell.
+            locators: if self.last.is_some() {
+                self.locators.clone()
+            } else {
+                std::sync::Arc::default()
+            },
         }
     }
 }
@@ -263,6 +272,9 @@ where
     /// that it observes the whole store, not a prefix of a climb.
     fn observe(&mut self, now: S::Snapshot, whole: bool) -> CoveredSnapshot<S::Snapshot> {
         let memo = self.carry_forward(&now);
+        if let Some((previous, _)) = &self.last {
+            self.locators = self.locators.advance(previous, now.changes_since(previous));
+        }
         // The held sets as the driver has computed them; what arrived since
         // the last snapshot is queued for it, and no blob is read for them.
         // Nothing is tracked, nothing is paid. Nothing is queued before the
@@ -273,6 +285,7 @@ where
             inner: now,
             memo,
             held,
+            locators: self.locators.clone(),
         }
     }
 }
@@ -439,11 +452,18 @@ impl Covered<crate::repo::pile::PileFile> {
     /// owner, or a process that opens and closes a pile repeatedly, must
     /// call [`Self::close`] instead.
     pub fn close_for_process_exit(self) -> Result<(), crate::repo::pile::FlushError> {
-        let Self { inner, host: _, last, held } = self;
+        let Self {
+            inner,
+            host: _,
+            last,
+            held,
+            locators,
+        } = self;
         let result = inner.close_for_process_exit();
         if result.is_ok() {
             std::mem::forget(last);
             std::mem::forget(held);
+            std::mem::forget(locators);
         }
         result
     }
@@ -461,13 +481,17 @@ pub struct CoveredSnapshot<T> {
     memo: std::sync::Arc<std::sync::Mutex<Memo>>,
     /// The held sets fixed when this snapshot was taken.
     held: std::sync::Arc<HeldView>,
+    locators: std::sync::Arc<crate::blob::locator::LocatorCache<T>>,
 }
 
 impl<T: std::fmt::Debug> std::fmt::Debug for CoveredSnapshot<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CoveredSnapshot")
             .field("inner", &self.inner)
-            .field("memo", &*self.memo.lock().expect("coverage memo is not poisoned"))
+            .field(
+                "memo",
+                &*self.memo.lock().expect("coverage memo is not poisoned"),
+            )
             .field("held", &self.held)
             .finish()
     }
@@ -569,7 +593,10 @@ impl<T: CollectionRead + BlobStoreGet + CapabilityProofRead> CoverageRead for Co
     /// and hand out the index as it stands: a persistent-root clone whose
     /// rows for the lineage are complete and whose other lineages may still
     /// be parked, which a reader asking for its own lineage never sees.
-    fn index(&self, lineage: &BTreeSet<CollectionHandle>) -> Result<CoverageIndex, Self::RecordsError> {
+    fn index(
+        &self,
+        lineage: &BTreeSet<CollectionHandle>,
+    ) -> Result<CoverageIndex, Self::RecordsError> {
         let mut memo = self.memo.lock().expect("coverage memo is not poisoned");
         self.settle_lineage(&mut memo, lineage)?;
         Ok(memo.index.clone())
@@ -593,13 +620,30 @@ impl<T: RecordDelta> RecordDelta for CoveredSnapshot<T> {
     }
 }
 
-impl<T: StoreSnapshot> StoreSnapshot for CoveredSnapshot<T> {
+impl<T: StoreSnapshot + BlobStoreList> StoreSnapshot for CoveredSnapshot<T> {
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         self.inner.changes_since(&previous.inner)
     }
 
     fn changes_for(&self, previous: &Self, dependencies: &StoreDependencies) -> StoreChanges {
-        self.inner.changes_for(&previous.inner, dependencies)
+        let mut physical = dependencies.clone();
+        physical.locators = Default::default();
+        let mut changes = self.inner.changes_for(&previous.inner, &physical);
+        if !dependencies.locators.is_empty()
+            && self.changes_since(previous).contains(StoreChanges::BLOBS)
+        {
+            match (self.blob_locators(), previous.blob_locators()) {
+                (Ok(now), Ok(before)) => {
+                    if dependencies.locators.iter().any(|locator| {
+                        now.get(locator.as_bytes()) != before.get(locator.as_bytes())
+                    }) {
+                        changes = changes.union(StoreChanges::BLOBS);
+                    }
+                }
+                _ => changes = changes.union(StoreChanges::BLOBS),
+            }
+        }
+        changes
     }
 }
 
@@ -625,6 +669,10 @@ impl<T: BlobStoreList> BlobStoreList for CoveredSnapshot<T> {
     where
         Self: 'a;
     type Err = T::Err;
+
+    fn blob_locators(&self) -> Result<crate::blob::locator::BlobLocatorIndex, Self::Err> {
+        self.locators.get(&self.inner)
+    }
 
     fn blobs<'a>(&'a self) -> Self::Iter<'a> {
         self.inner.blobs()
@@ -654,7 +702,10 @@ impl<T: BlobStoreList> BlobStoreList for CoveredSnapshot<T> {
 impl<T: BlobStoreMeta> BlobStoreMeta for CoveredSnapshot<T> {
     type MetaError = T::MetaError;
 
-    fn metadata<S>(&self, handle: Inline<Handle<S>>) -> Result<Option<BlobMetadata>, Self::MetaError>
+    fn metadata<S>(
+        &self,
+        handle: Inline<Handle<S>>,
+    ) -> Result<Option<BlobMetadata>, Self::MetaError>
     where
         S: BlobEncoding + 'static,
         Handle<S>: InlineEncoding,
@@ -699,16 +750,19 @@ impl<T: CollectionRead> CollectionRead for CoveredSnapshot<T> {
     }
 
     fn select_record_views(
-        &self, selectors: &std::collections::BTreeSet<crate::collection::CollectionRecordSelector>,
+        &self,
+        selectors: &std::collections::BTreeSet<crate::collection::CollectionRecordSelector>,
     ) -> Result<Vec<crate::collection::CollectionRecordView>, Self::RecordsError> {
         self.inner.select_record_views(selectors)
     }
 
     fn select_record_view_changes(
-        &self, previous: &Self,
+        &self,
+        previous: &Self,
         selectors: &std::collections::BTreeSet<crate::collection::CollectionRecordSelector>,
     ) -> Result<crate::collection::RecordViewChanges, Self::RecordsError> {
-        self.inner.select_record_view_changes(&previous.inner, selectors)
+        self.inner
+            .select_record_view_changes(&previous.inner, selectors)
     }
 
     fn select_record_changes(
@@ -757,11 +811,31 @@ mod tests {
     use crate::blob::encodings::utf8string::UTF8String;
     use crate::blob::Blob;
     use crate::capability::CapabilityResource;
-    use crate::prelude::entity;
     use crate::collection::{
         write_capability, AdmissionPolicy, Collection, CollectionPolicy, CollectionStoreExt,
     };
+    use crate::prelude::entity;
     use crate::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
+
+    #[test]
+    fn stores_cloned_before_observation_keep_distinct_locator_inventories() {
+        use crate::blob::locator::blob_locator;
+
+        let mut first = MemoryRepo::default();
+        let mut second = first.clone();
+        let a = first.put::<UTF8String, _>("only first".to_owned()).unwrap();
+        let b = second
+            .put::<UTF8String, _>("only second".to_owned())
+            .unwrap();
+        let first = first.snapshot().unwrap();
+        let second = second.snapshot().unwrap();
+        // Warming the first branch must not substitute its inventory for the
+        // second, even though both were cloned from an unobserved empty store.
+        assert_eq!(first.find_blob(blob_locator(a.raw)).unwrap(), Some(a.raw));
+        assert_eq!(second.find_blob(blob_locator(a.raw)).unwrap(), None);
+        assert_eq!(second.find_blob(blob_locator(b.raw)).unwrap(), Some(b.raw));
+        assert_eq!(first.find_blob(blob_locator(b.raw)).unwrap(), None);
+    }
 
     fn policy(root: &SigningKey) -> CollectionPolicy {
         CollectionPolicy::new(
@@ -798,12 +872,20 @@ mod tests {
 
         let only_first = snapshot.index(&BTreeSet::from([first.handle()])).unwrap();
         assert_eq!(only_first.published().len(), 1);
-        assert_eq!(only_first.parked(), 0, "the other lineage was never even offered");
+        assert_eq!(
+            only_first.parked(),
+            0,
+            "the other lineage was never even offered"
+        );
 
         let both = snapshot.index(&BTreeSet::from([second.handle()])).unwrap();
         assert_eq!(both.published().len(), 2);
         assert_eq!(both.parked(), 0);
-        assert_eq!(snapshot.coverage_index(), both, "the eager form has nothing left to decide");
+        assert_eq!(
+            snapshot.coverage_index(),
+            both,
+            "the eager form has nothing left to decide"
+        );
 
         // A later snapshot starts from what this one decided and pays only
         // for what arrived since, for the collections already settled.
@@ -824,8 +906,9 @@ mod tests {
     fn unchanged_snapshots_share_late_control_warming() {
         let root = SigningKey::from_bytes(&[73; 32]);
         let mut store = MemoryRepo::default();
-        let collection: Collection<SimpleArchive> =
-            store.collection("late control warming", policy(&root)).unwrap();
+        let collection: Collection<SimpleArchive> = store
+            .collection("late control warming", policy(&root))
+            .unwrap();
         store
             .commit(collection, &root, entity! { crate::metadata::name: "one" })
             .unwrap();
@@ -838,10 +921,20 @@ mod tests {
         assert_eq!(warmed.published().len(), 1);
         // Inspect before calling residency.index(): a cold memo would replay
         // the whole lineage and hide the regression behind an equal answer.
-        assert!(residency.memo.lock().unwrap().settled.contains(&collection.handle()));
+        assert!(residency
+            .memo
+            .lock()
+            .unwrap()
+            .settled
+            .contains(&collection.handle()));
         assert_eq!(residency.memo.lock().unwrap().index, warmed);
         let next = store.snapshot().unwrap();
-        assert!(next.memo.lock().unwrap().settled.contains(&collection.handle()));
+        assert!(next
+            .memo
+            .lock()
+            .unwrap()
+            .settled
+            .contains(&collection.handle()));
         assert_eq!(next.index(&lineage).unwrap(), warmed);
     }
 
@@ -849,8 +942,9 @@ mod tests {
     fn changed_records_fork_late_control_warming_without_advancing_it() {
         let root = SigningKey::from_bytes(&[73; 32]);
         let mut store = MemoryRepo::default();
-        let collection: Collection<SimpleArchive> =
-            store.collection("changed control records", policy(&root)).unwrap();
+        let collection: Collection<SimpleArchive> = store
+            .collection("changed control records", policy(&root))
+            .unwrap();
         store
             .commit(collection, &root, entity! { crate::metadata::name: "one" })
             .unwrap();
@@ -878,10 +972,15 @@ mod tests {
         let root = SigningKey::from_bytes(&[71; 32]);
         let writer = SigningKey::from_bytes(&[72; 32]);
         let mut store = MemoryRepo::default();
-        let collection: Collection<SimpleArchive> =
-            store.collection("changed control authority", policy(&root)).unwrap();
+        let collection: Collection<SimpleArchive> = store
+            .collection("changed control authority", policy(&root))
+            .unwrap();
         store
-            .commit(collection, &writer, entity! { crate::metadata::name: "waiting" })
+            .commit(
+                collection,
+                &writer,
+                entity! { crate::metadata::name: "waiting" },
+            )
             .unwrap();
         let control = store.snapshot().unwrap();
         let residency = store.snapshot().unwrap();
@@ -894,7 +993,10 @@ mod tests {
             ))
             .unwrap();
         let changed = store.snapshot().unwrap();
-        assert_eq!(changed.changes_since(&control), StoreChanges::CAPABILITY_PROOFS);
+        assert_eq!(
+            changed.changes_since(&control),
+            StoreChanges::CAPABILITY_PROOFS
+        );
         assert!(!std::sync::Arc::ptr_eq(&control.memo, &changed.memo));
         let lineage = BTreeSet::from([collection.handle()]);
         assert_eq!(changed.index(&lineage).unwrap().published().len(), 1);
@@ -908,18 +1010,23 @@ mod tests {
     fn changed_blob_residency_forks_the_memo_without_filling_old_misses() {
         let root = SigningKey::from_bytes(&[71; 32]);
         let mut elsewhere = MemoryRepo::default();
-        let collection: Collection<SimpleArchive> =
-            elsewhere.collection("late control descriptor", policy(&root)).unwrap();
+        let collection: Collection<SimpleArchive> = elsewhere
+            .collection("late control descriptor", policy(&root))
+            .unwrap();
         let record = elsewhere
             .commit(collection, &root, entity! { crate::metadata::name: "one" })
             .unwrap();
-        let descriptor: Blob<UnknownBlob> = elsewhere.snapshot().unwrap()
-            .get(collection.handle().transmute()).unwrap();
+        let descriptor: Blob<UnknownBlob> = elsewhere
+            .snapshot()
+            .unwrap()
+            .get(collection.handle().transmute())
+            .unwrap();
         let mut store = MemoryRepo::default();
         // Give both observations the ordinary capability definitions, while
         // withholding only the descriptor whose arrival this test isolates.
         let _: Collection<SimpleArchive> = store
-            .collection("known capability definitions", policy(&root)).unwrap();
+            .collection("known capability definitions", policy(&root))
+            .unwrap();
         store.insert(CollectionRecord::Commit(record)).unwrap();
         let control = store.snapshot().unwrap();
         let residency = store.snapshot().unwrap();
@@ -944,8 +1051,9 @@ mod tests {
         let path = dir.path().join("memo.pile");
         std::fs::File::create(&path).unwrap();
         let mut store = crate::repo::pile::Pile::open(&path).unwrap();
-        let collection: Collection<SimpleArchive> =
-            store.collection("pile control warming", policy(&root)).unwrap();
+        let collection: Collection<SimpleArchive> = store
+            .collection("pile control warming", policy(&root))
+            .unwrap();
         store
             .commit(collection, &root, entity! { crate::metadata::name: "one" })
             .unwrap();
@@ -955,9 +1063,19 @@ mod tests {
         let lineage = BTreeSet::from([collection.handle()]);
         let warmed = control.index(&lineage).unwrap();
         assert_eq!(warmed.published().len(), 1);
-        assert!(residency.memo.lock().unwrap().settled.contains(&collection.handle()));
+        assert!(residency
+            .memo
+            .lock()
+            .unwrap()
+            .settled
+            .contains(&collection.handle()));
         let next = store.snapshot().unwrap();
-        assert!(next.memo.lock().unwrap().settled.contains(&collection.handle()));
+        assert!(next
+            .memo
+            .lock()
+            .unwrap()
+            .settled
+            .contains(&collection.handle()));
         assert_eq!(next.index(&lineage).unwrap(), warmed);
     }
 
@@ -986,9 +1104,16 @@ mod tests {
 
         let other = store.put::<UTF8String, _>("other".to_owned()).unwrap();
         store
-            .commit(collection, &writer, entity! { crate::metadata::name: other })
+            .commit(
+                collection,
+                &writer,
+                entity! { crate::metadata::name: other },
+            )
             .unwrap();
-        let parked = agree(&store.snapshot().unwrap(), "a commit by an unadmitted writer");
+        let parked = agree(
+            &store.snapshot().unwrap(),
+            "a commit by an unadmitted writer",
+        );
         assert_eq!(parked.parked_on_signers(), 1);
         assert_eq!(parked.published().len(), 1);
 
@@ -1000,13 +1125,17 @@ mod tests {
                 writer.verifying_key(),
             ))
             .unwrap();
-        let proven = agree(&store.snapshot().unwrap(), "the proof that admits the writer");
+        let proven = agree(
+            &store.snapshot().unwrap(),
+            "the proof that admits the writer",
+        );
         assert_eq!(proven.parked_on_signers(), 0);
         assert_eq!(proven.published().len(), 2);
 
         // A record for a collection whose descriptor this store has not seen.
         let mut elsewhere = MemoryRepo::default();
-        let later: Collection<SimpleArchive> = elsewhere.collection("later", policy(&root)).unwrap();
+        let later: Collection<SimpleArchive> =
+            elsewhere.collection("later", policy(&root)).unwrap();
         let payload = elsewhere.put::<UTF8String, _>("later".to_owned()).unwrap();
         let ahead = elsewhere
             .commit(later, &root, entity! { crate::metadata::name: payload })
@@ -1020,13 +1149,19 @@ mod tests {
         // Nothing is known about who may write a collection whose descriptor
         // is absent, so the commit waits on that descriptor -- an ordinary
         // blob, whose arrival is what re-offers it.
-        let waiting = agree(&store.snapshot().unwrap(), "a record ahead of its descriptor");
+        let waiting = agree(
+            &store.snapshot().unwrap(),
+            "a record ahead of its descriptor",
+        );
         assert_eq!(waiting.parked_on_lineages(), 1);
         assert_eq!(waiting.parked_on_signers(), 0);
         assert_eq!(waiting.published().len(), 2);
 
         store.put::<UnknownBlob, _>(descriptor).unwrap();
-        let landed = agree(&store.snapshot().unwrap(), "the descriptor it was waiting on");
+        let landed = agree(
+            &store.snapshot().unwrap(),
+            "the descriptor it was waiting on",
+        );
         assert_eq!(landed.parked(), 0);
         assert_eq!(landed.published().len(), 3);
 

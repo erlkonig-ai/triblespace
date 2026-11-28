@@ -163,10 +163,10 @@ One immutable, coherent known-prefix observation produced by
 and capability-proof reads for that prefix and implements
 `StoreSnapshot::changes_since` for conservative local invalidation. Collection
 admission reads the coverage index in it and produces a semantic `Cover<E>`,
-the union of what the collection's frontier stands for; `Collection::read`
-and `CollectionSnapshotExt::collection` attach that frontier from the same
-index and reconstruct an eager value or a lazy sharded view from the nodes
-whose bytes are resident, through the same snapshot.
+the union of what the collection's frontier stands for.
+`CollectionSnapshotExt::collection` selects that frontier from the same
+index. Its `view` reconstructs an eager value or a lazy sharded view from the
+nodes whose bytes are resident, through the same snapshot.
 
 ### Collection READ
 The exact `ACTION_READ` capability over one collection descriptor handle. A

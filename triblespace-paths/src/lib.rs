@@ -24,8 +24,8 @@ pub use constraint::PathConstraint;
 pub use expr::PathExpr;
 pub use index::PathIndex;
 pub use path_summary_union::{
-    PathIndexViewError, PathSummaryView, RegularPathMappingError, RegularPathMappingV1,
-    REGULAR_PATH_MAPPING_V1,
+    regular_path, PathIndexViewError, PathSummaryView, RegularPathMappingError,
+    RegularPathMappingV1, REGULAR_PATH_MAPPING_V1,
 };
 pub use persistence::{
     automaton_fingerprint, path_automaton_accepting_state, path_automaton_fingerprint,

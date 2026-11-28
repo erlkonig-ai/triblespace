@@ -1000,10 +1000,9 @@ fn run_health(
     max_age: u64,
 ) -> Result<()> {
     use health_record::{attrs, KIND_REPORT};
-    use triblespace_core::blob::encodings::succinctarchive::{
-        OrderedUniverse, SuccinctArchiveBlob, UnionArchive,
-    };
-    use triblespace_core::collection::lww_register::{LwwIndex, LwwRegisterBlob};
+    use triblespace_core::blob::encodings::succinctarchive::{OrderedUniverse, UnionArchive};
+    use triblespace_core::collection::lww_register::{register_coordinates, LwwIndex};
+    use triblespace_core::collection::succinctarchive_union::simple_to_succinct;
     use triblespace_core::macros::{find, pattern};
     use triblespace_core::metadata;
     use triblespace_core::prelude::*;
@@ -1018,9 +1017,11 @@ fn run_health(
         let source = open_health_collection(&mut pile, authority, collection_value.as_deref())?;
         // Attached indexes name the source and their mapping and nothing
         // else, so every reader of the same source attaches the same ones.
-        let facts = pile.attach::<SuccinctArchiveBlob>(source, ())?;
-        let latest =
-            pile.attach::<LwwRegisterBlob>(source, (attrs::node.id(), metadata::created_at.id()))?;
+        let facts = pile.attach(source, simple_to_succinct())?;
+        let latest = pile.attach(
+            source,
+            register_coordinates(attrs::node.id(), metadata::created_at.id()),
+        )?;
         // Pile is local-only: missing report bytes cannot start acquisition.
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         runtime.block_on(async {

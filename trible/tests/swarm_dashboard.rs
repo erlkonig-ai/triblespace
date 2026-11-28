@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 use tempfile::TempDir;
-use triblespace_core::blob::encodings::entity_id_set::{EntityIdSet, EntityIdSetBlob};
+use triblespace_core::blob::encodings::entity_id_set::{
+    genid_attribute_values, EntityIdSet, EntityIdSetBlob,
+};
 use triblespace_core::collection::{
     AdmissionPolicy, Collection, CollectionPolicy, CollectionRead, CollectionRecord,
     CollectionSnapshotExt, CollectionStoreExt,
@@ -45,7 +47,7 @@ impl Fixture {
         let mut pile = Pile::open(&path).unwrap();
         let source = pile.collection("generated facts", policy.clone()).unwrap();
         let target = pile
-            .attach::<EntityIdSetBlob>(source, metadata::supersedes.id())
+            .attach(source, genid_attribute_values(metadata::supersedes.id()))
             .unwrap();
         let reports = pile.collection("generated telemetry", policy).unwrap();
         let expected = *genid();

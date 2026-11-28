@@ -453,7 +453,11 @@ fn issuer_held_read_proof_reaches_a_handle_only_recipient_by_grant_exchange() {
                 .len(),
             1
         );
-        let facts = recipient_collection.read::<TribleSet, _>(&ready).unwrap();
+        let facts = ready
+            .collection(recipient_collection)
+            .unwrap()
+            .view::<TribleSet>()
+            .unwrap();
         assert_eq!(facts, payload_facts);
         assert!(
             admitted
@@ -734,7 +738,7 @@ fn native_read_credential_admits_on_retry_and_rejects_writer_only_peer() {
         let unavailable = dangling.collection(reader_collection).unwrap();
         assert!(unavailable.cover().is_empty());
         assert!(unavailable.support().unwrap().is_empty());
-        assert!(reader_collection.read::<TribleSet, _>(&dangling).unwrap().is_empty());
+        assert!(unavailable.view::<TribleSet>().unwrap().is_empty());
         assert_eq!(dangling.wants().unwrap().count(), 0);
         assert!(
             acquire_once(
@@ -753,7 +757,7 @@ fn native_read_credential_admits_on_retry_and_rejects_writer_only_peer() {
         let available = reader_snapshot.collection(reader_collection).unwrap();
         assert_eq!(available.cover().len(), 1);
         assert_eq!(available.support().unwrap(), &admitted);
-        assert_eq!(reader_collection.read::<TribleSet, _>(&reader_snapshot).unwrap(), payload_facts);
+        assert_eq!(available.view::<TribleSet>().unwrap(), payload_facts);
         assert!(!dangling.contains_blob(payload_handle).unwrap());
         assert!(dangling.collection(reader_collection).unwrap().cover().is_empty());
         let writer_snapshot = writer_only.snapshot().unwrap();

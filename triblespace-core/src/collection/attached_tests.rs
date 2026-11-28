@@ -8,14 +8,15 @@ use ed25519_dalek::SigningKey;
 use futures::executor::block_on;
 
 use crate::attribute::Attribute;
-use crate::blob::encodings::entity_id_set::{EntityIdSet, EntityIdSetBlob};
+use crate::blob::encodings::entity_id_set::{genid_attribute_values, EntityIdSet, EntityIdSetBlob};
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::succinctarchive::{
     OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
 use crate::blob::{Blob, IntoBlob};
-use crate::collection::latest::{LatestBlob, LatestIndex};
-use crate::collection::lww_register::{LwwIndex, LwwRegisterBlob};
+use crate::collection::latest::{latest_states, LatestBlob, LatestIndex};
+use crate::collection::lww_register::{register_coordinates, LwwIndex, LwwRegisterBlob};
+use crate::collection::succinctarchive_union::{raw_to_rank9, simple_to_succinct};
 use crate::collection::{
     empty_metadata_handle, simplearchive_union, succinctarchive_union, AdmissionPolicy, Collection,
     CollectionAttachment, CollectionCommit, CollectionData, CollectionDerive, CollectionEncoding,
@@ -83,6 +84,50 @@ fn policy() -> CollectionPolicy {
     )
 }
 
+#[test]
+fn named_recipes_preserve_canonical_attachment_descriptor_bytes() {
+    fn check<T: CollectionAttachment>(
+        store: &mut MemoryRepo,
+        parent: Collection<SimpleArchive>,
+        argument: T::Argument,
+        recipe: impl super::MapMapping<Target = T>,
+    ) -> Collection<T> {
+        let old = super::descriptor::attaching_with(
+            parent.handle(),
+            &super::CanonicalAttachment::<T>::new(argument),
+        );
+        let old: Blob<SimpleArchive> = old.facts().to_blob();
+        let attached = store.attach(parent, recipe).unwrap();
+        assert_eq!(attached.handle(), old.get_handle());
+        let snapshot = store.snapshot().unwrap();
+        let new: Blob<SimpleArchive> = snapshot.get(attached.handle()).unwrap();
+        assert_eq!(new.bytes, old.bytes);
+        attached
+    }
+
+    let mut store = MemoryRepo::default();
+    let parent = store
+        .collection("attachment recipe identity", policy())
+        .unwrap();
+    let succinct = check(&mut store, parent, (), simple_to_succinct());
+    check(&mut store, parent, succinct, raw_to_rank9(succinct));
+    let attribute = metadata::supersedes.id();
+    check(
+        &mut store,
+        parent,
+        attribute,
+        genid_attribute_values(attribute),
+    );
+    check(&mut store, parent, attribute, latest_states(attribute));
+    let coordinates = (attribute, metadata::tag.id());
+    check(
+        &mut store,
+        parent,
+        coordinates,
+        register_coordinates(coordinates.0, coordinates.1),
+    );
+}
+
 fn id(byte: u8) -> Id {
     Id::new([byte; 16]).unwrap()
 }
@@ -108,7 +153,7 @@ fn succinct_root(
 ) {
     let mut store = MemoryRepo::for_host(host().verifying_key());
     let root = store.collection(name, policy()).unwrap();
-    let attached = store.attach::<SuccinctArchiveBlob>(root, ()).unwrap();
+    let attached = store.attach(root, simple_to_succinct()).unwrap();
     (store, root, attached)
 }
 
@@ -236,10 +281,8 @@ fn a_believed_map_whose_bytes_are_absent_is_descended() {
 fn a_resident_rank9_whose_succinct_child_is_absent_is_descended() {
     let mut store = MemoryRepo::for_host(host().verifying_key());
     let root = store.collection("rank9-descent", policy()).unwrap();
-    let succinct = store.attach::<SuccinctArchiveBlob>(root, ()).unwrap();
-    let rank9 = store
-        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(root, succinct)
-        .unwrap();
+    let succinct = store.attach(root, simple_to_succinct()).unwrap();
+    let rank9 = store.attach(root, raw_to_rank9(succinct)).unwrap();
     let mut children = Vec::new();
     for byte in 1..=8u8 {
         children.push(commit(&mut store, root, row(byte, 4, 5)));
@@ -650,7 +693,10 @@ fn a_register_read_waits_for_durable_upkeep() {
     let mut store = MemoryRepo::for_host(host().verifying_key());
     let root = store.collection("register-residual", policy()).unwrap();
     let register = store
-        .attach::<LwwRegisterBlob>(root, (state_of().id(), written_at().id()))
+        .attach(
+            root,
+            register_coordinates(state_of().id(), written_at().id()),
+        )
         .unwrap();
     let (goal, other_goal) = (id(100), id(101));
     let mut first = lww_identity(id(1), goal);
@@ -682,11 +728,6 @@ fn a_register_read_waits_for_durable_upkeep() {
     assert_eq!(cover_only.winner(goal), Some(id(1)));
     assert_eq!(cover_only.winner(other_goal), None);
 
-    let read = attached.read::<LwwIndex>().unwrap();
-    assert_eq!(read.unread().len(), 2);
-    let stored = read.value().query().unwrap();
-    assert_eq!(stored.winner(goal), Some(id(1)));
-    assert_eq!(stored.winner(other_goal), None);
     // Nothing was stored or published by the read.
     assert_eq!(
         store.snapshot().unwrap().records().unwrap().count(),
@@ -694,22 +735,16 @@ fn a_register_read_waits_for_durable_upkeep() {
     );
     assert_eq!(upkeep(&mut store, register, &host(), u64::MAX).unwrap(), 1);
     let after = store.snapshot().unwrap();
-    let complete = after
-        .attached(register)
-        .unwrap()
-        .read::<LwwIndex>()
-        .unwrap();
+    let complete = after.attached(register).unwrap();
     assert_eq!(
-        complete.unread().data_members().collect::<Vec<_>>(),
+        complete.residual().data_members().collect::<Vec<_>>(),
         vec![absent]
     );
-    assert_eq!(complete.value().query().unwrap().winner(goal), Some(id(2)));
+    let winners = complete.view::<LwwIndex>().unwrap().query().unwrap();
+    assert_eq!(winners.winner(goal), Some(id(2)));
+    assert_eq!(winners.winner(other_goal), Some(id(3)));
     assert_eq!(
-        complete.value().query().unwrap().winner(other_goal),
-        Some(id(3))
-    );
-    assert_eq!(
-        read.unread().len(),
+        attached.residual().len(),
         2,
         "the old observation does not change"
     );
@@ -722,7 +757,10 @@ fn a_register_nothing_attached_is_pending_until_upkeep() {
     let mut store = MemoryRepo::for_host(host().verifying_key());
     let root = store.collection("register-fresh", policy()).unwrap();
     let register = store
-        .attach::<LwwRegisterBlob>(root, (state_of().id(), written_at().id()))
+        .attach(
+            root,
+            register_coordinates(state_of().id(), written_at().id()),
+        )
         .unwrap();
     for (state, nanos) in [(1u8, 10i128), (2, 30), (3, 20)] {
         let mut facts = lww_identity(id(state), id(100));
@@ -733,19 +771,13 @@ fn a_register_nothing_attached_is_pending_until_upkeep() {
     let attached = snapshot.attached(register).unwrap();
     assert!(attached.cover().is_empty());
     assert_eq!(attached.residual().len(), 3);
-    let read = attached.read::<LwwIndex>().unwrap();
-    assert_eq!(read.unread().len(), 3);
-    assert_eq!(read.value().query().unwrap().winner(id(100)), None);
+    let index = attached.view::<LwwIndex>().unwrap();
+    assert_eq!(index.query().unwrap().winner(id(100)), None);
     assert_eq!(upkeep(&mut store, register, &host(), u64::MAX).unwrap(), 3);
-    let fresh = store
-        .snapshot()
-        .unwrap()
-        .attached(register)
-        .unwrap()
-        .read::<LwwIndex>()
-        .unwrap();
-    assert!(fresh.unread().is_empty());
-    assert_eq!(fresh.value().query().unwrap().winner(id(100)), Some(id(2)));
+    let fresh = store.snapshot().unwrap().attached(register).unwrap();
+    assert!(fresh.residual().is_empty());
+    let index = fresh.view::<LwwIndex>().unwrap();
+    assert_eq!(index.query().unwrap().winner(id(100)), Some(id(2)));
 }
 
 /// A mapping that reads a sibling's attachment cannot be built here for a
@@ -755,19 +787,17 @@ fn a_register_nothing_attached_is_pending_until_upkeep() {
 fn a_read_through_a_mapping_with_siblings_names_its_residual_unread() {
     let mut store = MemoryRepo::for_host(host().verifying_key());
     let root = store.collection("rank9-residual", policy()).unwrap();
-    let succinct = store.attach::<SuccinctArchiveBlob>(root, ()).unwrap();
-    let rank9 = store
-        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(root, succinct)
-        .unwrap();
+    let succinct = store.attach(root, simple_to_succinct()).unwrap();
+    let rank9 = store.attach(root, raw_to_rank9(succinct)).unwrap();
     let node = commit(&mut store, root, row(1, 2, 3));
     let snapshot = store.snapshot().unwrap();
     let attached = snapshot.attached(rank9).unwrap();
-    let generic = attached.read::<UnionArchive<OrderedUniverse>>().unwrap();
+    let generic = attached.view::<UnionArchive<OrderedUniverse>>().unwrap();
     assert_eq!(
-        generic.unread().data_members().collect::<Vec<_>>(),
+        attached.residual().data_members().collect::<Vec<_>>(),
         vec![node]
     );
-    assert_eq!(generic.value().iter().count(), 0);
+    assert_eq!(generic.iter().count(), 0);
     let facts = succinctarchive_union::read_attached(&attached).unwrap();
     assert_eq!(facts.unread().len(), 1);
     assert_eq!(facts.value().iter().count(), 0);
@@ -1037,10 +1067,8 @@ fn attaching_with_a_key_that_is_not_the_host_is_an_error() {
 fn rank9_is_built_from_the_named_succinct_attachment() {
     let mut store = MemoryRepo::for_host(host().verifying_key());
     let root = store.collection("rank9-pair", policy()).unwrap();
-    let succinct = store.attach::<SuccinctArchiveBlob>(root, ()).unwrap();
-    let rank9 = store
-        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(root, succinct)
-        .unwrap();
+    let succinct = store.attach(root, simple_to_succinct()).unwrap();
+    let rank9 = store.attach(root, raw_to_rank9(succinct)).unwrap();
     let mut expected = TribleSet::new();
     for byte in 1..=3u8 {
         expected += row(byte, 6, 7);
@@ -1065,10 +1093,8 @@ fn rank9_is_built_from_the_named_succinct_attachment() {
 fn attached_collections_are_found_from_their_parent_siblings_first() {
     let mut store = MemoryRepo::for_host(host().verifying_key());
     let root = store.collection("upkeep", policy()).unwrap();
-    let succinct = store.attach::<SuccinctArchiveBlob>(root, ()).unwrap();
-    let rank9 = store
-        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(root, succinct)
-        .unwrap();
+    let succinct = store.attach(root, simple_to_succinct()).unwrap();
+    let rank9 = store.attach(root, raw_to_rank9(succinct)).unwrap();
     let node = commit(&mut store, root, row(1, 2, 3));
     // Discovery lists what holds a MAP; seed both.
     map_succinct(&mut store, succinct, node, &host());
@@ -1112,7 +1138,7 @@ fn a_descriptor_naming_two_parents_is_upkept_with_neither() {
     let mut store = MemoryRepo::for_host(host().verifying_key());
     let root = store.collection("upkept", policy()).unwrap();
     let second = store.collection("second-parent", policy()).unwrap();
-    let succinct = store.attach::<SuccinctArchiveBlob>(root, ()).unwrap();
+    let succinct = store.attach(root, simple_to_succinct()).unwrap();
     let descriptor = entity! {
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
         collection_parent*: [root.handle(), second.handle()],
@@ -1348,9 +1374,9 @@ where
 {
     upkeep(store, attached, &host(), u64::MAX).unwrap();
     let snapshot = store.snapshot().unwrap();
-    let read = snapshot.attached(attached).unwrap().read::<V>().unwrap();
-    assert!(read.unread().is_empty());
-    read.into_value()
+    let selected = snapshot.attached(attached).unwrap();
+    assert!(selected.residual().is_empty());
+    selected.view().unwrap()
 }
 
 fn random_rows(random: &mut Stream, entities: u8) -> Vec<TribleSet> {
@@ -1387,7 +1413,7 @@ fn succinct_covers_answer_like_the_union() {
         let mut lattice = lattice(&format!("succinct-{seed}"), fragments, &mut random);
         let attached = lattice
             .store
-            .attach::<SuccinctArchiveBlob>(lattice.root, ())
+            .attach(lattice.root, simple_to_succinct())
             .unwrap();
         let (cover, union) = covers(&mut lattice, attached, build, &mut random);
         let through_cover: UnionArchive<OrderedUniverse> =
@@ -1439,11 +1465,11 @@ fn rank9_covers_answer_like_the_union() {
         let mut lattice = lattice(&format!("rank9-{seed}"), fragments, &mut random);
         let succinct = lattice
             .store
-            .attach::<SuccinctArchiveBlob>(lattice.root, ())
+            .attach(lattice.root, simple_to_succinct())
             .unwrap();
         let attached = lattice
             .store
-            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(lattice.root, succinct)
+            .attach(lattice.root, raw_to_rank9(succinct))
             .unwrap();
         let (cover, union) = covers(&mut lattice, attached, build, &mut random);
         let through_cover: UnionArchive<OrderedUniverse> =
@@ -1537,7 +1563,10 @@ fn lww_covers_answer_like_the_union() {
         let mut lattice = lattice(&format!("lww-{seed}"), fragments, &mut random);
         let attached = lattice
             .store
-            .attach::<LwwRegisterBlob>(lattice.root, (state_of().id(), written_at().id()))
+            .attach(
+                lattice.root,
+                register_coordinates(state_of().id(), written_at().id()),
+            )
             .unwrap();
         let (cover, union) = covers(&mut lattice, attached, build_lww, &mut random);
         let through_cover: LwwIndex = view(&mut lattice.store, attached, &cover);
@@ -1563,7 +1592,10 @@ fn lww_rows_split_between_an_attachment_and_a_raw_member_pair_up() {
     let mut store = MemoryRepo::for_host(host().verifying_key());
     let root = store.collection("lww-split", policy()).unwrap();
     let attached = store
-        .attach::<LwwRegisterBlob>(root, (state_of().id(), written_at().id()))
+        .attach(
+            root,
+            register_coordinates(state_of().id(), written_at().id()),
+        )
         .unwrap();
     let state = id(1);
     let register = id(2);
@@ -1644,7 +1676,7 @@ fn latest_covers_answer_like_the_union() {
         let mut lattice = lattice(&format!("latest-{seed}"), fragments, &mut random);
         let attached = lattice
             .store
-            .attach::<LatestBlob>(lattice.root, metadata::supersedes.id())
+            .attach(lattice.root, latest_states(metadata::supersedes.id()))
             .unwrap();
         let (cover, union) = covers(&mut lattice, attached, build_latest, &mut random);
         let through_cover: LatestIndex = view(&mut lattice.store, attached, &cover);
@@ -1670,7 +1702,7 @@ fn latest_retirement_in_one_node_and_live_state_in_another() {
     let mut store = MemoryRepo::for_host(host().verifying_key());
     let root = store.collection("latest-split", policy()).unwrap();
     let attached = store
-        .attach::<LatestBlob>(root, metadata::supersedes.id())
+        .attach(root, latest_states(metadata::supersedes.id()))
         .unwrap();
     store
         .commit(root, &host(), Fragment::from(exists(1)))
@@ -1713,7 +1745,10 @@ fn entity_id_set_covers_answer_like_the_union() {
         let mut lattice = lattice(&format!("ids-{seed}"), fragments, &mut random);
         let attached = lattice
             .store
-            .attach::<EntityIdSetBlob>(lattice.root, metadata::supersedes.id())
+            .attach(
+                lattice.root,
+                genid_attribute_values(metadata::supersedes.id()),
+            )
             .unwrap();
         let (cover, union) = covers(&mut lattice, attached, build, &mut random);
         let through_cover: EntityIdSet = view(&mut lattice.store, attached, &cover);
@@ -1754,14 +1789,7 @@ fn bounded_upkeep_is_the_next_reads_cover() {
                 .length
         })
         .collect();
-    assert_eq!(
-        frozen
-            .read::<UnionArchive<OrderedUniverse>>()
-            .unwrap()
-            .unread()
-            .len(),
-        3
-    );
+    assert_eq!(frozen.residual().len(), 3);
     assert_eq!(upkeep(&mut store, attached, &host(), 0).unwrap(), 1);
     let after = store.snapshot().unwrap();
     assert!(after.collections().unwrap().contains(&attached.handle()));
@@ -1787,17 +1815,12 @@ fn bounded_upkeep_is_the_next_reads_cover() {
     );
     assert_eq!(upkeep(&mut store, attached, &host(), u64::MAX).unwrap(), 1);
     assert_eq!(upkeep(&mut store, attached, &host(), 0).unwrap(), 0);
-    let last = store
-        .snapshot()
-        .unwrap()
-        .attached(attached)
-        .unwrap()
-        .read::<UnionArchive<OrderedUniverse>>()
-        .unwrap();
-    assert!(last.unread().is_empty());
+    let last = store.snapshot().unwrap().attached(attached).unwrap();
+    assert!(last.residual().is_empty());
     let expected =
         row(1, 1, 1) + row(2, 1, 1) + row(2, 2, 2) + row(3, 1, 1) + row(3, 2, 2) + row(3, 3, 3);
-    assert_eq!(last.value().iter().collect::<TribleSet>(), expected);
+    let value = last.view::<UnionArchive<OrderedUniverse>>().unwrap();
+    assert_eq!(value.iter().collect::<TribleSet>(), expected);
     assert_eq!(
         frozen.residual().len(),
         3,
@@ -1896,15 +1919,10 @@ fn staged_upkeep_requires_publication_and_preserves_scope() {
     let count = store.snapshot().unwrap().records().unwrap().count();
     assert_eq!(prepare().publish(&mut store, &host()).unwrap(), 1);
     assert_eq!(store.snapshot().unwrap().records().unwrap().count(), count);
-    let read = store
-        .snapshot()
-        .unwrap()
-        .attached(attached)
-        .unwrap()
-        .read::<UnionArchive<OrderedUniverse>>()
-        .unwrap();
-    assert_eq!(read.value().iter().collect::<TribleSet>(), row(1, 2, 3));
-    assert_eq!(read.unread().len(), 1);
+    let read = store.snapshot().unwrap().attached(attached).unwrap();
+    let value = read.view::<UnionArchive<OrderedUniverse>>().unwrap();
+    assert_eq!(value.iter().collect::<TribleSet>(), row(1, 2, 3));
+    assert_eq!(read.residual().len(), 1);
 }
 
 #[test]
@@ -1952,31 +1970,23 @@ fn stored_reads_do_not_invoke_even_a_resident_residual_mapping() {
             panic!("ordinary read must not run a mapping")
         }
     }
-    let (mut store, root, attached) = succinct_root("no-read-mapping");
+    let (mut store, root, _) = succinct_root("no-read-mapping");
+    let attached = store.attach(root, NeverMap).unwrap();
     commit(&mut store, root, row(1, 2, 3));
     let snapshot = store.snapshot().unwrap();
-    let selected = snapshot.attached(attached).unwrap();
-    for read in [
-        selected
-            .read_with::<NeverMap, UnionArchive<OrderedUniverse>>()
-            .unwrap(),
-        selected
-            .read_with_acquiring::<NeverMap, UnionArchive<OrderedUniverse>>()
-            .unwrap(),
+    for selected in [
+        snapshot.attached(attached).unwrap(),
+        snapshot.attached_acquiring(attached).unwrap(),
     ] {
-        assert_eq!(read.unread().len(), 1);
-        assert_eq!(read.value().iter().count(), 0);
+        assert_eq!(selected.residual().len(), 1);
+        let value = selected.view::<UnionArchive<OrderedUniverse>>().unwrap();
+        assert_eq!(value.iter().count(), 0);
     }
     block_on(store.ensure_attached(attached, &host())).unwrap();
-    let fresh = store
-        .snapshot()
-        .unwrap()
-        .attached(attached)
-        .unwrap()
-        .read_with::<NeverMap, UnionArchive<OrderedUniverse>>()
-        .unwrap();
-    assert!(fresh.unread().is_empty());
-    assert_eq!(fresh.value().iter().collect::<TribleSet>(), row(1, 2, 3));
+    let fresh = store.snapshot().unwrap().attached(attached).unwrap();
+    assert!(fresh.residual().is_empty());
+    let value = fresh.view::<UnionArchive<OrderedUniverse>>().unwrap();
+    assert_eq!(value.iter().collect::<TribleSet>(), row(1, 2, 3));
 }
 
 #[test]
@@ -2037,16 +2047,11 @@ fn missing_first_dependency_does_not_starve_bounded_durable_progress() {
         upkeep_with::<Hole>(&mut store, attached, &host(), 0).unwrap(),
         1
     );
-    let done = store
-        .snapshot()
-        .unwrap()
-        .attached(attached)
-        .unwrap()
-        .read::<UnionArchive<OrderedUniverse>>()
-        .unwrap();
-    assert!(done.unread().is_empty());
+    let done = store.snapshot().unwrap().attached(attached).unwrap();
+    assert!(done.residual().is_empty());
+    let value = done.view::<UnionArchive<OrderedUniverse>>().unwrap();
     assert_eq!(
-        done.value().iter().collect::<TribleSet>(),
+        value.iter().collect::<TribleSet>(),
         row(1, 2, 3) + row(4, 5, 6)
     );
 }

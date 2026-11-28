@@ -495,8 +495,10 @@ pub trait MapMapping: Sized {
 /// [`MapMapping`] counterpart of [`CollectionDerivation`], with the same
 /// contract and law.
 ///
-/// The target names the runtime argument its mapping fragment carries;
-/// attaching it is [`crate::collection::CollectionStoreExt::attach`].
+/// The target names the runtime argument its mapping fragment carries.
+/// This supplies the implementation for shared producer upkeep. To register
+/// an attachment, pass the producer's named recipe to
+/// [`crate::collection::CollectionStoreExt::attach`].
 pub trait CollectionAttachment: CollectionEncoding {
     /// Runtime argument which distinguishes concrete mappings of this
     /// canonical relation.
@@ -528,14 +530,17 @@ pub trait CollectionAttachment: CollectionEncoding {
         R: StoreRead;
 }
 
-/// Internal adapter from a target-owned attachment to the explicit mapping
-/// engine, the counterpart of [`CanonicalDerivation`].
-pub(crate) struct CanonicalAttachment<T: CollectionAttachment> {
+/// Adapter for producers whose mapping is implemented by their target encoding.
+///
+/// Named recipe constructors can use this adapter to share the encoding's
+/// [`CollectionAttachment`] implementation with producer upkeep.
+pub struct CanonicalAttachment<T: CollectionAttachment> {
     argument: T::Argument,
 }
 
 impl<T: CollectionAttachment> CanonicalAttachment<T> {
-    pub(crate) fn new(argument: T::Argument) -> Self {
+    /// Construct the canonical mapping with the arguments its descriptor carries.
+    pub fn new(argument: T::Argument) -> Self {
         Self { argument }
     }
 }

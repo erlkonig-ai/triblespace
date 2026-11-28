@@ -4,25 +4,27 @@
 //! A [`CollectionSnapshot`] owns the store observation against which its
 //! realized target cover is valid. Its support comes with it, read from the
 //! coverage index by the same selection: a cover of the collection's own
-//! foundations. Whether a derived collection has caught up with its source
-//! is [`CollectionSnapshot::missing_from`]. Logical values remain
-//! caller-chosen projections reconstructed through [`TryFromCover`].
+//! foundations. A [`DerivedSnapshot`] adds the descriptor's source domain and
+//! locator coverage without requiring the source collection to be resident.
+//! Logical values remain caller-chosen projections reconstructed through
+//! [`TryFromCover`].
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
+use std::ops::Deref;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::inline::encodings::hash::Handle;
-use crate::repo::{BlobStoreGet, StoreChanges, StoreRead, StoreSnapshot};
+use crate::repo::{BlobStoreGet, BlobStoreList, StoreChanges, StoreRead, StoreSnapshot};
 use crate::trible::Fragment;
 
 use super::observed_store::{DependencyTracker, ObservedStore};
 use super::{
     CollectionData, CollectionDescriptorError, CollectionEncoding, CollectionHandle,
-    CollectionRealizationError, Cover, CoverageRead, MapMapping, RecordDecodeError, SourceLocator,
-    Support,
+    CollectionRealizationError, Cover, CoverageRead, LocatorCover, RecordDecodeError,
+    SourceLocator, Support,
 };
 
 /// One immutable collection observation and what it stands on.
@@ -106,67 +108,13 @@ where
     ///
     /// It is read from the target's own rows, the same ones the cover came
     /// from, so it adds nothing to the read-set. Two collections' supports
-    /// are never comparable; ask [`Self::missing_from`] whether a derived
-    /// collection has caught up with its source.
+    /// are never comparable; select a [`DerivedSnapshot`] to compare source
+    /// locators with the target's represented locators.
     pub fn support(&self) -> Result<&Support<E>, CollectionRealizationError>
     where
         R: StoreRead,
     {
         Ok(&self.support)
-    }
-
-    /// The foundations of `source` this observation does not answer for:
-    /// the freshness of a view against a source observation.
-    ///
-    /// Each source foundation `F` is looked up by its locator `L(F)` in this
-    /// collection's leaves, the DERIVE relation read by its own key, and
-    /// counts as answered only when one of its outputs is in this
-    /// observation's support, which is what [`Self::view`] reads. A leaf whose
-    /// image is not here yet, and is under no resident merge, is still
-    /// missing: a caller that treated the leaf record as delivery would skip
-    /// facts it never saw. Nothing is compared between the two collections'
-    /// supports. `source` must be the collection this one's descriptor names
-    /// as its source; the two observations may be of different store
-    /// snapshots, and the answer is then this view against that source's
-    /// foundations.
-    pub fn missing_from<RS, S>(
-        &self,
-        source: &CollectionSnapshot<RS, S>,
-    ) -> Result<Cover<S>, CollectionRealizationError>
-    where
-        R: StoreRead,
-        RS: StoreRead,
-        S: CollectionEncoding,
-    {
-        let target = self.cover.collection().handle();
-        let observed =
-            ObservedStore::with_tracker(self.snapshot.clone(), self.dependencies.clone());
-        let descriptor = super::api::load_collection_descriptor(&observed, target)
-            .map_err(|error| CollectionRealizationError::storage("read view descriptor", error))?;
-        let named = super::descriptor::source(descriptor.fragment.facts()).map_err(|error| {
-            CollectionRealizationError::resolution_from("read view source", error)
-        })?;
-        let source_collection = source.cover().collection();
-        if named != Some(source_collection.handle()) {
-            return Err(CollectionRealizationError::InvalidCover(format!(
-                "collection {} does not derive from {}",
-                hex::encode_upper(target.raw),
-                hex::encode_upper(source_collection.handle().raw),
-            )));
-        }
-        let coverage = observed
-            .coverage(&BTreeSet::from([target]))
-            .map_err(|error| CollectionRealizationError::storage("read view leaves", error))?;
-        let missing = source.support()?.data_members().filter(|foundation| {
-            !coverage
-                .leaf_outputs(target, SourceLocator::of(foundation.raw))
-                .into_iter()
-                .any(|output| {
-                    self.support
-                        .contains(crate::inline::Inline::new(output.raw))
-                })
-        });
-        Ok(Cover::from_data(source_collection, missing))
     }
 
     /// Resident target cover selected from the coverage index.
@@ -195,6 +143,232 @@ where
         R: StoreRead,
     {
         Ok((self.snapshot, self.support, self.cover))
+    }
+}
+
+/// One immutable observation of a derived collection and its locator source.
+///
+/// The selected physical target cover and its logical views are the same as a
+/// [`CollectionSnapshot`]. The additional source handle comes from the target
+/// descriptor, so opening this observation never requires source records,
+/// source payloads, or knowledge of the source encoding.
+pub struct DerivedSnapshot<R, E>
+where
+    R: StoreSnapshot,
+    E: CollectionEncoding,
+{
+    selected: CollectionSnapshot<R, E>,
+    source: CollectionHandle,
+}
+
+impl<R, E> DerivedSnapshot<R, E>
+where
+    R: StoreSnapshot,
+    E: CollectionEncoding,
+{
+    pub(crate) fn from_collection(
+        selected: CollectionSnapshot<R, E>,
+    ) -> Result<Self, CollectionRealizationError>
+    where
+        R: StoreRead,
+    {
+        let target = selected.cover.collection().handle();
+        let observed =
+            ObservedStore::with_tracker(selected.snapshot.clone(), selected.dependencies.clone());
+        let descriptor =
+            super::api::load_collection_descriptor(&observed, target).map_err(|error| {
+                CollectionRealizationError::storage("read derived descriptor", error)
+            })?;
+        let source = super::descriptor::source(descriptor.fragment.facts())
+            .map_err(|error| {
+                CollectionRealizationError::resolution_from("read derived source", error)
+            })?
+            .ok_or_else(|| {
+                CollectionRealizationError::InvalidCover(format!(
+                    "collection {} is not derived",
+                    hex::encode_upper(target.raw),
+                ))
+            })?;
+        Ok(Self { selected, source })
+    }
+
+    /// Exact source descriptor named by this derived collection.
+    pub const fn source(&self) -> CollectionHandle {
+        self.source
+    }
+
+    fn ensure_source(&self, locators: &LocatorCover) -> Result<(), CollectionRealizationError> {
+        if locators.source() == self.source {
+            Ok(())
+        } else {
+            Err(CollectionRealizationError::InvalidCover(format!(
+                "locator cover source {} differs from derived source {}",
+                hex::encode_upper(locators.source().raw),
+                hex::encode_upper(self.source.raw),
+            )))
+        }
+    }
+
+    /// Whether this selected target answers one exact source locator.
+    ///
+    /// This performs one prefix lookup in the target's DERIVE relation. The
+    /// locator counts only when at least one of its outputs belongs to the
+    /// selected target support; a leaf whose output is unavailable is not
+    /// delivery.
+    pub fn covers(&self, locator: SourceLocator) -> Result<bool, CollectionRealizationError>
+    where
+        R: StoreRead,
+    {
+        let target = self.selected.cover.collection().handle();
+        let observed = ObservedStore::with_tracker(
+            self.selected.snapshot.clone(),
+            self.selected.dependencies.clone(),
+        );
+        let coverage = observed
+            .coverage(&BTreeSet::from([target]))
+            .map_err(|error| CollectionRealizationError::storage("read derived locator", error))?;
+        Ok(coverage
+            .leaf_outputs(target, locator)
+            .into_iter()
+            .any(|output| {
+                self.selected
+                    .support
+                    .contains(crate::inline::Inline::new(output.raw))
+            }))
+    }
+
+    /// Every source locator represented by this selected target support.
+    ///
+    /// This is the explicit bulk operation: it enumerates the target's leaf
+    /// relation only when requested. Use [`Self::covers`] for one locator or
+    /// [`Self::represented`] for a small caller-supplied subset.
+    pub fn represented_locators(&self) -> Result<LocatorCover, CollectionRealizationError>
+    where
+        R: StoreRead,
+    {
+        let target = self.selected.cover.collection().handle();
+        let observed = ObservedStore::with_tracker(
+            self.selected.snapshot.clone(),
+            self.selected.dependencies.clone(),
+        );
+        let coverage = observed
+            .coverage(&BTreeSet::from([target]))
+            .map_err(|error| {
+                CollectionRealizationError::storage("read represented locators", error)
+            })?;
+        Ok(LocatorCover::from_locators(
+            self.source,
+            coverage
+                .leaves(target)
+                .into_iter()
+                .filter(|(_, output)| {
+                    self.selected
+                        .support
+                        .contains(crate::inline::Inline::new(output.raw))
+                })
+                .map(|(locator, _)| locator),
+        ))
+    }
+
+    /// The caller-supplied source locators represented by this target.
+    ///
+    /// Each candidate is looked up by its exact leaf prefix, so cost is
+    /// proportional to `candidates`, not the target's complete leaf relation.
+    /// Known source handles carried by `candidates` survive the subtraction.
+    pub fn represented(
+        &self,
+        candidates: &LocatorCover,
+    ) -> Result<LocatorCover, CollectionRealizationError>
+    where
+        R: StoreRead,
+    {
+        self.ensure_source(candidates)?;
+        let target = self.selected.cover.collection().handle();
+        let observed = ObservedStore::with_tracker(
+            self.selected.snapshot.clone(),
+            self.selected.dependencies.clone(),
+        );
+        let coverage = observed
+            .coverage(&BTreeSet::from([target]))
+            .map_err(|error| {
+                CollectionRealizationError::storage("read represented locator subset", error)
+            })?;
+        let absent = LocatorCover::from_locators(
+            self.source,
+            candidates.locators().filter(|locator| {
+                !coverage
+                    .leaf_outputs(target, *locator)
+                    .into_iter()
+                    .any(|output| {
+                        self.selected
+                            .support
+                            .contains(crate::inline::Inline::new(output.raw))
+                    })
+            }),
+        );
+        candidates
+            .difference(&absent)
+            .map_err(|error| CollectionRealizationError::InvalidCover(error.to_string()))
+    }
+
+    /// Add locally resident bearer handles for unresolved source locators.
+    ///
+    /// Resolution is lazy and exact: unresolved locators share one frozen
+    /// lookup batch through this observation's tracked reader. Unknown
+    /// locators remain members, and unrelated blob arrivals do not invalidate
+    /// the observation on a backend with scoped locator dependencies.
+    pub fn resolve_handles(
+        &self,
+        locators: &LocatorCover,
+    ) -> Result<LocatorCover, CollectionRealizationError>
+    where
+        R: StoreRead,
+    {
+        self.ensure_source(locators)?;
+        let observed = ObservedStore::with_tracker(
+            self.selected.snapshot.clone(),
+            self.selected.dependencies.clone(),
+        );
+        let mut resolved = locators.clone();
+        let unknown: Vec<_> = locators
+            .locators()
+            .filter(|locator| !locators.has_known_handle(*locator))
+            .map(SourceLocator::raw)
+            .collect();
+        for handle in observed
+            .find_blobs(&unknown)
+            .map_err(|error| CollectionRealizationError::storage("resolve source locators", error))?
+            .into_iter()
+            .flatten()
+        {
+            resolved.with_known_handle(handle);
+        }
+        Ok(resolved)
+    }
+}
+
+impl<R, E> Clone for DerivedSnapshot<R, E>
+where
+    R: StoreSnapshot,
+    E: CollectionEncoding,
+{
+    fn clone(&self) -> Self {
+        Self {
+            selected: self.selected.clone(),
+            source: self.source,
+        }
+    }
+}
+
+impl<R, E> Deref for DerivedSnapshot<R, E>
+where
+    R: StoreSnapshot,
+    E: CollectionEncoding,
+{
+    type Target = CollectionSnapshot<R, E>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.selected
     }
 }
 
@@ -305,19 +479,15 @@ where
 
     /// The parent foundations no taken attachment reaches: a node whose
     /// attachment is not built yet, cannot be represented, or waits for a
-    /// dependency. Attached reads report these as a gap; explicit writer
-    /// upkeep can build and publish their images. Membership never implies
-    /// that their bytes are here.
+    /// dependency. Explicit writer upkeep can build and publish their images.
+    /// Membership never implies that their bytes are here.
     pub fn residual(&self) -> &Support<SimpleArchive> {
         &self.residual
     }
 
-    /// Reconstruct one caller-chosen logical value from the attachments
-    /// taken, and nothing else.
-    ///
-    /// The residual is not part of it. [`Self::read`] uses the same stored
-    /// cover and returns the residual alongside the value, so callers can
-    /// distinguish a complete attached observation from a partial one.
+    /// Reconstruct one caller-chosen logical value from the stored attachments
+    /// selected here. Use [`Self::residual`] for the parent foundations they
+    /// leave unread.
     pub fn view<V>(&self) -> Result<V, TryFromCoverError<R::GetError<Infallible>, V::Error>>
     where
         R: BlobStoreGet,
@@ -329,47 +499,6 @@ where
             super::api::load_collection_descriptor(&observed, self.cover.collection().handle())
                 .map_err(TryFromCoverError::from)?;
         V::try_from_cover(&self.cover, &descriptor.fragment, &observed)
-    }
-
-    /// Read only the stored attached cover. Every foundation outside that
-    /// cover remains explicitly unread, even when its source bytes are resident.
-    /// This never runs a mapping or publishes an attachment.
-    pub fn read<V>(
-        &self,
-    ) -> Result<AttachedRead<V>, AttachedReadError<R::GetError<Infallible>, V::Error>>
-    where
-        R: StoreRead,
-        E: super::CollectionAttachment,
-        V: TryFromCover<E>,
-    {
-        self.read_with::<super::encoding::CanonicalAttachment<E>, V>()
-    }
-
-    /// Read the same stored cover through the supplied reader. An acquiring
-    /// reader may get selected attachment bytes; residual source bytes are
-    /// neither requested nor mapped. Upkeep is an explicit store operation.
-    pub fn read_acquiring<V>(
-        &self,
-    ) -> Result<AttachedRead<V>, AttachedReadError<R::GetError<Infallible>, V::Error>>
-    where
-        R: StoreRead,
-        E: super::CollectionAttachment,
-        V: TryFromCover<E>,
-    {
-        self.read::<V>()
-    }
-
-    /// Stored-only read with an explicit mapping, validating its descriptor
-    /// without invoking the mapping.
-    pub fn read_with_acquiring<M, V>(
-        &self,
-    ) -> Result<AttachedRead<V>, AttachedReadError<R::GetError<Infallible>, V::Error>>
-    where
-        R: StoreRead,
-        M: MapMapping<Target = E>,
-        V: TryFromCover<E>,
-    {
-        self.read_with::<M, V>()
     }
 
     /// Wrap only the byte reader of this already-selected observation.
@@ -390,32 +519,6 @@ where
             residual: self.residual.clone(),
             dependencies: self.dependencies.clone(),
         }
-    }
-
-    /// Validate the named mapping, then read only persisted attachments.
-    /// Use `ensure_attached_limited_with` on the owning store for bounded
-    /// durable construction, and take a fresh observation after it finishes.
-    pub fn read_with<M, V>(
-        &self,
-    ) -> Result<AttachedRead<V>, AttachedReadError<R::GetError<Infallible>, V::Error>>
-    where
-        R: StoreRead,
-        M: MapMapping<Target = E>,
-        V: TryFromCover<E>,
-    {
-        let observed =
-            ObservedStore::with_tracker(self.snapshot.clone(), self.dependencies.clone());
-        let descriptor =
-            super::api::load_collection_descriptor(&observed, self.cover.collection().handle())
-                .map_err(|error| AttachedReadError::View(error.into()))?;
-        let parent_descriptor =
-            super::api::load_collection_descriptor(&observed, self.support.collection().handle())
-                .map_err(|error| AttachedReadError::View(error.into()))?;
-        M::bind(&parent_descriptor.fragment, &descriptor.fragment)
-            .map_err(AttachedReadError::Mapping)?;
-        let value = V::try_from_cover(&self.cover, &descriptor.fragment, &observed)
-            .map_err(AttachedReadError::View)?;
-        Ok(AttachedRead::new(value, self.residual.clone()))
     }
 }
 
@@ -458,46 +561,6 @@ impl<V> AttachedRead<V> {
         AttachedRead {
             value: transform(self.value),
             unread: self.unread,
-        }
-    }
-}
-
-/// Failure to read an attached collection's stored cover
-/// ([`AttachedSnapshot::read_with`]).
-#[derive(Debug)]
-pub enum AttachedReadError<GetError, ViewError> {
-    /// A descriptor or an attachment could not be read, or the view could
-    /// not be formed from the stored attachments.
-    View(TryFromCoverError<GetError, ViewError>),
-    /// The attached descriptor does not name the mapping read through.
-    Mapping(super::CollectionOperationError),
-}
-
-impl<GetError, ViewError> fmt::Display for AttachedReadError<GetError, ViewError>
-where
-    GetError: fmt::Display,
-    ViewError: fmt::Display,
-{
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::View(source) => source.fmt(formatter),
-            Self::Mapping(source) => write!(
-                formatter,
-                "attached descriptor does not bind the mapping read through: {source}"
-            ),
-        }
-    }
-}
-
-impl<GetError, ViewError> Error for AttachedReadError<GetError, ViewError>
-where
-    GetError: Error + 'static,
-    ViewError: Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::View(source) => Some(source),
-            Self::Mapping(source) => Some(source),
         }
     }
 }

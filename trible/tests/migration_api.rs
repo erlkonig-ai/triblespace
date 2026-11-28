@@ -1,5 +1,6 @@
 //! Native preparation over the released fixture, without CLI argv/stdout.
 use std::path::Path;
+use triblespace_core::collection::CollectionSnapshotExt;
 
 use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
@@ -83,7 +84,7 @@ fn native_conversion_retains_source_and_reports_retained_pins_honestly() {
     reader.refresh().unwrap();
     let snapshot = reader.snapshot().unwrap();
     let collection = Collection::<SimpleArchive>::open(&snapshot, branches[0].collection).unwrap();
-    let actual: TribleSet = collection.read(&snapshot).unwrap();
+    let actual: TribleSet = snapshot.collection(collection).unwrap().view().unwrap();
     // Frozen fixture A/B/C are exactly these three tag facts. The orphan and
     // repository metadata must not enter the returned collection's content.
     let mut expected = TribleSet::new();

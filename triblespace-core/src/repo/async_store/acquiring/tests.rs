@@ -1,8 +1,9 @@
 use super::*;
-use crate::blob::encodings::entity_id_set::{EntityIdSet, EntityIdSetBlob};
+use crate::blob::encodings::entity_id_set::{genid_attribute_values, EntityIdSet};
 use crate::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 use crate::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
 use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
+use crate::collection::succinctarchive_union::simple_to_succinct;
 use crate::collection::{
     succinctarchive_union, AdmissionPolicy, Collection, CollectionPolicy, CollectionSnapshotExt,
     CollectionStore, CollectionStoreExt,
@@ -96,7 +97,7 @@ fn fixture() -> (
             ),
         )
         .unwrap();
-    let attached = source.attach::<SuccinctArchiveBlob>(root, ()).unwrap();
+    let attached = source.attach(root, simple_to_succinct()).unwrap();
     (source, root, attached)
 }
 fn cold(source: &mut MemoryRepo, omit: [u8; 32]) -> ColdSnapshot<MemoryRepoSnapshot> {
@@ -135,7 +136,7 @@ fn reader(
 fn attached_reads_never_fetch_or_build_residuals_even_with_an_acquiring_reader() {
     let (mut source, root, attached) = fixture();
     let ids = source
-        .attach::<EntityIdSetBlob>(root, metadata::tag.id())
+        .attach(root, genid_attribute_values(metadata::tag.id()))
         .unwrap();
     let first = facts(11);
     let payload = IntoBlob::<SimpleArchive>::to_blob(first.clone())
@@ -164,13 +165,9 @@ fn attached_reads_never_fetch_or_build_residuals_even_with_an_acquiring_reader()
         .contains_blob(Inline::<Handle<SimpleArchive>>::new(payload))
         .unwrap());
     assert!(requests.lock().unwrap().is_empty());
-    let projected = reader
-        .attached(ids)
-        .unwrap()
-        .read_acquiring::<EntityIdSet>()
-        .unwrap();
-    assert_eq!(projected.value().iter().count(), 0);
-    assert_eq!(projected.unread().len(), 1);
+    let projected = reader.attached(ids).unwrap();
+    assert_eq!(projected.view::<EntityIdSet>().unwrap().iter().count(), 0);
+    assert_eq!(projected.residual().len(), 1);
     assert!(requests.lock().unwrap().is_empty());
     let selected_root = reader.collection_acquiring(root).unwrap();
     assert_eq!(selected_root.support().unwrap().len(), 1);

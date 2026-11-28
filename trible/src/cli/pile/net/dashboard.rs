@@ -13,13 +13,16 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{
-    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, UnionArchive,
 };
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::Blob;
 use triblespace_core::collection::descriptor;
-use triblespace_core::collection::lww_register::{LwwIndex, LwwQuery, LwwRegisterBlob};
+use triblespace_core::collection::lww_register::{
+    register_coordinates, LwwIndex, LwwQuery, LwwRegisterBlob,
+};
+use triblespace_core::collection::succinctarchive_union::{raw_to_rank9, simple_to_succinct};
 use triblespace_core::collection::{
     AdmissionPolicy, AttachedSnapshot, Collection, CollectionHandle, CollectionPolicy,
     CollectionSnapshot, CollectionSnapshotExt, CollectionStoreExt, TryFromCoverError,
@@ -248,15 +251,15 @@ impl HealthSource {
             .map_err(|_| ReadFailure::OpenCollection)?;
         let mut descriptors = MemoryRepo::default();
         let succinct = descriptors
-            .attach::<SuccinctArchiveBlob>(root, ())
+            .attach(root, simple_to_succinct())
             .map_err(|_| ReadFailure::HealthDescriptor)?;
         let facts = descriptors
-            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(root, succinct)
+            .attach(root, raw_to_rank9(succinct))
             .map_err(|_| ReadFailure::HealthDescriptor)?;
         let latest = descriptors
-            .attach::<LwwRegisterBlob>(
+            .attach(
                 root,
-                (
+                register_coordinates(
                     health_record::attrs::node.id(),
                     triblespace_core::metadata::created_at.id(),
                 ),
@@ -299,11 +302,10 @@ impl HealthSource {
                     let archive = facts
                         .view::<UnionArchive<OrderedUniverse>>()
                         .map_err(|_| ReadFailure::InvalidFacts)?;
-                    let (index, unread_latest) = latest
-                        .read::<LwwIndex>()
-                        .map_err(|_| ReadFailure::InvalidFacts)?
-                        .into_parts();
-                    if !unread_latest.is_empty() {
+                    let index = latest
+                        .view::<LwwIndex>()
+                        .map_err(|_| ReadFailure::InvalidFacts)?;
+                    if !latest.residual().is_empty() {
                         return Err(ReadFailure::MemberUnavailable);
                     }
                     let winners = index.query().map_err(|_| ReadFailure::InvalidFacts)?;
@@ -2067,7 +2069,7 @@ mod tests {
         store
             .commit(source, &signer, entity! { metadata::name: "first" })
             .unwrap();
-        let target = store.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
+        let target = store.attach(source, simple_to_succinct()).unwrap();
         (store, source.handle(), target.handle())
     }
 
@@ -2291,7 +2293,7 @@ mod tests {
         let second = store
             .commit(collection, &host, entity! { metadata::name: "second" })
             .unwrap();
-        let attached = store.attach::<SuccinctArchiveBlob>(collection, ()).unwrap();
+        let attached = store.attach(collection, simple_to_succinct()).unwrap();
         // The attachment's bytes are deliberately not stored: it must draw as
         // the hole it is, not be left out.
         let attachment = CollectionData::new([7; 32]);
@@ -3402,14 +3404,12 @@ mod tests {
                 report(&mut writer, node, seconds);
             }
         }
-        let succinct = writer.attach::<SuccinctArchiveBlob>(health, ()).unwrap();
-        let facts = writer
-            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(health, succinct)
-            .unwrap();
+        let succinct = writer.attach(health, simple_to_succinct()).unwrap();
+        let facts = writer.attach(health, raw_to_rank9(succinct)).unwrap();
         let latest = writer
-            .attach::<LwwRegisterBlob>(
+            .attach(
                 health,
-                (health_record::attrs::node.id(), metadata::created_at.id()),
+                register_coordinates(health_record::attrs::node.id(), metadata::created_at.id()),
             )
             .unwrap();
         tokio::runtime::Builder::new_current_thread()

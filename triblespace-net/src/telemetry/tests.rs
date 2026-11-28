@@ -1,4 +1,5 @@
 use ed25519_dalek::SigningKey;
+use triblespace_core::collection::CollectionSnapshotExt;
 use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy};
 
 use super::*;
@@ -608,7 +609,7 @@ fn telemetry_collection_roundtrip_is_an_ordinary_read_without_appends() {
 
     let mut pile = Pile::open(&path).unwrap();
     let snapshot = pile.snapshot().unwrap();
-    let admitted: TribleSet = collection.read(&snapshot).unwrap();
+    let admitted: TribleSet = snapshot.collection(collection).unwrap().view().unwrap();
     assert_eq!(
         observe(
             &admitted,

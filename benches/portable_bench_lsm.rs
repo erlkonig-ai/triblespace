@@ -64,12 +64,13 @@
 //! compilation (the design point of this file), never emulated at runtime.
 
 use std::time::Instant;
+use triblespace::core::collection::succinctarchive_union::{raw_to_rank9, simple_to_succinct};
 
 use ed25519_dalek::SigningKey;
 use futures::executor::block_on;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{
-    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
+    OrderedUniverse, SuccinctArchiveBlob, UnionArchive,
 };
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::collection::{
@@ -763,10 +764,10 @@ fn main() {
                 .collection(name, policy.clone())
                 .expect("register source collection");
             let raw = store
-                .attach::<SuccinctArchiveBlob>(source, ())
+                .attach(source, simple_to_succinct())
                 .expect("attach the Succinct index");
             let accelerated = store
-                .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, raw)
+                .attach(source, raw_to_rank9(raw))
                 .expect("attach the Rank9 accelerator");
             for chunk in &chunks {
                 store

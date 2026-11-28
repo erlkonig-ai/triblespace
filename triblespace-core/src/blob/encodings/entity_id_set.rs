@@ -245,6 +245,13 @@ pub fn derive_element(
     Ok(encode_rows(values))
 }
 
+/// Project an attribute's well-formed GenId values into an entity ID set.
+pub fn genid_attribute_values(
+    attribute: Id,
+) -> impl crate::collection::MapMapping<Target = EntityIdSetBlob> {
+    crate::collection::CanonicalAttachment::<EntityIdSetBlob>::new(attribute)
+}
+
 impl CollectionAttachment for EntityIdSetBlob {
     type Argument = Id;
 
@@ -416,8 +423,8 @@ mod tests {
 
     use crate::blob::MemoryBlobStore;
     use crate::collection::{
-        AdmissionPolicy, CanonicalAttachment, Collection, CollectionHandle, CollectionPolicy,
-        CollectionRead, CollectionSnapshotExt, CollectionStoreExt,
+        AdmissionPolicy, Collection, CollectionHandle, CollectionPolicy, CollectionRead,
+        CollectionSnapshotExt, CollectionStoreExt,
     };
     use crate::inline::encodings::time::NsTAIInterval;
     use crate::repo::memoryrepo::MemoryRepo;
@@ -550,13 +557,10 @@ mod tests {
             .collection("id-value-projection", policy.clone())
             .unwrap();
         let argument = metadata::supersedes.id();
-        let target = descriptor::attaching_with(
-            source.handle(),
-            &CanonicalAttachment::<EntityIdSetBlob>::new(argument),
-        );
+        let target = descriptor::attaching_with(source.handle(), &genid_attribute_values(argument));
         let other_attribute = descriptor::attaching_with(
             source.handle(),
-            &CanonicalAttachment::<EntityIdSetBlob>::new(metadata::tag.id()),
+            &genid_attribute_values(metadata::tag.id()),
         );
         assert_ne!(target, other_attribute);
         assert_eq!(
@@ -573,7 +577,7 @@ mod tests {
         );
         let another_algorithm = descriptor::attaching_with(
             source.handle(),
-            &CanonicalAttachment::<crate::collection::latest::LatestBlob>::new(argument),
+            &crate::collection::latest::latest_states(argument),
         );
         assert!(EntityIdSetBlob::bind(&Fragment::empty(), &another_algorithm).is_err());
 
@@ -598,7 +602,7 @@ mod tests {
         let mut store = MemoryRepo::for_host(key.verifying_key());
         let source = store.collection("receipt-facts", policy).unwrap();
         let target = store
-            .attach::<EntityIdSetBlob>(source, metadata::supersedes.id())
+            .attach(source, genid_attribute_values(metadata::supersedes.id()))
             .unwrap();
         let first_receipt = id(31);
         let second_receipt = id(32);

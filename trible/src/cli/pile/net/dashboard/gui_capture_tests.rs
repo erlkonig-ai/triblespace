@@ -17,7 +17,6 @@ use super::*;
 use std::fs::{self, OpenOptions};
 use std::path::Path;
 
-use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 use triblespace_core::prelude::*;
 use triblespace_core::{metadata, signing_key_file};
 
@@ -47,7 +46,7 @@ fn generated_frame(directory: &Path) -> Result<(Frame, i128)> {
     // A registered attachment that is never maintained. It has no records at
     // all, so it is exactly the case a record-seeded walk would omit: the
     // lattice must show the declared-but-unperformed index as a hole.
-    let derived = writer.attach::<SuccinctArchiveBlob>(collection, ())?;
+    let derived = writer.attach(collection, simple_to_succinct())?;
     // These are disposable, public fixture endpoint labels, not any node's key.
     let nodes = [11, 12, 13, 14, 15]
         .map(|seed| ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key());
@@ -251,11 +250,11 @@ fn generated_frame(directory: &Path) -> Result<(Frame, i128)> {
     // collection's archives and latest-report index, mapped by the host the
     // reader opens as. The reader takes health through them.
     let mut upkeep = crate::cli::pile::open_refreshed_with(&path, Some(authority))?;
-    let succinct = upkeep.attach::<SuccinctArchiveBlob>(health, ())?;
-    let archive = upkeep.attach::<Rank9AcceleratedSuccinctArchiveBlob>(health, succinct)?;
-    let latest = upkeep.attach::<LwwRegisterBlob>(
+    let succinct = upkeep.attach(health, simple_to_succinct())?;
+    let archive = upkeep.attach(health, raw_to_rank9(succinct))?;
+    let latest = upkeep.attach(
         health,
-        (health_record::attrs::node.id(), metadata::created_at.id()),
+        register_coordinates(health_record::attrs::node.id(), metadata::created_at.id()),
     )?;
     tokio::runtime::Builder::new_current_thread()
         .build()?

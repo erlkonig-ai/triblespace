@@ -160,15 +160,15 @@ multiplicity through their other witnesses.
 
 ## Persist through the native collection algebra
 
-A durable path index is identified by the exact source descriptor, one
-automaton, and the independent READ/WRITE policies of its derived descriptor:
+A durable path index names its root collection and the mapping with its
+automaton.
 
 ```rust,ignore
 use std::sync::Arc;
 use triblespace::core::collection::{
     AdmissionPolicy, CollectionPolicy, CollectionSnapshotExt, CollectionStoreExt,
 };
-use triblespace_paths::{PathIndex, PathSummaryBlob};
+use triblespace_paths::{regular_path, PathIndex};
 
 let source_policy = CollectionPolicy::new(
     AdmissionPolicy::direct(source_reader),
@@ -176,7 +176,7 @@ let source_policy = CollectionPolicy::new(
 );
 let source = store.collection("social", source_policy)?;
 // Attached to the root: no policy of its own, built by the store's host.
-let paths = store.attach::<PathSummaryBlob>(source, friend_automaton)?;
+let paths = store.attach(source, regular_path(friend_automaton))?;
 
 let after = store.maintain_attached(paths, &host).await?;
 let observed = after.attached(paths)?;
@@ -262,7 +262,7 @@ would miss such paths. Merge order remains irrelevant because closure is
 derived only after the canonical semilattice join.
 
 The low-level `path_summary_union` module exposes the concrete law directly.
-`store.attach::<PathSummaryBlob>(source, automaton)` identifies one attached
+`store.attach(source, regular_path(automaton))` identifies one attached
 collection by the handle of the root it summarises, the `PathSummaryBlob`
 representation and the canonical automaton fingerprint; it carries no policy.
 `derive_element` lowers one canonical `SimpleArchive` into direct product

@@ -36,7 +36,7 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::collection::records::CollectionCommit;
-use triblespace_core::collection::{Collection, CollectionStoreExt};
+use triblespace_core::collection::{Collection, CollectionSnapshotExt, CollectionStoreExt};
 use triblespace_core::id::{ExclusiveId, Id};
 use triblespace_core::id_hex;
 use triblespace_core::inline::encodings::genid::GenId;
@@ -273,8 +273,10 @@ pub(crate) fn backfill(
     let snapshot = pile
         .snapshot()
         .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
-    let view: TribleSet = collection
-        .read(&snapshot)
+    let view: TribleSet = snapshot
+        .collection(collection)
+        .map_err(|error| anyhow!("read collection view: {error}"))?
+        .view()
         .map_err(|error| anyhow!("read collection view: {error}"))?;
     let plan = plan(&view, pairs);
     let twins = plan.twins();
@@ -534,7 +536,11 @@ mod tests {
 
         // Every twin reads back through the view, text through its blob.
         let snapshot = pile.snapshot()?;
-        let view: TribleSet = collection.read(&snapshot).map_err(|e| anyhow!("{e}"))?;
+        let view: TribleSet = snapshot
+            .collection(collection)
+            .map_err(|e| anyhow!("{e}"))?
+            .view()
+            .map_err(|e| anyhow!("{e}"))?;
         assert!(
             old.iter().all(|fact| view.contains(fact)),
             "old facts are untouched"
@@ -644,7 +650,11 @@ mod tests {
         pile.refresh()?;
         let collection = open_resolved::<SimpleArchive>(&mut pile, "telemetry")?;
         let snapshot = pile.snapshot()?;
-        let view: TribleSet = collection.read(&snapshot).map_err(|e| anyhow!("{e}"))?;
+        let view: TribleSet = snapshot
+            .collection(collection)
+            .map_err(|e| anyhow!("{e}"))?
+            .view()
+            .map_err(|e| anyhow!("{e}"))?;
         let handle: Inline<Handle<UTF8String>> =
             IntoBlob::<UTF8String>::to_blob("worker-one").get_handle();
         assert!(view.contains(&Trible::new(

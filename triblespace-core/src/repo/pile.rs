@@ -3510,7 +3510,7 @@ impl super::StoreSnapshot for PileFileSnapshot {
             changes = changes.union(super::StoreChanges::COLLECTION_RECORDS);
         }
 
-        let blobs_changed = if dependencies.all_blobs {
+        let blobs_changed = if dependencies.all_blobs || !dependencies.locators.is_empty() {
             !self.blobs.shares_root(&previous.blobs)
         } else {
             dependencies

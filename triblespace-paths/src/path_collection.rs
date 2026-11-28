@@ -70,7 +70,7 @@ fn attached_paths(
     let key = host_key();
     let mut store = MemoryRepo::for_host(key.verifying_key());
     let root = store.collection(name, policy(key.verifying_key())).unwrap();
-    let target = store.attach::<PathSummaryBlob>(root, plus()).unwrap();
+    let target = store.attach(root, crate::regular_path(plus())).unwrap();
     (store, root, target)
 }
 
@@ -128,7 +128,7 @@ fn malformed_fixed_representation_capacity_is_fatal() {
         .collection("paths", policy(key.verifying_key()))
         .unwrap();
     let target = store
-        .attach::<PathSummaryBlob>(root, automaton.clone())
+        .attach(root, crate::regular_path(automaton.clone()))
         .unwrap();
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&crate::automaton_fingerprint(&automaton).raw);

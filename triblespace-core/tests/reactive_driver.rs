@@ -61,7 +61,13 @@ fn driver(
 }
 /// Durable conclusion entities about `subject`, read from the store, not the driver.
 fn conclusions(store: &mut MemoryRepo, root: Collection<SimpleArchive>, about: Id, s: Id) -> usize {
-    let facts: TribleSet = root.read(&store.snapshot().unwrap()).unwrap();
+    let facts: TribleSet = store
+        .snapshot()
+        .unwrap()
+        .collection(root)
+        .unwrap()
+        .view()
+        .unwrap();
     find!(e: Id, facts.pattern::<GenId>(e, about.to_inline(), s.to_inline())).count()
 }
 
@@ -164,14 +170,26 @@ fn restart_repeats_firings_without_duplicate_conclusions() {
         .unwrap();
     let step = driver(root, anchor, &key).poll(&mut store).unwrap();
     assert_eq!((step.firings, step.commits.len()), (1, 1));
-    let before: TribleSet = root.read(&store.snapshot().unwrap()).unwrap();
+    let before: TribleSet = store
+        .snapshot()
+        .unwrap()
+        .collection(root)
+        .unwrap()
+        .view()
+        .unwrap();
 
     // A restart is a new driver: memo gone, the binding fires again.
     let mut restarted = driver(root, anchor, &key);
     let step = restarted.poll(&mut store).unwrap();
     assert!(matches!(step.outcome, Outcome::Quiescent));
     assert_eq!((step.firings, step.commits.len()), (1, 0));
-    let after: TribleSet = root.read(&store.snapshot().unwrap()).unwrap();
+    let after: TribleSet = store
+        .snapshot()
+        .unwrap()
+        .collection(root)
+        .unwrap()
+        .view()
+        .unwrap();
     assert_eq!(before, after);
     assert_eq!(conclusions(&mut store, root, about, x), 1);
 }
@@ -258,14 +276,26 @@ fn restart_over_a_temporary_pile_publishes_nothing_new() {
         let mut d = CollectionDriver::new(root, anchor, key.clone(), Bounds::default());
         let step = d.poll(&mut store).unwrap();
         assert_eq!((step.firings, step.commits.len()), (1, 1));
-        before = root.read(&store.snapshot().unwrap()).unwrap();
+        before = store
+            .snapshot()
+            .unwrap()
+            .collection(root)
+            .unwrap()
+            .view()
+            .unwrap();
     }
     let mut store = triblespace_core::repo::pile::Pile::open(&path).unwrap();
     let mut d = CollectionDriver::new(root, anchor, key.clone(), Bounds::default());
     let step = d.poll(&mut store).unwrap();
     assert!(matches!(step.outcome, Outcome::Quiescent));
     assert_eq!((step.firings, step.commits.len()), (1, 0));
-    let after: TribleSet = root.read(&store.snapshot().unwrap()).unwrap();
+    let after: TribleSet = store
+        .snapshot()
+        .unwrap()
+        .collection(root)
+        .unwrap()
+        .view()
+        .unwrap();
     assert_eq!(before, after);
     let found = find!(e: Id, after.pattern::<GenId>(e, about.to_inline(), x.to_inline())).count();
     assert_eq!(found, 1);

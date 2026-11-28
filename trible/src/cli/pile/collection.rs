@@ -2577,9 +2577,10 @@ fn run_attach(
     kind: AttachKind,
     arguments: AttachArguments,
 ) -> Result<()> {
-    use triblespace_core::collection::latest::LatestBlob;
-    use triblespace_core::collection::lww_register::LwwRegisterBlob;
-    use triblespace_search::portable_bm25::PortableBM25Blob;
+    use triblespace_core::blob::encodings::entity_id_set::genid_attribute_values;
+    use triblespace_core::collection::latest::latest_states;
+    use triblespace_core::collection::lww_register::register_coordinates;
+    use triblespace_core::collection::succinctarchive_union::{raw_to_rank9, simple_to_succinct};
     use triblespace_search::text_bm25::{Bm25Tokenizer, TextAttributeToBm25};
 
     let mut pile = open_refreshed(&path)?;
@@ -2588,37 +2589,37 @@ fn run_attach(
         let registered = |error| anyhow!("register attached collection: {error:?}");
         let handle = match kind {
             AttachKind::Succinct => pile
-                .attach::<SuccinctArchiveBlob>(parent, ())
+                .attach(parent, simple_to_succinct())
                 .map_err(registered)?
                 .handle(),
             AttachKind::Rank9 => {
                 let succinct = pile
-                    .attach::<SuccinctArchiveBlob>(parent, ())
+                    .attach(parent, simple_to_succinct())
                     .map_err(registered)?;
                 eprintln!(
                     "reads the Succinct attachment blake3:{}",
                     handle_hex(succinct.handle())
                 );
-                pile.attach::<Rank9AcceleratedSuccinctArchiveBlob>(parent, succinct)
+                pile.attach(parent, raw_to_rank9(succinct))
                     .map_err(registered)?
                     .handle()
             }
             AttachKind::EntityIdSet => {
                 let attribute = parse_attribute_id("--attribute", arguments.attribute.as_deref())?;
-                pile.attach::<EntityIdSetBlob>(parent, attribute)
+                pile.attach(parent, genid_attribute_values(attribute))
                     .map_err(registered)?
                     .handle()
             }
             AttachKind::Latest => {
                 let observes = parse_attribute_id("--observes", arguments.observes.as_deref())?;
-                pile.attach::<LatestBlob>(parent, observes)
+                pile.attach(parent, latest_states(observes))
                     .map_err(registered)?
                     .handle()
             }
             AttachKind::Lww => {
                 let identity = parse_attribute_id("--identity", arguments.identity.as_deref())?;
                 let orders = parse_attribute_id("--orders", arguments.orders.as_deref())?;
-                pile.attach::<LwwRegisterBlob>(parent, (identity, orders))
+                pile.attach(parent, register_coordinates(identity, orders))
                     .map_err(registered)?
                     .handle()
             }
@@ -2631,7 +2632,7 @@ fn run_attach(
                             arguments.tokenizer
                         )
                     })?;
-                pile.attach::<PortableBM25Blob>(
+                pile.attach(
                     parent,
                     TextAttributeToBm25 {
                         attribute,
@@ -2649,7 +2650,7 @@ fn run_attach(
                 let automaton = super::path_text::parse(text)
                     .map_err(|error| anyhow!("--expr: {error}"))?
                     .compile();
-                pile.attach::<triblespace_paths::PathSummaryBlob>(parent, automaton)
+                pile.attach(parent, triblespace_paths::regular_path(automaton))
                     .map_err(registered)?
                     .handle()
             }

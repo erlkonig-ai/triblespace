@@ -1,6 +1,8 @@
 use super::*;
 use ed25519_dalek::SigningKey;
 use triblespace_core::blob::IntoBlob;
+use triblespace_core::blob::encodings::entity_id_set::genid_attribute_values;
+use triblespace_core::collection::succinctarchive_union::{raw_to_rank9, simple_to_succinct};
 use triblespace_core::collection::{CollectionPolicy, CollectionStore, CollectionStoreExt};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{BlobStoreList, BlobStorePut};
@@ -97,10 +99,8 @@ fn maintenance_read_set_ignores_unrelated_arrivals_but_tracks_source_and_cold_bl
     let mut writer = Pile::open(&path).unwrap();
     let policy = direct_policy(signer.verifying_key());
     let source = pile.collection("scoped source", policy.clone()).unwrap();
-    let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
-    let target = pile
-        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
-        .unwrap();
+    let succinct = pile.attach(source, simple_to_succinct()).unwrap();
+    let target = pile.attach(source, raw_to_rank9(succinct)).unwrap();
     let other = pile.collection("unrelated source", policy).unwrap();
     for text in ["first scoped member", "second scoped member"] {
         pile.commit(source, &signer, entity! { metadata::description: text })
@@ -270,7 +270,7 @@ fn maintenance_errors_keep_missing_descriptors_and_grant_definitions_as_interest
     // definition is not here yet, so its member is not admitted, and the
     // attached target has nothing to attach until the definition arrives.
     let source = pile.collection("delegated source", policy.clone()).unwrap();
-    let target = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
+    let target = pile.attach(source, simple_to_succinct()).unwrap();
     pile.commit(
         source,
         &signer,
@@ -393,7 +393,7 @@ fn driver_fixture() -> (
         .collection("native maintenance", direct_policy(signer.verifying_key()))
         .unwrap();
     let target = pile
-        .attach::<EntityIdSetBlob>(source, metadata::supersedes.id())
+        .attach(source, genid_attribute_values(metadata::supersedes.id()))
         .unwrap();
     let value = triblespace_core::id::genid();
     for description in ["first", "second"] {
@@ -628,7 +628,7 @@ async fn cancelling_an_active_acquisition_drops_it_and_closes_the_pile() {
         .collection("cold source", direct_policy(signer.verifying_key()))
         .unwrap();
     let target = elsewhere
-        .attach::<EntityIdSetBlob>(source, metadata::supersedes.id())
+        .attach(source, genid_attribute_values(metadata::supersedes.id()))
         .unwrap();
     let snapshot = elsewhere.snapshot().unwrap();
     let target_blob: Blob<SimpleArchive> = snapshot.get(target.handle()).unwrap();
@@ -814,7 +814,7 @@ async fn a_registered_attached_mapping_runs_by_its_algorithm() {
     let source = pile
         .collection("registered", direct_policy(signer.verifying_key()))
         .unwrap();
-    let target = pile.attach_with(source, RenamedIdSet).unwrap();
+    let target = pile.attach(source, RenamedIdSet).unwrap();
     let value = triblespace_core::id::genid();
     pile.commit(source, &signer, entity! { metadata::supersedes: &value })
         .unwrap();
@@ -982,7 +982,7 @@ async fn attached_and_derived_registrations_run_in_one_driver() {
     let mut pile = Pile::open_as(&path, signer.verifying_key()).unwrap();
     let policy = direct_policy(signer.verifying_key());
     let source = pile.collection("both", policy.clone()).unwrap();
-    let attached = pile.attach_with(source, RenamedIdSet).unwrap();
+    let attached = pile.attach(source, RenamedIdSet).unwrap();
     let copy = pile.derive_with(source, CopyNodes, policy).unwrap();
     pile.commit(source, &signer, entity! { metadata::supersedes: &triblespace_core::id::genid() })
         .unwrap();

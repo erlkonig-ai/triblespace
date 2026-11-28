@@ -41,7 +41,7 @@ use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::{Blob, TryFromBlob};
 use triblespace_core::collection::records::{mapping_algorithm, KIND_COLLECTION_MAPPING};
 use triblespace_core::collection::{
-    CollectionAttachment, CollectionData, CollectionOperationError,
+    CollectionAttachment, CollectionData, CollectionOperationError, MapMapping,
 };
 use triblespace_core::id::{id_hex, ExclusiveId, Id};
 use triblespace_core::inline::encodings::genid::GenId;
@@ -137,11 +137,14 @@ impl Bm25Tokenizer {
     }
 }
 
-/// The argument of one BM25 derivation: which attribute holds the texts, and
-/// how to cut them.
+/// Map one text attribute to a portable BM25 attachment using the named tokenizer.
+///
+/// Pass this recipe to `store.attach(source, mapping)`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TextAttributeToBm25 {
+    /// Attribute whose values name UTF-8 text blobs.
     pub attribute: Id,
+    /// Tokenizer applied to each text.
     pub tokenizer: Bm25Tokenizer,
 }
 
@@ -320,6 +323,30 @@ impl CollectionAttachment for PortableBM25Blob {
     }
 }
 
+impl MapMapping for TextAttributeToBm25 {
+    type Target = PortableBM25Blob;
+
+    fn fragment(&self) -> Fragment {
+        <PortableBM25Blob as CollectionAttachment>::fragment(self)
+    }
+
+    fn bind(parent: &Fragment, attached: &Fragment) -> Result<Self, CollectionOperationError> {
+        <PortableBM25Blob as CollectionAttachment>::bind(parent, attached)
+    }
+
+    fn map<R>(
+        &self,
+        node: &Blob<SimpleArchive>,
+        siblings: &[CollectionData],
+        reader: &R,
+    ) -> Result<Blob<Self::Target>, CollectionOperationError>
+    where
+        R: StoreRead,
+    {
+        <PortableBM25Blob as CollectionAttachment>::map(self, node, siblings, reader)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,7 +394,7 @@ mod tests {
             .put::<UTF8String, _>(String::from("the quick brown fox"))
             .unwrap();
         let source = store.collection("bm25-texts", policy).unwrap();
-        let target = store.attach::<PortableBM25Blob>(source, argument).unwrap();
+        let target = store.attach(source, argument).unwrap();
         store
             .commit(
                 source,
@@ -381,13 +408,15 @@ mod tests {
         let descriptor: Blob<SimpleArchive> = snapshot.get(target.handle()).unwrap();
         let descriptor = Fragment::from(TribleSet::try_from_blob(descriptor).unwrap());
         assert_eq!(
-            PortableBM25Blob::bind(&Fragment::empty(), &descriptor).unwrap(),
+            TextAttributeToBm25::bind(&Fragment::empty(), &descriptor).unwrap(),
             argument
         );
         drop(snapshot);
 
         // Maintenance attaches the one node, holding the one document.
-        let snapshot = block_on(store.maintain_attached(target, &authority)).unwrap();
+        let snapshot =
+            block_on(store.maintain_attached_with::<TextAttributeToBm25>(target, &authority))
+                .unwrap();
         let attached = snapshot.attached(target).unwrap();
         assert!(attached.residual().is_empty());
         let members: Vec<_> = attached.cover().members().collect();
@@ -441,7 +470,7 @@ mod tests {
             Bm25Tokenizer::Code,
         ] {
             let target = store
-                .attach::<PortableBM25Blob>(
+                .attach(
                     source,
                     TextAttributeToBm25 {
                         attribute: attribute.id(),
@@ -500,7 +529,7 @@ mod tests {
         .map(|t| store.put::<UTF8String, _>(String::from(t)).unwrap())
         .collect();
         let source = store.collection("bm25-trigram-texts", policy).unwrap();
-        let target = store.attach::<PortableBM25Blob>(source, argument).unwrap();
+        let target = store.attach(source, argument).unwrap();
         store
             .commit(
                 source,
@@ -584,7 +613,7 @@ mod tests {
         };
         let mut store = MemoryRepo::for_host(root);
         let source = store.collection("bm25-late", policy).unwrap();
-        let target = store.attach::<PortableBM25Blob>(source, argument).unwrap();
+        let target = store.attach(source, argument).unwrap();
         let text: Blob<UTF8String> = String::from("late arrival").to_blob();
         let handle = text.get_handle();
         let commit = store
@@ -686,7 +715,7 @@ mod tests {
             let root = store
                 .collection(&format!("bm25-law-{seed}"), policy)
                 .unwrap();
-            let target = store.attach::<PortableBM25Blob>(root, argument).unwrap();
+            let target = store.attach(root, argument).unwrap();
             let mut union = TribleSet::new();
             for index in 0..8 + random.below(8) {
                 let mut rows = Vec::new();
@@ -877,7 +906,7 @@ mod tests {
         let policy =
             CollectionPolicy::new(AdmissionPolicy::direct(host), AdmissionPolicy::direct(host));
         let root = store.collection("bm25-twice", policy).unwrap();
-        let target = store.attach::<PortableBM25Blob>(root, argument).unwrap();
+        let target = store.attach(root, argument).unwrap();
         let shared = store
             .put::<UTF8String, _>(String::from("needle hay"))
             .unwrap();
@@ -934,8 +963,6 @@ mod tests {
         let attached = snapshot.attached(target).unwrap();
         assert_eq!(attached.cover().len(), 1);
         assert_eq!(attached.residual().len(), 1);
-        let pending = attached.read::<TextView>().unwrap();
-        assert_eq!(pending.unread().len(), 1);
         drop(snapshot);
 
         // Both attached: the cover the store selects holds both nodes.
@@ -945,19 +972,15 @@ mod tests {
         assert_eq!(attached.cover().len(), 2);
         assert!(attached.residual().is_empty());
         let through_cover: TextView = attached.view().unwrap();
-        let read = attached.read::<TextView>().unwrap();
-        assert!(read.unread().is_empty());
 
         // Three texts, whichever entities name them, in either node.
-        for view in [&through_cover, read.value()] {
-            assert_eq!(view.query().unwrap().doc_count(), 3);
-            for query in ["needle", "hay", "needle hay"] {
-                assert_eq!(
-                    scores(view, query),
-                    scores(&through_union, query),
-                    "{query}"
-                );
-            }
+        assert_eq!(through_cover.query().unwrap().doc_count(), 3);
+        for query in ["needle", "hay", "needle hay"] {
+            assert_eq!(
+                scores(&through_cover, query),
+                scores(&through_union, query),
+                "{query}"
+            );
         }
     }
 
@@ -982,7 +1005,7 @@ mod tests {
         let policy =
             CollectionPolicy::new(AdmissionPolicy::direct(host), AdmissionPolicy::direct(host));
         let root = store.collection("bm25-read-late", policy).unwrap();
-        let target = store.attach::<PortableBM25Blob>(root, argument).unwrap();
+        let target = store.attach(root, argument).unwrap();
         let text: Blob<UTF8String> = String::from("late arrival").to_blob();
         let commit = store
             .commit(
@@ -993,15 +1016,16 @@ mod tests {
             .unwrap();
         let before = store.snapshot().unwrap();
         let attached = before.attached(target).unwrap();
-        let read = attached.read::<TextView>().unwrap();
         assert_eq!(
-            read.unread()
+            attached
+                .residual()
                 .members()
                 .map(|member| member.raw)
                 .collect::<Vec<_>>(),
             vec![commit.data().raw]
         );
-        assert_eq!(read.value().query().unwrap().doc_count(), 0);
+        let view = attached.view::<TextView>().unwrap();
+        assert_eq!(view.query().unwrap().doc_count(), 0);
 
         let pending = futures::executor::block_on(store.ensure_attached_limited(
             target,
@@ -1011,15 +1035,14 @@ mod tests {
         .unwrap();
         assert_eq!(pending.attached(target).unwrap().residual().len(), 1);
         store.put::<UTF8String, _>(text).unwrap();
-        let arrived = store
-            .snapshot()
-            .unwrap()
-            .attached(target)
-            .unwrap()
-            .read::<TextView>()
-            .unwrap();
-        assert_eq!(arrived.unread().len(), 1, "arrival does not build an index");
-        assert_eq!(arrived.value().query().unwrap().doc_count(), 0);
+        let arrived = store.snapshot().unwrap().attached(target).unwrap();
+        assert_eq!(
+            arrived.residual().len(),
+            1,
+            "arrival does not build an index"
+        );
+        let view = arrived.view::<TextView>().unwrap();
+        assert_eq!(view.query().unwrap().doc_count(), 0);
         futures::executor::block_on(store.ensure_attached_limited(
             target,
             &key,
@@ -1031,9 +1054,10 @@ mod tests {
             !attached.is_current(&after),
             "publication changes the selected cover"
         );
-        let read = after.attached(target).unwrap().read::<TextView>().unwrap();
-        assert!(read.unread().is_empty());
-        assert_eq!(read.value().query().unwrap().doc_count(), 1);
+        let complete = after.attached(target).unwrap();
+        assert!(complete.residual().is_empty());
+        let view = complete.view::<TextView>().unwrap();
+        assert_eq!(view.query().unwrap().doc_count(), 1);
     }
 
     /// A key that is not the store's host is refused before anything is
@@ -1060,7 +1084,7 @@ mod tests {
         let policy =
             CollectionPolicy::new(AdmissionPolicy::direct(host), AdmissionPolicy::direct(host));
         let root = store.collection("bm25-not-host", policy).unwrap();
-        let target = store.attach::<PortableBM25Blob>(root, argument).unwrap();
+        let target = store.attach(root, argument).unwrap();
         let absent: Inline<Handle<UTF8String>> = Inline::new([9u8; 32]);
         store
             .commit(
@@ -1080,7 +1104,7 @@ mod tests {
                 CollectionPolicy::new(AdmissionPolicy::direct(host), AdmissionPolicy::direct(host)),
             )
             .unwrap();
-        let empty_target = store.attach::<PortableBM25Blob>(empty, argument).unwrap();
+        let empty_target = store.attach(empty, argument).unwrap();
         assert!(block_on(store.ensure_attached(empty_target, &other)).is_ok());
     }
 

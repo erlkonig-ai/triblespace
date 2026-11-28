@@ -247,6 +247,18 @@ where
         Self: 'a;
     type Err = B::Err;
 
+    fn blob_locators(&self) -> Result<crate::blob::locator::BlobLocatorIndex, Self::Err> {
+        self.blobs.blob_locators()
+    }
+
+    fn find_blob(&self, locator: [u8; 32]) -> Result<Option<[u8; 32]>, Self::Err> {
+        self.blobs.find_blob(locator)
+    }
+
+    fn find_blobs(&self, locators: &[[u8; 32]]) -> Result<Vec<Option<[u8; 32]>>, Self::Err> {
+        self.blobs.find_blobs(locators)
+    }
+
     fn blobs<'a>(&'a self) -> Self::Iter<'a> {
         self.blobs.blobs()
     }
@@ -445,7 +457,7 @@ mod tests {
     use crate::blob::IntoBlob;
     use crate::collection::{
         descriptor, CollectionHandle, CollectionMerge, CollectionPolicy, CollectionRead,
-        CollectionRecordSelector, CollectionStoreExt,
+        CollectionRecordSelector, CollectionSnapshotExt, CollectionStoreExt,
     };
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::SnapshotSource;
@@ -546,7 +558,7 @@ mod tests {
             .commit(target, &signing_key, Fragment::empty())
             .unwrap();
         let snapshot = hybrid.snapshot().unwrap();
-        let facts: TribleSet = target.read(&snapshot).unwrap();
+        let facts: TribleSet = snapshot.collection(target).unwrap().view().unwrap();
         assert_eq!(facts.len(), 0);
         assert_eq!(commit.collection(), target.handle());
         assert!(hybrid.blobs.blobs.len() >= 2);

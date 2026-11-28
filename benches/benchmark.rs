@@ -993,8 +993,10 @@ fn collection_materialize_benchmark(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("materialize", n_commits), |b| {
             b.iter(|| {
                 let snapshot = storage.snapshot().expect("freeze store snapshot");
-                collection
-                    .read::<TribleSet, _>(&snapshot)
+                snapshot
+                    .collection(collection)
+                    .expect("select collection")
+                    .view::<TribleSet>()
                     .expect("materialize collection")
             });
         });

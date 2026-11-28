@@ -36,8 +36,8 @@ use crate::repo::{BlobStoreGet, BlobStoreMeta};
 
 use super::records::mapping_reads_attached;
 use super::{
-    Collection, CollectionAttachment, CollectionData, CollectionEncoding, CollectionHandle,
-    CollectionOperationError,
+    CanonicalAttachment, Collection, CollectionAttachment, CollectionData, CollectionEncoding,
+    CollectionHandle, CollectionOperationError, MapMapping,
 };
 
 mod collection;
@@ -266,6 +266,11 @@ fn mapping_fragment() -> Fragment {
     }
 }
 
+/// Convert each SimpleArchive node into a portable SuccinctArchive.
+pub fn simple_to_succinct() -> impl MapMapping<Target = SuccinctArchiveBlob> {
+    CanonicalAttachment::<SuccinctArchiveBlob>::new(())
+}
+
 impl CollectionAttachment for SuccinctArchiveBlob {
     type Argument = ();
 
@@ -373,6 +378,13 @@ fn rank9_accelerated_mapping_fragment(succinct: Collection<SuccinctArchiveBlob>)
     }
 }
 
+/// Build a native Rank9 accelerator from each node's named Succinct attachment.
+pub fn raw_to_rank9(
+    succinct: Collection<SuccinctArchiveBlob>,
+) -> impl MapMapping<Target = Rank9AcceleratedSuccinctArchiveBlob> {
+    CanonicalAttachment::<Rank9AcceleratedSuccinctArchiveBlob>::new(succinct)
+}
+
 /// A node's Rank9 accelerator, built from the same node's attachment in the
 /// Succinct attached collection its descriptor names. The accelerator's
 /// header names that raw archive, so it is usable only where the archive is
@@ -463,7 +475,7 @@ mod tests {
     use crate::blob::IntoBlob;
     use crate::collection::descriptor::identity_for_tests;
     use crate::collection::simplearchive_union;
-    use crate::collection::{CanonicalAttachment, CollectionPolicy};
+    use crate::collection::CollectionPolicy;
     use crate::trible::{Trible, TribleSet, TRIBLE_LEN};
 
     fn direct_policy() -> CollectionPolicy {
@@ -480,10 +492,7 @@ mod tests {
     }
 
     fn attached(parent: &Fragment) -> Fragment {
-        descriptor_facts::attaching_with(
-            identity_for_tests(parent),
-            &CanonicalAttachment::<SuccinctArchiveBlob>::new(()),
-        )
+        descriptor_facts::attaching_with(identity_for_tests(parent), &simple_to_succinct())
     }
 
     fn row(entity: u8, attribute: u8, value: u8) -> [u8; TRIBLE_LEN] {
@@ -535,10 +544,8 @@ mod tests {
 
         // A Rank9 index names the Succinct attached collection it reads.
         let succinct = Collection::<SuccinctArchiveBlob>::from_handle(identity_for_tests(&index));
-        let rank9 = descriptor_facts::attaching_with(
-            identity_for_tests(&parent),
-            &CanonicalAttachment::<Rank9AcceleratedSuccinctArchiveBlob>::new(succinct),
-        );
+        let rank9 =
+            descriptor_facts::attaching_with(identity_for_tests(&parent), &raw_to_rank9(succinct));
         assert_eq!(
             descriptor_facts::reads_attached(rank9.facts()),
             Ok(vec![succinct.handle()])

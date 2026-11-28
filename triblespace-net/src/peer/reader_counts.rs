@@ -1,8 +1,8 @@
 //! Count resident-handle enumeration, not payload hashes or simulated latency.
 //!
-//! The adapter delegates residency and delta operations. Native Pile deltas
-//! enumerate only changed handles; MemoryRepo's conservative fallback lists
-//! both observations. The final control keeps this backend distinction visible.
+//! The adapter delegates the snapshot-owned locator association. Networking
+//! must not enumerate another inventory over this boundary. Core cache tests
+//! count the cold inventory and subsequent native deltas below the adapter.
 //! Fake exact acquisition starts the ordinary lazy Peer boundary without a live
 //! endpoint. Publication policy is tested separately by the existing simulated
 //! `zero_announcement_budget_still_answers_resident_self_hints` test.
@@ -32,6 +32,7 @@ use super::*;
 
 #[derive(Default)]
 struct Counts {
+    locator_reads: AtomicUsize,
     full_calls: AtomicUsize,
     full_handles: Arc<AtomicUsize>,
     delta_calls: AtomicUsize,
@@ -123,6 +124,13 @@ impl<R: BlobStoreList> BlobStoreList for Counted<R> {
     where
         Self: 'a;
     type Err = R::Err;
+
+    fn blob_locators(
+        &self,
+    ) -> Result<triblespace_core::blob::locator::BlobLocatorIndex, Self::Err> {
+        self.counts.locator_reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.blob_locators()
+    }
 
     fn blobs<'a>(&'a self) -> Self::Iter<'a> {
         self.counts.full_calls.fetch_add(1, Ordering::Relaxed);
@@ -475,7 +483,7 @@ async fn frozen_get_and_bare_reader_refresh_do_not_enumerate_inventory() {
 }
 
 #[tokio::test]
-async fn first_peer_resnapshot_enumerates_all_handles_then_only_deltas() {
+async fn first_peer_resnapshot_reuses_the_store_locator_index() {
     for resident in [0, 8, 128] {
         let Fixture {
             mut peer,
@@ -490,7 +498,8 @@ async fn first_peer_resnapshot_enumerates_all_handles_then_only_deltas() {
         // An ordinary peer snapshot still refreshes serving after acquisition.
         let refreshed = peer.snapshot().unwrap();
         assert!(refreshed.contains_blob(handle).unwrap());
-        assert_eq!(counts.inventory(), [1, resident + 1, 0, 0]);
+        assert_eq!(counts.inventory(), [0, 0, 0, 0]);
+        assert_eq!(counts.locator_reads.load(Ordering::Relaxed), 1);
         assert_eq!(
             counts.get_calls.load(Ordering::Relaxed),
             reads,
@@ -508,15 +517,25 @@ async fn first_peer_resnapshot_enumerates_all_handles_then_only_deltas() {
         for _ in 0..3 {
             peer.snapshot().unwrap();
         }
-        assert_eq!(counts.inventory(), [1, resident + 1, 0, 0]);
+        assert_eq!(counts.inventory(), [0, 0, 0, 0]);
+        assert_eq!(counts.locator_reads.load(Ordering::Relaxed), 1);
         counts.report("first-peer-resnapshot", resident);
 
         peer.put::<UnknownBlob, _>(Bytes::from_source(b"later local payload".to_vec()))
             .unwrap();
         peer.snapshot().unwrap();
-        assert_eq!(counts.inventory(), [1, resident + 1, 2, 1]);
+        assert_eq!(counts.inventory(), [0, 0, 0, 0]);
+        assert_eq!(counts.locator_reads.load(Ordering::Relaxed), 2);
         assert_eq!(counts.get_calls.load(Ordering::Relaxed), reads);
         assert_eq!(peer.serving_snapshot_rebuilds(), 2);
+        // The actual serving table and the caller's frozen local lookup share
+        // the same PATCH entries, rather than separately rebuilding equal maps.
+        let local_index = refreshed.blob_locators().unwrap();
+        let locator = crate::bearer::blob_locator(handle.raw);
+        assert!(std::ptr::eq(
+            local_index.get(&locator).unwrap(),
+            serving.bearer_locators().get(&locator).unwrap(),
+        ));
         counts.report("later-delta-refresh", resident);
         peer.close().unwrap();
     }
@@ -539,7 +558,8 @@ async fn second_peer_acquire_triggers_inventory_even_for_the_same_resident_handl
         assert_eq!(counts.inventory(), [0, 0, 0, 0]);
         assert_eq!(peer.acquire(handle).await.unwrap(), Some(remote.bytes));
         assert_eq!(counts.requests.load(Ordering::Relaxed), 1);
-        assert_eq!(counts.inventory(), [1, resident + 1, 0, 0]);
+        assert_eq!(counts.inventory(), [0, 0, 0, 0]);
+        assert_eq!(counts.locator_reads.load(Ordering::Relaxed), 1);
         counts.report("second-peer-acquire", resident);
         peer.close().unwrap();
     }
@@ -620,7 +640,8 @@ fn eager_peer_constructs_a_serving_inventory() {
             _file,
             ..
         } = Fixture::new(resident, true);
-        assert_eq!(counts.inventory(), [1, resident, 0, 0]);
+        assert_eq!(counts.inventory(), [0, 0, 0, 0]);
+        assert_eq!(counts.locator_reads.load(Ordering::Relaxed), 1);
         assert_eq!(counts.get_calls.load(Ordering::Relaxed), 0);
         assert_eq!(counts.requests.load(Ordering::Relaxed), 0);
         assert!(peer.sender.current_snapshot().is_some());
@@ -631,7 +652,7 @@ fn eager_peer_constructs_a_serving_inventory() {
 }
 
 #[test]
-fn memory_repo_conservative_delta_is_counted_without_claiming_native_pile_cost() {
+fn memory_repo_locator_association_is_owned_by_the_snapshot() {
     for resident in [0, 8, 128] {
         let counts = Arc::new(Counts::default());
         let mut store = Counted {
@@ -644,13 +665,19 @@ fn memory_repo_conservative_delta_is_counted_without_claiming_native_pile_cost()
                 .unwrap();
         }
         let before = store.snapshot().unwrap();
-        let index = crate::bearer::locator_index(&before).unwrap();
+        let index = before.blob_locators().unwrap();
         let handle = store
             .put::<UnknownBlob, _>(Bytes::from_source(b"one later memory blob".to_vec()))
             .unwrap();
         let after = store.snapshot().unwrap();
-        let updated = crate::bearer::update_locator_index(&after, &before, &index).unwrap();
-        assert_eq!(counts.inventory(), [1, resident, 2, 2 * resident + 1]);
+        let updated = after.blob_locators().unwrap();
+        assert!(
+            index
+                .get(&crate::bearer::blob_locator(handle.raw))
+                .is_none()
+        );
+        assert_eq!(counts.inventory(), [0, 0, 0, 0]);
+        assert_eq!(counts.locator_reads.load(Ordering::Relaxed), 2);
         assert_eq!(counts.get_calls.load(Ordering::Relaxed), 0);
         assert_eq!(
             updated.get(&crate::bearer::blob_locator(handle.raw)),
@@ -662,6 +689,7 @@ fn memory_repo_conservative_delta_is_counted_without_claiming_native_pile_cost()
 
 fn assert_leech_has_no_serving_inventory(leech: &Leech<Counted<Pile>>, counts: &Counts) {
     assert_eq!(counts.inventory(), [0, 0, 0, 0]);
+    assert_eq!(counts.locator_reads.load(Ordering::Relaxed), 0);
     assert!(!leech.peer.observed());
     assert!(leech.peer.sender.current_snapshot().is_none());
     assert_eq!(leech.peer.serving_snapshot_rebuilds(), 0);

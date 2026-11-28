@@ -41,7 +41,7 @@ use super::simplearchive_union::PreparedCollectionCommit;
 use super::{
     descriptor, read_capability, write_capability, Collection, CollectionCommit, CollectionData,
     CollectionEncoding, CollectionHandle, CollectionSnapshot, CollectionStore, CollectionTypeError,
-    RecordDecodeError, TryFromCover, TryFromCoverError,
+    DerivedSnapshot, RecordDecodeError, SourceLocator, TryFromCoverError,
 };
 use super::{
     AdmissionPolicy, AttachedSnapshot, CanonicalAttachment, CanonicalDerivation,
@@ -443,6 +443,25 @@ impl<L: CollectionEncoding> Cover<L> {
             .map(|member| Inline::new(*member))
     }
 
+    /// Project these known members into their one-way locator coordinate.
+    ///
+    /// The returned locator cover retains this exact handle cover as a
+    /// partial reverse association, so later locator algebra can recover the
+    /// known handles that survive without treating a locator as a handle.
+    pub fn locators(&self) -> LocatorCover {
+        let mut locators = PATCH::new();
+        let mut known = KnownLocatorMap::new();
+        for member in self.members.iter_ordered() {
+            let locator = SourceLocator::of(*member);
+            locators.insert(&crate::patch::Entry::new(locator.as_bytes()));
+            known.insert(&crate::patch::Entry::with_value(
+                locator.as_bytes(),
+                *member,
+            ));
+        }
+        LocatorCover::from_parts(self.collection.handle(), locators, known)
+    }
+
     /// Number of distinct collection members.
     pub fn len(&self) -> usize {
         self.members.len().min(usize::MAX as u64) as usize
@@ -549,15 +568,196 @@ impl<L: CollectionEncoding> PartialEq for Cover<L> {
 
 impl<L: CollectionEncoding> Eq for Cover<L> {}
 
+/// Source foundations named in the one-way locator coordinate.
+///
+/// The source descriptor scopes the set: equal locator bytes under two
+/// collections are different domains and cannot be combined. Membership and
+/// set algebra depend only on `locators`. `known` is an adjacent, partial
+/// locator-to-handle association retained when a locator was projected from a
+/// known source cover or resolved in a particular snapshot. Unknown locators
+/// remain members and never disappear merely because their bearer handles are
+/// not locally known.
+pub struct LocatorCover {
+    source: CollectionHandle,
+    locators: PATCH<32, IdentitySchema, (), Blake3Merkle>,
+    known: KnownLocatorMap,
+}
+
+type KnownLocatorMap = PATCH<32, IdentitySchema, [u8; 32], Blake3Merkle>;
+
+impl LocatorCover {
+    pub(crate) fn from_locators(
+        source: CollectionHandle,
+        locators: impl IntoIterator<Item = SourceLocator>,
+    ) -> Self {
+        Self {
+            source,
+            locators: PATCH::from_keys(locators.into_iter().map(SourceLocator::raw)),
+            known: PATCH::new(),
+        }
+    }
+
+    fn from_parts(
+        source: CollectionHandle,
+        locators: PATCH<32, IdentitySchema, (), Blake3Merkle>,
+        known: KnownLocatorMap,
+    ) -> Self {
+        Self {
+            source,
+            locators,
+            known,
+        }
+    }
+
+    pub(crate) fn with_known_handle(&mut self, handle: [u8; 32]) {
+        let locator = SourceLocator::of(handle);
+        if self.locators.get(locator.as_bytes()).is_some() {
+            self.known
+                .insert(&crate::patch::Entry::with_value(locator.as_bytes(), handle));
+        }
+    }
+
+    pub(crate) fn has_known_handle(&self, locator: SourceLocator) -> bool {
+        self.known.get(locator.as_bytes()).is_some()
+    }
+
+    /// Exact descriptor whose foundations these locators name.
+    pub const fn source(&self) -> CollectionHandle {
+        self.source
+    }
+
+    /// Locator identities in ascending byte order.
+    pub fn locators(&self) -> impl ExactSizeIterator<Item = SourceLocator> + '_ {
+        self.locators
+            .iter_ordered()
+            .map(|locator| SourceLocator::from_raw(*locator))
+    }
+
+    /// Whether the source-domain cover contains this locator.
+    pub fn contains(&self, locator: SourceLocator) -> bool {
+        self.locators.get(locator.as_bytes()).is_some()
+    }
+
+    /// Known bearer handles whose locators are members of this cover.
+    ///
+    /// This is intentionally partial: a smaller result does not make the
+    /// unresolved locators absent. The typed collection must be the exact
+    /// source descriptor carried by this locator cover.
+    pub fn known_cover<L: CollectionEncoding>(
+        &self,
+        source: Collection<L>,
+    ) -> Result<Cover<L>, CoverAlgebraError> {
+        if source.handle() != self.source {
+            return Err(CoverAlgebraError::DifferentCollection {
+                left: self.source,
+                right: source.handle(),
+            });
+        }
+        Ok(Cover::from_data(
+            source,
+            self.known
+                .iter_entries_ordered()
+                .map(|(_, handle)| Inline::new(*handle)),
+        ))
+    }
+
+    /// Number of distinct source locators, including unresolved ones.
+    pub fn len(&self) -> usize {
+        self.locators.len().min(usize::MAX as u64) as usize
+    }
+
+    /// Whether this is the empty source-domain cover.
+    pub fn is_empty(&self) -> bool {
+        self.locators.is_empty()
+    }
+
+    fn ensure_same_source(&self, other: &Self) -> Result<(), CoverAlgebraError> {
+        if self.source == other.source {
+            Ok(())
+        } else {
+            Err(CoverAlgebraError::DifferentCollection {
+                left: self.source,
+                right: other.source,
+            })
+        }
+    }
+
+    /// Return the locator union in one exact source domain.
+    pub fn union(&self, other: &Self) -> Result<Self, CoverAlgebraError> {
+        self.ensure_same_source(other)?;
+        let mut locators = self.locators.clone();
+        locators.union(other.locators.clone());
+        let mut known = self.known.clone();
+        known.union(other.known.clone());
+        Ok(Self::from_parts(self.source, locators, known))
+    }
+
+    /// Return the locator intersection in one exact source domain.
+    pub fn intersection(&self, other: &Self) -> Result<Self, CoverAlgebraError> {
+        self.ensure_same_source(other)?;
+        let locators = self.locators.intersect(&other.locators);
+        let left_excluded = self.locators.difference(&other.locators);
+        let right_excluded = other.locators.difference(&self.locators);
+        let mut known = self.known.difference_keys(&left_excluded);
+        known.union(other.known.difference_keys(&right_excluded));
+        Ok(Self::from_parts(self.source, locators, known))
+    }
+
+    /// Return the locators of `self` absent from `other`.
+    pub fn difference(&self, other: &Self) -> Result<Self, CoverAlgebraError> {
+        self.ensure_same_source(other)?;
+        Ok(Self::from_parts(
+            self.source,
+            self.locators.difference(&other.locators),
+            self.known.difference_keys(&other.locators),
+        ))
+    }
+
+    /// Whether every locator in `self` is present in `other`.
+    pub fn is_subset(&self, other: &Self) -> Result<bool, CoverAlgebraError> {
+        self.ensure_same_source(other)?;
+        Ok(self.locators <= other.locators)
+    }
+}
+
+impl Clone for LocatorCover {
+    fn clone(&self) -> Self {
+        Self {
+            source: self.source,
+            locators: self.locators.clone(),
+            known: self.known.clone(),
+        }
+    }
+}
+
+impl fmt::Debug for LocatorCover {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocatorCover")
+            .field("source", &self.source)
+            .field("locators", &self.locators().collect::<Vec<_>>())
+            .field("known_handles", &self.known.len())
+            .finish()
+    }
+}
+
+impl PartialEq for LocatorCover {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source && self.locators == other.locators
+    }
+}
+
+impl Eq for LocatorCover {}
+
 /// What a collection stands on: a cover of its OWN foundations.
 ///
 /// A root's foundations are its distinct admitted `COMMIT.data` payloads; a
 /// derived collection's are the images its believed leaves (`DERIVE`s) name.
 /// `MERGE` changes the physical cover, never this value, and several
 /// authorized records attesting one payload are one member. Supports of two
-/// collections are never compared: whether a view has caught up with its
-/// source is [`CollectionSnapshot::missing_from`], which asks the view's
-/// leaves for each source foundation's locator.
+/// collections are never compared. A [`DerivedSnapshot`] instead projects
+/// its represented source locators, which can be subtracted from a source
+/// support's [`LocatorCover`].
 ///
 /// The parameter is the collection's own encoding; it defaults to a root's.
 pub type Support<E = SimpleArchive> = Cover<E>;
@@ -1185,6 +1385,14 @@ impl<L: CollectionEncoding> Collection<L> {
         Cover::from_members(self, members)
     }
 
+    /// Name source foundations in their one-way locator coordinate.
+    ///
+    /// This performs no store access and does not disclose or require the
+    /// bearer handles whose locators are supplied.
+    pub fn locator_cover(self, locators: impl IntoIterator<Item = SourceLocator>) -> LocatorCover {
+        LocatorCover::from_locators(self.handle(), locators)
+    }
+
     /// Open an existing descriptor as a typed collection without mutating the
     /// backing store.
     ///
@@ -1395,43 +1603,6 @@ impl<L: CollectionEncoding> Collection<L> {
         let (support, _) = coverage.frontier_support(self.handle());
         Ok(Cover::from_patch(self, support))
     }
-
-    /// Read one logical value through this snapshot's realized collection.
-    ///
-    /// This is exactly `snapshot.collection(self)?.view()`: it neither fetches
-    /// missing blobs nor claims support beyond the snapshot's resident cover.
-    pub fn read<V, S>(
-        self,
-        snapshot: &S,
-    ) -> Result<V, CollectionReadError<S::GetError<Infallible>, V::Error>>
-    where
-        S: StoreRead,
-        V: TryFromCover<L>,
-    {
-        snapshot
-            .collection(self)
-            .map_err(CollectionReadError::Realization)?
-            .view()
-            .map_err(CollectionReadError::View)
-    }
-
-    /// Read known support through exact acquisition without choosing another
-    /// record/proof frontier after bytes arrive. Unlike a passive read, missing
-    /// chosen foundation bytes fail the view rather than disappearing from it.
-    pub fn read_acquiring<V, S>(
-        self,
-        snapshot: &S,
-    ) -> Result<V, CollectionReadError<S::GetError<Infallible>, V::Error>>
-    where
-        S: StoreRead,
-        V: TryFromCover<L>,
-    {
-        snapshot
-            .collection_acquiring(self)
-            .map_err(CollectionReadError::Realization)?
-            .view()
-            .map_err(CollectionReadError::View)
-    }
 }
 
 /// Immutable collection observations implemented by every complete store snapshot.
@@ -1459,6 +1630,23 @@ pub trait CollectionSnapshotExt: StoreRead + Sized {
         super::observation::attach(self, target)
     }
 
+    /// Observe one derived collection while retaining its source domain.
+    ///
+    /// The source descriptor handle comes from `target`'s own descriptor.
+    /// Its encoding, records and payloads need not be locally present, so a
+    /// derived-only peer can still read the selected target value and ask
+    /// exact locator-coverage questions.
+    fn derived<E>(
+        &self,
+        target: Collection<E>,
+    ) -> Result<DerivedSnapshot<Self, E>, CollectionRealizationError>
+    where
+        E: CollectionEncoding,
+        Handle<E>: InlineEncoding,
+    {
+        DerivedSnapshot::from_collection(super::observation::attach(self, target)?)
+    }
+
     /// Select the resident cover plus known foundations it does not represent.
     /// A fetching reader can then read that fixed cover's exact bytes through
     /// `view`. No new observation is taken during acquisition; a view which
@@ -1482,10 +1670,9 @@ pub trait CollectionSnapshotExt: StoreRead + Sized {
     /// representation dependencies are here -- and otherwise the
     /// attachments of the highest nodes beneath it that have one, found
     /// through the host's own merges. The parent foundations no taken
-    /// attachment reaches are the [`AttachedSnapshot::residual`], reported as
-    /// unread by attached reads. Explicit writer upkeep can publish their
-    /// attachments for a later observation. Supports and usability come from
-    /// this one observation.
+    /// attachment reaches are reported by [`AttachedSnapshot::residual`].
+    /// Explicit writer upkeep can publish their attachments for a later
+    /// observation. Supports and usability come from this one observation.
     fn attached<E>(
         &self,
         attached: Collection<E>,
@@ -1501,8 +1688,8 @@ pub trait CollectionSnapshotExt: StoreRead + Sized {
     /// parent descriptors even when frozen residency says absent. A fetching
     /// reader may acquire those exact bytes. Selection otherwise uses the same
     /// frozen records/proofs and resident attachment cover as `attached`;
-    /// `read_acquiring` reads only that fixed stored cover and reports the
-    /// entire residual without mapping or fetching its source bodies.
+    /// [`AttachedSnapshot::view`] reads that fixed stored cover.
+    /// [`AttachedSnapshot::residual`] reports its unread parent foundations.
     fn attached_acquiring<E>(
         &self,
         attached: Collection<E>,
@@ -1720,25 +1907,14 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         Ok(Collection::from_handle(handle))
     }
 
-    /// Create and register one canonical attached collection: an index of
-    /// `parent`'s nodes through `T`'s own mapping.
+    /// Create and register an index of `parent`'s nodes through `mapping`.
     ///
-    /// The descriptor is the parent's handle and the mapping, with no
-    /// policy; registering it publishes nothing else.
-    fn attach<T>(
-        &mut self,
-        parent: Collection<SimpleArchive>,
-        argument: T::Argument,
-    ) -> Result<Collection<T>, CollectionRegistrationError<<Self as BlobStorePut>::PutError>>
-    where
-        T: CollectionAttachment,
-    {
-        self.attach_with::<CanonicalAttachment<T>>(parent, CanonicalAttachment::new(argument))
-    }
-
-    /// Create and register one attached collection through an explicit
-    /// mapping value.
-    fn attach_with<M>(
+    /// Pass a named recipe such as
+    /// [`simple_to_succinct()`](super::succinctarchive_union::simple_to_succinct),
+    /// or supply your own [`MapMapping`].
+    /// The descriptor names the parent and the mapping. Registering it
+    /// stores the descriptor closure without publishing any MAP records.
+    fn attach<M>(
         &mut self,
         parent: Collection<SimpleArchive>,
         mapping: M,
@@ -2107,6 +2283,70 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
 }
 
 impl<S> CollectionStoreExt for S where S: BlobStorePut + CollectionStore {}
+
+#[cfg(test)]
+mod locator_cover_tests {
+    use super::*;
+
+    fn source(byte: u8) -> Collection<SimpleArchive> {
+        Collection::from_handle(CollectionHandle::new([byte; 32]))
+    }
+
+    fn member(byte: u8) -> Inline<Handle<SimpleArchive>> {
+        Inline::new([byte; 32])
+    }
+
+    #[test]
+    fn locator_algebra_keeps_partial_handle_knowledge_and_exact_source_domain() {
+        let a = source(1);
+        let b = source(2);
+        let a_known = a.cover([member(10), member(11)]).locators();
+        let a_unknown = a.locator_cover([
+            SourceLocator::of(member(11).raw),
+            SourceLocator::of(member(12).raw),
+        ]);
+
+        let union = a_known.union(&a_unknown).unwrap();
+        assert_eq!(union.len(), 3);
+        assert!(union.contains(SourceLocator::of(member(12).raw)));
+        assert_eq!(
+            union.known_cover(a).unwrap().members().collect::<Vec<_>>(),
+            vec![member(10), member(11)],
+            "an unresolved member remains in locator membership only",
+        );
+
+        let removed = a.locator_cover([SourceLocator::of(member(10).raw)]);
+        let difference = union.difference(&removed).unwrap();
+        assert_eq!(difference.len(), 2);
+        assert_eq!(
+            difference
+                .known_cover(a)
+                .unwrap()
+                .members()
+                .collect::<Vec<_>>(),
+            vec![member(11)],
+        );
+
+        let right_known = a.cover([member(11), member(12)]).locators();
+        let intersection = union.intersection(&right_known).unwrap();
+        assert_eq!(intersection.len(), 2);
+        assert_eq!(
+            intersection
+                .known_cover(a)
+                .unwrap()
+                .members()
+                .collect::<Vec<_>>(),
+            vec![member(11), member(12)],
+            "known handles from either operand survive",
+        );
+
+        let same_bytes_other_domain = b.locator_cover([SourceLocator::of(member(11).raw)]);
+        assert!(matches!(
+            union.difference(&same_bytes_other_domain),
+            Err(CoverAlgebraError::DifferentCollection { .. })
+        ));
+    }
+}
 
 #[cfg(test)]
 mod grant_tests {

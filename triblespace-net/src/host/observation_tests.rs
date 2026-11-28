@@ -43,6 +43,8 @@ struct CountedSnapshot<R = MemoryRepoSnapshot> {
     enumerations: Arc<AtomicUsize>,
     proof_enumerations: Arc<AtomicUsize>,
     blob_reads: Arc<AtomicUsize>,
+    fallback_locators: bool,
+    locator_enumerations: Arc<AtomicUsize>,
 }
 
 impl<R> CountedSnapshot<R> {
@@ -52,6 +54,8 @@ impl<R> CountedSnapshot<R> {
             enumerations: enumerations.clone(),
             proof_enumerations: Arc::default(),
             blob_reads: Arc::default(),
+            fallback_locators: false,
+            locator_enumerations: Arc::default(),
         }
     }
 }
@@ -90,6 +94,16 @@ impl<R: BlobStoreList> BlobStoreList for CountedSnapshot<R> {
         Self: 'a;
     type Err = R::Err;
 
+    fn blob_locators(
+        &self,
+    ) -> Result<triblespace_core::blob::locator::BlobLocatorIndex, Self::Err> {
+        if self.fallback_locators {
+            ListOnly(self).blob_locators()
+        } else {
+            self.inner.blob_locators()
+        }
+    }
+
     fn blobs<'a>(&'a self) -> Self::Iter<'a> {
         self.inner.blobs()
     }
@@ -112,6 +126,22 @@ impl<R: BlobStoreList> BlobStoreList for CountedSnapshot<R> {
 
     fn blobs_diff<'a>(&'a self, previous: &Self) -> Self::Iter<'a> {
         self.inner.blobs_diff(&previous.inner)
+    }
+}
+
+// Exercise the real BlobStoreList default rather than a native cached override.
+struct ListOnly<'a, R>(&'a CountedSnapshot<R>);
+
+impl<R: BlobStoreList> BlobStoreList for ListOnly<'_, R> {
+    type Err = R::Err;
+    type Iter<'a>
+        = R::Iter<'a>
+    where
+        Self: 'a;
+
+    fn blobs(&self) -> Self::Iter<'_> {
+        self.0.locator_enumerations.fetch_add(1, Ordering::Relaxed);
+        self.0.inner.blobs()
     }
 }
 
@@ -535,6 +565,50 @@ fn assert_shared_record_leaves(
             "unchanged record leaves must be retained, not reconstructed"
         );
     }
+}
+
+#[test]
+fn record_only_observations_reuse_a_list_only_locator_inventory() {
+    let mut fixture = Fixture::new();
+    let mut before = fixture.snapshot();
+    before.fallback_locators = true;
+    let active = ActiveCollections::new();
+    let local = fixture.root.verifying_key();
+    let first = StoreSnapshot::from_store_changes(
+        before.clone(),
+        &active,
+        &active,
+        local,
+        None,
+        None,
+        StoreChanges::ALL,
+    )
+    .unwrap();
+    assert_eq!(before.locator_enumerations.load(Ordering::Relaxed), 1);
+    // The fixture's pending record references bytes already present: this is
+    // an actual record-only change, not a fabricated change mask.
+    fixture.store.insert(fixture.pending).unwrap();
+    let mut after = fixture.snapshot();
+    after.fallback_locators = true;
+    after.locator_enumerations = before.locator_enumerations.clone();
+    let changes = after.changes_since(&before);
+    assert_eq!(changes, StoreChanges::COLLECTION_RECORDS);
+    let second = StoreSnapshot::from_store_changes(
+        after.clone(),
+        &active,
+        &active,
+        local,
+        Some(&before),
+        Some(&first),
+        changes,
+    )
+    .unwrap();
+    assert_eq!(before.locator_enumerations.load(Ordering::Relaxed), 1);
+    assert_eq!(second.bearer_locators(), first.bearer_locators());
+    // Without a known prior store observation, equality cannot justify reuse.
+    StoreSnapshot::from_store_changes(after, &active, &active, local, None, Some(&second), changes)
+        .unwrap();
+    assert_eq!(before.locator_enumerations.load(Ordering::Relaxed), 2);
 }
 
 #[test]
@@ -1004,6 +1078,8 @@ impl ScopedFixture {
             enumerations: self.enumerations.clone(),
             proof_enumerations: self.proof_enumerations.clone(),
             blob_reads: self.blob_reads.clone(),
+            fallback_locators: false,
+            locator_enumerations: Arc::default(),
         };
         let changes = previous.map_or(StoreChanges::ALL, |previous| {
             snapshot.changes_since(&previous.0)

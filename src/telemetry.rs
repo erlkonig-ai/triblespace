@@ -857,7 +857,7 @@ mod tests {
             // archive scan bypasses the supplied collection's authority.
             let mut reader = Pile::open(&path).unwrap();
             let snapshot = reader.snapshot().unwrap();
-            let facts: TribleSet = collection.read(&snapshot).unwrap();
+            let facts: TribleSet = snapshot.collection(collection).unwrap().view().unwrap();
             assert!(exists!(pattern!(&facts, [{ child_id @
                 schema::parent: parent_id, schema::end_ns: _?end,
             }])));

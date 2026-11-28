@@ -306,6 +306,20 @@ where
     S::Snapshot: BlobStoreList,
 {
     type Err = <S::Snapshot as BlobStoreList>::Err;
+
+    fn blob_locators(
+        &self,
+    ) -> Result<triblespace_core::blob::locator::BlobLocatorIndex, Self::Err> {
+        self.frozen.blob_locators()
+    }
+
+    fn find_blob(&self, locator: RawHash) -> Result<Option<RawHash>, Self::Err> {
+        self.frozen.find_blob(locator)
+    }
+
+    fn find_blobs(&self, locators: &[[u8; 32]]) -> Result<Vec<Option<[u8; 32]>>, Self::Err> {
+        self.frozen.find_blobs(locators)
+    }
     type Iter<'a>
         = <S::Snapshot as BlobStoreList>::Iter<'a>
     where

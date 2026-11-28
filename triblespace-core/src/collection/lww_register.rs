@@ -438,8 +438,7 @@ pub fn join(
 /// Construct the attached LWW register descriptor for one parent collection.
 #[cfg(test)]
 pub(crate) fn descriptor(parent: CollectionHandle, identity: Id, orders: Id) -> Fragment {
-    let mapping =
-        crate::collection::CanonicalAttachment::<LwwRegisterBlob>::new((identity, orders));
+    let mapping = register_coordinates(identity, orders);
     crate::collection::descriptor::attaching_with(parent, &mapping)
 }
 
@@ -518,6 +517,14 @@ impl CollectionEncoding for LwwRegisterBlob {
     {
         join(low, high).map_err(|source| CollectionOperationError::Fatal(source.to_string()))
     }
+}
+
+/// Project the register identity and order key of each state.
+pub fn register_coordinates(
+    identity: Id,
+    orders: Id,
+) -> impl super::MapMapping<Target = LwwRegisterBlob> {
+    super::CanonicalAttachment::<LwwRegisterBlob>::new((identity, orders))
 }
 
 impl CollectionAttachment for LwwRegisterBlob {
@@ -939,7 +946,7 @@ mod tests {
             .collection("lww-row-view", direct_policy(key.verifying_key()))
             .unwrap();
         let target = store
-            .attach::<LwwRegisterBlob>(source, (state_of.id(), written_at.id()))
+            .attach(source, register_coordinates(state_of.id(), written_at.id()))
             .unwrap();
         let handles = members
             .iter()
@@ -1443,7 +1450,7 @@ mod tests {
         let mut store = MemoryRepo::default();
         let source = store.collection("lww-source", direct_policy(root)).unwrap();
         let target = store
-            .attach::<LwwRegisterBlob>(source, (state_of.id(), written_at.id()))
+            .attach(source, register_coordinates(state_of.id(), written_at.id()))
             .unwrap();
         let snapshot = store.snapshot().unwrap();
         let target_descriptor =
@@ -1469,7 +1476,7 @@ mod tests {
             .collection("maintained-lww", direct_policy(team))
             .unwrap();
         let target = store
-            .attach::<LwwRegisterBlob>(source, (state_of.id(), written_at.id()))
+            .attach(source, register_coordinates(state_of.id(), written_at.id()))
             .unwrap();
         let register = ufoid();
         let state = ufoid();

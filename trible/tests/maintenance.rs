@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Output};
 use std::time::Duration;
 use tempfile::TempDir;
+use triblespace_core::blob::encodings::entity_id_set::genid_attribute_values;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{
     OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
@@ -18,7 +19,9 @@ use triblespace_core::blob::encodings::succinctarchive::{
 use triblespace_core::collection::records::{
     collection_representation, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
 };
-use triblespace_core::collection::succinctarchive_union::read_attached;
+use triblespace_core::collection::succinctarchive_union::{
+    raw_to_rank9, read_attached, simple_to_succinct,
+};
 use triblespace_core::collection::AttachedSnapshot;
 use triblespace_core::collection::{
     AdmissionPolicy, Collection, CollectionPolicy, CollectionRead, CollectionRecord,
@@ -52,10 +55,8 @@ impl Fixture {
         let mut pile = Pile::open(&path).unwrap();
         let policy = policy(&signer);
         let source = pile.collection("facts", policy.clone()).unwrap();
-        let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
-        let rank9 = pile
-            .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
-            .unwrap();
+        let succinct = pile.attach(source, simple_to_succinct()).unwrap();
+        let rank9 = pile.attach(source, raw_to_rank9(succinct)).unwrap();
         let mut expected = TribleSet::new();
         for text in ["first fact", "other fact"] {
             let fragment = entity! { metadata::description: text };
@@ -64,9 +65,7 @@ impl Fixture {
         }
 
         let unrelated_source = pile.collection("not-selected", policy.clone()).unwrap();
-        let unrelated = pile
-            .attach::<SuccinctArchiveBlob>(unrelated_source, ())
-            .unwrap();
+        let unrelated = pile.attach(unrelated_source, simple_to_succinct()).unwrap();
         pile.commit(
             unrelated_source,
             &signer,
@@ -653,7 +652,10 @@ fn maintain_all_schedules_a_shared_upstream_once() {
     // A second collection attached to the same root: the root is upstream of
     // both it and the pair, and Succinct is upstream of Rank9.
     let second = pile
-        .attach::<EntityIdSetBlob>(fixture.source, metadata::supersedes.id())
+        .attach(
+            fixture.source,
+            genid_attribute_values(metadata::supersedes.id()),
+        )
         .unwrap();
     pile.close().unwrap();
 
@@ -819,9 +821,7 @@ fn one_failed_target_does_not_prevent_independent_targets_from_advancing() {
                 let absent = elsewhere
                     .collection("a root this pile never held", policy(&fixture.signer))
                     .unwrap();
-                pile.attach::<SuccinctArchiveBlob>(absent, ())
-                    .unwrap()
-                    .handle()
+                pile.attach(absent, simple_to_succinct()).unwrap().handle()
             };
             pile.close().unwrap();
 
@@ -866,10 +866,8 @@ fn an_upstream_node_left_unattached_does_not_suppress_available_downstream_work(
         entity! { metadata::description: "first fact" },
     )
     .unwrap();
-    let succinct = pile.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
-    let rank9 = pile
-        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
-        .unwrap();
+    let succinct = pile.attach(source, simple_to_succinct()).unwrap();
+    let rank9 = pile.attach(source, raw_to_rank9(succinct)).unwrap();
     let seeded = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap()
@@ -980,7 +978,7 @@ fn bm25_search_names_a_hit_whose_source_node_is_cold() {
     let fixture = Fixture::new();
     let mut pile = Pile::open(&fixture.path).unwrap();
     let index = pile
-        .attach::<PortableBM25Blob>(
+        .attach(
             fixture.source,
             TextAttributeToBm25 {
                 attribute: metadata::description.id(),
@@ -1061,13 +1059,12 @@ fn bm25_search_names_a_hit_whose_source_node_is_cold() {
 #[cfg(feature = "search")]
 #[test]
 fn search_prints_an_entity_once_at_its_best_text() {
-    use triblespace_search::portable_bm25::PortableBM25Blob;
     use triblespace_search::text_bm25::{Bm25Tokenizer, TextAttributeToBm25};
 
     let fixture = Fixture::new();
     let mut pile = Pile::open(&fixture.path).unwrap();
     let index = pile
-        .attach::<PortableBM25Blob>(
+        .attach(
             fixture.source,
             TextAttributeToBm25 {
                 attribute: metadata::description.id(),
@@ -1136,7 +1133,7 @@ fn search_joins_through_the_sources_attached_fact_index() {
     let fixture = Fixture::new();
     let mut pile = Pile::open(&fixture.path).unwrap();
     let index = pile
-        .attach::<PortableBM25Blob>(
+        .attach(
             fixture.source,
             TextAttributeToBm25 {
                 attribute: metadata::description.id(),
@@ -1278,13 +1275,12 @@ fn search_joins_through_the_sources_attached_fact_index() {
 #[cfg(feature = "search")]
 #[test]
 fn search_reads_existing_bm25_support_and_snippets_after_source_growth() {
-    use triblespace_search::portable_bm25::PortableBM25Blob;
     use triblespace_search::text_bm25::{Bm25Tokenizer, TextAttributeToBm25};
 
     let fixture = Fixture::new();
     let mut pile = Pile::open(&fixture.path).unwrap();
     let index = pile
-        .attach::<PortableBM25Blob>(
+        .attach(
             fixture.source,
             TextAttributeToBm25 {
                 attribute: metadata::description.id(),
@@ -1368,7 +1364,6 @@ fn search_reads_existing_bm25_support_and_snippets_after_source_growth() {
 #[test]
 fn a_search_that_believes_no_attachment_names_the_key_not_maintenance() {
     use triblespace_core::collection::CollectionStore;
-    use triblespace_search::portable_bm25::PortableBM25Blob;
     use triblespace_search::text_bm25::{Bm25Tokenizer, TextAttributeToBm25};
 
     // The index is maintained by the fixture's key, so every foundation of
@@ -1376,7 +1371,7 @@ fn a_search_that_believes_no_attachment_names_the_key_not_maintenance() {
     let fixture = Fixture::new();
     let mut pile = Pile::open(&fixture.path).unwrap();
     let index = pile
-        .attach::<PortableBM25Blob>(
+        .attach(
             fixture.source,
             TextAttributeToBm25 {
                 attribute: metadata::description.id(),

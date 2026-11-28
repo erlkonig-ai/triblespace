@@ -1678,7 +1678,7 @@ mod tests {
         let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
         let source = store.collection("test BM25", policy).unwrap();
         let collection = store
-            .attach::<PortableBM25Blob>(
+            .attach(
                 source,
                 TextAttributeToBm25 {
                     attribute: metadata::name.id(),

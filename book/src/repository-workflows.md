@@ -249,11 +249,11 @@ A trusted local store is not reverified on every read. Once a target producer
 is admitted, attachment selects its resident output without expanding the
 historical support. Exact record relationships order the physical cover; only
 selected outputs and their encoding-required dependencies must be resident.
-A missing result cannot suppress an available finer realization. An explicit
-`support()` query follows the exact witness DAG and descriptor lineage without
-re-admitting ancestors or reading ancestral payloads, metadata, and proofs.
-A missing or mismatched witness route makes that query fail, not return empty
-support, and does not prevent reading the endorsed target value.
+A missing result cannot suppress an available finer realization. Selection
+takes a target cover and that cover's own foundations from the indexed target
+rows together. `support()` returns those foundations -- commit payloads for a
+root, target leaf images for a derived collection -- without expanding a
+historical witness DAG or changing coordinates to the derived source.
 
 This deliberately trusts authorized producers to validate inputs and compute
 correctly. Signatures identify who endorsed that claim; they do not prevent an
@@ -275,26 +275,81 @@ with one interpretation instant for application queries. The
 snapshot, rather than a source frontier or a later materialization, is the
 watermark. Ask it what representation is actually readable at that instant:
 
-```rust,ignore
-let snapshot = store.snapshot()?;
-let observed = snapshot.collection(collection)?;
-let cover = observed.cover();
-let value: V = observed.view()?;
-// Only a consumer which needs provenance asks for historical support.
-let support = observed.support()?;
+```rust,no_run
+use triblespace::core::{
+    blob::encodings::simplearchive::SimpleArchive,
+    collection::{Collection, CollectionSnapshotExt, SourceLocator},
+    inline::{encodings::hash::Handle, Inline},
+    repo::memoryrepo::MemoryRepoSnapshot,
+    trible::TribleSet,
+};
+
+fn inspect_one_observation(
+    snapshot: &MemoryRepoSnapshot,
+    root: Collection<SimpleArchive>,
+    attached: Collection<SimpleArchive>,
+    derived: Collection<SimpleArchive>,
+    source_member: Inline<Handle<SimpleArchive>>,
+) {
+    let root_selection = snapshot.collection(root).expect("select root");
+    let _root_cover = root_selection.cover();
+    let _root_value: TribleSet = root_selection.view().expect("view root");
+
+    let attached_selection = snapshot.attached(attached).expect("select attachment");
+    let _attached_cover = attached_selection.cover();
+    let _attached_value: TribleSet = attached_selection.view().expect("view attachment");
+
+    // No source object or source bytes are needed to view a derived target.
+    let derived_selection = snapshot.derived(derived).expect("select derivation");
+    let _derived_cover = derived_selection.cover();
+    let _derived_value: TribleSet = derived_selection.view().expect("view derivation");
+
+    // One locator is one indexed lookup. Bulk projection is explicit.
+    let locator = SourceLocator::of(source_member.raw);
+    let _one = derived_selection
+        .covers(locator)
+        .expect("check one source locator");
+    let represented = derived_selection
+        .represented_locators()
+        .expect("enumerate represented source locators");
+
+    // Locator algebra keeps the handles already known from the source support
+    // private and adjacent. Unknown locators remain members of the result.
+    let source_locators = root_selection
+        .support()
+        .expect("root support")
+        .locators();
+    let missing = source_locators.difference(&represented).expect("same source");
+    let _known_missing_handles = missing.known_cover(root).expect("typed source");
+}
 ```
+
+All three selections own the same immutable `snapshot`, but their extra
+coordinates differ. `collection` is the common target-first cover and view;
+`attached` additionally exposes parent support and `residual()`; `derived`
+adds the descriptor's type-erased source handle and locator coverage. Neither
+opening nor viewing the derived target requires its source descriptor, records,
+or payloads to be resident.
 
 `snapshot.collection(target)` admits producers of target records from the
 snapshot's proof and resident definition evidence and chooses their resident
-target cover. Neither upstream descriptor residency nor a complete historical
-witness closure is a prerequisite for this read. The observation retains exact
-endorsements for its lazy `support()` query, not a fresh admission query over
-every source COMMIT. Admitted but not yet derived data is absent: an immutable
-snapshot never promises work which will happen later.
-There is no assertion form which takes a requested support: what a target
-stands on is read back through `support()`, and a caller who needs two views
-to agree attaches both from one snapshot and compares their supports.
-Neither passive observation method reads the clock: identical operations on one
+target cover. Admitted but not yet derived data is absent: an immutable
+snapshot never promises work which will happen later. A collection's
+`support()` stays in that collection's own typed coordinate, so supports from
+different descriptors are not compared. For a derived target, compare source
+coverage through `LocatorCover`: `covers` checks one locator without projecting
+the whole relation, while `represented_locators` is the explicit bulk
+enumeration. `represented(&candidates)` is the bounded alternative when the
+caller already has a small source subset.
+
+Locators are one-way membership keys, not bearer handles. A `LocatorCover`
+therefore keeps unresolved locators and a separate partial association for
+handles the caller already knew or explicitly resolved in this snapshot.
+Set algebra preserves that private association without making it part of
+membership or equality; `known_cover(source)` recovers only the known handles.
+It never turns an unknown locator into a handle.
+
+No passive selection or query reads the clock: identical operations on one
 frozen store snapshot have identical results even while wall time passes. A
 passive decision using later-arriving proof or definition evidence requires a
 new snapshot.
@@ -314,19 +369,20 @@ membership, authority and residency cannot leak into an older read. Backends
 whose conservative classification reports `ALL` keep the separate-memo path.
 
 `observed.is_current(&later_snapshot)` compares the raw dependencies actually
-consulted by attachment, views, and explicit support queries. Indexed backends
-ignore unrelated collection and blob appends. Missing lookups count too: a
-later matching record or a recoverable physical occurrence of a blob triggers
-a refresh. This is conservative dependency comparison, not a global sequence
-number or another materialized catalog. Query deadlines remain caller-owned.
+consulted by selection, views, and explicit locator or handle-resolution
+queries. Reading the already-selected `support()` adds no dependency. Indexed
+backends ignore unrelated collection and blob appends. Missing lookups count
+too: a later matching record or a recoverable physical occurrence of a blob
+triggers a refresh. This is conservative dependency comparison, not a global
+sequence number or another materialized catalog. Query deadlines remain
+caller-owned.
 
-Both forms keep the chosen target cover inseparable from the store snapshot
-which established its residency. `view` invokes `TryFromCover<E>` solely
-through that frozen observation. For a `SimpleArchive`, `V = TribleSet`; for a
-`SuccinctArchiveBlob`, `V` may be an mmap-backed union retaining selected
-shards. `collection.read::<V, _>(&snapshot)` remains a concise
-resident collection read when the intermediate support and physical cover are
-irrelevant.
+All selection forms keep the chosen target cover inseparable from the store
+snapshot which established its residency. `view` invokes `TryFromCover<E>`
+solely through that frozen observation. For a `SimpleArchive`, `V = TribleSet`;
+for a `SuccinctArchiveBlob`, `V` may be an mmap-backed union retaining selected
+shards. Use `snapshot.collection(collection)?.view::<V>()?` when you only need
+the logical value.
 
 ### Foreground exact-byte acquisition
 
@@ -353,16 +409,11 @@ derive missing images from upstream data.
 
 For an attached collection, first select once with `attached_acquiring` through
 the acquiring reader. This exact-gets its target and parent descriptors instead
-of requiring their residency in the frozen index. Then call `read_acquiring`,
-or `succinctarchive_union::read_attached_acquiring`
-for fact shards. These read only the fixed stored attached cover and return
-every residual foundation as `unread`, even when its source bytes are resident.
-They never run a mapping, maintain, publish, or replace a selected view after
-obtaining bytes. Explicit writer upkeep can use an acquiring reader for the
-mapping's named dependencies; a later fresh observation sees its published MAPs.
-A complete operational value requires checking `unread`; taking only
-`into_value` is an explicit partial-read choice. This says nothing about peer
-records which have not yet arrived or bulk synchronization completion.
+of requiring their residency in the frozen index. Call `view` on the
+selection to read the fixed stored cover, and check its `residual` for unread
+parent foundations. A complete operational value requires an empty residual
+in that observation. Explicit writer upkeep can use an acquiring reader for
+the mapping's named dependencies. A fresh observation sees its published MAPs.
 
 `AttachedSnapshot<AcquiringReader<R>, E>::into_frozen` removes only the adapter,
 retaining its exact original reader, chosen cover/support/residual and read-set.
@@ -400,9 +451,9 @@ Raw record readers still expose dangling native collection records and stored
 proof records for repair. A member is readable only when its selected payload
 and representation dependencies are resident in that exact frozen snapshot.
 An endorsed result does not need its historical input payloads or COMMIT
-metadata to remain resident. Its exact record witnesses must still close when
-support is requested; merely holding the result blob does not establish that
-provenance.
+metadata to remain resident. Exact record relationships and admission decide
+whether it entered the coverage index; merely holding the result blob does not
+establish collection membership.
 A capability proof's signatures can be checked from its bytes
 alone; action and delegation interpretation also needs the referenced
 definition blobs. A missing definition does not erase the raw proof, but it
@@ -603,10 +654,16 @@ SimpleArchive node --MAP--> SuccinctArchiveBlob
 An attached collection has no carry, no `COMMIT`, `DERIVE` or `MERGE` of its
 own, and no policy: every host builds its own attachments, and a store believes
 only the `MAP`s its own host signed, so another host's that reach it stay
-inert. A read's residual -- foundations no usable attachment reaches -- does
-not say whether their source bytes are here. `AttachedSnapshot::read` returns
-only the stored cover and names the entire residual in `AttachedRead::unread`;
-neither generic nor specialized attached reads build an index.
+inert. `AttachedSnapshot::view` reads the selected attachments, and
+`AttachedSnapshot::residual` reports every parent foundation they leave
+uncovered, including foundations whose source bytes are resident.
+
+Register an attached collection with `store.attach(parent, mapping)`.
+Pass the recipe you want to run. The mapping supplies the output encoding
+and the algorithm and arguments stored in the descriptor. You can also
+pass your own `MapMapping` value, including one that produces the same
+encoding with a different algorithm. Keep the handle returned by registration
+to select the attachment cover from a snapshot.
 
 Foreground writers use the existing `ensure_attached` operation, or its
 `ensure_attached_limited` / `ensure_attached_limited_with` forms with an
@@ -641,16 +698,16 @@ collection names it in its descriptor: Rank9 is built from the same node's
 Succinct attachment.
 
 ```rust,ignore
-use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 use triblespace::core::blob::encodings::succinctarchive::{
-    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob,
-    UnionArchive,
+    OrderedUniverse, UnionArchive,
 };
+use triblespace::core::collection::succinctarchive_union::{raw_to_rank9, simple_to_succinct};
+use triblespace::core::collection::{CollectionSnapshotExt, CollectionStoreExt};
 
 // The store is opened as the host: only its MAPs and MERGEs are believed.
 let source = storage.collection("models", source_policy)?;
-let raw = storage.attach::<SuccinctArchiveBlob>(source, ())?;
-let accelerated = storage.attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, raw)?;
+let raw = storage.attach(source, simple_to_succinct())?;
+let accelerated = storage.attach(source, raw_to_rank9(raw))?;
 
 storage.maintain_attached(raw, &host).await?;
 let after = storage.maintain_attached(accelerated, &host).await?;
@@ -741,7 +798,7 @@ no support argument to pass along, and none to request narrower.
 - `snapshot.collection` remains the purely read-only alternative: it
   performs no acquisition or collection algebra and binds only the
   resident target cover visible in that immutable snapshot. What that cover
-  stands on is its `support()`.
+  stands on in the target's own collection coordinate is its `support()`.
 - For a derived target, `ensure` publishes a leaf for each foundation of its
   immediate source the key owns that has no leaf yet, and returns a fresh
   store snapshot. Missing source members are invisible to selection: an

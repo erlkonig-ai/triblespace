@@ -1,6 +1,8 @@
 use super::*;
+use crate::collection::succinctarchive_union::simple_to_succinct;
 
 use std::cell::{Cell, RefCell};
+use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,9 +18,10 @@ use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use crate::capability::{CapabilityHandle, CapabilityProof, CapabilityProofId, CapabilityResource};
 use crate::collection::{
     collection_read_audience, read_capability, write_capability, AdmissionPolicy, CollectionCommit,
-    CollectionDerive, CollectionMerge, CollectionOperationError, CollectionPolicy, CollectionRead,
-    CollectionReadAudience, CollectionRecord, CollectionRecordSelector, CollectionSnapshotExt,
-    CollectionStore, CollectionStoreExt, Cover, Support,
+    CollectionDerive, CollectionEncoding, CollectionMerge, CollectionOperationError,
+    CollectionPolicy, CollectionRead, CollectionReadAudience, CollectionRecord,
+    CollectionRecordSelector, CollectionSnapshot, CollectionSnapshotExt, CollectionStore,
+    CollectionStoreExt, Cover, DerivedSnapshot, Support, TryFromCover, TryFromCoverError,
 };
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
@@ -29,9 +32,29 @@ use crate::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
 use crate::repo::{
     async_store::AsyncBlobStoreAcquire, BlobInfo, BlobMetadata, BlobStoreGet, BlobStoreList,
     BlobStoreMeta, BlobStorePut, CapabilityProofRead, CapabilityProofStore, SnapshotSource,
-    StoreChanges, StoreSnapshot, WantRead,
+    StoreChanges, StoreRead, StoreSnapshot, WantRead,
 };
 use crate::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
+
+fn known_missing<R, T, RS, S>(
+    target: &CollectionSnapshot<R, T>,
+    source: &CollectionSnapshot<RS, S>,
+) -> Cover<S>
+where
+    R: StoreRead,
+    RS: StoreRead,
+    T: CollectionEncoding,
+    S: CollectionEncoding,
+{
+    let target = DerivedSnapshot::from_collection(target.clone()).unwrap();
+    let source_locators = source.support().unwrap().locators();
+    let represented = target.represented(&source_locators).unwrap();
+    source_locators
+        .difference(&represented)
+        .unwrap()
+        .known_cover(source.cover().collection())
+        .unwrap()
+}
 
 fn policy() -> CollectionPolicy {
     CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open)
@@ -182,6 +205,34 @@ impl CollectionEncoding for FirstEncoding {
             ));
         }
         join_first(low, high)
+    }
+}
+
+struct FirstBlobs(Vec<Blob<FirstEncoding>>);
+
+impl TryFromCover<FirstEncoding> for FirstBlobs {
+    type Error = Infallible;
+
+    fn try_from_cover<R>(
+        cover: &Cover<FirstEncoding>,
+        _descriptor: &Fragment,
+        snapshot: &R,
+    ) -> Result<Self, TryFromCoverError<R::GetError<Infallible>, Self::Error>>
+    where
+        R: BlobStoreGet,
+    {
+        let mut blobs = Vec::with_capacity(cover.len());
+        for member in cover.members() {
+            blobs.push(
+                snapshot
+                    .get(member)
+                    .map_err(|source| TryFromCoverError::MemberGet {
+                        member: Handle::<FirstEncoding>::to_hash(member),
+                        source,
+                    })?,
+            );
+        }
+        Ok(Self(blobs))
     }
 }
 
@@ -504,6 +555,7 @@ impl Error for GuardStoreError {}
 
 struct GuardSnapshot {
     inner: MemoryRepoSnapshot,
+    locator_enumerations: Arc<AtomicUsize>,
     live: Arc<AtomicUsize>,
     semantic_probes: Arc<AtomicUsize>,
     selected_collections: Arc<Mutex<Vec<BTreeSet<CollectionRecordSelector>>>>,
@@ -517,6 +569,7 @@ impl Clone for GuardSnapshot {
         self.live.fetch_add(1, Ordering::SeqCst);
         Self {
             inner: self.inner.clone(),
+            locator_enumerations: Arc::clone(&self.locator_enumerations),
             live: Arc::clone(&self.live),
             semantic_probes: Arc::clone(&self.semantic_probes),
             selected_collections: Arc::clone(&self.selected_collections),
@@ -598,6 +651,7 @@ impl BlobStoreList for GuardSnapshot {
     type Err = <MemoryRepoSnapshot as BlobStoreList>::Err;
 
     fn blobs<'a>(&'a self) -> Self::Iter<'a> {
+        self.locator_enumerations.fetch_add(1, Ordering::SeqCst);
         self.inner.blobs()
     }
 
@@ -850,6 +904,7 @@ impl SnapshotSource for GuardStore {
         self.live.fetch_add(1, Ordering::SeqCst);
         Ok(GuardSnapshot {
             inner,
+            locator_enumerations: Arc::new(AtomicUsize::new(0)),
             live: Arc::clone(&self.live),
             semantic_probes: Arc::clone(&self.semantic_probes),
             selected_collections: Arc::clone(&self.selected_collections),
@@ -987,7 +1042,7 @@ fn ordinary_attachment_reports_only_support_realized_in_its_snapshot() {
     // The gap is the view's freshness, asked of its source explicitly.
     let source = snapshot.collection(root).unwrap();
     assert_eq!(
-        observed.missing_from(&source).unwrap(),
+        known_missing(&observed, &source),
         support(root, std::slice::from_ref(&right))
     );
 }
@@ -1213,8 +1268,7 @@ fn ensure_reuses_a_resident_image_without_mapping() {
         support(root, &foundations[1..]),
     );
     assert_eq!(
-        view.missing_from(&before.collection(root).unwrap())
-            .unwrap(),
+        known_missing(&view, &before.collection(root).unwrap()),
         support(root, std::slice::from_ref(&a)),
     );
     drop(view);
@@ -2387,13 +2441,10 @@ fn complete_realization_is_reused_without_write_authority() {
             block_on(store.ensure(target, &reader))
         }
         .unwrap();
-        assert_eq!(snapshot.collection(target).unwrap().cover().len(), 1);
-        assert!(snapshot
-            .collection(target)
-            .unwrap()
-            .missing_from(&snapshot.collection(root).unwrap())
-            .unwrap()
-            .is_empty());
+        let target_view = snapshot.collection(target).unwrap();
+        let source_view = snapshot.collection(root).unwrap();
+        assert_eq!(target_view.cover().len(), 1);
+        assert!(known_missing(&target_view, &source_view).is_empty());
     }
     assert!(store.events.is_empty());
     assert!(store.acquired.is_empty());
@@ -2681,12 +2732,9 @@ fn target_maintenance_reendorses_a_resident_upper_without_joining_again() {
     let requested = support(root, &foundations[1..]);
     assert_eq!(second_images[6].bytes.len().ilog2(), z.bytes.len().ilog2());
     let before = inner.snapshot().unwrap();
+    let first_view = before.collection(first).unwrap();
     assert_eq!(
-        before
-            .collection(first)
-            .unwrap()
-            .missing_from(&before.collection(root).unwrap())
-            .unwrap(),
+        known_missing(&first_view, &before.collection(root).unwrap()),
         support(root, std::slice::from_ref(&a)),
     );
     let selected = before.collection(second).unwrap();
@@ -3288,7 +3336,7 @@ mod lattice_v2 {
             let snapshot = store.snapshot().unwrap();
             let view = snapshot.collection(first).unwrap();
             let source = snapshot.collection(root).unwrap();
-            view.missing_from(&source).unwrap().data_members().collect()
+            known_missing(&view, &source).data_members().collect()
         };
         assert_eq!(missing(&mut store), BTreeSet::from([a1, a2, b1]));
 
@@ -3326,8 +3374,11 @@ mod lattice_v2 {
         let snapshot = store.snapshot().unwrap();
         let view = snapshot.collection(first).unwrap();
         let unrelated = snapshot.collection(other).unwrap();
+        let unrelated_locators = unrelated.support().unwrap().locators();
         assert!(matches!(
-            view.missing_from(&unrelated),
+            DerivedSnapshot::from_collection(view)
+                .unwrap()
+                .represented(&unrelated_locators),
             Err(CollectionRealizationError::InvalidCover(_))
         ));
     }
@@ -3359,7 +3410,7 @@ mod lattice_v2 {
         assert_eq!(leaf.output(), data(&image));
         let view = snapshot.collection(images).unwrap();
         let source = snapshot.collection(root).unwrap();
-        assert!(view.missing_from(&source).unwrap().is_empty());
+        assert!(known_missing(&view, &source).is_empty());
         assert_eq!(view.support().unwrap().len(), 2);
     }
 
@@ -3603,8 +3654,8 @@ mod lattice_v2 {
         assert_eq!(facts, expected);
         let raw_view = snapshot.collection(raw).unwrap();
         let source = snapshot.collection(root).unwrap();
-        assert!(raw_view.missing_from(&source).unwrap().is_empty());
-        assert!(view.missing_from(&raw_view).unwrap().is_empty());
+        assert!(known_missing(&raw_view, &source).is_empty());
+        assert!(known_missing(&view, &raw_view).is_empty());
     }
     /// Any key the view admits may derive, but only the store's host
     /// carries: another key's carry would publish merges nothing here
@@ -3910,9 +3961,7 @@ mod lattice_v2 {
         let view = snapshot.collection(first).unwrap();
         assert!(view.support().unwrap().is_empty());
         assert_eq!(
-            view.missing_from(&snapshot.collection(root).unwrap())
-                .unwrap()
-                .len(),
+            known_missing(&view, &snapshot.collection(root).unwrap()).len(),
             1,
             "a leaf record is not delivery"
         );
@@ -3922,10 +3971,7 @@ mod lattice_v2 {
         let snapshot = store.snapshot().unwrap();
         let view = snapshot.collection(first).unwrap();
         assert_eq!(view.support().unwrap().len(), 1);
-        assert!(view
-            .missing_from(&snapshot.collection(root).unwrap())
-            .unwrap()
-            .is_empty());
+        assert!(known_missing(&view, &snapshot.collection(root).unwrap()).is_empty());
     }
 
     #[test]
@@ -3939,7 +3985,7 @@ mod lattice_v2 {
             let snapshot = store.snapshot().unwrap();
             let view = snapshot.collection(first).unwrap();
             let source = snapshot.collection(root).unwrap();
-            view.missing_from(&source).unwrap().data_members().collect()
+            known_missing(&view, &source).data_members().collect()
         };
 
         // The per-write ensure derives only what 41 wrote.
@@ -4035,12 +4081,8 @@ mod lattice_v2 {
         assert!(outputs.values().all(|images| images.len() == 1));
         for store in [&mut left, &mut right] {
             let snapshot = store.snapshot().unwrap();
-            assert!(snapshot
-                .collection(first)
-                .unwrap()
-                .missing_from(&snapshot.collection(root).unwrap())
-                .unwrap()
-                .is_empty());
+            let view = snapshot.collection(first).unwrap();
+            assert!(known_missing(&view, &snapshot.collection(root).unwrap()).is_empty());
         }
 
         // Converged: another pass by either host publishes nothing, and
@@ -4087,13 +4129,11 @@ mod lattice_v2 {
             // The pass succeeds, and every foundation but the two the
             // mapping refused has a leaf: the refusals are 42's lag.
             let snapshot = store.snapshot().unwrap();
-            let missing: BTreeSet<CollectionData> = snapshot
-                .collection(first)
-                .unwrap()
-                .missing_from(&snapshot.collection(root).unwrap())
-                .unwrap()
-                .data_members()
-                .collect();
+            let view = snapshot.collection(first).unwrap();
+            let missing: BTreeSet<CollectionData> =
+                known_missing(&view, &snapshot.collection(root).unwrap())
+                    .data_members()
+                    .collect();
             drop(snapshot);
             assert_eq!(missing, BTreeSet::from([refused, too_big]));
             assert!(derives_in(&mut store, first.handle())
@@ -4474,7 +4514,7 @@ mod lattice_v2 {
             let snapshot = store.snapshot().unwrap();
             let view = snapshot.collection(first).unwrap();
             let source = snapshot.collection(root).unwrap();
-            view.missing_from(&source).unwrap().data_members().collect()
+            known_missing(&view, &source).data_members().collect()
         };
         assert_eq!(missing(&mut store), BTreeSet::from([own]));
 
@@ -4482,6 +4522,182 @@ mod lattice_v2 {
         block_on(store.maintain_with::<PinnedFirst>(first, &host)).unwrap();
         assert_eq!(FIRST_MAP_CALLS.get(), 1);
         assert!(missing(&mut store).is_empty());
+    }
+
+    #[test]
+    fn resolving_many_unknown_locators_enumerates_default_inventory_once() {
+        let (mut store, root, first, _) = collections();
+        let a = own_commit(&mut store, root, 41, 0);
+        let b = own_commit(&mut store, root, 41, 1);
+        let mut guarded = GuardStore::new(store);
+        let snapshot = guarded.snapshot().unwrap();
+        let derived = snapshot.derived(first).unwrap();
+        snapshot.locator_enumerations.store(0, Ordering::SeqCst);
+        let missing = SourceLocator::of([0xFC; 32]);
+        let unknown =
+            root.locator_cover([SourceLocator::of(a.raw), SourceLocator::of(b.raw), missing]);
+        let resolved = derived.resolve_handles(&unknown).unwrap();
+        assert_eq!(snapshot.locator_enumerations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            resolved.len(),
+            3,
+            "a missing handle remains a locator member"
+        );
+        assert_eq!(
+            resolved
+                .known_cover(root)
+                .unwrap()
+                .data_members()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([a, b])
+        );
+
+        let known = root.cover([a.transmute(), b.transmute()]).locators();
+        let again = derived.resolve_handles(&known).unwrap();
+        assert_eq!(again.known_cover(root).unwrap().len(), 2);
+        assert_eq!(
+            snapshot.locator_enumerations.load(Ordering::SeqCst),
+            1,
+            "all-known costs zero extra inventories"
+        );
+    }
+
+    #[test]
+    fn derived_locator_queries_are_target_only_and_keep_many_to_one_multioutput_and_gaps() {
+        let (mut store, root, first, _) = collections();
+        let a = own_commit(&mut store, root, 41, 0);
+        let b = own_commit(&mut store, root, 41, 1);
+        let absent = own_commit(&mut store, root, 41, 2);
+
+        // Two source locators share one target output, and `a` also has a
+        // second output. DERIVE is a relation in both directions.
+        let shared = salted_image(&payload(41, 0), 0);
+        let alternate = salted_image(&payload(41, 0), 9);
+        for image in [&shared, &alternate] {
+            store.put::<FirstEncoding, _>(image.clone()).unwrap();
+        }
+        for (input, output) in [
+            (a, data(&shared)),
+            (a, data(&alternate)),
+            (b, data(&shared)),
+        ] {
+            store
+                .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                    &key(41),
+                    first.handle(),
+                    SourceLocator::of(input.raw),
+                    output,
+                )))
+                .unwrap();
+        }
+        let unavailable = salted_image(&payload(41, 2), 7);
+        store
+            .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                &key(41),
+                first.handle(),
+                SourceLocator::of(absent.raw),
+                data(&unavailable),
+            )))
+            .unwrap();
+
+        let snapshot = store.snapshot().unwrap();
+        // Opening and viewing the target does not require opening its source.
+        let derived = snapshot.derived(first).unwrap();
+        assert_eq!(derived.source(), root.handle());
+        let value: FirstBlobs = derived.view().unwrap();
+        assert_eq!(value.0.len(), 2);
+
+        assert!(derived.covers(SourceLocator::of(a.raw)).unwrap());
+        assert!(derived.covers(SourceLocator::of(b.raw)).unwrap());
+        assert!(!derived.covers(SourceLocator::of(absent.raw)).unwrap());
+        let represented = derived.represented_locators().unwrap();
+        assert_eq!(represented.len(), 2, "locators deduplicate leaf outputs");
+        assert!(represented.known_cover(root).unwrap().is_empty());
+        let resolved = derived.resolve_handles(&represented).unwrap();
+        assert_eq!(
+            resolved
+                .known_cover(root)
+                .unwrap()
+                .data_members()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([a, b]),
+        );
+        let with_unknown =
+            root.locator_cover([SourceLocator::of(a.raw), SourceLocator::of([0xFE; 32])]);
+        let with_unknown = derived.resolve_handles(&with_unknown).unwrap();
+        assert_eq!(
+            with_unknown.len(),
+            2,
+            "resolution preserves an unknown locator"
+        );
+        assert_eq!(with_unknown.known_cover(root).unwrap().len(), 1);
+
+        // A restricted query performs only the two requested locator-prefix
+        // lookups; it need not materialize the complete target projection.
+        let candidates =
+            root.locator_cover([SourceLocator::of(a.raw), SourceLocator::of(absent.raw)]);
+        let restricted = derived.represented(&candidates).unwrap();
+        assert_eq!(
+            restricted.locators().collect::<Vec<_>>(),
+            vec![SourceLocator::of(a.raw)]
+        );
+
+        let source = snapshot.collection(root).unwrap();
+        let source_locators = source.support().unwrap().locators();
+        let missing = source_locators.difference(&represented).unwrap();
+        assert_eq!(
+            missing
+                .known_cover(root)
+                .unwrap()
+                .data_members()
+                .collect::<Vec<_>>(),
+            vec![absent],
+            "an unavailable target output leaves the known source handle missing",
+        );
+    }
+
+    #[test]
+    fn merged_locator_coverage_and_old_observations_advance_incrementally() {
+        let (mut store, root, first, _) = collections();
+        let first_eight: Vec<_> = (0..8)
+            .map(|entity| own_commit(&mut store, root, 41, entity))
+            .collect();
+        block_on(store.maintain(first, &key(41))).unwrap();
+
+        let before = store.snapshot().unwrap();
+        let old = before.derived(first).unwrap();
+        assert_eq!(
+            old.cover().len(),
+            1,
+            "eight leaves are read through one merge"
+        );
+        let old_represented = old.represented_locators().unwrap();
+        assert_eq!(old_represented.len(), first_eight.len());
+        assert!(first_eight
+            .iter()
+            .all(|member| old.covers(SourceLocator::of(member.raw)).unwrap()));
+
+        let ninth = own_commit(&mut store, root, 41, 8);
+        let ninth_image = salted_image(&payload(41, 8), 0);
+        store
+            .insert(CollectionRecord::Derive(CollectionDerive::sign(
+                &key(41),
+                first.handle(),
+                SourceLocator::of(ninth.raw),
+                data(&ninth_image),
+            )))
+            .unwrap();
+        let unavailable = store.snapshot().unwrap();
+        assert!(!old.is_current(&unavailable));
+        assert_eq!(old.represented_locators().unwrap(), old_represented);
+        let current = unavailable.derived(first).unwrap();
+        assert!(!current.covers(SourceLocator::of(ninth.raw)).unwrap());
+
+        store.put::<FirstEncoding, _>(ninth_image).unwrap();
+        let available = store.snapshot().unwrap();
+        let current = available.derived(first).unwrap();
+        assert!(current.covers(SourceLocator::of(ninth.raw)).unwrap());
+        assert_eq!(current.represented_locators().unwrap().len(), 9);
     }
 
     /// A DERIVE is a relation: two leaves for one locator, from runs that
@@ -4523,10 +4739,7 @@ mod lattice_v2 {
         );
         let view = snapshot.collection(first).unwrap();
         assert_eq!(view.support().unwrap().len(), 8);
-        assert!(view
-            .missing_from(&snapshot.collection(root).unwrap())
-            .unwrap()
-            .is_empty());
+        assert!(known_missing(&view, &snapshot.collection(root).unwrap()).is_empty());
         drop((view, coverage, snapshot));
         assert!(both.is_subset(&frontier(&mut store, first.handle())));
         assert_eq!(frontier(&mut store, first.handle()).len(), MERGE_FAN_IN);
@@ -4546,10 +4759,7 @@ mod lattice_v2 {
             view.cover().data_members().collect::<Vec<_>>(),
             vec![carried[0].result()]
         );
-        assert!(view
-            .missing_from(&snapshot.collection(root).unwrap())
-            .unwrap()
-            .is_empty());
+        assert!(known_missing(&view, &snapshot.collection(root).unwrap()).is_empty());
         let joined: Blob<FirstEncoding> = snapshot
             .get(Handle::<FirstEncoding>::from_hash(carried[0].result()))
             .unwrap();
@@ -4601,10 +4811,7 @@ mod lattice_v2 {
             .any(|event| matches!(event, WriteEvent::Insert(CollectionRecord::Derive(_)))));
         let snapshot = store.inner.snapshot().unwrap();
         let view = snapshot.collection(first).unwrap();
-        assert!(view
-            .missing_from(&snapshot.collection(root).unwrap())
-            .unwrap()
-            .is_empty());
+        assert!(known_missing(&view, &snapshot.collection(root).unwrap()).is_empty());
         assert_eq!(view.support().unwrap().len(), 3);
         let _ = (a, b, c);
     }
@@ -4641,10 +4848,7 @@ mod lattice_v2 {
             let leaves = derives_in(&mut store.inner, first.handle());
             let snapshot = store.inner.snapshot().unwrap();
             let view = snapshot.collection(first).unwrap();
-            assert!(view
-                .missing_from(&snapshot.collection(root).unwrap())
-                .unwrap()
-                .is_empty());
+            assert!(known_missing(&view, &snapshot.collection(root).unwrap()).is_empty());
             drop((view, snapshot));
             if salt == 3 {
                 // The same bytes: the believed leaf is restored as it stands.
@@ -4923,12 +5127,8 @@ mod lattice_v2 {
         assert_eq!(leaves_by(&mut store.inner, first, 42).len(), 4);
         assert!(store.acquired.is_empty());
         let snapshot = store.inner.snapshot().unwrap();
-        assert!(snapshot
-            .collection(first)
-            .unwrap()
-            .missing_from(&snapshot.collection(root).unwrap())
-            .unwrap()
-            .is_empty());
+        let view = snapshot.collection(first).unwrap();
+        assert!(known_missing(&view, &snapshot.collection(root).unwrap()).is_empty());
         drop(snapshot);
 
         // The next pass finds every foundation done.
@@ -4994,12 +5194,8 @@ mod lattice_v2 {
             .unwrap();
         assert_eq!(FIRST_MAP_LOG.with_borrow(|log| log[1]), data(lost_source));
         let snapshot = store.inner.snapshot().unwrap();
-        assert!(snapshot
-            .collection(first)
-            .unwrap()
-            .missing_from(&snapshot.collection(root).unwrap())
-            .unwrap()
-            .is_empty());
+        let view = snapshot.collection(first).unwrap();
+        assert!(known_missing(&view, &snapshot.collection(root).unwrap()).is_empty());
     }
 
     /// Review finding, 2026-09-28: every missing output cost one restart of
@@ -5068,12 +5264,8 @@ mod lattice_v2 {
         );
         assert_eq!(FIRST_MAP_CALLS.get(), 11);
         let snapshot = store.inner.snapshot().unwrap();
-        assert!(snapshot
-            .collection(first)
-            .unwrap()
-            .missing_from(&snapshot.collection(root).unwrap())
-            .unwrap()
-            .is_empty());
+        let view = snapshot.collection(first).unwrap();
+        assert!(known_missing(&view, &snapshot.collection(root).unwrap()).is_empty());
     }
 
     /// Review finding, 2026-09-28: a refusal of one own foundation ended the
@@ -5132,7 +5324,7 @@ mod lattice_v2 {
             let snapshot = store.snapshot().unwrap();
             let view = snapshot.collection(first).unwrap();
             let source = snapshot.collection(root).unwrap();
-            view.missing_from(&source).unwrap().data_members().collect()
+            known_missing(&view, &source).data_members().collect()
         };
 
         for signer in [41, 42] {
@@ -6309,7 +6501,7 @@ mod lattice_v2 {
         let root = store.collection("facts", policy()).unwrap();
         let raw = store.derive::<TestImage>(root, (), policy()).unwrap();
         let first = store.derive::<FirstEncoding>(root, (), policy()).unwrap();
-        let succinct = store.attach::<SuccinctArchiveBlob>(root, ()).unwrap();
+        let succinct = store.attach(root, simple_to_succinct()).unwrap();
         own_commit(&mut store, root, 41, 0);
         block_on(store.ensure(raw, &owner)).unwrap();
         block_on(store.ensure(first, &owner)).unwrap();
@@ -6647,7 +6839,7 @@ mod attach_dependencies {
     ) {
         let mut store = MemoryRepo::for_host(host().verifying_key());
         let root = store.collection("witnessed", policy()).unwrap();
-        let attached = store.attach_with(root, Witnessed).unwrap();
+        let attached = store.attach(root, Witnessed).unwrap();
         let payloads: Vec<_> = (1..=count).map(|entity| archive(entity, 3)).collect();
         for payload in &payloads {
             publish_root(&mut store, root, payload, 71);

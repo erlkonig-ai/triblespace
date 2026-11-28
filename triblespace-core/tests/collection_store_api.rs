@@ -403,7 +403,12 @@ fn unrecognized_policy_is_invisible_without_poisoning_other_collections() {
         QuorumOutcome::Unmet
     );
     assert!(unknown.admitted(&snapshot).unwrap().is_empty());
-    assert!(unknown.read::<TribleSet, _>(&snapshot).unwrap().is_empty());
+    assert!(snapshot
+        .collection(unknown)
+        .unwrap()
+        .view::<TribleSet>()
+        .unwrap()
+        .is_empty());
     assert_eq!(
         collection_read_audience(&snapshot, unknown.handle()).unwrap(),
         CollectionReadAudience::Restricted(Vec::new())
@@ -411,7 +416,11 @@ fn unrecognized_policy_is_invisible_without_poisoning_other_collections() {
     // Explicit scalar inspection remains diagnostic, not an admission gate.
     assert!(unknown.policy(&snapshot).is_err());
     assert_eq!(
-        healthy.read::<TribleSet, _>(&snapshot).unwrap(),
+        snapshot
+            .collection(healthy)
+            .unwrap()
+            .view::<TribleSet>()
+            .unwrap(),
         expected_facts
     );
 }
@@ -440,7 +449,11 @@ fn missing_read_policy_does_not_hide_supported_write_admission() {
         .writer_is_admitted(&snapshot, writer.verifying_key())
         .unwrap());
     assert_eq!(
-        collection.read::<TribleSet, _>(&snapshot).unwrap(),
+        snapshot
+            .collection(collection)
+            .unwrap()
+            .view::<TribleSet>()
+            .unwrap(),
         *expected.facts()
     );
     assert!(collection.policy(&snapshot).is_err());
@@ -517,7 +530,11 @@ fn multiple_policy_alternatives_union_admission_without_combining_quorum_shares(
         .writer_is_admitted(&after, writer.verifying_key())
         .unwrap());
     assert_eq!(
-        collection.read::<TribleSet, _>(&after).unwrap(),
+        after
+            .collection(collection)
+            .unwrap()
+            .view::<TribleSet>()
+            .unwrap(),
         *expected.facts()
     );
     assert!(collection.admitted(&before).unwrap().is_empty());

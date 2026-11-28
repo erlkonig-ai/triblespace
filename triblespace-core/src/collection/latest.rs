@@ -339,6 +339,11 @@ impl CollectionEncoding for LatestBlob {
     }
 }
 
+/// Project state identities and the superseded targets named by `observes`.
+pub fn latest_states(observes: Id) -> impl super::MapMapping<Target = LatestBlob> {
+    super::CanonicalAttachment::<LatestBlob>::new(observes)
+}
+
 impl CollectionAttachment for LatestBlob {
     type Argument = Id;
 
@@ -660,7 +665,7 @@ mod tests {
             .collection("latest-row-view", policy(key.verifying_key()))
             .unwrap();
         let target = store
-            .attach::<LatestBlob>(source, metadata::supersedes.id())
+            .attach(source, latest_states(metadata::supersedes.id()))
             .unwrap();
         let handles = members
             .iter()
@@ -1008,14 +1013,14 @@ mod tests {
 
     #[test]
     fn configured_edge_is_part_of_mapping_identity_and_does_not_limit_subjects() {
-        use super::super::{descriptor, CanonicalAttachment};
+        use super::super::descriptor;
         let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
         let mut store = MemoryRepo::default();
         let source = store
             .collection("latest-identity", policy(key.verifying_key()))
             .unwrap();
-        let a = CanonicalAttachment::<LatestBlob>::new(metadata::supersedes.id());
-        let b = CanonicalAttachment::<LatestBlob>::new(metadata::tag.id());
+        let a = latest_states(metadata::supersedes.id());
+        let b = latest_states(metadata::tag.id());
         let first = descriptor::attaching_with(source.handle(), &a);
         let second = descriptor::attaching_with(source.handle(), &b);
         assert_ne!(first, second);
@@ -1044,7 +1049,7 @@ mod tests {
             .collection("maintained-latest", policy(key.verifying_key()))
             .unwrap();
         let target = store
-            .attach::<LatestBlob>(source, metadata::supersedes.id())
+            .attach(source, latest_states(metadata::supersedes.id()))
             .unwrap();
         let a = ufoid();
         let b = ufoid();

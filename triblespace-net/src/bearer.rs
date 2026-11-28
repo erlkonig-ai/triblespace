@@ -25,8 +25,7 @@
 //! same provider merely repeats an authorized read of immutable content; replay
 //! under any other endpoint identity fails.
 
-use anyhow::Result;
-use triblespace_core::patch::{Entry as PatchEntry, IdentitySchema, PATCH};
+#[cfg(test)]
 use triblespace_core::repo::BlobStoreList;
 
 use crate::protocol::RawHash;
@@ -36,7 +35,7 @@ use crate::transport::PeerId;
 ///
 /// The locator is a cryptographic image of the handle. Its collision model is
 /// the same 256-bit content-address assumption used by the blob namespace.
-pub(crate) type BearerLocatorIndex = PATCH<32, IdentitySchema, RawHash>;
+pub(crate) use triblespace_core::blob::locator::BlobLocatorIndex as BearerLocatorIndex;
 
 pub use triblespace_core::blob::locator::blob_locator;
 
@@ -66,54 +65,6 @@ pub(crate) fn proof_matches(actual: &RawHash, expected: &RawHash) -> bool {
             difference | (left ^ right)
         })
         == 0
-}
-
-/// Build the exact locator index for one immutable blob-store observation.
-pub(crate) fn locator_index<R>(snapshot: &R) -> Result<BearerLocatorIndex>
-where
-    R: BlobStoreList,
-{
-    let mut index = BearerLocatorIndex::new();
-    for info in snapshot.blobs() {
-        let handle = info
-            .map_err(|error| anyhow::anyhow!("cannot enumerate bearer blobs: {error:?}"))?
-            .handle
-            .raw;
-        let locator = blob_locator(handle);
-        index.insert(&PatchEntry::with_value(&locator, handle));
-    }
-    Ok(index)
-}
-
-/// Apply one store-snapshot delta to a structurally shared locator index.
-///
-/// Native Pile/Yard snapshots answer both differences from PATCH indexes. A
-/// list-only backend may conservatively enumerate old and new in full; remove
-/// then add remains correct.
-pub(crate) fn update_locator_index<R>(
-    snapshot: &R,
-    previous: &R,
-    previous_index: &BearerLocatorIndex,
-) -> Result<BearerLocatorIndex>
-where
-    R: BlobStoreList,
-{
-    let mut index = previous_index.clone();
-    for info in previous.blobs_diff(snapshot) {
-        let handle = info
-            .map_err(|error| anyhow::anyhow!("cannot enumerate removed bearer blobs: {error:?}"))?
-            .handle
-            .raw;
-        index.remove(&blob_locator(handle));
-    }
-    for info in snapshot.blobs_diff(previous) {
-        let handle = info
-            .map_err(|error| anyhow::anyhow!("cannot enumerate added bearer blobs: {error:?}"))?
-            .handle
-            .raw;
-        index.replace(&PatchEntry::with_value(&blob_locator(handle), handle));
-    }
-    Ok(index)
 }
 
 #[cfg(test)]
@@ -209,26 +160,27 @@ mod tests {
     fn locator_index_tracks_patch_backed_snapshot_additions() {
         let mut store = MemoryRepo::default();
         let before = store.snapshot().unwrap();
-        let before_index = locator_index(&before).unwrap();
+        let before_index = before.blob_locators().unwrap();
         let added = store
             .put::<UnknownBlob, _>(Bytes::from_source(vec![17; 257]))
             .unwrap();
         let after = store.snapshot().unwrap();
-        let after_index = update_locator_index(&after, &before, &before_index).unwrap();
+        let after_index = after.blob_locators().unwrap();
 
         assert!(before_index.get(&blob_locator(added.raw)).is_none());
         assert_eq!(after_index.get(&blob_locator(added.raw)), Some(&added.raw));
     }
 
     #[test]
-    fn locator_index_fallback_remove_then_add_is_exact() {
+    fn list_only_snapshot_locator_lookup_is_exact() {
         let removed = [21; 32];
         let retained = [22; 32];
         let added = [23; 32];
         let before = ListSnapshot(vec![info(removed), info(retained)]);
         let after = ListSnapshot(vec![info(retained), info(added)]);
-        let before_index = locator_index(&before).unwrap();
-        let after_index = update_locator_index(&after, &before, &before_index).unwrap();
+        let before_index = before.blob_locators().unwrap();
+        assert_eq!(before_index.get(&blob_locator(removed)), Some(&removed));
+        let after_index = after.blob_locators().unwrap();
 
         assert!(after_index.get(&blob_locator(removed)).is_none());
         assert_eq!(after_index.get(&blob_locator(retained)), Some(&retained));

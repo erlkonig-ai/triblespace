@@ -202,6 +202,16 @@ impl DependencyKey<INLINE_LEN> for CollectionData {
     }
 }
 
+impl DependencyKey<INLINE_LEN> for crate::collection::SourceLocator {
+    fn to_key(&self) -> [u8; INLINE_LEN] {
+        self.raw()
+    }
+
+    fn from_key(key: &[u8; INLINE_LEN]) -> Self {
+        Self::from_raw(*key)
+    }
+}
+
 /// One component of a raw read-set, held as PATCH keys.
 ///
 /// A retained observation is cloned whenever it is reused, so a clone shares
@@ -327,6 +337,8 @@ pub struct StoreDependencies {
     pub records: DependencySet<SELECTOR_KEY_LEN, CollectionRecordSelector>,
     /// Exact blob hashes consulted, whether resident, missing, or unreadable.
     pub blobs: DependencySet<INLINE_LEN, CollectionData>,
+    /// Local locator lookups, including misses. These are not blob handles.
+    pub locators: DependencySet<INLINE_LEN, crate::collection::SourceLocator>,
     /// Whether complete capability proof evidence was consulted.
     pub capability_proofs: bool,
     /// Whether an unrestricted record enumeration was consulted.
@@ -340,6 +352,7 @@ impl StoreDependencies {
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
             && self.blobs.is_empty()
+            && self.locators.is_empty()
             && !self.capability_proofs
             && !self.all_records
             && !self.all_blobs
@@ -390,7 +403,9 @@ pub trait StoreSnapshot: Clone + Send + Sync + 'static {
         {
             relevant = relevant.union(StoreChanges::COLLECTION_RECORDS);
         }
-        if (dependencies.all_blobs || !dependencies.blobs.is_empty())
+        if (dependencies.all_blobs
+            || !dependencies.blobs.is_empty()
+            || !dependencies.locators.is_empty())
             && observed.contains(StoreChanges::BLOBS)
         {
             relevant = relevant.union(StoreChanges::BLOBS);
@@ -740,6 +755,39 @@ pub trait BlobStoreList {
 
     /// Lists all blobs in the repository.
     fn blobs<'a>(&'a self) -> Self::Iter<'a>;
+
+    /// Local association of locators with resident handles in this snapshot.
+    /// Native snapshots share a lazy immutable index. The fallback enumerates
+    /// storage metadata; it never reads payloads, acquires bytes or publishes.
+    /// Handles are bearer capabilities: this is not a remote resolver API.
+    fn blob_locators(&self) -> Result<crate::blob::locator::BlobLocatorIndex, Self::Err> {
+        crate::blob::locator::index(self)
+    }
+
+    /// Resolve a locator locally, without turning an unknown handle into demand.
+    /// A miss says nothing about collection membership or another holder. A hit
+    /// still requires normal payload validation when its bytes are read.
+    fn find_blob(&self, locator: [u8; INLINE_LEN]) -> Result<Option<[u8; INLINE_LEN]>, Self::Err> {
+        Ok(self.blob_locators()?.get(&locator).copied())
+    }
+
+    /// Resolve a batch against one frozen local inventory, preserving order
+    /// and misses. The default enumerates metadata at most once, and an empty
+    /// batch does no work. Backends specializing `find_blob` must override this
+    /// too if their lookup has semantics beyond the resident locator index.
+    fn find_blobs(
+        &self,
+        locators: &[[u8; INLINE_LEN]],
+    ) -> Result<Vec<Option<[u8; INLINE_LEN]>>, Self::Err> {
+        if locators.is_empty() {
+            return Ok(Vec::new());
+        }
+        let index = self.blob_locators()?;
+        Ok(locators
+            .iter()
+            .map(|locator| index.get(locator).copied())
+            .collect())
+    }
 
     /// Test whether one blob is present in this store snapshot without
     /// turning absence into demand.

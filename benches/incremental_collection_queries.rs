@@ -33,6 +33,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
+use triblespace::core::collection::succinctarchive_union::{raw_to_rank9, simple_to_succinct};
 
 use ed25519_dalek::SigningKey;
 use futures::executor::block_on;
@@ -134,10 +135,10 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
     }
 
     let raw = store
-        .attach::<SuccinctArchiveBlob>(collection, ())
+        .attach(collection, simple_to_succinct())
         .expect("attach the Succinct index");
     let accelerated = store
-        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(collection, raw)
+        .attach(collection, raw_to_rank9(raw))
         .expect("attach the Rank9 accelerator");
     Fixture {
         store,

@@ -99,7 +99,7 @@ fn cross_commit_join_publishes_then_restart_recomputes_without_new_facts() {
     assert!(has(env.facts(), x, out, y));
     env.publish(&mut store, &key).unwrap().unwrap();
     let snapshot = store.snapshot().unwrap();
-    let durable: TribleSet = root.read(&snapshot).unwrap();
+    let durable: TribleSet = snapshot.collection(root).unwrap().view().unwrap();
     assert!(has(&durable, x, out, y));
     let mut reopened = CollectionEnvironment::new(root, anchor);
     reopened.observe(&snapshot).unwrap();
@@ -305,8 +305,12 @@ fn uncertain_commit_and_flush_retry_identical_batch_and_signer() {
     ));
     assert_eq!(env.unpublished(), &pending);
     assert!(has(
-        &root
-            .read::<TribleSet, _>(&store.snapshot().unwrap())
+        &store
+            .snapshot()
+            .unwrap()
+            .collection(root)
+            .unwrap()
+            .view::<TribleSet>()
             .unwrap(),
         x,
         out,

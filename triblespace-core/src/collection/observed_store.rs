@@ -185,6 +185,38 @@ impl<R: BlobStoreList> BlobStoreList for ObservedStore<R> {
         Self: 'a;
     type Err = R::Err;
 
+    fn blob_locators(&self) -> Result<crate::blob::locator::BlobLocatorIndex, Self::Err> {
+        self.tracker
+            .lock()
+            .expect("store dependency tracker is not poisoned")
+            .all_blobs = true;
+        self.inner.blob_locators()
+    }
+
+    fn find_blob(&self, locator: [u8; 32]) -> Result<Option<[u8; 32]>, Self::Err> {
+        self.tracker
+            .lock()
+            .expect("store dependency tracker is not poisoned")
+            .locators
+            .insert(super::SourceLocator::from_raw(locator));
+        self.inner.find_blob(locator)
+    }
+
+    fn find_blobs(&self, locators: &[[u8; 32]]) -> Result<Vec<Option<[u8; 32]>>, Self::Err> {
+        {
+            let mut tracker = self
+                .tracker
+                .lock()
+                .expect("store dependency tracker is not poisoned");
+            for locator in locators {
+                tracker
+                    .locators
+                    .insert(super::SourceLocator::from_raw(*locator));
+            }
+        }
+        self.inner.find_blobs(locators)
+    }
+
     fn blobs<'a>(&'a self) -> Self::Iter<'a> {
         self.tracker
             .lock()
@@ -383,6 +415,49 @@ impl<R: WantRead> WantRead for ObservedStore<R> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn locator_miss_tracks_only_the_matching_resident_arrival() {
+        use crate::blob::locator::blob_locator;
+        use crate::repo::pile::Pile;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut store = Pile::open(file.path()).unwrap();
+        let expected = blob("locator wanted");
+        let handle = expected.get_handle();
+        let before = store.snapshot().unwrap();
+        let observed = ObservedStore::new(before.clone());
+        assert_eq!(
+            observed.find_blobs(&[blob_locator(handle.raw)]).unwrap(),
+            vec![None]
+        );
+        let interests = observed.dependencies();
+        assert_eq!(interests.locators.len(), 1);
+        assert!(!interests.all_blobs);
+        assert!(interests.blobs.is_empty());
+        store
+            .put::<UnknownBlob, _>(blob("unrelated locator"))
+            .unwrap();
+        let unrelated = store.snapshot().unwrap();
+        assert_eq!(
+            unrelated.changes_for(&before, &interests),
+            StoreChanges::NONE
+        );
+        store.put::<UnknownBlob, _>(expected).unwrap();
+        let arrived = store.snapshot().unwrap();
+        assert_eq!(
+            arrived.changes_for(&before, &interests),
+            StoreChanges::BLOBS
+        );
+        assert_eq!(
+            arrived.find_blob(blob_locator(handle.raw)).unwrap(),
+            Some(handle.raw)
+        );
+        assert_eq!(before.find_blob(blob_locator(handle.raw)).unwrap(), None);
+        assert!(arrived
+            .blob_locators()
+            .unwrap()
+            .shares_root(&arrived.clone().blob_locators().unwrap()));
+    }
+
     use std::convert::Infallible;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

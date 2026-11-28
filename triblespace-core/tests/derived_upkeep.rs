@@ -4,10 +4,12 @@
 
 use ed25519_dalek::SigningKey;
 use futures::executor::block_on;
+use triblespace_core::blob::encodings::entity_id_set::genid_attribute_values;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{
     OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
 };
+use triblespace_core::collection::succinctarchive_union::{raw_to_rank9, simple_to_succinct};
 use triblespace_core::collection::{
     attached_to, ensure_downstream, maintain_downstream, AdmissionPolicy, Attached, Collection,
     CollectionPolicy, CollectionRead, CollectionRealizationError, CollectionRecord,
@@ -44,10 +46,8 @@ struct Pair {
 
 fn pair(store: &mut MemoryRepo, name: &str, owner: &SigningKey) -> Pair {
     let source = store.collection(name, open_for(owner)).unwrap();
-    let succinct = store.attach::<SuccinctArchiveBlob>(source, ()).unwrap();
-    let rank9 = store
-        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, succinct)
-        .unwrap();
+    let succinct = store.attach(source, simple_to_succinct()).unwrap();
+    let rank9 = store.attach(source, raw_to_rank9(succinct)).unwrap();
     Pair {
         source,
         succinct,
@@ -255,7 +255,6 @@ fn a_key_that_is_not_the_host_fails_and_an_unknown_representation_is_named_not_g
 /// through them.
 #[test]
 fn one_attached_collection_failing_leaves_the_others_upkept() {
-    use triblespace_core::blob::encodings::entity_id_set::EntityIdSetBlob;
     use triblespace_core::collection::CollectionHandle;
 
     /// The core realizer, except that one attached collection fails.
@@ -293,7 +292,7 @@ fn one_attached_collection_failing_leaves_the_others_upkept() {
     let mut store = MemoryRepo::for_host(owner.verifying_key());
     let pair = pair(&mut store, "isolated", &owner);
     let named = store
-        .attach::<EntityIdSetBlob>(pair.source, metadata::name.id())
+        .attach(pair.source, genid_attribute_values(metadata::name.id()))
         .unwrap();
     store
         .commit(pair.source, &owner, fragment("first"))
@@ -387,7 +386,7 @@ fn a_descriptor_naming_another_mapping_is_left_to_whoever_registered_it() {
     let owner = key(5);
     let mut store = MemoryRepo::for_host(owner.verifying_key());
     let source = store.collection("mapped", open_for(&owner)).unwrap();
-    let other = store.attach_with(source, OtherWay).unwrap();
+    let other = store.attach(source, OtherWay).unwrap();
     store.commit(source, &owner, fragment("mapped")).unwrap();
     block_on(store.ensure_attached_with::<OtherWay>(other, &owner)).unwrap();
 

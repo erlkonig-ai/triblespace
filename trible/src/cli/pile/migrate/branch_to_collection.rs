@@ -510,7 +510,7 @@ mod tests {
 
     use ed25519_dalek::Signer;
     use tempfile::NamedTempFile;
-    use triblespace_core::collection::{CollectionRead, CollectionRecord};
+    use triblespace_core::collection::{CollectionRead, CollectionRecord, CollectionSnapshotExt};
     use triblespace_core::id::ExclusiveId;
     use triblespace_core::patch::Entry;
     use triblespace_core::repo::BlobStorePut;
@@ -611,8 +611,10 @@ mod tests {
         expected_union += fact(2);
         expected_union += fact(3);
         let snapshot = pile.snapshot()?;
-        let materialized: TribleSet = collection
-            .read(&snapshot)
+        let materialized: TribleSet = snapshot
+            .collection(collection)
+            .map_err(|error| anyhow!("materialize migrated collection: {error}"))?
+            .view()
             .map_err(|error| anyhow!("materialize migrated collection: {error}"))?;
         assert_eq!(materialized, expected_union);
 
@@ -736,8 +738,10 @@ mod tests {
         assert_eq!(data_target.metadata(), empty_metadata);
 
         let snapshot = pile.snapshot()?;
-        let materialized: TribleSet = collection
-            .read(&snapshot)
+        let materialized: TribleSet = snapshot
+            .collection(collection)
+            .map_err(|error| anyhow!("materialize authored-empty fixture: {error}"))?
+            .view()
             .map_err(|error| anyhow!("materialize authored-empty fixture: {error}"))?;
         assert_eq!(materialized, fact(9));
         pile.close()?;

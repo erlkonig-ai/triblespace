@@ -182,7 +182,7 @@ fn ordinary_fragment_commit_publishes_the_root_and_every_carried_attachment() {
     let commit = store.commit(collection, &authority, fragment).unwrap();
     let reader = store.snapshot().unwrap();
 
-    let outer: TribleSet = collection.read(&reader).unwrap();
+    let outer: TribleSet = reader.collection(collection).unwrap().view().unwrap();
     let inner: TribleSet = reader.get(root).unwrap();
     let metadata: TribleSet = reader.get(commit.metadata()).unwrap();
     assert_eq!(outer, expected_outer);

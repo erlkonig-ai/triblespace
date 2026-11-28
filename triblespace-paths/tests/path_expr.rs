@@ -16,9 +16,7 @@ use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::SnapshotSource;
 use triblespace_core::trible::Fragment;
 use triblespace_core::trible::TribleSet;
-use triblespace_paths::{
-    automaton_fingerprint, GraphEdge, PathExpr, PathIndex, PathSummaryBlob, Step,
-};
+use triblespace_paths::{automaton_fingerprint, GraphEdge, PathExpr, PathIndex, Step};
 
 fn vertex(byte: u8) -> RawInline {
     [byte; 32]
@@ -99,7 +97,10 @@ fn compiled_expression_roundtrips_through_native_collection_and_query_constraint
     let mut store = MemoryRepo::for_host(authority);
     let source = store.collection(name, policy).unwrap();
     let target = store
-        .attach::<PathSummaryBlob>(source, expression.compile())
+        .attach(
+            source,
+            triblespace_paths::regular_path(expression.compile()),
+        )
         .unwrap();
     let mut graph = tagged_edge(1, 2);
     graph += tagged_edge(2, 3);

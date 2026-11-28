@@ -37,6 +37,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
+use triblespace::core::collection::succinctarchive_union::{raw_to_rank9, simple_to_succinct};
 
 use ed25519_dalek::SigningKey;
 use futures::executor::block_on;
@@ -629,10 +630,10 @@ fn register_collections(store: &mut MemoryRepo) -> Collections {
         .collection(benchmark_name(), benchmark_policy())
         .expect("register benchmark source collection");
     let raw = store
-        .attach::<SuccinctArchiveBlob>(source, ())
+        .attach(source, simple_to_succinct())
         .expect("attach the Succinct index");
     let accelerated = store
-        .attach::<Rank9AcceleratedSuccinctArchiveBlob>(source, raw)
+        .attach(source, raw_to_rank9(raw))
         .expect("attach the Rank9 accelerator");
     Collections {
         source,

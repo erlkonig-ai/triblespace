@@ -177,11 +177,10 @@ above it.
 The collection value is its canonical descriptor handle, and the storage
 backend owns I/O and durability. `store.collection(name, policy)` constructs
 and registers a canonical root descriptor. `store.derive::<Target>(source,
-argument, policy)` does the same for a target-owned canonical derivation, and
-`store.attach::<Target>(parent, argument)` for an index attached to a root,
-whose descriptor carries no policy. Mappings between two foreign encoding
-types use the explicit `store.derive_with(source, mapping, policy)` and
-`store.attach_with(parent, mapping)` coherence seams.
+argument, policy)` does the same for a target-owned canonical derivation.
+`store.derive_with(source, mapping, policy)` takes an explicit derivation.
+`store.attach(parent, mapping)` takes an explicit mapping for an index
+attached to a root. An attached descriptor carries no policy.
 `store.commit(collection,
 signer, fragment)` publishes attachments, canonical data, canonical metadata,
 and the signed native record in dependency order. Local publication performs
@@ -198,7 +197,7 @@ Reads are exact about what they observed, not magical about global time:
   policy and the resident capability evidence -- and returns one semantic
   `Cover<E>`, the union of what the collection's frontier stands for, without
   fetching member data; and
-- `collection.read(&snapshot)` attaches that frontier from the same index and
+- `snapshot.collection(collection)?.view()?` selects that frontier from the same index and
   reconstructs the logical value from the nodes whose bytes are resident,
   descending through the `MERGE` that produced a node whose bytes are not,
   through that same immutable observation.

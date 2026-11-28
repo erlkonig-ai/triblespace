@@ -10,6 +10,7 @@ use triblespace_core::blob::encodings::succinctarchive::{
     WaveletMatrixFreezeBackend,
 };
 use triblespace_core::blob::{Blob, IntoBlob};
+use triblespace_core::collection::succinctarchive_union::simple_to_succinct;
 use triblespace_core::collection::{
     AdmissionPolicy, CollectionAttachment, CollectionPolicy, CollectionRead, CollectionRecord,
     CollectionSnapshotExt, CollectionStoreExt, MapMapping,
@@ -146,16 +147,13 @@ where
     let mut store = MemoryRepo::for_host(signer.verifying_key());
     let source = store.collection("raw-backend", policy).unwrap();
     let target = store
-        .attach_with(source, BackendSuccinctMapping::new(B::default()))
+        .attach(source, BackendSuccinctMapping::new(B::default()))
         .unwrap();
     // The canonical attached descriptor is the backend's: one collection,
     // whichever device builds it.
     assert_eq!(
         target.handle(),
-        store
-            .attach::<SuccinctArchiveBlob>(source, ())
-            .unwrap()
-            .handle()
+        store.attach(source, simple_to_succinct()).unwrap().handle()
     );
     let mut expected = TribleSet::new();
     for start in 0..8u32 {

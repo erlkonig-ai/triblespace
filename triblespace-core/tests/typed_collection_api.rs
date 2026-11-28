@@ -109,7 +109,7 @@ fn simplearchive_collection_round_trips_typed_views() {
     assert_eq!(cover.collection(), collection);
     assert_eq!(cover.members().collect::<Vec<_>>(), vec![expected_member]);
 
-    let materialized: TribleSet = collection.read(&snapshot).unwrap();
+    let materialized: TribleSet = snapshot.collection(collection).unwrap().view().unwrap();
     assert_eq!(materialized, expected);
 }
 

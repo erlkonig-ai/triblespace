@@ -6,6 +6,7 @@
 
 use std::error::Error;
 use std::io;
+use triblespace::core::collection::succinctarchive_union::{raw_to_rank9, simple_to_succinct};
 
 use ed25519_dalek::SigningKey;
 use futures::executor::block_on;
@@ -160,8 +161,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
     )?;
 
-    let raw = store.attach::<SuccinctArchiveBlob>(collection, ())?;
-    let accelerated = store.attach::<Rank9AcceleratedSuccinctArchiveBlob>(collection, raw)?;
+    let raw = store.attach(collection, simple_to_succinct())?;
+    let accelerated = store.attach(collection, raw_to_rank9(raw))?;
     let mut checkpoint = None;
 
     let first = observe(

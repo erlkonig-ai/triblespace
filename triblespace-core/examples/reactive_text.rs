@@ -155,7 +155,7 @@ pub fn run(print_projection: bool) -> Result<()> {
         ])));
         assert!(env.publish(&mut store, &key)?.is_some());
     }
-    let durable: TribleSet = root.read(&store.snapshot()?)?;
+    let durable: TribleSet = store.snapshot()?.collection(root)?.view()?;
     assert_eq!(durable, *env.facts());
     let mut reopened = CollectionEnvironment::new(root, *anchor);
     let snapshot = store.snapshot()?;

@@ -105,7 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     storage.commit(library, &key, import)?;
 
     let snapshot = storage.snapshot()?;
-    let facts: TribleSet = library.read(&snapshot)?;
+    let facts: TribleSet = snapshot.collection(library)?.view()?;
     let title = "Dune";
     for (first, last, quote) in find!(
         (first, last, quote),
@@ -147,8 +147,8 @@ Other strictly verified signers become visible only when
 `ACTION_WRITE` on this descriptor handle through resident proof and definition
 evidence. Collection WRITE authority has no wall-clock expiry.
 Identical retries deduplicate by intrinsic record identity, distinct commits
-coexist, and `library.read(&snapshot)` reads the union of every admitted
-author's commits through the same snapshot. Call
+coexist, and `snapshot.collection(library)?.view()?` reads the resident
+representation of admitted commits through the same snapshot. Call
 the store's `flush` operation when an application needs an explicit durability
 barrier.
 

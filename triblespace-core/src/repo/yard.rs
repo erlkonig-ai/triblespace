@@ -145,6 +145,7 @@ pub struct Yard {
     generations: Vec<Generation>,
     config: YardConfig,
     want_state: Arc<Mutex<WantState>>,
+    last_locator_snapshot: Option<YardSnapshot>,
 }
 
 impl Yard {
@@ -189,6 +190,7 @@ impl Yard {
             generations,
             config,
             want_state: Arc::new(Mutex::new(WantState::default())),
+            last_locator_snapshot: None,
         })
     }
 
@@ -291,6 +293,7 @@ impl Yard {
             generations,
             config,
             want_state: Arc::new(Mutex::new(want_state)),
+            last_locator_snapshot: None,
         })
     }
 
@@ -478,6 +481,10 @@ impl Yard {
     /// propagate together via [`YardReclaimError::Reopen`] and the segment
     /// is left closed.
     fn reclaim_segment(&mut self, level: usize, index: usize) -> Result<(), YardReclaimError> {
+        // Physical replacement retires an entire file mapping. Do not retain
+        // that mapping solely as a deferred locator delta baseline. The next
+        // snapshot starts cold, including when replacement fails and reopens.
+        self.last_locator_snapshot = None;
         // Put the complete surviving WANT union in the active young segment's
         // replacement *before* its atomic rename. A post-rename append would
         // leave a crash window in which the only durable marker was lost.
@@ -1004,7 +1011,18 @@ impl SnapshotSource for Yard {
             .lock()
             .expect("want mutex poisoned")
             .requests();
-        Ok(YardSnapshot { generations, wants })
+        let mut snapshot = YardSnapshot {
+            generations,
+            wants,
+            locators: Arc::default(),
+        };
+        if let Some(previous) = &self.last_locator_snapshot {
+            snapshot.locators = previous
+                .locators
+                .advance(previous, snapshot.changes_since(previous));
+        }
+        self.last_locator_snapshot = Some(snapshot.clone());
+        Ok(snapshot)
     }
 }
 
@@ -1052,6 +1070,7 @@ struct YardGenerationSnapshot {
 pub struct YardSnapshot {
     generations: Vec<YardGenerationSnapshot>,
     wants: Vec<WantRequest>,
+    locators: Arc<crate::blob::locator::LocatorCache<YardSnapshot>>,
 }
 
 impl WantRead for YardSnapshot {
@@ -1110,6 +1129,37 @@ impl YardSnapshot {
 }
 
 impl StoreSnapshot for YardSnapshot {
+    fn changes_for(
+        &self,
+        previous: &Self,
+        dependencies: &super::StoreDependencies,
+    ) -> StoreChanges {
+        let observed = self.changes_since(previous);
+        let mut changes = StoreChanges::NONE;
+        if (dependencies.all_records || !dependencies.records.is_empty())
+            && observed.contains(StoreChanges::COLLECTION_RECORDS)
+        {
+            changes = changes.union(StoreChanges::COLLECTION_RECORDS);
+        }
+        if dependencies.capability_proofs && observed.contains(StoreChanges::CAPABILITY_PROOFS) {
+            changes = changes.union(StoreChanges::CAPABILITY_PROOFS);
+        }
+        if observed.contains(StoreChanges::BLOBS) {
+            if dependencies.all_blobs || !dependencies.blobs.is_empty() {
+                changes = changes.union(StoreChanges::BLOBS);
+            } else if !dependencies.locators.is_empty() {
+                match (self.blob_locators(), previous.blob_locators()) {
+                    (Ok(now), Ok(before))
+                        if dependencies.locators.iter().all(|locator| {
+                            now.get(locator.as_bytes()) == before.get(locator.as_bytes())
+                        }) => {}
+                    _ => changes = changes.union(StoreChanges::BLOBS),
+                }
+            }
+        }
+        changes
+    }
+
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         if previous.generations.len() != self.generations.len() {
             return StoreChanges::ALL;
@@ -1178,6 +1228,9 @@ impl BlobChildren for YardSnapshot {
 }
 
 impl BlobStoreList for YardSnapshot {
+    fn blob_locators(&self) -> Result<crate::blob::locator::BlobLocatorIndex, Self::Err> {
+        self.locators.get(self)
+    }
     type Iter<'a> = YardListIter;
     type Err = Infallible;
 
@@ -1642,6 +1695,87 @@ mod tests {
             let actual = yard.put::<UnknownBlob, _>(blob).unwrap();
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn physical_reclaim_drops_the_yards_locator_baseline() {
+        use crate::blob::locator::blob_locator;
+
+        let (_dir, mut yard) = yard_with(1, YardConfig::default());
+        let handle = yard
+            .put::<RawBytes, _>(raw_blob(b"retained across reclaim"))
+            .unwrap();
+        let before = yard.snapshot().unwrap();
+        assert_eq!(
+            before.find_blob(blob_locator(handle.raw)).unwrap(),
+            Some(handle.raw)
+        );
+        let retired = Arc::downgrade(&before.locators);
+        drop(before);
+        assert!(
+            retired.upgrade().is_some(),
+            "the yard retains the last observation"
+        );
+        yard.reclaim().unwrap();
+        let after = yard.snapshot().unwrap();
+        assert!(
+            retired.upgrade().is_none(),
+            "no old mmap observation retained just for a locator delta"
+        );
+        assert_eq!(
+            after.find_blob(blob_locator(handle.raw)).unwrap(),
+            Some(handle.raw)
+        );
+    }
+
+    #[test]
+    fn locator_lookup_tracks_yard_eviction_without_changing_old_snapshots() {
+        use crate::blob::locator::blob_locator;
+        use crate::collection::SourceLocator;
+        use crate::repo::ObservedStore;
+
+        let (_dir, mut yard) = yard_with(2, YardConfig::default());
+        let handle = yard
+            .put::<RawBytes, _>(raw_blob(b"resident then evicted"))
+            .unwrap();
+        let locator = blob_locator(handle.raw);
+        let old = yard.snapshot().unwrap();
+        let observed = ObservedStore::new(old.clone());
+        assert_eq!(observed.find_blob(locator).unwrap(), Some(handle.raw));
+        let interests = observed.dependencies();
+        assert!(interests
+            .locators
+            .contains(&SourceLocator::from_raw(locator)));
+        assert!(old
+            .blob_locators()
+            .unwrap()
+            .shares_root(&yard.snapshot().unwrap().blob_locators().unwrap()));
+
+        yard.collect(&RetentionRoots::new()).unwrap();
+        let evicted = yard.snapshot().unwrap();
+        assert_eq!(evicted.find_blob(locator).unwrap(), None);
+        assert_eq!(evicted.changes_for(&old, &interests), StoreChanges::BLOBS);
+        assert_eq!(old.find_blob(locator).unwrap(), Some(handle.raw));
+
+        yard.put::<RawBytes, _>(raw_blob(b"unrelated arrival"))
+            .unwrap();
+        let unrelated = yard.snapshot().unwrap();
+        assert_eq!(
+            unrelated.changes_for(&evicted, &interests),
+            StoreChanges::NONE
+        );
+        assert_eq!(
+            yard.put::<RawBytes, _>(raw_blob(b"resident then evicted"))
+                .unwrap(),
+            handle
+        );
+        let returned = yard.snapshot().unwrap();
+        assert_eq!(returned.find_blob(locator).unwrap(), Some(handle.raw));
+        assert_eq!(
+            returned.changes_for(&evicted, &interests),
+            StoreChanges::BLOBS
+        );
+        assert_eq!(evicted.find_blob(locator).unwrap(), None);
     }
 
     #[test]
