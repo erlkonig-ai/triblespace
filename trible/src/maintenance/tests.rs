@@ -1,7 +1,7 @@
 use super::*;
 use ed25519_dalek::SigningKey;
-use triblespace_core::blob::IntoBlob;
 use triblespace_core::blob::encodings::entity_id_set::genid_attribute_values;
+use triblespace_core::blob::IntoBlob;
 use triblespace_core::collection::succinctarchive_union::{raw_to_rank9, simple_to_succinct};
 use triblespace_core::collection::{CollectionPolicy, CollectionStore, CollectionStoreExt};
 use triblespace_core::repo::memoryrepo::MemoryRepo;
